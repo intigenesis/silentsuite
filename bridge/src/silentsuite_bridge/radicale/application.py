@@ -5,7 +5,7 @@ import re
 
 from radicale.app import Application as RadicaleApplication
 
-from ..privacy_logging import bounded_identifier
+from ..privacy_logging import bounded_exception_class, bounded_identifier
 
 _MAX_DIAGNOSTIC_LENGTH = 320
 
@@ -15,7 +15,12 @@ def _safe_exception_diagnostic(exc_info):
     if not exc_info or not exc_info[0]:
         return "Radicale server request failed"
 
-    exception_class = bounded_identifier(getattr(exc_info[0], "__name__", None))
+    exception = exc_info[1] if len(exc_info) > 1 else None
+    exception_class = (
+        bounded_exception_class(exception)
+        if exception is not None
+        else bounded_identifier(getattr(exc_info[0], "__name__", None))
+    )
 
     product_origin = None
     traceback = exc_info[2]

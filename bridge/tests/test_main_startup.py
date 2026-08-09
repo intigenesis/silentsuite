@@ -120,6 +120,24 @@ def test_bounded_failure_logging_drops_exception_text_and_traceback(caplog):
     assert len(caplog.messages[0]) < 80
 
 
+def test_bounded_diagnostic_error_exposes_only_allowlisted_code():
+    private_value = "private.person@example.invalid/private/path"
+
+    error = privacy_logging.BoundedDiagnosticError("CachePullItemIntegrityError")
+
+    assert privacy_logging.bounded_exception_class(error) == (
+        "CachePullItemIntegrityError"
+    )
+    assert private_value not in privacy_logging.bounded_exception_class(error)
+    with pytest.raises(ValueError):
+        privacy_logging.BoundedDiagnosticError(
+            "PrivatePersonIntegrityError",
+        )
+    error.diagnostic_code = private_value
+    assert privacy_logging.bounded_exception_class(error) == "BoundedDiagnosticError"
+    assert private_value not in str(error)
+
+
 def test_product_logging_call_sites_use_the_bounded_exception_helper():
     package_root = Path(bridge_main.__file__).parent
     violations = []

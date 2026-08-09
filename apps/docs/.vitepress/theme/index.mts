@@ -2,7 +2,7 @@ import DefaultTheme from 'vitepress/theme'
 import { useRouter, type EnhanceAppContext } from 'vitepress'
 import { defineComponent, h, onMounted, onUnmounted } from 'vue'
 import AppLogoStrip from './components/AppLogoStrip.vue'
-import { classifyDocsOutboundEvent, createDocsPageviewTracker } from './public-analytics.mts'
+import { buildDocsPageviewPayload, classifyDocsOutboundEvent, createDocsPageviewTracker } from './public-analytics.mts'
 import './custom.css'
 
 declare const __SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__: string
@@ -27,12 +27,10 @@ function sendDocsEvent(event: ReturnType<typeof classifyDocsOutboundEvent>) {
   })
 }
 
-function sendDocsPageview(path: string) {
-  const payload = JSON.stringify({
-    domain: 'docs.silentsuite.io',
-    name: 'pageview',
-    url: `https://docs.silentsuite.io${path}`,
-  })
+function sendDocsPageview(path: string, rawReferrer: string) {
+  const pageview = buildDocsPageviewPayload(path, rawReferrer)
+  if (!pageview) return
+  const payload = JSON.stringify(pageview)
   if (navigator.sendBeacon) {
     navigator.sendBeacon(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, new Blob([payload], { type: 'application/json' }))
     return
@@ -51,7 +49,7 @@ export default {
   Layout: defineComponent({
     setup() {
       const router = useRouter()
-      const trackPageview = createDocsPageviewTracker((path) => sendDocsPageview(path))
+      const trackPageview = createDocsPageviewTracker((path) => sendDocsPageview(path, document.referrer))
       let previousAfterRouteChanged: typeof router.onAfterRouteChanged | undefined
       const handleClick = (event: MouseEvent) => {
         if (!__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__ || window.location.hostname !== 'docs.silentsuite.io') return
