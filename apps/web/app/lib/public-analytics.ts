@@ -133,9 +133,17 @@ function hasExplicitPort(raw: string): boolean {
   return authority ? /:\d*$/.test(authority) : false
 }
 
+function isCanonicalDnsAuthority(authority: string): boolean {
+  return authority.length <= 253 && authority.split('.').every(
+    (label) => label.length >= 1
+      && label.length <= 63
+      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label),
+  )
+}
+
 function hasNonCanonicalAuthoritySyntax(raw: string): boolean {
   const authority = rawHttpAuthority(raw)
-  return !authority || !/^[a-z0-9.-]+$/i.test(authority)
+  return !authority || !isCanonicalDnsAuthority(authority)
 }
 
 type ReferrerMatch = { category: ReferrerCategory, referrer: CanonicalReferrer }

@@ -119,6 +119,8 @@ describe('public analytics privacy contract', () => {
     'https://google。com/search', 'https://google%E3%80%82com/search', 'https://google%2ecom/search', 'https://xn--googl-fsa.com/search',
     'https:///google%2ecom/search', 'https:////google%2ecom/search',
     'https:google%2ecom/search', 'https:google%E3%80%82com/search', 'https:github.com:443/private',
+    'https://.github.com/private', 'https://a..github.com/private',
+    'https://-a.github.com/private', 'https://a-.github.com/private',
     'https://user:password@github.com/private', 'https://github.com:443/private',
     ' https://github.com:443/private', 'https://github.com:443\\private', 'https://127.0.0.1/private',
     'https://localhost/private', 'ftp://github.com/private', 'javascript://github.com/private',
