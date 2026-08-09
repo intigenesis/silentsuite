@@ -59,14 +59,18 @@ function hasNonCanonicalRawSyntax(raw: string): boolean {
   return /[\u0000-\u0020\u007f\\]/.test(raw)
 }
 
+function rawHttpAuthority(raw: string): string | undefined {
+  return raw.match(/^https?:\/\/([^/?#]+)(?:[/?#]|$)/i)?.[1]
+}
+
 function hasExplicitPort(raw: string): boolean {
-  const authority = raw.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1]
+  const authority = rawHttpAuthority(raw)
   return authority ? /:\d*$/.test(authority) : false
 }
 
 function hasNonCanonicalAuthoritySyntax(raw: string): boolean {
-  const authority = raw.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1]
-  return authority ? /[^\x00-\x7f]|%/.test(authority) : false
+  const authority = rawHttpAuthority(raw)
+  return !authority || !/^[a-z0-9.-]+$/i.test(authority)
 }
 
 export function canonicalizeDocsReferrer(raw: string): DocsCanonicalReferrer | undefined {
