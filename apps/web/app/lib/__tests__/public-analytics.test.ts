@@ -6,6 +6,7 @@ import {
   buildPlanSelectedPayload,
   buildSubscriptionManagementEntryPayload,
   canonicalizeCampaignParams,
+  canonicalizeReferrer,
   classifyReferrer,
   sanitizedSignupPageUrl,
 } from '../public-analytics'
@@ -60,6 +61,8 @@ describe('public analytics privacy contract', () => {
     expect(classifyReferrer('https://github.com/silent-suite/silentsuite/issues/123?token=secret')).toBe(
       'github',
     )
+    expect(classifyReferrer('https://new.reddit.com/r/privacy/comments/1/opaque')).toBe('other')
+    expect(classifyReferrer('https://news.ycombinator.com/item?id=1')).toBe('other')
     expect(classifyReferrer('https://evil.test/reset/user@example.com')).toBe('other')
     expect(classifyReferrer('bad url')).toBeUndefined()
   })
@@ -72,8 +75,58 @@ describe('public analytics privacy contract', () => {
       domain: 'app.silentsuite.io',
       name: 'pageview',
       url: 'https://app.silentsuite.io/signup',
+      referrer: 'https://github.com/',
       props: { referrer_category: 'github', utm_source: 'github' },
     })
+  })
+
+  it('sends the fixed Google referrer for a recognized regional Google source', () => {
+    expect(buildSignupPageviewPayload(
+      'https://app.silentsuite.io/signup',
+      'https://www.google.co.uk/search?q=silentsuite',
+    )).toEqual({
+      domain: 'app.silentsuite.io',
+      name: 'pageview',
+      url: 'https://app.silentsuite.io/signup',
+      referrer: 'https://www.google.com/',
+      props: { referrer_category: 'search' },
+    })
+  })
+
+  it.each([
+    ['https://www.bing.com/search?q=silentsuite', 'https://www.bing.com/'],
+    ['https://duckduckgo.com/?q=silentsuite', 'https://duckduckgo.com/'],
+    ['https://search.brave.com/search?q=silentsuite', 'https://search.brave.com/'],
+    ['https://www.ecosia.org/search?q=silentsuite', 'https://www.ecosia.org/'],
+    ['https://t.co/opaque-id', 'https://x.com/'],
+    ['https://old.reddit.com/r/privacy/comments/1/opaque', 'https://www.reddit.com/'],
+    ['https://redd.it/opaque-id', 'https://www.reddit.com/'],
+    ['https://github.com/silent-suite/silentsuite', 'https://github.com/'],
+    ['https://mastodon.social/@silent/opaque', 'https://mastodon.social/'],
+    ['https://bsky.app/profile/example/post/opaque', 'https://bsky.app/'],
+    ['https://alternativeto.net/software/silentsuite/', 'https://alternativeto.net/'],
+    ['https://www.privacyguides.org/en/tools/', 'https://www.privacyguides.org/'],
+    ['https://news.ycombinator.com/item?id=1', 'https://news.ycombinator.com/'],
+  ])('maps recognized source %s to its fixed Plausible referrer', (raw, referrer) => {
+    expect(canonicalizeReferrer(raw)).toBe(referrer)
+  })
+
+  it.each([
+    '', 'not a url', 'https://google.com.evil.example/search', 'https://google.zip/search',
+    'https://google.dev/search', 'https://google.co.io/search', 'https://google.ab.cd/search',
+    'https://x.com.evil.example/post',
+    'https://reddit.com.evil.example/r/privacy', 'https://gοogle.com/search', 'https://ｇoogle.com/search',
+    'https://google。com/search', 'https://google%E3%80%82com/search', 'https://google%2ecom/search', 'https://xn--googl-fsa.com/search',
+    'https:///google%2ecom/search', 'https:////google%2ecom/search',
+    'https:google%2ecom/search', 'https:google%E3%80%82com/search', 'https:github.com:443/private',
+    'https://.github.com/private', 'https://a..github.com/private',
+    'https://-a.github.com/private', 'https://a-.github.com/private',
+    'https://user:password@github.com/private', 'https://github.com:443/private',
+    ' https://github.com:443/private', 'https://github.com:443\\private', 'https://127.0.0.1/private',
+    'https://localhost/private', 'ftp://github.com/private', 'javascript://github.com/private',
+  ])('omits a standard referrer for unsafe or unrecognized input %s', (raw) => {
+    expect(canonicalizeReferrer(raw)).toBeUndefined()
+    expect(buildSignupPageviewPayload('https://app.silentsuite.io/signup', raw)).not.toHaveProperty('referrer')
   })
 
   it('creates only fixed commercial-funnel event payloads', () => {

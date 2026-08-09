@@ -30,6 +30,7 @@ from silentsuite_bridge.local_cache.models import (
     ItemEntity,
     User,
 )
+from silentsuite_bridge.privacy_logging import BoundedDiagnosticError
 from tests.conftest import (
     SAMPLE_VCALENDAR_VEVENT,
     SAMPLE_VCARD,
@@ -842,6 +843,37 @@ class TestSyncLogic:
             assert persisted.dirty is True
             mock_item_mgr.list.assert_called_once()
 
+    def test_pull_collection_retries_outside_writer_transaction(self, mem_db, user):
+        cache_col = CollectionEntity.create(
+            local_user=user,
+            uid="contacts",
+            eb_col=b"collection-cache",
+        )
+        item_mgr = MagicMock()
+        item_mgr.list.return_value = MagicMock(data=[], done=True, stoken="new-token")
+        col_mgr = MagicMock()
+        col = MagicMock()
+        col_mgr.cache_load.return_value = col
+        col_mgr.get_item_manager.return_value = item_mgr
+        account = MagicMock()
+        account.get_collection_manager.return_value = col_mgr
+        etebase = Etebase.__new__(Etebase)
+        etebase.etebase = account
+        etebase.user = user
+        retry_transaction_states = []
+
+        def inspect_retry_transaction(*_args):
+            retry_transaction_states.append(mem_db.in_transaction())
+
+        etebase._retry_unresolved_items = MagicMock(
+            side_effect=inspect_retry_transaction
+        )
+
+        with patch.object(mem_db, "close", return_value=False):
+            etebase.pull_collection(cache_col.uid)
+
+        assert retry_transaction_states == [False]
+
     def test_superseded_session_cannot_apply_page_or_advance_token(self, mem_db):
         user = User.create(username="superseded@example.com")
         collection = CollectionEntity.create(
@@ -1113,6 +1145,108 @@ def test_remote_tombstone_without_name_reuses_remote_identity_and_original_href(
     assert CollectionEntity.get_by_id(cache_col.id).dav_revision == 1
 
 
+def test_partial_cache_duplicate_remote_uids_reports_bounded_migration_stage(tmp_path):
+    cache_path = tmp_path / "partial-cache.sqlite"
+    database = pw.SqliteDatabase(str(cache_path), pragmas={"foreign_keys": 1})
+    database.execute_sql(
+        "CREATE TABLE collectionentity (id INTEGER PRIMARY KEY)"
+    )
+    database.execute_sql(
+        "CREATE TABLE itementity ("
+        "id INTEGER PRIMARY KEY, "
+        "collection_id INTEGER NOT NULL, "
+        "remote_uid VARCHAR(255)"
+        ")"
+    )
+    database.execute_sql("INSERT INTO collectionentity (id) VALUES (1)")
+    database.execute_sql(
+        "INSERT INTO itementity (collection_id, remote_uid) VALUES (1, 'duplicate')"
+    )
+    database.execute_sql(
+        "INSERT INTO itementity (collection_id, remote_uid) VALUES (1, 'duplicate')"
+    )
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        local_cache_module._migrate_cache_schema(database)
+
+    assert error.value.diagnostic_code == "CacheSchemaRemoteUidIntegrityError"
+
+
+def test_partial_cache_duplicate_remote_uids_are_bounded_during_table_init(tmp_path):
+    cache_path = tmp_path / "partial-init-cache.sqlite"
+    database = pw.SqliteDatabase(str(cache_path), pragmas={"foreign_keys": 1})
+    db.database_proxy.initialize(database)
+    database.execute_sql(
+        "CREATE TABLE collectionentity (id INTEGER PRIMARY KEY)"
+    )
+    database.execute_sql(
+        "CREATE TABLE itementity ("
+        "id INTEGER PRIMARY KEY, "
+        "collection_id INTEGER NOT NULL, "
+        "uid VARCHAR(255) NOT NULL, "
+        "eb_item BLOB NOT NULL, "
+        "new INTEGER NOT NULL DEFAULT 0, "
+        "dirty INTEGER NOT NULL DEFAULT 0, "
+        "deleted INTEGER NOT NULL DEFAULT 0, "
+        "remote_uid VARCHAR(255)"
+        ")"
+    )
+    database.execute_sql("INSERT INTO collectionentity (id) VALUES (1)")
+    database.execute_sql(
+        "INSERT INTO itementity (collection_id, uid, eb_item, remote_uid) "
+        "VALUES (1, 'first', X'01', 'duplicate')"
+    )
+    database.execute_sql(
+        "INSERT INTO itementity (collection_id, uid, eb_item, remote_uid) "
+        "VALUES (1, 'second', X'02', 'duplicate')"
+    )
+    etebase = Etebase.__new__(Etebase)
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        etebase._init_db_tables(database)
+
+    assert error.value.diagnostic_code == "CacheSchemaRemoteUidIntegrityError"
+
+
+def test_partial_cache_duplicate_token_revisions_reports_bounded_migration_stage(
+    tmp_path,
+):
+    cache_path = tmp_path / "partial-token-cache.sqlite"
+    database = pw.SqliteDatabase(str(cache_path), pragmas={"foreign_keys": 1})
+    database.execute_sql(
+        "CREATE TABLE collectionentity (id INTEGER PRIMARY KEY)"
+    )
+    database.execute_sql(
+        "CREATE TABLE itementity ("
+        "id INTEGER PRIMARY KEY, "
+        "collection_id INTEGER NOT NULL, "
+        "remote_uid VARCHAR(255)"
+        ")"
+    )
+    database.execute_sql(
+        "CREATE TABLE davsynctoken ("
+        "id INTEGER PRIMARY KEY, "
+        "collection_id INTEGER NOT NULL, "
+        "revision INTEGER NOT NULL, "
+        "state_hash VARCHAR(255)"
+        ")"
+    )
+    database.execute_sql("INSERT INTO collectionentity (id) VALUES (1)")
+    database.execute_sql(
+        "INSERT INTO davsynctoken (collection_id, revision) VALUES (1, 4)"
+    )
+    database.execute_sql(
+        "INSERT INTO davsynctoken (collection_id, revision) VALUES (1, 4)"
+    )
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        local_cache_module._migrate_cache_schema(database)
+
+    assert error.value.diagnostic_code == (
+        "CacheSchemaTokenRevisionIntegrityError"
+    )
+
+
 def test_v1_cache_is_migrated_additively_without_bumping_legacy_version(tmp_path):
     cache_path = tmp_path / "legacy-v1.sqlite"
     legacy_db = pw.SqliteDatabase(str(cache_path), pragmas={"foreign_keys": 1})
@@ -1246,6 +1380,36 @@ def test_revision_ledger_activation_rolls_back_marker_when_token_deletion_fails(
     assert models.DavSyncToken.select().count() == 0
 
 
+def test_dav_revision_integrity_failure_reports_bounded_stage_and_rolls_back(
+    mem_db,
+    user,
+    monkeypatch,
+):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    monkeypatch.setattr(
+        models.DavRevision,
+        "create",
+        MagicMock(side_effect=pw.IntegrityError("private revision details")),
+    )
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        local_cache_module.record_dav_change(
+            cache_col,
+            "contact.vcf",
+            previous_state_hash="previous-state",
+            deleted=True,
+        )
+
+    assert error.value.diagnostic_code == "CacheRevisionIntegrityError"
+    assert "private revision details" not in str(error.value)
+    assert CollectionEntity.get_by_id(cache_col.id).dav_revision == 0
+    assert models.DavChange.select().count() == 0
+
+
 def test_backfill_remote_uids_uses_cached_envelopes_without_remote_io(mem_db, user):
     cache_col = CollectionEntity.create(
         local_user=user,
@@ -1274,6 +1438,40 @@ def test_backfill_remote_uids_uses_cached_envelopes_without_remote_io(mem_db, us
     assert unresolved == 0
     assert ItemEntity.get_by_id(cache_item.id).remote_uid == "remote-item-1"
     item_mgr.cache_load.assert_called_once_with(b"item-cache")
+
+
+def test_backfill_integrity_failure_reports_bounded_stage(mem_db, user, monkeypatch):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    ItemEntity.create(
+        collection=cache_col,
+        uid="malformed-contact",
+        eb_item=b"malformed-cache",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = ValueError("private parser details")
+    col_mgr = MagicMock()
+    col_mgr.cache_load.return_value = MagicMock()
+    col_mgr.get_item_manager.return_value = item_mgr
+    account = MagicMock()
+    account.get_collection_manager.return_value = col_mgr
+    etebase = Etebase.__new__(Etebase)
+    etebase.etebase = account
+    etebase.user = user
+    monkeypatch.setattr(
+        etebase,
+        "_quarantine_legacy_cache_item",
+        MagicMock(side_effect=pw.IntegrityError("private quarantine details")),
+    )
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        etebase._backfill_remote_uids()
+
+    assert error.value.diagnostic_code == "CacheBackfillIntegrityError"
+    assert "private quarantine details" not in str(error.value)
 
 
 def test_backfill_replaces_unsafe_legacy_href_and_invalidates_tokens(mem_db, user):
@@ -1423,6 +1621,183 @@ def test_backfill_quarantines_legacy_duplicate_remote_identity(mem_db, user):
     assert quarantine.attempts == 0
 
 
+def test_backfill_prefers_clean_remote_uid_owner_over_earlier_dirty_row(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    pending = ItemEntity.create(
+        collection=cache_col,
+        uid="pending-contact",
+        eb_item=b"pending-envelope",
+        dirty=True,
+        new=True,
+    )
+    clean = ItemEntity.create(
+        collection=cache_col,
+        uid="clean-contact",
+        eb_item=b"clean-envelope",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.return_value = MagicMock(uid="shared-remote-item")
+    col_mgr = MagicMock()
+    col_mgr.cache_load.return_value = MagicMock(collection_type="etebase.vcard")
+    col_mgr.get_item_manager.return_value = item_mgr
+    account = MagicMock()
+    account.get_collection_manager.return_value = col_mgr
+    etebase = Etebase.__new__(Etebase)
+    etebase.etebase = account
+    etebase.user = user
+
+    assert etebase._backfill_remote_uids() == 1
+
+    assert ItemEntity.get_by_id(clean.id).remote_uid == "shared-remote-item"
+    preserved = ItemEntity.get_by_id(pending.id)
+    assert preserved.remote_uid is None
+    assert preserved.deleted is False
+    assert preserved.dirty is True
+    assert preserved.new is True
+    assert models.DavUnresolvedItem.get().local_item_id == pending.id
+
+
+def test_dirty_new_legacy_duplicate_is_forked_before_push(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    owner = ItemEntity.create(
+        collection=cache_col,
+        uid="contact-1",
+        eb_item=b"owner-envelope",
+    )
+    pending = ItemEntity.create(
+        collection=cache_col,
+        uid="contact-2",
+        eb_item=b"pending-envelope",
+        dirty=True,
+        new=True,
+    )
+    HrefMapper.create(content=owner, href="contact-1.vcf")
+    HrefMapper.create(content=pending, href="contact-2.vcf")
+    owner_remote = MagicMock(uid="shared-remote-item")
+    pending_remote = MagicMock(
+        uid="shared-remote-item",
+        meta={"name": "contact-2"},
+        content=b"pending-content",
+        deleted=False,
+    )
+    edited_remote = MagicMock(
+        uid="shared-remote-item",
+        meta={"name": "contact-2"},
+        content=b"edited-content",
+        deleted=False,
+    )
+    forked_remote = MagicMock(uid="fresh-remote-item", deleted=False)
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = lambda envelope: {
+        b"owner-envelope": owner_remote,
+        b"pending-envelope": pending_remote,
+        b"edited-envelope": edited_remote,
+    }[envelope]
+    item_mgr.create.return_value = forked_remote
+    item_mgr.cache_save.return_value = b"forked-envelope"
+    col = MagicMock(collection_type="etebase.vcard")
+    col_mgr = MagicMock()
+    col_mgr.cache_load.return_value = col
+    col_mgr.get_item_manager.return_value = item_mgr
+    account = MagicMock()
+    account.get_collection_manager.return_value = col_mgr
+    etebase = Etebase.__new__(Etebase)
+    etebase.etebase = account
+    etebase.user = user
+
+    assert etebase._backfill_remote_uids() == 1
+    assert ItemEntity.get_by_id(pending.id).deleted is False
+    assert list(etebase._collection_dirty_get(cache_col)) == []
+    (
+        ItemEntity.update(eb_item=b"edited-envelope")
+        .where(ItemEntity.id == pending.id)
+        .execute()
+    )
+
+    etebase._retry_unresolved_items(cache_col, col, item_mgr)
+
+    recovered = ItemEntity.get_by_id(pending.id)
+    assert ItemEntity.get_by_id(owner.id).remote_uid == "shared-remote-item"
+    assert recovered.remote_uid == "fresh-remote-item"
+    assert recovered.eb_item == b"forked-envelope"
+    assert recovered.deleted is False
+    assert recovered.dirty is True
+    assert recovered.new is True
+    assert models.DavUnresolvedItem.select().count() == 0
+    assert list(etebase._collection_dirty_get(cache_col)) == [recovered]
+    item_mgr.create.assert_called_once_with(
+        {"name": "contact-2"},
+        b"edited-content",
+    )
+
+
+def test_deleted_dirty_new_legacy_duplicate_resolves_without_remote_write(
+    mem_db,
+    user,
+):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    owner = ItemEntity.create(
+        collection=cache_col,
+        uid="contact-1",
+        remote_uid="shared-remote-item",
+        eb_item=b"owner-envelope",
+    )
+    pending = ItemEntity.create(
+        collection=cache_col,
+        uid="contact-2",
+        eb_item=b"deleted-envelope",
+        deleted=True,
+        dirty=True,
+        new=True,
+    )
+    models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="legacy-cache:pending",
+        eb_item=b"stale-live-envelope",
+        deleted=True,
+        reason="legacy_duplicate",
+        local_item=pending,
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = lambda envelope: {
+        b"stale-live-envelope": MagicMock(
+            uid="shared-remote-item",
+            deleted=False,
+        ),
+        b"deleted-envelope": MagicMock(
+            uid="shared-remote-item",
+            deleted=True,
+        ),
+    }[envelope]
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+
+    etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    resolved = ItemEntity.get_by_id(pending.id)
+    assert ItemEntity.get_by_id(owner.id).remote_uid == "shared-remote-item"
+    assert resolved.remote_uid is None
+    assert resolved.deleted is True
+    assert resolved.dirty is False
+    assert resolved.new is False
+    assert models.DavUnresolvedItem.select().count() == 0
+    assert list(etebase._collection_dirty_get(cache_col)) == []
+    item_mgr.create.assert_not_called()
+    item_mgr.batch.assert_not_called()
+
+
 def test_unresolved_retry_preserves_concurrent_local_item_mutation(mem_db, user):
     cache_col = CollectionEntity.create(
         local_user=user,
@@ -1471,7 +1846,313 @@ def test_unresolved_retry_preserves_concurrent_local_item_mutation(mem_db, user)
     persisted = ItemEntity.get_by_id(local_item.id)
     assert persisted.eb_item == b"local-envelope"
     assert persisted.dirty is True
-    assert persisted.remote_uid == "remote-contact"
+    assert persisted.remote_uid is None
+    assert models.DavUnresolvedItem.select().count() == 1
+
+    item_mgr.cache_save.side_effect = None
+    item_mgr.cache_save.return_value = b"unused-remote-envelope"
+    etebase._retry_unresolved_items(
+        cache_col,
+        MagicMock(collection_type="etebase.vcard"),
+        item_mgr,
+    )
+
+    recovered = ItemEntity.get_by_id(local_item.id)
+    assert recovered.eb_item == b"local-envelope"
+    assert recovered.dirty is True
+    assert recovered.remote_uid == "remote-contact"
+    assert models.DavUnresolvedItem.select().count() == 0
+
+
+def test_clean_unresolved_retry_defers_concurrent_local_revival(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    ItemEntity.create(
+        collection=cache_col,
+        uid="owner",
+        remote_uid="shared-remote-item",
+        eb_item=b"owner-envelope",
+    )
+    local_item = ItemEntity.create(
+        collection=cache_col,
+        uid="quarantined",
+        eb_item=b"stale-envelope",
+        deleted=True,
+    )
+    unresolved = models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="legacy-cache:quarantined",
+        eb_item=b"stale-envelope",
+        deleted=True,
+        reason="legacy_corrupt",
+        local_item=local_item,
+    )
+    stale_item = MagicMock(
+        uid="shared-remote-item",
+        meta={"name": "quarantined"},
+        content=b"stale-content",
+        deleted=False,
+    )
+    item_mgr = MagicMock()
+
+    def revive_during_parse(_envelope):
+        (
+            ItemEntity.update(
+                eb_item=b"revived-envelope",
+                deleted=False,
+                dirty=True,
+            )
+            .where(ItemEntity.id == local_item.id)
+            .execute()
+        )
+        return stale_item
+
+    item_mgr.cache_load.side_effect = revive_during_parse
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+
+    etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    revived = ItemEntity.get_by_id(local_item.id)
+    assert revived.eb_item == b"revived-envelope"
+    assert revived.deleted is False
+    assert revived.dirty is True
+    assert models.DavUnresolvedItem.get_by_id(unresolved.id)
+    item_mgr.create.assert_not_called()
+
+
+def test_attached_retry_defers_concurrent_identity_and_quarantine_change(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    local_item = ItemEntity.create(
+        collection=cache_col,
+        uid="pending",
+        eb_item=b"pending-envelope",
+        dirty=True,
+        new=True,
+    )
+    unresolved = models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="legacy-cache:pending",
+        eb_item=b"pending-envelope",
+        reason="legacy_corrupt",
+        local_item=local_item,
+    )
+    parsed_item = MagicMock(uid="parsed-remote", deleted=False)
+    item_mgr = MagicMock()
+
+    def mutate_ownership_during_parse(_envelope):
+        (
+            ItemEntity.update(remote_uid="concurrent-remote")
+            .where(ItemEntity.id == local_item.id)
+            .execute()
+        )
+        (
+            models.DavUnresolvedItem.update(
+                reason="concurrent_update",
+                attempts=7,
+            )
+            .where(models.DavUnresolvedItem.id == unresolved.id)
+            .execute()
+        )
+        return parsed_item
+
+    item_mgr.cache_load.side_effect = mutate_ownership_during_parse
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+
+    etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    assert ItemEntity.get_by_id(local_item.id).remote_uid == "concurrent-remote"
+    retained = models.DavUnresolvedItem.get_by_id(unresolved.id)
+    assert retained.reason == "concurrent_update"
+    assert retained.attempts == 7
+    item_mgr.create.assert_not_called()
+
+
+def test_unresolved_retry_bookkeeping_uses_immediate_transactions(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    failed = models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="failed-item",
+        eb_item=b"failed-envelope",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = ValueError("private parser details")
+    transaction_states = []
+    original_execute_sql = mem_db.execute_sql
+
+    def inspect_execute(sql, params=None, commit=None):
+        if sql.startswith('UPDATE "davunresolveditem"'):
+            transaction_states.append(mem_db.in_transaction())
+        return original_execute_sql(sql, params, commit)
+
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+    with patch.object(mem_db, "execute_sql", side_effect=inspect_execute):
+        etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    assert models.DavUnresolvedItem.get_by_id(failed.id).attempts == 1
+    assert transaction_states == [True]
+
+
+def test_unresolved_retry_resolution_delete_uses_immediate_transaction(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    resolved = models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="resolved-item",
+        eb_item=b"resolved-envelope",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.return_value = MagicMock(uid="resolved-item")
+    transaction_states = []
+    original_execute_sql = mem_db.execute_sql
+
+    def inspect_execute(sql, params=None, commit=None):
+        if sql.startswith('DELETE FROM "davunresolveditem"'):
+            transaction_states.append(mem_db.in_transaction())
+        return original_execute_sql(sql, params, commit)
+
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+    apply_states = []
+
+    def apply_without_resolving(*_args, **kwargs):
+        apply_states.append((mem_db.in_transaction(), kwargs["resolve_unresolved"]))
+        return True
+
+    etebase._apply_pulled_item = MagicMock(side_effect=apply_without_resolving)
+    with patch.object(mem_db, "execute_sql", side_effect=inspect_execute):
+        etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    assert models.DavUnresolvedItem.get_or_none(id=resolved.id) is None
+    assert transaction_states == [True]
+    assert apply_states == [(True, False)]
+
+
+def test_unattached_retry_defers_concurrent_quarantine_refresh(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    unresolved = models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="remote-item",
+        eb_item=b"stale-envelope",
+    )
+    item_mgr = MagicMock()
+
+    def refresh_during_parse(_envelope):
+        (
+            models.DavUnresolvedItem.update(
+                eb_item=b"fresh-envelope",
+                attempts=3,
+            )
+            .where(models.DavUnresolvedItem.id == unresolved.id)
+            .execute()
+        )
+        return MagicMock(uid="remote-item")
+
+    item_mgr.cache_load.side_effect = refresh_during_parse
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+    etebase._apply_pulled_item = MagicMock(return_value=True)
+
+    etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    retained = models.DavUnresolvedItem.get_by_id(unresolved.id)
+    assert retained.eb_item == b"fresh-envelope"
+    assert retained.attempts == 3
+    etebase._apply_pulled_item.assert_not_called()
+
+
+def test_attached_cache_load_failure_defers_concurrent_local_change(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    local_item = ItemEntity.create(
+        collection=cache_col,
+        uid="pending",
+        eb_item=b"stale-envelope",
+        dirty=True,
+    )
+    unresolved = models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="legacy-cache:pending",
+        eb_item=b"stale-envelope",
+        reason="legacy_corrupt",
+        local_item=local_item,
+    )
+    item_mgr = MagicMock()
+
+    def edit_then_fail(_envelope):
+        (
+            ItemEntity.update(eb_item=b"edited-envelope")
+            .where(ItemEntity.id == local_item.id)
+            .execute()
+        )
+        raise ValueError("private parser details")
+
+    item_mgr.cache_load.side_effect = edit_then_fail
+    etebase = Etebase.__new__(Etebase)
+    etebase.user = user
+
+    etebase._retry_unresolved_items(cache_col, MagicMock(), item_mgr)
+
+    assert ItemEntity.get_by_id(local_item.id).eb_item == b"edited-envelope"
+    assert models.DavUnresolvedItem.get_by_id(unresolved.id).attempts == 0
+
+
+def test_unresolved_retry_integrity_failure_reports_bounded_stage(
+    mem_db,
+    user,
+    monkeypatch,
+):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    models.DavUnresolvedItem.create(
+        collection=cache_col,
+        remote_uid="remote-contact",
+        eb_item=b"deferred-envelope",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = ValueError("private parser details")
+    monkeypatch.setattr(
+        models.DavUnresolvedItem,
+        "save",
+        MagicMock(side_effect=pw.IntegrityError("private retry details")),
+    )
+    etebase = Etebase.__new__(Etebase)
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        etebase._retry_unresolved_items(
+            cache_col,
+            MagicMock(collection_type="etebase.vcard"),
+            item_mgr,
+        )
+
+    assert error.value.diagnostic_code == "CacheUnresolvedRetryIntegrityError"
+    assert "private retry details" not in str(error.value)
 
 
 def test_backfill_quarantines_malformed_legacy_envelope(mem_db, user):
@@ -1514,6 +2195,280 @@ def test_backfill_quarantines_malformed_legacy_envelope(mem_db, user):
 
     assert models.DavUnresolvedItem.get_by_id(quarantine.id).attempts == 8
     item_mgr.cache_load.assert_not_called()
+
+
+def test_backfill_preserves_malformed_dirty_new_item_until_retry(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    pending = ItemEntity.create(
+        collection=cache_col,
+        uid="pending-contact",
+        eb_item=b"malformed-local-envelope",
+        dirty=True,
+        new=True,
+    )
+    HrefMapper.create(content=pending, href="pending-contact.vcf")
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = ValueError("private parser details")
+    col = MagicMock(collection_type="etebase.vcard")
+    col_mgr = MagicMock()
+    col_mgr.cache_load.return_value = col
+    col_mgr.get_item_manager.return_value = item_mgr
+    account = MagicMock()
+    account.get_collection_manager.return_value = col_mgr
+    etebase = Etebase.__new__(Etebase)
+    etebase.etebase = account
+    etebase.user = user
+
+    assert etebase._backfill_remote_uids() == 1
+
+    preserved = ItemEntity.get_by_id(pending.id)
+    assert preserved.deleted is False
+    assert preserved.dirty is True
+    assert preserved.new is True
+    assert models.DavRevision.select().count() == 0
+    quarantine = models.DavUnresolvedItem.get(collection=cache_col)
+    assert quarantine.local_item_id == pending.id
+    assert quarantine.deleted is False
+    assert list(etebase._collection_dirty_get(cache_col)) == []
+    quarantine.attempts = local_cache_module.DAV_UNRESOLVED_RETRY_LIMIT
+    quarantine.save(only=[models.DavUnresolvedItem.attempts])
+
+    remote_item = MagicMock(uid="remote-contact", deleted=False)
+    item_mgr.cache_load.side_effect = None
+    item_mgr.cache_load.return_value = remote_item
+    item_mgr.cache_save.return_value = b"remote-envelope"
+    etebase._retry_unresolved_items(cache_col, col, item_mgr)
+
+    recovered = ItemEntity.get_by_id(pending.id)
+    assert recovered.deleted is False
+    assert recovered.dirty is True
+    assert recovered.new is True
+    assert recovered.remote_uid == "remote-contact"
+    assert models.DavUnresolvedItem.select().count() == 0
+    assert list(etebase._collection_dirty_get(cache_col)) == [recovered]
+
+
+def test_backfill_quarantine_advances_past_retained_revision(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+        dav_revision=0,
+    )
+    malformed = ItemEntity.create(
+        collection=cache_col,
+        uid="malformed-contact",
+        eb_item=b"malformed-cache",
+    )
+    HrefMapper.create(content=malformed, href="malformed-contact.vcf")
+    models.DavRevision.create(
+        collection=cache_col,
+        href="retained-contact.vcf",
+        revision=1,
+        deleted=True,
+        state_hash="retained-state",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = ValueError("private parser details")
+    col_mgr = MagicMock()
+    col_mgr.cache_load.return_value = MagicMock()
+    col_mgr.get_item_manager.return_value = item_mgr
+    account = MagicMock()
+    account.get_collection_manager.return_value = col_mgr
+    etebase = Etebase.__new__(Etebase)
+    etebase.etebase = account
+    etebase.user = user
+
+    assert etebase._backfill_remote_uids() == 1
+
+    assert CollectionEntity.get_by_id(cache_col.id).dav_revision == 2
+    assert [
+        row.revision
+        for row in models.DavRevision.select()
+        .where(models.DavRevision.collection == cache_col)
+        .order_by(models.DavRevision.revision)
+    ] == [1, 2]
+    assert models.DavUnresolvedItem.get(collection=cache_col).reason == (
+        "legacy_corrupt"
+    )
+
+
+def test_partial_upgrade_backfill_sync_dav_read_and_restart_is_idempotent(
+    mem_db,
+    user,
+):
+    from silentsuite_bridge.radicale.storage import Collection
+
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+        dav_revision=0,
+    )
+    legacy = ItemEntity.create(
+        collection=cache_col,
+        uid="remote-contact",
+        eb_item=b"legacy-envelope",
+    )
+    HrefMapper.create(content=legacy, href="legacy-contact.vcf")
+    models.DavRevision.create(
+        collection=cache_col,
+        href="retained-contact.vcf",
+        revision=1,
+        deleted=True,
+        state_hash="retained-state",
+    )
+
+    remote_item = MagicMock(
+        uid="remote-contact",
+        meta={},
+        deleted=False,
+        etag="remote-etag",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_load.side_effect = ValueError("legacy parser failure")
+    item_mgr.cache_save.return_value = b"remote-envelope"
+    remote_collection = MagicMock(
+        uid="contacts",
+        col_type="etebase.vcard",
+        collection_type="etebase.vcard",
+    )
+    remote_collection.list.return_value = []
+    col_mgr = MagicMock()
+    col_mgr.cache_load.return_value = remote_collection
+    col_mgr.get_item_manager.return_value = item_mgr
+    account = MagicMock()
+    account.get_collection_manager.return_value = col_mgr
+
+    etebase = Etebase.__new__(Etebase)
+    etebase.etebase = account
+    etebase.username = user.username
+    etebase._set_db(mem_db)
+
+    cache_col = CollectionEntity.get_by_id(cache_col.id)
+    assert cache_col.dav_revision == 2
+    assert models.DavUnresolvedItem.select().count() == 1
+
+    item_mgr.cache_load.side_effect = None
+    item_mgr.cache_load.return_value = remote_item
+    etebase.sync_collection_list = MagicMock()
+    etebase.list = MagicMock(return_value=[MagicMock(uid="contacts")])
+
+    def sync_collection(_uid):
+        etebase._retry_unresolved_items(cache_col, remote_collection, item_mgr)
+        etebase._apply_pulled_item(
+            cache_col,
+            remote_collection,
+            item_mgr,
+            remote_item,
+        )
+
+    etebase.sync_collection = sync_collection
+    etebase.sync()
+
+    migrated = ItemEntity.get_by_id(legacy.id)
+    assert migrated.remote_uid == "remote-contact"
+    assert migrated.deleted is False
+    assert models.DavUnresolvedItem.select().count() == 0
+
+    storage = MagicMock()
+    storage.etesync = MagicMock()
+    storage.etesync.get.return_value = remote_collection
+    remote_collection.cache_col = cache_col
+    token, _hrefs = Collection(storage, f"/{user.username}/contacts").sync(None)
+    assert token.startswith("http://radicale.org/ns/sync/")
+
+    revision_before_restart = CollectionEntity.get_by_id(
+        cache_col.id
+    ).dav_revision
+    restart = Etebase.__new__(Etebase)
+    restart.etebase = account
+    restart.username = user.username
+    restart._set_db(mem_db)
+
+    assert CollectionEntity.get_by_id(cache_col.id).dav_revision == (
+        revision_before_restart
+    )
+    assert ItemEntity.select().count() == 1
+    assert models.DavUnresolvedItem.select().count() == 0
+
+
+def test_pulled_item_without_name_reuses_identityless_legacy_uid(mem_db, user):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    legacy = ItemEntity.create(
+        collection=cache_col,
+        uid="remote-contact",
+        eb_item=b"legacy-envelope",
+    )
+    HrefMapper.create(content=legacy, href="legacy-contact.vcf")
+    item = MagicMock(
+        uid="remote-contact",
+        meta={},
+        deleted=False,
+        etag="remote-etag",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_save.return_value = b"remote-envelope"
+    etebase = Etebase.__new__(Etebase)
+
+    assert etebase._apply_pulled_item(
+        cache_col,
+        MagicMock(collection_type="etebase.vcard"),
+        item_mgr,
+        item,
+    ) is True
+
+    rows = list(ItemEntity.select().where(ItemEntity.collection == cache_col))
+    assert len(rows) == 1
+    assert rows[0].id == legacy.id
+    assert rows[0].remote_uid == "remote-contact"
+    assert rows[0].eb_item == b"remote-envelope"
+    assert HrefMapper.get(content=rows[0]).href == "legacy-contact.vcf"
+
+
+def test_pulled_item_integrity_failure_reports_bounded_stage(
+    mem_db,
+    user,
+    monkeypatch,
+):
+    cache_col = CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    item = MagicMock(
+        uid="remote-contact",
+        meta={},
+        deleted=False,
+        etag="remote-etag",
+    )
+    item_mgr = MagicMock()
+    item_mgr.cache_save.return_value = b"remote-envelope"
+    etebase = Etebase.__new__(Etebase)
+    monkeypatch.setattr(
+        ItemEntity,
+        "save",
+        MagicMock(side_effect=pw.IntegrityError("private row details")),
+    )
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        etebase._apply_pulled_item(
+            cache_col,
+            MagicMock(collection_type="etebase.vcard"),
+            item_mgr,
+            item,
+        )
+
+    assert error.value.diagnostic_code == "CachePullItemIntegrityError"
+    assert "private row details" not in str(error.value)
 
 
 def test_pulled_carddav_item_uses_single_segment_opaque_href(mem_db, user):
