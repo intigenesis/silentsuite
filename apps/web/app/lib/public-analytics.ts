@@ -10,6 +10,7 @@ export type SignupPageviewPayload = {
   domain: 'app.silentsuite.io'
   name: 'pageview'
   url: string
+  referrer?: CanonicalReferrer
   props: { referrer_category: ReferrerCategory } & CampaignParams
 }
 
@@ -19,6 +20,20 @@ type SignupAnalyticsPath = typeof SIGNUP_ANALYTICS_PATHS[number]
 type PlanClass = 'monthly' | 'annual'
 type PaymentMethod = 'stripe' | 'btcpay' | 'unknown'
 type CheckoutOutcome = 'returned' | 'cancelled' | 'failed' | 'pending'
+export type CanonicalReferrer =
+  | 'https://www.google.com/'
+  | 'https://www.bing.com/'
+  | 'https://duckduckgo.com/'
+  | 'https://search.brave.com/'
+  | 'https://www.ecosia.org/'
+  | 'https://x.com/'
+  | 'https://www.reddit.com/'
+  | 'https://github.com/'
+  | 'https://mastodon.social/'
+  | 'https://bsky.app/'
+  | 'https://alternativeto.net/'
+  | 'https://www.privacyguides.org/'
+  | 'https://news.ycombinator.com/'
 type PlanSelectedPayload = {
   domain: 'app.silentsuite.io'
   name: 'Plan Selected'
@@ -97,26 +112,66 @@ function hostMatches(host: string, domain: string): boolean {
   return host === domain || host.endsWith(`.${domain}`)
 }
 
-export function classifyReferrer(raw: string): ReferrerCategory | undefined {
-  if (!raw) return 'direct'
+function hasExplicitPort(raw: string): boolean {
+  const authority = raw.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1]
+  return authority ? /:\d*$/.test(authority) : false
+}
+
+function hasNonAsciiAuthority(raw: string): boolean {
+  const authority = raw.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1]
+  return authority ? /[^\x00-\x7f]/.test(authority) : false
+}
+
+type ReferrerMatch = { category: ReferrerCategory, referrer: CanonicalReferrer }
+
+function matchReferrer(raw: string): ReferrerMatch | undefined {
+  if (!raw) return undefined
   try {
-    const host = new URL(raw).hostname.toLowerCase()
-    if (hostMatches(host, 'github.com')) return 'github'
-    if (hostMatches(host, 'google.com') || hostMatches(host, 'bing.com') || hostMatches(host, 'duckduckgo.com')) return 'search'
-    if (hostMatches(host, 'x.com') || hostMatches(host, 'twitter.com') || hostMatches(host, 'mastodon.social') || hostMatches(host, 'bsky.app')) return 'social'
-    if (hostMatches(host, 'alternativeto.net') || hostMatches(host, 'privacyguides.org')) return 'known_partner'
-    return 'other'
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    const host = url.hostname.toLowerCase()
+    if (url.username || url.password || hasExplicitPort(raw) || hasNonAsciiAuthority(raw) || host === 'localhost' || host.includes(':') || /^\d+(?:\.\d+){3}$/.test(host) || host.includes('xn--')) return undefined
+    if (/^(?:[a-z0-9-]+\.)?google\.(?:com|[a-z]{2,3}|co\.[a-z]{2}|com\.[a-z]{2})$/.test(host)) return { category: 'search', referrer: 'https://www.google.com/' }
+    if (hostMatches(host, 'bing.com')) return { category: 'search', referrer: 'https://www.bing.com/' }
+    if (hostMatches(host, 'duckduckgo.com')) return { category: 'search', referrer: 'https://duckduckgo.com/' }
+    if (hostMatches(host, 'search.brave.com')) return { category: 'search', referrer: 'https://search.brave.com/' }
+    if (hostMatches(host, 'ecosia.org')) return { category: 'search', referrer: 'https://www.ecosia.org/' }
+    if (hostMatches(host, 'x.com') || hostMatches(host, 'twitter.com') || host === 't.co') return { category: 'social', referrer: 'https://x.com/' }
+    if (hostMatches(host, 'reddit.com') || host === 'redd.it') return { category: 'other', referrer: 'https://www.reddit.com/' }
+    if (hostMatches(host, 'github.com')) return { category: 'github', referrer: 'https://github.com/' }
+    if (host === 'mastodon.social') return { category: 'social', referrer: 'https://mastodon.social/' }
+    if (hostMatches(host, 'bsky.app')) return { category: 'social', referrer: 'https://bsky.app/' }
+    if (hostMatches(host, 'alternativeto.net')) return { category: 'known_partner', referrer: 'https://alternativeto.net/' }
+    if (hostMatches(host, 'privacyguides.org')) return { category: 'known_partner', referrer: 'https://www.privacyguides.org/' }
+    if (host === 'news.ycombinator.com') return { category: 'other', referrer: 'https://news.ycombinator.com/' }
+    return undefined
   } catch {
     return undefined
   }
 }
 
+export function classifyReferrer(raw: string): ReferrerCategory | undefined {
+  if (!raw) return 'direct'
+  try {
+    new URL(raw)
+    return matchReferrer(raw)?.category ?? 'other'
+  } catch {
+    return undefined
+  }
+}
+
+export function canonicalizeReferrer(raw: string): CanonicalReferrer | undefined {
+  return matchReferrer(raw)?.referrer
+}
+
 export function buildSignupPageviewPayload(rawUrl: string, rawReferrer: string): SignupPageviewPayload {
   const current = new URL(rawUrl)
+  const referrer = canonicalizeReferrer(rawReferrer)
   return {
     domain: 'app.silentsuite.io',
     name: 'pageview',
     url: sanitizedSignupPageUrl(rawUrl),
+    ...(referrer ? { referrer } : {}),
     props: { referrer_category: classifyReferrer(rawReferrer) ?? 'other', ...canonicalizeCampaignParams(current.searchParams) },
   }
 }
