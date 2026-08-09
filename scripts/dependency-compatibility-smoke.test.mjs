@@ -13,6 +13,8 @@ const minimatch10 = requireFrom('node_modules/.pnpm/minimatch@10.2.4/node_module
 const Ajv = requireFrom('node_modules/.pnpm/ajv@8.18.0/node_modules/ajv/package.json')('.')
 const addFormats = requireFrom('node_modules/.pnpm/ajv-formats@2.1.1_ajv@8.18.0/node_modules/ajv-formats/package.json')('.')
 const { JSDOM } = requireFrom('apps/web/package.json')('jsdom')
+const yaml = requireFrom('node_modules/.pnpm/js-yaml@4.3.1/node_modules/js-yaml/package.json')('.')
+const { customAlphabet, nanoid } = requireFrom('node_modules/.pnpm/nanoid@3.3.17/node_modules/nanoid/package.json')('.')
 
 for (const [line, minimatch] of [['3', minimatch3], ['5', minimatch5], ['10', minimatch10]]) {
   test(`minimatch ${line} preserves brace alternation, ranges, escapes, matches, and non-matches`, () => {
@@ -37,4 +39,15 @@ test('jsdom constructs and tears down through its patched undici dependency path
   assert.equal(dom.window.document.querySelector('#status')?.textContent, 'ready')
   assert.equal(dom.window.location.origin, 'https://silent-suite.example')
   dom.window.close()
+})
+
+test('js-yaml 4 parses representative ESLint configuration data', () => {
+  assert.deepEqual(yaml.load('rules:\n  no-debugger: error\n'), {
+    rules: { 'no-debugger': 'error' },
+  })
+})
+
+test('nanoid 3 patched generators preserve normal positive-size behavior', () => {
+  assert.equal(nanoid(12).length, 12)
+  assert.match(customAlphabet('abc', 8)(), /^[abc]{8}$/)
 })
