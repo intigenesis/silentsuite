@@ -21,9 +21,108 @@ export const REGISTERED_DOCS_PATHS = new Set([
   '/user-guide/apps/thunderbird', '/user-guide/apps/windows',
 ])
 
+export type DocsCanonicalReferrer =
+  | 'https://www.google.com/'
+  | 'https://www.bing.com/'
+  | 'https://duckduckgo.com/'
+  | 'https://search.brave.com/'
+  | 'https://www.ecosia.org/'
+  | 'https://x.com/'
+  | 'https://www.reddit.com/'
+  | 'https://github.com/'
+  | 'https://mastodon.social/'
+  | 'https://bsky.app/'
+  | 'https://alternativeto.net/'
+  | 'https://www.privacyguides.org/'
+  | 'https://news.ycombinator.com/'
+
+export type DocsPageviewPayload = {
+  domain: 'docs.silentsuite.io'
+  name: 'pageview'
+  url: string
+  referrer?: DocsCanonicalReferrer
+}
+
+function hostMatches(host: string, domain: string): boolean {
+  return host === domain || host.endsWith(`.${domain}`)
+}
+
+const GOOGLE_SEARCH_DOMAINS = [
+  'google.com', 'google.co.uk', 'google.de', 'google.fr', 'google.nl', 'google.be',
+  'google.ch', 'google.at', 'google.ca', 'google.com.au', 'google.co.nz', 'google.ie',
+  'google.es', 'google.it', 'google.pt', 'google.se', 'google.no', 'google.dk',
+  'google.fi', 'google.pl', 'google.cz', 'google.co.jp', 'google.co.kr', 'google.co.in',
+  'google.com.br', 'google.com.mx', 'google.co.za',
+] as const
+
+function hasNonCanonicalRawSyntax(raw: string): boolean {
+  return /[\u0000-\u0020\u007f\\]/.test(raw)
+}
+
+function rawHttpAuthority(raw: string): string | undefined {
+  return raw.match(/^https?:\/\/([^/?#]+)(?:[/?#]|$)/i)?.[1]
+}
+
+function hasExplicitPort(raw: string): boolean {
+  const authority = rawHttpAuthority(raw)
+  return authority ? /:\d*$/.test(authority) : false
+}
+
+function isCanonicalDnsAuthority(authority: string): boolean {
+  return authority.length <= 253 && authority.split('.').every(
+    (label) => label.length >= 1
+      && label.length <= 63
+      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label),
+  )
+}
+
+function hasNonCanonicalAuthoritySyntax(raw: string): boolean {
+  const authority = rawHttpAuthority(raw)
+  return !authority || !isCanonicalDnsAuthority(authority)
+}
+
+export function canonicalizeDocsReferrer(raw: string): DocsCanonicalReferrer | undefined {
+  if (!raw) return undefined
+  if (hasNonCanonicalRawSyntax(raw)) return undefined
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    const host = url.hostname.toLowerCase()
+    if (url.username || url.password || hasExplicitPort(raw) || hasNonCanonicalAuthoritySyntax(raw) || host === 'localhost' || host.includes(':') || /^\d+(?:\.\d+){3}$/.test(host) || host.includes('xn--')) return undefined
+    if (GOOGLE_SEARCH_DOMAINS.some((domain) => hostMatches(host, domain))) return 'https://www.google.com/'
+    if (hostMatches(host, 'bing.com')) return 'https://www.bing.com/'
+    if (hostMatches(host, 'duckduckgo.com')) return 'https://duckduckgo.com/'
+    if (hostMatches(host, 'search.brave.com')) return 'https://search.brave.com/'
+    if (hostMatches(host, 'ecosia.org')) return 'https://www.ecosia.org/'
+    if (hostMatches(host, 'x.com') || hostMatches(host, 'twitter.com') || host === 't.co') return 'https://x.com/'
+    if (hostMatches(host, 'reddit.com') || host === 'redd.it') return 'https://www.reddit.com/'
+    if (hostMatches(host, 'github.com')) return 'https://github.com/'
+    if (host === 'mastodon.social') return 'https://mastodon.social/'
+    if (hostMatches(host, 'bsky.app')) return 'https://bsky.app/'
+    if (hostMatches(host, 'alternativeto.net')) return 'https://alternativeto.net/'
+    if (hostMatches(host, 'privacyguides.org')) return 'https://www.privacyguides.org/'
+    if (host === 'news.ycombinator.com') return 'https://news.ycombinator.com/'
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function canonicalDocsPath(rawPath: string): string | undefined {
   const path = rawPath.split(/[?#]/, 1)[0].replace(/\/$/, '') || '/'
   return REGISTERED_DOCS_PATHS.has(path) ? path : undefined
+}
+
+export function buildDocsPageviewPayload(rawPath: string, rawReferrer: string): DocsPageviewPayload | undefined {
+  const path = canonicalDocsPath(rawPath)
+  if (!path) return undefined
+  const referrer = canonicalizeDocsReferrer(rawReferrer)
+  return {
+    domain: 'docs.silentsuite.io',
+    name: 'pageview',
+    url: `https://docs.silentsuite.io${path}`,
+    ...(referrer ? { referrer } : {}),
+  }
 }
 
 export function createDocsPageviewTracker(deliver: (path: string) => void) {

@@ -30,7 +30,7 @@ describe('signup analytics transport boundary', () => {
     expect(shouldSendSignupAnalytics(new URL(url), 'true')).toBe(false)
   })
 
-  it('sends only the canonicalized payload through beacon', () => {
+  it('sends only the canonicalized payload through beacon', async () => {
     const beacon = vi.fn(() => true)
     const fetcher = vi.fn()
 
@@ -46,6 +46,13 @@ describe('signup analytics transport boundary', () => {
     const [endpoint, body] = beacon.mock.calls[0]
     expect(endpoint).toBe('https://plausible.silentsuite.io/api/event')
     expect(body).toBeInstanceOf(Blob)
+    await expect((body as Blob).text()).resolves.toBe(JSON.stringify({
+      domain: 'app.silentsuite.io',
+      name: 'pageview',
+      url: 'https://app.silentsuite.io/signup',
+      referrer: 'https://github.com/',
+      props: { referrer_category: 'github', utm_source: 'github' },
+    }))
   })
 
   it('uses the same canonical payload for the fetch fallback', async () => {
