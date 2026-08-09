@@ -730,10 +730,10 @@ jobs:
              "app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}.aab"
           cd app/build/outputs/apk/release
           sha256sum "silentsuite-android-${{ github.ref_name }}.apk" \
-            > "silentsuite-android-${{ github.ref_name }}.apk.sha256"
+            > "silentsuite-android-${{ github.ref_name }}-installer.sha256"
           cd ../../bundle/release
           sha256sum "silentsuite-android-${{ github.ref_name }}.aab" \
-            > "silentsuite-android-${{ github.ref_name }}.aab.sha256"
+            > "silentsuite-android-${{ github.ref_name }}-bundle.sha256"
 
       - name: Attach Android artifacts to umbrella GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -744,9 +744,9 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             android/app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}.apk
-            android/app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}.apk.sha256
+            android/app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}-installer.sha256
             android/app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}.aab
-            android/app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}.aab.sha256
+            android/app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}-bundle.sha256
 
       - name: Cleanup keystore
         if: always()
