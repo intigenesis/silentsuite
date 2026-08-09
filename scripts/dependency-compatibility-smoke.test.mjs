@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import test from 'node:test'
@@ -15,6 +16,7 @@ const addFormats = requireFrom('node_modules/.pnpm/ajv-formats@2.1.1_ajv@8.18.0/
 const { JSDOM } = requireFrom('apps/web/package.json')('jsdom')
 const yaml = requireFrom('node_modules/.pnpm/js-yaml@4.3.1/node_modules/js-yaml/package.json')('.')
 const { customAlphabet, nanoid } = requireFrom('node_modules/.pnpm/nanoid@3.3.17/node_modules/nanoid/package.json')('.')
+const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf8'))
 
 for (const [line, minimatch] of [['3', minimatch3], ['5', minimatch5], ['10', minimatch10]]) {
   test(`minimatch ${line} preserves brace alternation, ranges, escapes, matches, and non-matches`, () => {
@@ -50,4 +52,11 @@ test('js-yaml 4 parses representative ESLint configuration data', () => {
 test('nanoid 3 patched generators preserve normal positive-size behavior', () => {
   assert.equal(nanoid(12).length, 12)
   assert.match(customAlphabet('abc', 8)(), /^[abc]{8}$/)
+})
+
+test('security overrides remain scoped to compatible vulnerable major lines', () => {
+  assert.equal(manifest.pnpm.overrides['js-yaml@>=4.0.0 <4.3.1'], '4.3.1')
+  assert.equal(manifest.pnpm.overrides['nanoid@>=3.0.0 <3.3.17'], '3.3.17')
+  assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'js-yaml'), false)
+  assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.17'), false)
 })
