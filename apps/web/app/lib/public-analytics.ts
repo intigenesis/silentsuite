@@ -129,9 +129,9 @@ function hasExplicitPort(raw: string): boolean {
   return authority ? /:\d*$/.test(authority) : false
 }
 
-function hasNonAsciiAuthority(raw: string): boolean {
+function hasNonCanonicalAuthoritySyntax(raw: string): boolean {
   const authority = raw.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1]
-  return authority ? /[^\x00-\x7f]/.test(authority) : false
+  return authority ? /[^\x00-\x7f]|%/.test(authority) : false
 }
 
 type ReferrerMatch = { category: ReferrerCategory, referrer: CanonicalReferrer }
@@ -143,7 +143,7 @@ function matchReferrer(raw: string): ReferrerMatch | undefined {
     const url = new URL(raw)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
     const host = url.hostname.toLowerCase()
-    if (url.username || url.password || hasExplicitPort(raw) || hasNonAsciiAuthority(raw) || host === 'localhost' || host.includes(':') || /^\d+(?:\.\d+){3}$/.test(host) || host.includes('xn--')) return undefined
+    if (url.username || url.password || hasExplicitPort(raw) || hasNonCanonicalAuthoritySyntax(raw) || host === 'localhost' || host.includes(':') || /^\d+(?:\.\d+){3}$/.test(host) || host.includes('xn--')) return undefined
     if (GOOGLE_SEARCH_DOMAINS.some((domain) => hostMatches(host, domain))) return { category: 'search', referrer: 'https://www.google.com/' }
     if (hostMatches(host, 'bing.com')) return { category: 'search', referrer: 'https://www.bing.com/' }
     if (hostMatches(host, 'duckduckgo.com')) return { category: 'search', referrer: 'https://duckduckgo.com/' }
