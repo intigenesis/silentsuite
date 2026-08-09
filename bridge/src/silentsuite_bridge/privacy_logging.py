@@ -2,6 +2,28 @@
 
 import re
 
+_BOUNDED_DIAGNOSTIC_CODES = frozenset(
+    {
+        "CacheBackfillIntegrityError",
+        "CachePullItemIntegrityError",
+        "CacheRevisionIntegrityError",
+        "CacheSchemaRemoteUidIntegrityError",
+        "CacheSchemaTokenRevisionIntegrityError",
+        "CacheSyncTokenIntegrityError",
+        "CacheUnresolvedRetryIntegrityError",
+    }
+)
+
+
+class BoundedDiagnosticError(RuntimeError):
+    """Carry one allowlisted product diagnostic code without private details."""
+
+    def __init__(self, diagnostic_code):
+        if diagnostic_code not in _BOUNDED_DIAGNOSTIC_CODES:
+            raise ValueError("unsupported diagnostic code")
+        super().__init__("Bridge operation failed")
+        self.diagnostic_code = diagnostic_code
+
 
 def bounded_identifier(value, *, fallback="Exception", max_length=64):
     """Return one short source-style identifier or a fixed fallback."""
@@ -16,6 +38,11 @@ def bounded_identifier(value, *, fallback="Exception", max_length=64):
 
 def bounded_exception_class(error):
     """Return a bounded exception-class identifier for product diagnostics."""
+    if (
+        isinstance(error, BoundedDiagnosticError)
+        and error.diagnostic_code in _BOUNDED_DIAGNOSTIC_CODES
+    ):
+        return error.diagnostic_code
     return bounded_identifier(error.__class__.__name__)
 
 
