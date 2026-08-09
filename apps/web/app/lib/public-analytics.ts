@@ -112,6 +112,18 @@ function hostMatches(host: string, domain: string): boolean {
   return host === domain || host.endsWith(`.${domain}`)
 }
 
+const GOOGLE_SEARCH_DOMAINS = [
+  'google.com', 'google.co.uk', 'google.de', 'google.fr', 'google.nl', 'google.be',
+  'google.ch', 'google.at', 'google.ca', 'google.com.au', 'google.co.nz', 'google.ie',
+  'google.es', 'google.it', 'google.pt', 'google.se', 'google.no', 'google.dk',
+  'google.fi', 'google.pl', 'google.cz', 'google.co.jp', 'google.co.kr', 'google.co.in',
+  'google.com.br', 'google.com.mx', 'google.co.za',
+] as const
+
+function hasNonCanonicalRawSyntax(raw: string): boolean {
+  return /[\u0000-\u0020\u007f\\]/.test(raw)
+}
+
 function hasExplicitPort(raw: string): boolean {
   const authority = raw.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1]
   return authority ? /:\d*$/.test(authority) : false
@@ -126,12 +138,13 @@ type ReferrerMatch = { category: ReferrerCategory, referrer: CanonicalReferrer }
 
 function matchReferrer(raw: string): ReferrerMatch | undefined {
   if (!raw) return undefined
+  if (hasNonCanonicalRawSyntax(raw)) return undefined
   try {
     const url = new URL(raw)
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
     const host = url.hostname.toLowerCase()
     if (url.username || url.password || hasExplicitPort(raw) || hasNonAsciiAuthority(raw) || host === 'localhost' || host.includes(':') || /^\d+(?:\.\d+){3}$/.test(host) || host.includes('xn--')) return undefined
-    if (/^(?:[a-z0-9-]+\.)?google\.(?:com|[a-z]{2,3}|co\.[a-z]{2}|com\.[a-z]{2})$/.test(host)) return { category: 'search', referrer: 'https://www.google.com/' }
+    if (GOOGLE_SEARCH_DOMAINS.some((domain) => hostMatches(host, domain))) return { category: 'search', referrer: 'https://www.google.com/' }
     if (hostMatches(host, 'bing.com')) return { category: 'search', referrer: 'https://www.bing.com/' }
     if (hostMatches(host, 'duckduckgo.com')) return { category: 'search', referrer: 'https://duckduckgo.com/' }
     if (hostMatches(host, 'search.brave.com')) return { category: 'search', referrer: 'https://search.brave.com/' }

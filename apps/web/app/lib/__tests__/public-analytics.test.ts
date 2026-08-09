@@ -112,9 +112,12 @@ describe('public analytics privacy contract', () => {
   })
 
   it.each([
-    '', 'not a url', 'https://google.com.evil.example/search', 'https://x.com.evil.example/post',
+    '', 'not a url', 'https://google.com.evil.example/search', 'https://google.zip/search',
+    'https://google.dev/search', 'https://google.co.io/search', 'https://google.ab.cd/search',
+    'https://x.com.evil.example/post',
     'https://reddit.com.evil.example/r/privacy', 'https://gοogle.com/search', 'https://ｇoogle.com/search', 'https://xn--googl-fsa.com/search',
-    'https://user:password@github.com/private', 'https://github.com:443/private', 'https://127.0.0.1/private',
+    'https://user:password@github.com/private', 'https://github.com:443/private',
+    ' https://github.com:443/private', 'https://github.com:443\\private', 'https://127.0.0.1/private',
     'https://localhost/private', 'ftp://github.com/private', 'javascript://github.com/private',
   ])('omits a standard referrer for unsafe or unrecognized input %s', (raw) => {
     expect(canonicalizeReferrer(raw)).toBeUndefined()
