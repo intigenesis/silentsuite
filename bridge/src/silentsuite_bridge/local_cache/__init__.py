@@ -15,13 +15,14 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from functools import wraps
 
 import msgpack
 import peewee as pw
 from etebase import Account, Client, CollectionAccessLevel, FetchOptions
 
 from .. import config
-from ..privacy_logging import bounded_exception_class
+from ..privacy_logging import BoundedDiagnosticError, bounded_exception_class
 from . import db, models
 
 logger = logging.getLogger("silentsuite-bridge.cache")
@@ -31,6 +32,24 @@ DAV_UNRESOLVED_RETRY_LIMIT = 8
 
 class DavUnresolvedItemsError(RuntimeError):
     """A sync applied safe changes but retained unresolved DAV conflicts."""
+
+
+def _bounded_integrity(diagnostic_code):
+    """Translate one constrained-write failure into a fixed product code."""
+
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except BoundedDiagnosticError:
+                raise
+            except pw.IntegrityError:
+                raise BoundedDiagnosticError(diagnostic_code) from None
+
+        return wrapped
+
+    return decorate
 
 
 @contextmanager
@@ -147,11 +166,16 @@ def _migrate_cache_schema(database):
         database.execute_sql(
             "ALTER TABLE itementity ADD COLUMN remote_uid VARCHAR(255)"
         )
-    database.execute_sql(
-        "CREATE UNIQUE INDEX IF NOT EXISTS "
-        "itementity_collection_remote_uid "
-        "ON itementity (collection_id, remote_uid)"
-    )
+    try:
+        database.execute_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "itementity_collection_remote_uid "
+            "ON itementity (collection_id, remote_uid)"
+        )
+    except pw.IntegrityError:
+        raise BoundedDiagnosticError(
+            "CacheSchemaRemoteUidIntegrityError"
+        ) from None
     if "davsynctoken" in tables:
         token_columns = {
             column.name for column in database.get_columns("davsynctoken")
@@ -160,11 +184,16 @@ def _migrate_cache_schema(database):
             database.execute_sql(
                 "ALTER TABLE davsynctoken ADD COLUMN state_hash VARCHAR(255)"
             )
-        database.execute_sql(
-            "CREATE UNIQUE INDEX IF NOT EXISTS "
-            "davsynctoken_collection_revision "
-            "ON davsynctoken (collection_id, revision)"
-        )
+        try:
+            database.execute_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "davsynctoken_collection_revision "
+                "ON davsynctoken (collection_id, revision)"
+            )
+        except pw.IntegrityError:
+            raise BoundedDiagnosticError(
+                "CacheSchemaTokenRevisionIntegrityError"
+            ) from None
     if "davrevision" in tables:
         revision_columns = {
             column.name for column in database.get_columns("davrevision")
@@ -513,19 +542,27 @@ def ensure_dav_href(
         return models.HrefMapper.get(models.HrefMapper.content == cache_item)
 
 
+@_bounded_integrity("CacheRevisionIntegrityError")
 def record_dav_change(
     cache_col, href, *, previous_state_hash, etag=None, deleted=False
 ):
     """Atomically advance a collection revision and record its latest href change."""
-    with db.database_proxy.atomic():
+    with db.database_proxy.atomic("IMMEDIATE"):
+        current_revision = models.CollectionEntity.get_by_id(
+            cache_col.id
+        ).dav_revision
+        retained_revision = (
+            models.DavRevision.select(pw.fn.MAX(models.DavRevision.revision))
+            .where(models.DavRevision.collection == cache_col)
+            .scalar()
+            or 0
+        )
+        revision = max(current_revision, retained_revision) + 1
         (
-            models.CollectionEntity.update(
-                dav_revision=models.CollectionEntity.dav_revision + 1
-            )
+            models.CollectionEntity.update(dav_revision=revision)
             .where(models.CollectionEntity.id == cache_col.id)
             .execute()
         )
-        revision = models.CollectionEntity.get_by_id(cache_col.id).dav_revision
         (
             models.DavChange.insert(
                 collection=cache_col,
@@ -675,6 +712,7 @@ class Etebase:
         _activate_dav_revision_ledger()
         _restrict_cache_database_files(getattr(database, "database", None))
 
+    @_bounded_integrity("CacheBackfillIntegrityError")
     def _backfill_remote_uids(self):
         """Recover stable Etebase item identities from cached envelopes only."""
         unresolved = 0
@@ -973,6 +1011,7 @@ class Etebase:
             .execute()
         )
 
+    @_bounded_integrity("CachePullItemIntegrityError")
     def _apply_pulled_item(
         self,
         cache_col,
@@ -989,16 +1028,17 @@ class Etebase:
                 (models.ItemEntity.collection == cache_col)
                 & (models.ItemEntity.remote_uid == item.uid)
             )
-            if cache_item is None and meta.get("name"):
+            local_uid = meta.get("name") or item.uid
+            if cache_item is None:
                 cache_item = models.ItemEntity.get_or_none(
                     (models.ItemEntity.collection == cache_col)
-                    & (models.ItemEntity.uid == meta["name"])
+                    & (models.ItemEntity.uid == local_uid)
                     & (models.ItemEntity.remote_uid.is_null(True))
                 )
                 if cache_item is None:
                     identity_bound_collision = models.ItemEntity.get_or_none(
                         (models.ItemEntity.collection == cache_col)
-                        & (models.ItemEntity.uid == meta["name"])
+                        & (models.ItemEntity.uid == local_uid)
                         & (models.ItemEntity.remote_uid.is_null(False))
                     )
                     if identity_bound_collision is not None:
@@ -1014,7 +1054,7 @@ class Etebase:
             if cache_item is None:
                 cache_item = models.ItemEntity(
                     collection=cache_col,
-                    uid=meta.get("name") or item.uid,
+                    uid=local_uid,
                 )
 
             if cache_item.id is not None and (cache_item.dirty or cache_item.new):
@@ -1087,6 +1127,7 @@ class Etebase:
             ).execute()
             return True
 
+    @_bounded_integrity("CacheUnresolvedRetryIntegrityError")
     def _retry_unresolved_items(self, cache_col, col, item_mgr):
         unresolved_items = list(
             models.DavUnresolvedItem.select().where(

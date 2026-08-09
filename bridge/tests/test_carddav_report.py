@@ -3,11 +3,14 @@ import logging
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock
 
+import peewee as pw
+import pytest
 from playhouse.sqlite_ext import SqliteExtDatabase
 
 from silentsuite_bridge import config
 from silentsuite_bridge import local_cache as local_cache_module
 from silentsuite_bridge.local_cache import db, models, record_dav_change
+from silentsuite_bridge.privacy_logging import BoundedDiagnosticError
 from silentsuite_bridge.radicale import application as bridge_application
 from silentsuite_bridge.radicale import storage as bridge_storage
 from silentsuite_bridge.radicale.storage import Collection
@@ -26,6 +29,38 @@ SYNC_REPORT = b"""<?xml version="1.0" encoding="utf-8"?>
   <d:prop><d:getetag /></d:prop>
 </d:sync-collection>
 """
+
+
+def test_sync_token_integrity_failure_reports_bounded_stage(
+    mem_db,
+    user,
+    monkeypatch,
+):
+    cache_col = models.CollectionEntity.create(
+        local_user=user,
+        uid="contacts",
+        eb_col=b"collection-cache",
+    )
+    cached_collection = MagicMock()
+    cached_collection.cache_col = cache_col
+    cached_collection.col_type = "etebase.vcard"
+    cached_collection.list.return_value = []
+    etesync = MagicMock()
+    etesync.get.return_value = cached_collection
+    storage = MagicMock()
+    storage.etesync = etesync
+    collection = Collection(storage, f"/{user.username}/contacts")
+    monkeypatch.setattr(
+        models.DavSyncToken,
+        "create",
+        MagicMock(side_effect=pw.IntegrityError("private token details")),
+    )
+
+    with pytest.raises(BoundedDiagnosticError) as error:
+        collection.sync(None)
+
+    assert error.value.diagnostic_code == "CacheSyncTokenIntegrityError"
+    assert "private token details" not in str(error.value)
 
 
 def test_sync_collection_report_emits_literal_404_for_remote_deletion(
