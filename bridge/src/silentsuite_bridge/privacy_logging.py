@@ -38,7 +38,10 @@ def bounded_identifier(value, *, fallback="Exception", max_length=64):
 
 def bounded_exception_class(error):
     """Return a bounded exception-class identifier for product diagnostics."""
-    if isinstance(error, BoundedDiagnosticError):
+    if (
+        isinstance(error, BoundedDiagnosticError)
+        and error.diagnostic_code in _BOUNDED_DIAGNOSTIC_CODES
+    ):
         return error.diagnostic_code
     return bounded_identifier(error.__class__.__name__)
 

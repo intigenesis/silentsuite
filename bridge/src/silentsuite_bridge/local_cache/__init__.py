@@ -117,19 +117,30 @@ def _init_cache_database(db_path=None):
     return database, True
 
 
+_BASE_CACHE_MODELS = (
+    models.Config,
+    models.User,
+    models.CollectionEntity,
+    models.ItemEntity,
+    models.HrefMapper,
+)
+
+
+def _create_and_migrate_base_tables(database):
+    """Create missing legacy tables, migrate existing ones, then add model indexes."""
+    existing_tables = set(database.get_tables())
+    for model in _BASE_CACHE_MODELS:
+        table_name = model._meta.table_name
+        if table_name not in existing_tables:
+            model.create_table(safe=True)
+            existing_tables.add(table_name)
+    _migrate_cache_schema(database)
+    database.create_tables(_BASE_CACHE_MODELS, safe=True)
+
+
 def _ensure_cache_tables(database):
     with _private_umask():
-        database.create_tables(
-            [
-                models.Config,
-                models.User,
-                models.CollectionEntity,
-                models.ItemEntity,
-                models.HrefMapper,
-            ],
-            safe=True,
-        )
-        _migrate_cache_schema(database)
+        _create_and_migrate_base_tables(database)
         database.create_tables(
             [
                 models.DavChange,
@@ -680,17 +691,7 @@ class Etebase:
             self._set_db(database)
 
     def _init_db_tables(self, database, additional_tables=None):
-        database.create_tables(
-            [
-                models.Config,
-                models.User,
-                models.CollectionEntity,
-                models.ItemEntity,
-                models.HrefMapper,
-            ],
-            safe=True,
-        )
-        _migrate_cache_schema(database)
+        _create_and_migrate_base_tables(database)
         database.create_tables(
             [
                 models.DavChange,
@@ -720,7 +721,14 @@ class Etebase:
         for cache_col in self.user.collections:
             col = col_mgr.cache_load(cache_col.eb_col)
             item_mgr = col_mgr.get_item_manager(col)
-            items = cache_col.items.where(models.ItemEntity.remote_uid.is_null(True))
+            items = cache_col.items.where(
+                models.ItemEntity.remote_uid.is_null(True)
+            ).order_by(
+                models.ItemEntity.dirty.asc(),
+                models.ItemEntity.new.asc(),
+                models.ItemEntity.deleted.asc(),
+                models.ItemEntity.id.asc(),
+            )
             for cache_item in items:
                 existing_quarantine = models.DavUnresolvedItem.get_or_none(
                     (models.DavUnresolvedItem.local_item == cache_item)
@@ -805,6 +813,11 @@ class Etebase:
                 .execute()
             )
             cache_item.remote_uid = None
+            if cache_item.dirty or cache_item.new:
+                # Preserve unsynced local intent and visibility. The push query
+                # excludes quarantined rows until retry can bind a remote UID.
+                cache_item.save(only=[models.ItemEntity.remote_uid])
+                return
             cache_item.deleted = True
             cache_item.save(
                 only=[
@@ -1020,6 +1033,7 @@ class Etebase:
         item,
         *,
         quarantine=True,
+        resolve_unresolved=True,
     ):
         meta = dict(item.meta)
         with db.database_proxy.atomic("IMMEDIATE"):
@@ -1061,10 +1075,11 @@ class Etebase:
                 if cache_item.remote_uid is None:
                     cache_item.remote_uid = item.uid
                     cache_item.save(only=[models.ItemEntity.remote_uid])
-                models.DavUnresolvedItem.delete().where(
-                    (models.DavUnresolvedItem.collection == cache_col)
-                    & (models.DavUnresolvedItem.local_item == cache_item)
-                ).execute()
+                if resolve_unresolved:
+                    models.DavUnresolvedItem.delete().where(
+                        (models.DavUnresolvedItem.collection == cache_col)
+                        & (models.DavUnresolvedItem.local_item == cache_item)
+                    ).execute()
                 return True
 
             cache_item.remote_uid = item.uid
@@ -1118,13 +1133,14 @@ class Etebase:
                     etag=item.etag,
                     deleted=item.deleted,
                 )
-            models.DavUnresolvedItem.delete().where(
-                (models.DavUnresolvedItem.collection == cache_col)
-                & (
-                    (models.DavUnresolvedItem.remote_uid == item.uid)
-                    | (models.DavUnresolvedItem.local_item == cache_item)
-                )
-            ).execute()
+            if resolve_unresolved:
+                models.DavUnresolvedItem.delete().where(
+                    (models.DavUnresolvedItem.collection == cache_col)
+                    & (
+                        (models.DavUnresolvedItem.remote_uid == item.uid)
+                        | (models.DavUnresolvedItem.local_item == cache_item)
+                    )
+                ).execute()
             return True
 
     @_bounded_integrity("CacheUnresolvedRetryIntegrityError")
@@ -1135,15 +1151,74 @@ class Etebase:
             )
         )
         for unresolved in unresolved_items:
-            if unresolved.reason == "legacy_duplicate":
+            retry_unresolved_state = (
+                unresolved.remote_uid,
+                unresolved.eb_item,
+                unresolved.deleted,
+                unresolved.attempts,
+                unresolved.reason,
+                unresolved.local_item_id,
+            )
+            pending_local_item = (
+                models.ItemEntity.get_or_none(
+                    models.ItemEntity.id == unresolved.local_item_id
+                )
+                if unresolved.local_item_id is not None
+                else None
+            )
+            preserves_local_intent = pending_local_item is not None and (
+                pending_local_item.dirty or pending_local_item.new
+            )
+            retry_local_state = None
+            retry_envelope = unresolved.eb_item
+            if pending_local_item is not None:
+                retry_envelope = pending_local_item.eb_item
+                retry_local_state = (
+                    pending_local_item.eb_item,
+                    pending_local_item.deleted,
+                    pending_local_item.dirty,
+                    pending_local_item.new,
+                    pending_local_item.remote_uid,
+                )
+            if unresolved.reason == "legacy_duplicate" and not preserves_local_intent:
                 continue
-            if unresolved.attempts >= DAV_UNRESOLVED_RETRY_LIMIT:
+            if (
+                unresolved.attempts >= DAV_UNRESOLVED_RETRY_LIMIT
+                and not preserves_local_intent
+            ):
                 continue
             try:
-                item = item_mgr.cache_load(unresolved.eb_item)
+                item = item_mgr.cache_load(retry_envelope)
             except Exception as exc:
-                unresolved.attempts += 1
-                unresolved.save(only=[models.DavUnresolvedItem.attempts])
+                with db.database_proxy.atomic("IMMEDIATE"):
+                    current_unresolved = models.DavUnresolvedItem.get_or_none(
+                        models.DavUnresolvedItem.id == unresolved.id
+                    )
+                    if current_unresolved is None or (
+                        current_unresolved.remote_uid,
+                        current_unresolved.eb_item,
+                        current_unresolved.deleted,
+                        current_unresolved.attempts,
+                        current_unresolved.reason,
+                        current_unresolved.local_item_id,
+                    ) != retry_unresolved_state:
+                        continue
+                    if retry_local_state is not None:
+                        current_local_item = models.ItemEntity.get_or_none(
+                            models.ItemEntity.id == unresolved.local_item_id
+                        )
+                        if current_local_item is None or (
+                            current_local_item.eb_item,
+                            current_local_item.deleted,
+                            current_local_item.dirty,
+                            current_local_item.new,
+                            current_local_item.remote_uid,
+                        ) != retry_local_state:
+                            continue
+                    current_unresolved.attempts += 1
+                    current_unresolved.save(
+                        only=[models.DavUnresolvedItem.attempts]
+                    )
                 logger.warning(
                     "Deferred unresolved DAV item after cache-load failure (%s)",
                     bounded_exception_class(exc),
@@ -1152,18 +1227,78 @@ class Etebase:
             if unresolved.local_item_id is not None:
                 remote_envelope = item_mgr.cache_save(item)
                 with db.database_proxy.atomic("IMMEDIATE"):
+                    current_unresolved = models.DavUnresolvedItem.get_or_none(
+                        models.DavUnresolvedItem.id == unresolved.id
+                    )
+                    if current_unresolved is None or (
+                        current_unresolved.remote_uid,
+                        current_unresolved.eb_item,
+                        current_unresolved.deleted,
+                        current_unresolved.attempts,
+                        current_unresolved.reason,
+                        current_unresolved.local_item_id,
+                    ) != retry_unresolved_state:
+                        continue
                     local_item = models.ItemEntity.get_or_none(
                         models.ItemEntity.id == unresolved.local_item_id
                     )
+                    if retry_local_state is not None and (
+                        local_item is None
+                        or (
+                            local_item.eb_item,
+                            local_item.deleted,
+                            local_item.dirty,
+                            local_item.new,
+                            local_item.remote_uid,
+                        )
+                        != retry_local_state
+                    ):
+                        continue
                     conflict = models.ItemEntity.get_or_none(
                         (models.ItemEntity.collection == cache_col)
                         & (models.ItemEntity.remote_uid == item.uid)
                         & (models.ItemEntity.id != unresolved.local_item_id)
                     )
+                    if (
+                        local_item is not None
+                        and conflict is not None
+                        and (local_item.dirty or local_item.new)
+                        and local_item.deleted
+                        and item.deleted
+                    ):
+                        local_item.dirty = False
+                        local_item.new = False
+                        local_item.save(
+                            only=[
+                                models.ItemEntity.dirty,
+                                models.ItemEntity.new,
+                            ]
+                        )
+                        current_unresolved.delete_instance()
+                        continue
+                    if (
+                        local_item is not None
+                        and conflict is not None
+                        and (local_item.dirty or local_item.new)
+                        and not item.deleted
+                    ):
+                        replacement = item_mgr.create(dict(item.meta), item.content)
+                        local_item.remote_uid = replacement.uid
+                        local_item.eb_item = item_mgr.cache_save(replacement)
+                        local_item.new = True
+                        local_item.save(
+                            only=[
+                                models.ItemEntity.remote_uid,
+                                models.ItemEntity.eb_item,
+                                models.ItemEntity.new,
+                            ]
+                        )
+                        current_unresolved.delete_instance()
+                        continue
                     if local_item is None or conflict is not None:
-                        unresolved.reason = "legacy_duplicate"
-                        unresolved.attempts += 1
-                        unresolved.save(
+                        current_unresolved.reason = "legacy_duplicate"
+                        current_unresolved.attempts += 1
+                        current_unresolved.save(
                             only=[
                                 models.DavUnresolvedItem.reason,
                                 models.DavUnresolvedItem.attempts,
@@ -1174,7 +1309,7 @@ class Etebase:
                         if local_item.remote_uid is None:
                             local_item.remote_uid = item.uid
                             local_item.save(only=[models.ItemEntity.remote_uid])
-                        unresolved.delete_instance()
+                        current_unresolved.delete_instance()
                         continue
                     previous_state_hash = dav_collection_state_hash(cache_col)
                     local_item.remote_uid = item.uid
@@ -1198,20 +1333,36 @@ class Etebase:
                             etag=getattr(item, "etag", None),
                             deleted=item.deleted,
                         )
-                    unresolved.delete_instance()
+                    current_unresolved.delete_instance()
                 continue
-            applied = self._apply_pulled_item(
-                cache_col,
-                col,
-                item_mgr,
-                item,
-                quarantine=False,
-            )
-            if not applied:
-                unresolved.attempts += 1
-                unresolved.save(only=[models.DavUnresolvedItem.attempts])
-            else:
-                unresolved.delete_instance()
+            with db.database_proxy.atomic("IMMEDIATE"):
+                current_unresolved = models.DavUnresolvedItem.get_or_none(
+                    models.DavUnresolvedItem.id == unresolved.id
+                )
+                if current_unresolved is None or (
+                    current_unresolved.remote_uid,
+                    current_unresolved.eb_item,
+                    current_unresolved.deleted,
+                    current_unresolved.attempts,
+                    current_unresolved.reason,
+                    current_unresolved.local_item_id,
+                ) != retry_unresolved_state:
+                    continue
+                applied = self._apply_pulled_item(
+                    cache_col,
+                    col,
+                    item_mgr,
+                    item,
+                    quarantine=False,
+                    resolve_unresolved=False,
+                )
+                if not applied:
+                    current_unresolved.attempts += 1
+                    current_unresolved.save(
+                        only=[models.DavUnresolvedItem.attempts]
+                    )
+                else:
+                    current_unresolved.delete_instance()
 
     def pull_collection(self, uid):
         with db.database_proxy.connection_context():
@@ -1221,8 +1372,7 @@ class Etebase:
             col = col_mgr.cache_load(cache_col.eb_col)
             item_mgr = col_mgr.get_item_manager(col)
             with self._mutation_session_guard():
-                with db.database_proxy.atomic("IMMEDIATE"):
-                    self._retry_unresolved_items(cache_col, col, item_mgr)
+                self._retry_unresolved_items(cache_col, col, item_mgr)
             stoken = cache_col.local_stoken
             done = False
 
@@ -1251,8 +1401,12 @@ class Etebase:
                         )
 
     def _collection_dirty_get(self, collection):
+        quarantined_local_items = models.DavUnresolvedItem.select(
+            models.DavUnresolvedItem.local_item
+        ).where(models.DavUnresolvedItem.local_item.is_null(False))
         return collection.items.where(
-            models.ItemEntity.dirty | models.ItemEntity.new
+            (models.ItemEntity.dirty | models.ItemEntity.new)
+            & ~(models.ItemEntity.id << quarantined_local_items)
         )
 
     def collection_is_dirty(self, uid):

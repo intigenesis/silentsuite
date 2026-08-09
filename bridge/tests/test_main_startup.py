@@ -133,6 +133,9 @@ def test_bounded_diagnostic_error_exposes_only_allowlisted_code():
         privacy_logging.BoundedDiagnosticError(
             "PrivatePersonIntegrityError",
         )
+    error.diagnostic_code = private_value
+    assert privacy_logging.bounded_exception_class(error) == "BoundedDiagnosticError"
+    assert private_value not in str(error)
 
 
 def test_product_logging_call_sites_use_the_bounded_exception_helper():

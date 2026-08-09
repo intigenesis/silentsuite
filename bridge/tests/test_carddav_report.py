@@ -241,6 +241,27 @@ def test_radicale_filter_redacts_server_request_exception():
     assert private_value not in record.getMessage()
 
 
+def test_radicale_server_reports_allowlisted_bridge_stage():
+    error = BoundedDiagnosticError("CacheSyncTokenIntegrityError")
+    record = logging.LogRecord(
+        name="radicale.server",
+        level=logging.ERROR,
+        pathname="/site-packages/radicale/server.py",
+        lineno=1,
+        msg="An exception occurred during request: %s",
+        args=(error,),
+        exc_info=(BoundedDiagnosticError, error, None),
+    )
+
+    bridge_application._DavDiagnosticRedactionFilter().filter(record)
+
+    assert record.getMessage() == (
+        "Radicale server request failed (CacheSyncTokenIntegrityError)"
+    )
+    assert "BoundedDiagnosticError" not in record.getMessage()
+    assert record.exc_info is None
+
+
 def test_radicale_item_normalization_diagnostic_redacts_component_uid():
     private_uid = "private-calendar-component-uid"
     record = logging.LogRecord(
