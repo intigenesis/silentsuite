@@ -61,7 +61,7 @@ test('omits docs referrer for unsafe or unrecognized sources', () => {
     '', 'not a url', 'https://google.com.evil.example/search', 'https://google.zip/search',
     'https://google.dev/search', 'https://google.co.io/search', 'https://google.ab.cd/search',
     'https://x.com.evil.example/post',
-    'https://reddit.com.evil.example/r/privacy', 'https://gοogle.com/search', 'https://ｇoogle.com/search', 'https://xn--googl-fsa.com/search',
+    'https://reddit.com.evil.example/r/privacy', 'https://gοogle.com/search', 'https://ｇoogle.com/search', 'https://google。com/search', 'https://xn--googl-fsa.com/search',
     'https://user:password@github.com/private', 'https://github.com:443/private',
     ' https://github.com:443/private', 'https://github.com:443\\private', 'https://127.0.0.1/private',
     'https://localhost/private', 'ftp://github.com/private', 'javascript://github.com/private',
