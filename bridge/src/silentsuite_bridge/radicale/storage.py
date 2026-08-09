@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+import peewee as pw
 import vobject
 from radicale import pathutils
 from radicale.item import Item
@@ -44,7 +45,7 @@ from ..local_cache.models import (
     HrefMapper,
     ItemEntity,
 )
-from ..privacy_logging import bounded_exception_class
+from ..privacy_logging import BoundedDiagnosticError, bounded_exception_class
 from ..web import log_sync_event, update_status
 from .etesync_cache import etesync_for_user, forget_etesync_user
 
@@ -701,13 +702,18 @@ class Collection(BaseCollection):
                 return _INVALID_SYNC_HISTORY
             current_token_row = None
         if current_token_row is None:
-            current_token_row = DavSyncToken.create(
-                collection=self.collection.cache_col,
-                revision=revision,
-                token=secrets.token_urlsafe(24),
-                created_at=int(time.time()),
-                state_hash=state_hash,
-            )
+            try:
+                current_token_row = DavSyncToken.create(
+                    collection=self.collection.cache_col,
+                    token=secrets.token_urlsafe(24),
+                    revision=revision,
+                    created_at=int(time.time()),
+                    state_hash=state_hash,
+                )
+            except pw.IntegrityError:
+                raise BoundedDiagnosticError(
+                    "CacheSyncTokenIntegrityError"
+                ) from None
         self._prune_sync_history()
         token = token_prefix + current_token_row.token
 
