@@ -561,7 +561,11 @@ def run_server():
                 "Remote bridge bind enabled by SILENTSUITE_ALLOW_REMOTE=1. "
                 "DAV traffic is plaintext HTTP unless protected by your own proxy/VPN."
             )
-        logger.warning("Bridge dashboard disabled while remote bind is configured.")
+        logger.warning(
+            "Remote listener exposes DAV endpoints only; the bridge dashboard is "
+            "disabled for this bind. Use a loopback bind on the Bridge host to "
+            "access the dashboard."
+        )
     logger.info("Etebase server configured")
     logger.info("Bridge data directory configured")
     logger.info("CalDAV/CardDAV scheme: %s", config.dav_scheme())
