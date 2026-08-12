@@ -29,7 +29,7 @@ On the roadmap, not yet shipped:
 
 ### Is SilentSuite free?
 
-The hosted service has paid plans (Monthly or Annual). Two free trials are offered at signup: a **7-day trial with no credit card required**, and a **30-day card-secured trial** (you're not charged until day 30 and can cancel any time before then). Self-hosting is free and includes every feature with no subscription. See [Self-Hosting](../self-hosting/).
+New hosted billing is annual only: Early Adopter access is **€36 annually (€3 per month, billed annually)**, and future Standard access is **€48 annually (€4 per month, billed annually)**. Two free trials are offered at signup: a **7-day trial with no credit card required and no automatic charge**, and a **30-day card-secured trial**. Billing shows the exact annual charge date and cancellation deadline; cancel before that deadline to avoid the charge. Card and prepaid Bitcoin annual payments include a 30-day refund promise. Self-hosting is free and includes every feature with no subscription. See [Self-Hosting](../self-hosting/).
 
 ## Privacy & Security
 

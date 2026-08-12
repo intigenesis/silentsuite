@@ -115,8 +115,8 @@ class BillingManager private constructor() {
 
         const val NOTIFICATION_SUBSCRIPTION_EXPIRED = 50
 
-        /** URL for subscription management / reactivation */
-        const val BILLING_MANAGE_URL = "https://app.silentsuite.io/settings/billing"
+        /** URL for payment and account management / reactivation. */
+        const val BILLING_MANAGE_URL = "https://app.silentsuite.io/settings/subscription"
 
         fun getInstance(): BillingManager {
             return instance ?: synchronized(this) {
@@ -218,7 +218,7 @@ class BillingManager private constructor() {
 
     /**
      * Invalidate the cached subscription status for an account.
-     * Call this when the user logs in, changes plan, or reactivates.
+     * Call this when the user logs in, refreshes payment management, or reactivates.
      */
     fun invalidateCache(context: Context, accountName: String) {
         cache.remove(accountName)

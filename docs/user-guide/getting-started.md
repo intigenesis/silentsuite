@@ -7,14 +7,14 @@ A walkthrough of creating your account and getting your first event syncing acro
 Go to [app.silentsuite.io](https://app.silentsuite.io/signup). For the hosted service the signup flow is three steps:
 
 1. **Account** — email and password.
-2. **Plan** — pick Monthly or Annual (Annual saves 17%) and choose your trial:
-   - **7-day free trial** — full access, no credit card required.
-   - **30-day free trial** — card secures the trial; you're not charged until day 30 and can cancel any time before then.
+2. **Plan** — new hosted billing is annual only: Early Adopter access is €36 annually (€3 per month, billed annually), while future Standard access is €48 annually (€4 per month, billed annually). Choose your trial:
+   - **7-day free trial** — full access, no credit card required and no automatic charge.
+   - **30-day free trial** — a card secures the trial; Billing shows the exact annual charge date and cancellation deadline, and you can cancel before that deadline. Card and prepaid Bitcoin annual payments include a 30-day refund promise.
 3. **Setup** — your encryption keys are derived from your password on this device. Store the password somewhere safe; without it, your data cannot be recovered. SilentSuite has no way to reset it because the server never sees your keys.
 
 After signup, an inline **Verify your email** banner stays at the top of the app until you click the link sent to your registered address. (No banner on self-hosted accounts.)
 
-Self-hosting your own server? Expand **Advanced Settings** on the signup page and enter your server URL before submitting. The flow becomes four steps (Account → Self-Hosting → Admin Setup → Setup) and skips the plan / billing entirely. See the [Self-Hosting guide](../self-hosting/) for the server side of that.
+Self-hosting your own server? Expand **Advanced Settings** on the signup page and enter your server URL before submitting. The flow becomes four steps (Account → Self-Hosting → Admin Setup → Setup) and skips the plan / billing entirely. Self-hosting is free with every feature unlocked. See the [Self-Hosting guide](../self-hosting/) for the server side of that.
 
 ## 2. Add Your First Event
 

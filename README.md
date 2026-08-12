@@ -93,7 +93,7 @@ The source is public for inspection, but SilentSuite has not yet completed an in
 
 ### Hosted service
 
-[Create your account](https://app.silentsuite.io/signup) and choose either a 7-day no-card trial or a 30-day card-backed trial. Monthly and annual plans are available after the trial.
+[Create your account](https://app.silentsuite.io/signup) and choose either a 7-day no-card trial (no automatic charge) or a 30-day card-backed trial. New hosted billing is annual only: Early Adopter access is €36 annually (€3 per month, billed annually), and future Standard access is €48 annually (€4 per month, billed annually). The exact annual charge date and cancellation deadline appear in Billing; cancel before that deadline to avoid the charge. Card and prepaid Bitcoin annual payments include a 30-day refund promise. Self-hosting remains free with every feature unlocked.
 
 ### Android and desktop Bridge
 

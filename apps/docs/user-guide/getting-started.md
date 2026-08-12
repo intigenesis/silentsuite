@@ -6,7 +6,7 @@ Set up SilentSuite and start syncing your calendar, contacts, and tasks with end
 
 1. Go to [app.silentsuite.io](https://app.silentsuite.io).
 2. Click **Sign Up**.
-3. Choose a plan. A 7-day free trial is available without a credit card.
+3. New hosted billing is annual only: Early Adopter access is €36 annually (€3 per month, billed annually), while future Standard access is €48 annually (€4 per month, billed annually). Choose a 7-day no-card trial with no automatic charge or a 30-day card-backed trial. Billing shows the exact annual charge date and cancellation deadline; cancel before that deadline. Card and prepaid Bitcoin annual payments include a 30-day refund promise. Self-hosting is free with every feature unlocked.
 4. Enter your email and choose a strong password.
 
 Your password is used to derive your encryption keys locally on your device. It never leaves your device, and the server never sees it.

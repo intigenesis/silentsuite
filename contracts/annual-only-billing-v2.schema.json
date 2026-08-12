@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentsuite.io/contracts/annual-only-billing-v2.schema.json",
+  "title": "SilentSuite annual-only billing v2",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "Uuid": { "type": "string", "format": "uuid" },
+    "Timestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "Email": { "type": "string", "format": "email", "maxLength": 254 },
+    "HttpUrl": { "type": "string", "format": "uri", "pattern": "^https?://" },
+    "Offer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["planId", "customerClass", "billingInterval", "annualAmountMinor", "monthlyEquivalentMinor", "currency", "providers", "offerRevision", "offerToken", "expiresAt"],
+      "properties": {
+        "planId": { "enum": ["early_annual", "standard_annual"] },
+        "customerClass": { "enum": ["early", "standard"] },
+        "billingInterval": { "const": "annual" },
+        "annualAmountMinor": { "enum": [3600, 4800] },
+        "monthlyEquivalentMinor": { "enum": [300, 400] },
+        "currency": { "const": "EUR" },
+        "providers": { "type": "array", "uniqueItems": true, "items": { "enum": ["stripe", "btcpay"] } },
+        "offerRevision": { "type": "integer", "minimum": 1 },
+        "offerToken": { "type": "string", "minLength": 1 },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" }
+      },
+      "allOf": [
+        { "if": { "properties": { "customerClass": { "const": "early" } } }, "then": { "properties": { "planId": { "const": "early_annual" }, "annualAmountMinor": { "const": 3600 }, "monthlyEquivalentMinor": { "const": 300 }, "providers": { "const": ["stripe", "btcpay"] } } } },
+        { "if": { "properties": { "customerClass": { "const": "standard" } } }, "then": { "properties": { "planId": { "const": "standard_annual" }, "annualAmountMinor": { "const": 4800 }, "monthlyEquivalentMinor": { "const": 400 }, "providers": { "const": ["stripe"] } } } }
+      ]
+    },
+    "OfferRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "email", "requestId"],
+      "properties": { "contractVersion": { "const": 2 }, "email": { "$ref": "#/$defs/Email" }, "requestId": { "$ref": "#/$defs/Uuid" } }
+    },
+    "OfferResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "requestId", "offer"],
+      "properties": { "contractVersion": { "const": 2 }, "requestId": { "$ref": "#/$defs/Uuid" }, "offer": { "$ref": "#/$defs/Offer" } }
+    },
+    "EmailProofRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "email", "requestId"],
+      "properties": { "contractVersion": { "const": 2 }, "email": { "$ref": "#/$defs/Email" }, "requestId": { "$ref": "#/$defs/Uuid" } }
+    },
+    "EmailProofConsume": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "email", "token"],
+      "properties": { "contractVersion": { "const": 2 }, "email": { "$ref": "#/$defs/Email" }, "token": { "type": "string", "minLength": 1 } }
+    },
+    "EmailProofResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "emailOwnershipToken", "expiresAt"],
+      "properties": { "contractVersion": { "const": 2 }, "emailOwnershipToken": { "type": "string", "minLength": 1 }, "expiresAt": { "$ref": "#/$defs/Timestamp" } }
+    },
+    "ActivateRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "offerToken", "requestId", "trialPath", "provider", "behavior"],
+      "properties": {
+        "contractVersion": { "const": 2 }, "offerToken": { "type": "string", "minLength": 1 }, "requestId": { "$ref": "#/$defs/Uuid" },
+        "email": { "$ref": "#/$defs/Email" }, "emailOwnershipToken": { "type": "string", "minLength": 1 },
+        "trialPath": { "enum": ["trial_7day_no_card", "trial_30day_card", "immediate"] },
+        "provider": { "enum": ["none", "stripe", "btcpay"] },
+        "behavior": { "enum": ["no_card_trial", "card_trial", "immediate_card", "prepaid_bitcoin"] },
+        "promotionCode": { "type": ["string", "null"], "maxLength": 0 }
+      },
+      "oneOf": [
+        { "properties": { "trialPath": { "const": "trial_7day_no_card" }, "provider": { "const": "none" }, "behavior": { "const": "no_card_trial" } } },
+        { "properties": { "trialPath": { "const": "trial_30day_card" }, "provider": { "const": "stripe" }, "behavior": { "const": "card_trial" } } },
+        { "properties": { "trialPath": { "const": "immediate" }, "provider": { "const": "stripe" }, "behavior": { "const": "immediate_card" } } },
+        { "properties": { "trialPath": { "const": "immediate" }, "provider": { "const": "btcpay" }, "behavior": { "const": "prepaid_bitcoin" } } }
+      ]
+    },
+    "Disclosure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "annualAmountMinor", "firstChargeAmountMinor", "renewalAmountMinor", "monthlyEquivalentMinor", "currency", "trialEndsAt", "firstChargeAt", "cancelBy", "cancelByInclusive", "autoRenew", "prepaid", "refundWindowDays", "bonusDays", "periodEndRule", "renewalAt", "entitlementEndsAt"],
+      "properties": {
+        "kind": { "enum": ["no_auto_charge", "card_trial", "charge_now", "prepaid"] },
+        "annualAmountMinor": { "enum": [3600, 4800] }, "firstChargeAmountMinor": { "type": "integer", "minimum": 0 }, "renewalAmountMinor": { "type": ["integer", "null"], "minimum": 0 }, "monthlyEquivalentMinor": { "enum": [300, 400] }, "currency": { "const": "EUR" },
+        "trialEndsAt": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }, "firstChargeAt": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }, "cancelBy": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }, "cancelByInclusive": { "const": false }, "autoRenew": { "type": "boolean" }, "prepaid": { "type": "boolean" }, "refundWindowDays": { "enum": [30, null] }, "bonusDays": { "enum": [0, 14] }, "periodEndRule": { "enum": ["activation_plus_trial", "first_charge_plus_1_utc_calendar_year", "confirmation_plus_1_utc_calendar_year", "confirmation_bonus_then_1_utc_calendar_year"] }, "renewalAt": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }, "entitlementEndsAt": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "ActivateResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "checkoutIntentToken", "expiresAt", "disclosure"],
+      "properties": { "contractVersion": { "const": 2 }, "checkoutIntentToken": { "type": "string", "minLength": 1 }, "expiresAt": { "$ref": "#/$defs/Timestamp" }, "disclosure": { "$ref": "#/$defs/Disclosure" } }
+    },
+    "ProvisionRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "checkoutIntentToken"],
+      "properties": { "contractVersion": { "const": 2 }, "checkoutIntentToken": { "type": "string", "minLength": 1 }, "etebaseLinkProof": { "type": "string", "minLength": 43, "maxLength": 256 }, "etebaseSessionToken": { "type": "string", "minLength": 1 }, "wantsProductUpdates": { "type": "boolean" }, "rememberDevice": { "type": "boolean" } },
+      "oneOf": [{ "required": ["etebaseLinkProof"] }, { "required": ["etebaseSessionToken"] }]
+    },
+    "ProvisionResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "id", "email", "provisioningStatus", "earlyAdopter", "createdAt", "clientSecret", "cryptoCheckoutUrl", "cryptoInvoiceId", "cryptoInvoiceLookupToken", "emailVerified", "rememberDevice"],
+      "properties": { "contractVersion": { "const": 2 }, "id": { "$ref": "#/$defs/Uuid" }, "email": { "$ref": "#/$defs/Email" }, "provisioningStatus": { "const": "trialing_no_card" }, "earlyAdopter": { "type": "boolean" }, "createdAt": { "$ref": "#/$defs/Timestamp" }, "clientSecret": { "type": "null" }, "cryptoCheckoutUrl": { "type": "null" }, "cryptoInvoiceId": { "type": "null" }, "cryptoInvoiceLookupToken": { "type": "null" }, "emailVerified": { "const": true }, "rememberDevice": { "type": "boolean" } }
+    },
+    "PaymentSessionRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["contractVersion", "checkoutIntentToken", "requestKey", "recoverySecret", "email"],
+      "properties": { "contractVersion": { "const": 2 }, "checkoutIntentToken": { "type": "string", "minLength": 1 }, "requestKey": { "$ref": "#/$defs/Uuid" }, "recoverySecret": { "type": "string", "minLength": 43, "maxLength": 128 }, "email": { "$ref": "#/$defs/Email" }, "wantsProductUpdates": { "type": "boolean" }, "rememberDevice": { "type": "boolean" }, "returnUrl": { "$ref": "#/$defs/HttpUrl" } }
+    },
+    "StripePaymentSessionResponse": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "kind", "clientSecret", "paymentSessionToken"], "properties": { "contractVersion": { "const": 2 }, "kind": { "const": "stripe" }, "clientSecret": { "type": "string", "minLength": 1 }, "paymentSessionToken": { "type": "string", "minLength": 43, "maxLength": 128 } } },
+    "BtcpayPaymentSessionResponse": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "kind", "cryptoCheckoutUrl", "cryptoInvoiceId", "cryptoInvoiceLookupToken", "paymentSessionToken"], "properties": { "contractVersion": { "const": 2 }, "kind": { "const": "btcpay" }, "cryptoCheckoutUrl": { "type": "string", "format": "uri", "pattern": "^https://" }, "cryptoInvoiceId": { "type": "string", "minLength": 1 }, "cryptoInvoiceLookupToken": { "type": "string", "minLength": 43, "maxLength": 128 }, "paymentSessionToken": { "type": "string", "minLength": 43, "maxLength": 128 } } },
+    "FinalizeRequest": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "paymentSessionToken"], "properties": { "contractVersion": { "const": 2 }, "paymentSessionToken": { "type": "string", "minLength": 1 }, "etebaseLinkProof": { "type": "string", "minLength": 43, "maxLength": 256 }, "etebaseSessionToken": { "type": "string", "minLength": 1 } }, "oneOf": [{ "required": ["etebaseLinkProof"] }, { "required": ["etebaseSessionToken"] }] },
+    "FinalizeResponse": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "id", "email", "planId", "provisioningStatus", "isAdmin", "earlyAdopter", "createdAt", "clientSecret", "cryptoCheckoutUrl", "cryptoInvoiceId", "cryptoInvoiceLookupToken", "emailVerified", "rememberDevice"], "properties": { "contractVersion": { "const": 2 }, "id": { "$ref": "#/$defs/Uuid" }, "email": { "$ref": "#/$defs/Email" }, "planId": { "enum": ["early_annual", "standard_annual"] }, "provisioningStatus": { "type": "string", "minLength": 1 }, "isAdmin": { "type": "boolean" }, "earlyAdopter": { "type": "boolean" }, "createdAt": { "$ref": "#/$defs/Timestamp" }, "clientSecret": { "type": "null" }, "cryptoCheckoutUrl": { "type": "null" }, "cryptoInvoiceId": { "type": "null" }, "cryptoInvoiceLookupToken": { "type": "null" }, "emailVerified": { "const": true }, "rememberDevice": { "type": "boolean" } } },
+    "AuthenticatedFlowRequest": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "checkoutIntentToken"], "properties": { "contractVersion": { "const": 2 }, "checkoutIntentToken": { "type": "string", "minLength": 1 }, "returnUrl": { "$ref": "#/$defs/HttpUrl" } } },
+    "AuthenticatedStripeFlowResponse": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "kind", "authorityId", "clientSecret"], "properties": { "contractVersion": { "const": 2 }, "kind": { "const": "stripe" }, "authorityId": { "$ref": "#/$defs/Uuid" }, "clientSecret": { "type": "string", "minLength": 1 } } },
+    "AuthenticatedBtcpayFlowResponse": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "kind", "authorityId", "checkoutUrl", "invoiceId", "invoiceLookupToken"], "properties": { "contractVersion": { "const": 2 }, "kind": { "const": "btcpay" }, "authorityId": { "$ref": "#/$defs/Uuid" }, "checkoutUrl": { "type": "string", "format": "uri", "pattern": "^https://" }, "invoiceId": { "type": "string", "minLength": 1 }, "invoiceLookupToken": { "type": "string", "minLength": 1 } } },
+    "Problem": { "type": "object", "additionalProperties": false, "required": ["type", "title", "status", "detail", "instance"], "properties": { "type": { "type": "string", "format": "uri" }, "title": { "type": "string" }, "status": { "type": "integer" }, "detail": { "type": "string" }, "instance": { "type": "string" } } },
+    "PaymentSessionRecoveryRequest": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "email", "requestKey", "recoverySecret"], "properties": { "contractVersion": { "const": 2 }, "email": { "$ref": "#/$defs/Email" }, "requestKey": { "$ref": "#/$defs/Uuid" }, "recoverySecret": { "type": "string", "minLength": 43, "maxLength": 128 } } },
+    "PaymentSessionRecoveryResponse": { "type": "object", "additionalProperties": false, "required": ["contractVersion", "state", "flow"], "properties": { "contractVersion": { "const": 2 }, "state": { "enum": ["open", "confirmed", "closed"] }, "flow": { "anyOf": [{ "type": "null" }, { "type": "object", "additionalProperties": false, "required": ["provider", "status"], "properties": { "provider": { "enum": ["stripe", "btcpay"] }, "status": { "type": "string" } } }] } } },
+    "Paths": { "type": "object", "additionalProperties": false, "required": ["emailProofRequest", "emailProofConsume", "anonymousOffer", "anonymousActivate", "authenticatedOffer", "authenticatedActivate", "provision", "paymentSession", "finalize", "authenticatedPaymentFlow", "paymentSessionCurrent", "paymentSessionReconcile", "paymentSessionCancel"], "properties": { "emailProofRequest": { "const": "/auth/signup-email-verifications/v2" }, "emailProofConsume": { "const": "/auth/signup-email-verifications/v2/consume" }, "anonymousOffer": { "const": "/auth/offers/v2" }, "anonymousActivate": { "const": "/auth/offers/v2/activate" }, "authenticatedOffer": { "const": "/subscription/offers/v2" }, "authenticatedActivate": { "const": "/subscription/offers/v2/activate" }, "provision": { "const": "/auth/provision/v2" }, "paymentSession": { "const": "/auth/signup/payment-session/v2" }, "finalize": { "const": "/auth/signup/finalize-payment/v2" }, "authenticatedPaymentFlow": { "const": "/subscription/payment-flows/v2" }, "paymentSessionCurrent": { "const": "/auth/signup/payment-session/v2/current" }, "paymentSessionReconcile": { "const": "/auth/signup/payment-session/v2/reconcile" }, "paymentSessionCancel": { "const": "/auth/signup/payment-session/v2/cancel" } } }
+  }
+}

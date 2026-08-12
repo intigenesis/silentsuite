@@ -1,3 +1,6 @@
+import type { AnnualOffer } from './billing-v2'
+import { annualOfferAnalyticsDimensions, type AnnualOfferAnalyticsDimensions } from './annual-offer-presentation'
+
 export type CampaignParams = Partial<{
   utm_source: 'search' | 'social' | 'github' | 'newsletter' | 'community' | 'known_partner' | 'paid' | 'other'
   utm_medium: 'organic' | 'referral' | 'email' | 'community' | 'paid_social' | 'cpc' | 'qr' | 'other'
@@ -20,7 +23,6 @@ export type SignupPageviewPayload = {
 export const SIGNUP_ANALYTICS_PATHS = ['/signup', '/signup/pending-payment', '/signup/success', '/signup/cancel'] as const
 type SignupAnalyticsPath = typeof SIGNUP_ANALYTICS_PATHS[number]
 
-type PlanClass = 'monthly' | 'annual'
 type PaymentMethod = 'stripe' | 'btcpay' | 'unknown'
 type CheckoutOutcome = 'returned' | 'cancelled' | 'failed' | 'pending'
 export type CanonicalReferrer =
@@ -41,13 +43,13 @@ type PlanSelectedPayload = {
   domain: 'app.silentsuite.io'
   name: 'Plan Selected'
   url: 'https://app.silentsuite.io/signup'
-  props: { plan_class: PlanClass }
+  props: AnnualOfferAnalyticsDimensions
 }
 type CheckoutInitiatedPayload = {
   domain: 'app.silentsuite.io'
   name: 'Checkout Initiated'
   url: 'https://app.silentsuite.io/signup'
-  props: { plan_class: PlanClass, payment_method: Exclude<PaymentMethod, 'unknown'> }
+  props: AnnualOfferAnalyticsDimensions & { payment_method: Exclude<PaymentMethod, 'unknown'> }
 }
 type CheckoutReturnedPayload = {
   domain: 'app.silentsuite.io'
@@ -202,12 +204,12 @@ export function buildSignupPageviewPayload(rawUrl: string, rawReferrer: string):
   }
 }
 
-export function buildPlanSelectedPayload(planClass: PlanClass): PlanSelectedPayload {
-  return { domain: 'app.silentsuite.io', name: 'Plan Selected', url: 'https://app.silentsuite.io/signup', props: { plan_class: planClass } }
+export function buildPlanSelectedPayload(offer: AnnualOffer): PlanSelectedPayload {
+  return { domain: 'app.silentsuite.io', name: 'Plan Selected', url: 'https://app.silentsuite.io/signup', props: annualOfferAnalyticsDimensions(offer) }
 }
 
-export function buildCheckoutInitiatedPayload(planClass: PlanClass, paymentMethod: Exclude<PaymentMethod, 'unknown'>): CheckoutInitiatedPayload {
-  return { domain: 'app.silentsuite.io', name: 'Checkout Initiated', url: 'https://app.silentsuite.io/signup', props: { plan_class: planClass, payment_method: paymentMethod } }
+export function buildCheckoutInitiatedPayload(offer: AnnualOffer, paymentMethod: Exclude<PaymentMethod, 'unknown'>): CheckoutInitiatedPayload {
+  return { domain: 'app.silentsuite.io', name: 'Checkout Initiated', url: 'https://app.silentsuite.io/signup', props: { ...annualOfferAnalyticsDimensions(offer), payment_method: paymentMethod } }
 }
 
 export function buildCheckoutReturnedPayload(outcome: CheckoutOutcome, paymentMethod: PaymentMethod): CheckoutReturnedPayload {

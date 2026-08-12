@@ -78,23 +78,23 @@ esac
 
 const jobContracts: Record<string, Record<string, { steps: string; permissions: string }>> = {
   'deploy-web.yml': {
-    'build-and-push': { steps: '986d2e9862eb81e1d9b3abc028158b3880435f19b52fbb6fc40ba37bdd406733', permissions: '005c397eb9ccf2cc53aad524b4ebcad817405ec025bb937a039a8a5ef8c69bca' },
-    deploy: { steps: '27e085d4e9108ff2e06b8ae1b4b616794c8c7fd3fac65c1a47277cb7717ef828', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
+    'build-and-push': { steps: '7ffa893cb9fe3ec23c36eb36504a4abe3ec947243dbb4635ecae39af1201daec', permissions: '005c397eb9ccf2cc53aad524b4ebcad817405ec025bb937a039a8a5ef8c69bca' },
+    deploy: { steps: '038fec227f6f6b26dd244462e5d2c9595fb00c36d6f6197641ea72580566e0db', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
   },
   'deploy-server.yml': {
     'build-and-push': { steps: 'eaaaecf8738fd3b7d25bfb6f383709911df7c00da94dff1cca81014fdb254a62', permissions: '005c397eb9ccf2cc53aad524b4ebcad817405ec025bb937a039a8a5ef8c69bca' },
     deploy: { steps: 'bbd0c9a9415d24b319bf53201011b78485a5a22674d36336b252fa770e19cf4c', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
   },
   'deploy-docs.yml': {
-    build: { steps: '4152d1fcdb56f0c8d6f7bb6f5c192536a4c29c201da386efe7488e55c5bed9e5', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
-    deploy: { steps: '9e11d7e32e0c425dcce74bcebcad1f8226610a896432764b5f42d33e2605819f', permissions: '551b70084a8244c7f3114d8603c3d2ddac6b642093a4b34cd2e3a00b7e4f8ee1' },
+    build: { steps: 'e15924db3b0825955e90c09ecbac8e505329babe5418abdf7c4a9be666e0a502', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
+    deploy: { steps: '0e4756de0db4f4603184e412045bb71d711530a998cbe4fe8c862772880dbc0d', permissions: '551b70084a8244c7f3114d8603c3d2ddac6b642093a4b34cd2e3a00b7e4f8ee1' },
   },
 }
 
 const workflowContracts: Record<string, string> = {
-  'deploy-web.yml': '67fe57e851cfa98a1736c623e070ddb3dc61bbc88f1b05f0f2b32cf8306ee74a',
+  'deploy-web.yml': 'c09667e79ae905e923d21d18f7e50512b0badb07b8fa6daee9c89f6184ea047b',
   'deploy-server.yml': 'ee8015b23a29d0faa6b0ecb0371f049ae9189c37fe4c80591f82f0e844193312',
-  'deploy-docs.yml': 'f2658b6a03897bb12fbd20c20387e0fbc2b861cb8ebe1ac37e7494e687ba7e50',
+  'deploy-docs.yml': '051ceb51b6eac4571828e9562d6569f69f2d5a302da86760571a906df2d40a6a',
 }
 
 const approvedNode24ActionPins: Record<string, string> = {
@@ -112,6 +112,7 @@ const approvedNode24ActionPins: Record<string, string> = {
   'actions/setup-node': '820762786026740c76f36085b0efc47a31fe5020',
   'actions/upload-artifact': '043fb46d1a93c77aae656e7c1c64a875d1fc6a0a',
   'actions/download-artifact': '3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c',
+  'actions/create-github-app-token': '0f859bf9e69e887678d5bbfbee594437cb440ffe',
   'docker/setup-buildx-action': 'bb05f3f5519dd87d3ba754cc423b652a5edd6d2c',
   'docker/login-action': 'dbcb813823bdd20940b903addbd779551569679f',
   'docker/build-push-action': '53b7df96c91f9c12dcc8a07bcb9ccacbed38856a',
@@ -258,6 +259,11 @@ describe('production deployment workflow integrity', () => {
     expect(deployRunbook).toContain('deployment branch policy that permits only `main`')
     expect(deployRunbook).toContain('Do not set an approval variable or dispatch any production workflow until this verification succeeds')
     expect(deployRunbook).toContain('all three component environments exist with a custom `main`-only deployment branch policy')
+    expect(deployRunbook).toContain('Stage A — private pre-public admission')
+    expect(deployRunbook).toContain('Stage B — truthful public-served attestation')
+    expect(deployRunbook).toContain('Stage C — private finalization')
+    expect(deployRunbook).toContain('no `clientServedAt` or `verifiedAt`')
+    expect(deployRunbook).not.toContain('health/link-proof')
   })
 
   it('keeps the Billing verifier through the previous-image rollback window', () => {
@@ -322,13 +328,23 @@ describe('production deployment workflow integrity', () => {
     expect(mutation).toBe(reauthorization + 1)
   })
 
-  it('blocks the web cutover until Billing proves the non-bearer handoff is ready', () => {
-    const source = workflow('deploy-web.yml')
-    const gate = source.indexOf('https://api.silentsuite.io/health/link-proof')
-    const deploy = source.indexOf('name: Deploy via SSH')
-
-    expect(gate).toBeGreaterThan(-1)
-    expect(deploy).toBeGreaterThan(gate)
+  it('blocks public deployment until an exact immutable signed Stage A artifact admits this exact public SHA', () => {
+    for (const name of ['deploy-web.yml', 'deploy-docs.yml']) {
+      const source = workflow(name)
+      const gate = source.indexOf('verify-annual-pre-public-admission')
+      const deploy = source.indexOf(name === 'deploy-web.yml' ? 'name: Deploy via SSH' : 'name: Deploy to production Worker')
+      expect(gate).toBeGreaterThan(-1)
+      expect(deploy).toBeGreaterThan(gate)
+      expect(source).toContain('private_admission_run_id')
+      expect(source).toContain('private_admission_run_attempt')
+      expect(source).toContain('private_admission_artifact_id')
+      expect(source).toContain('actions/create-github-app-token@0f859bf9e69e887678d5bbfbee594437cb440ffe')
+      expect(source).toContain('ANNUAL_PRIVATE_ADMISSION_HMAC_KEY')
+      expect(source).not.toContain('BILLING_V2_CUTOVER_MANIFEST')
+      expect(source).not.toContain('https://api.silentsuite.io/health/link-proof')
+    }
+    expect(deployRunbook).toContain('annual-only-pre-public-admission-<private-run-id>-<private-run-attempt>')
+    expect(deployRunbook).toContain('ANNUAL_PRIVATE_ADMISSION_HMAC_KEY')
   })
 
   it('builds docs once and deploys the admitted artifact after reauthorization', () => {
@@ -361,6 +377,10 @@ describe('production deployment workflow integrity', () => {
     expect(downloadIndex).toBeGreaterThan(-1)
     expect(downloadIndex).toBeLessThan(reauthorization)
     expect(mutation).toBe(reauthorization + 1)
+    expect(buildJob).toContain('Fetch and verify exact timestamp-free Stage A before docs publication')
+    expect(deployJob).toContain('Re-verify exact timestamp-free Stage A before docs deployment')
+    expect(buildJob).toContain('deployment-identity.json')
+    expect(deployJob).toContain('deployment-identity.json')
   })
 
   it('runs server migrations from the exact image before replacing the server', async () => {

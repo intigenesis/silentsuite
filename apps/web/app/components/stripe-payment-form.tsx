@@ -44,8 +44,8 @@ interface PaymentFormProps {
   onError?: (error: string) => void
   submitLabel?: string
   mode?: 'setup' | 'payment'
-  /** Billing interval to persist before a potential 3DS redirect. */
-  selectedInterval?: 'monthly' | 'annual'
+  /** Annual-only v2 checkout marker to persist before a potential 3DS redirect. */
+  selectedInterval?: 'annual'
   /** Same-origin path for non-signup payment redirects. */
   returnPath?: string
 }
