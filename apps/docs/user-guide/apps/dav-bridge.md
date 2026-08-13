@@ -116,6 +116,28 @@ Enabling bridge SSL changes the single local DAV listener from HTTP to HTTPS. Ex
 
 For detailed Apple setup fields and troubleshooting, see [macOS Calendar & Contacts](./macos.md).
 
+## Remote DAV Access (Tailscale / Private Networks)
+
+An explicit non-loopback bind exposes the Bridge's CalDAV and CardDAV endpoints
+to the configured private network. It does **not** expose the SilentSuite
+dashboard: the unauthenticated dashboard is disabled for the entire remote
+bind. To use the dashboard again, run the Bridge with a loopback bind on the
+Bridge host and open it from that host.
+
+`127.0.0.1` and `localhost` always refer to the device making the request. A
+DAV client on another Tailscale or private-network device must therefore use
+the Bridge host's private IP address, MagicDNS name, or another approved private
+hostname instead. Do not expose the Bridge listener to the public internet.
+
+When HTTPS is enabled, the exact IP address or hostname used by the DAV client
+must be present in the certificate's Subject Alternative Names (SANs). Do not
+bypass certificate verification. Certificate support for explicit Tailscale
+IPs and MagicDNS names is tracked in [#518](https://github.com/silent-suite/silentsuite/issues/518).
+
+Opening a remote listener in a browser can show `Radicale works!` or a similar
+generic Radicale status response. That confirms that the DAV listener is
+reachable; it is not the SilentSuite dashboard.
+
 ## Multi-Account Use
 
 The bridge can keep multiple accounts active in one local bridge profile. Each account has its own credentials, local cache namespace, sync thread, and DAV path.
@@ -281,7 +303,11 @@ silentsuite-bridge --login
 
 ### Can't connect from your app
 
-1. Verify the bridge is running: open `http://127.0.0.1:37358/` in your browser
+1. On the Bridge host with the default loopback bind, open
+   `http://127.0.0.1:37358/` and confirm the dashboard loads. For an intentional
+   remote bind, test the configured scheme and private-network address instead;
+   `Radicale works!` or a similar generic Radicale status response confirms
+   listener reachability, not dashboard availability.
 2. Check the tray icon color (green = OK, red = error)
 3. Check the dashboard sync log for errors
 4. If you installed on Windows, also check `%LOCALAPPDATA%\SilentSuite\install.log` and `%LOCALAPPDATA%\SilentSuite\bridge.log`
@@ -318,7 +344,9 @@ GNOME removed native tray support. Install the [AppIndicator extension](https://
 
 ### Firewall blocking
 
-Ensure `localhost:37358` is not blocked by your firewall. The bridge only listens on localhost -- it never accepts connections from other machines.
+With the default bind, ensure `localhost:37358` is not blocked by your firewall.
+If you explicitly enabled a remote bind, allow the configured port only on the
+intended private-network interface and keep it closed to the public internet.
 
 ## Next Steps
 
