@@ -6,12 +6,15 @@ export type CampaignParams = Partial<{
 
 export type ReferrerCategory = 'direct' | 'search' | 'social' | 'github' | 'known_partner' | 'other'
 
+// Baseline pageviews are deliberately property-free: a Plausible site property
+// allowlist can discard every pageview that carries an unapproved custom property,
+// so the signup pageview transmits only the canonical route and referrer. Campaign
+// and referrer dimensions live on flag-gated commercial events, never here.
 export type SignupPageviewPayload = {
   domain: 'app.silentsuite.io'
   name: 'pageview'
   url: string
   referrer?: CanonicalReferrer
-  props: { referrer_category: ReferrerCategory } & CampaignParams
 }
 
 export const SIGNUP_ANALYTICS_PATHS = ['/signup', '/signup/pending-payment', '/signup/success', '/signup/cancel'] as const
@@ -190,14 +193,12 @@ export function canonicalizeReferrer(raw: string): CanonicalReferrer | undefined
 }
 
 export function buildSignupPageviewPayload(rawUrl: string, rawReferrer: string): SignupPageviewPayload {
-  const current = new URL(rawUrl)
   const referrer = canonicalizeReferrer(rawReferrer)
   return {
     domain: 'app.silentsuite.io',
     name: 'pageview',
     url: sanitizedSignupPageUrl(rawUrl),
     ...(referrer ? { referrer } : {}),
-    props: { referrer_category: classifyReferrer(rawReferrer) ?? 'other', ...canonicalizeCampaignParams(current.searchParams) },
   }
 }
 
