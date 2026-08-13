@@ -158,6 +158,21 @@ class FirstRunSignInRuntimeTest {
                 assertTrue("Signup replay Activity did not launch", replayReturn is SignupReturnActivity)
                 instrumentation.waitForIdleSync()
                 assertTrue("Signup replay Activity did not finish", replayReturn!!.isFinishing)
+                val replayDeadline = android.os.SystemClock.elapsedRealtime() + 5_000L
+                var replayAcknowledged = false
+                while (!replayAcknowledged && android.os.SystemClock.elapsedRealtime() < replayDeadline) {
+                    instrumentation.waitForIdleSync()
+                    scenario.onActivity { activity ->
+                        activity.supportFragmentManager.executePendingTransactions()
+                        replayAcknowledged =
+                            !activity.intent.hasExtra(LoginActivity.EXTRA_SIGNUP_CONTINUATION_TOKEN) &&
+                                (activity.supportFragmentManager.findFragmentByTag(LoginActivity.CREDENTIALS_TAG)
+                                    is LoginCredentialsFragment) &&
+                                callbackOwnerFlow(activity) == ownerFlow
+                    }
+                    if (!replayAcknowledged) android.os.SystemClock.sleep(25L)
+                }
+                assertTrue("Replayed handled callback was not acknowledged by the owning login", replayAcknowledged)
                 scenario.onActivity { activity ->
                     assertFalse(activity.intent.hasExtra(LoginActivity.EXTRA_SIGNUP_CONTINUATION_TOKEN))
                     assertFalse(activity.intent.extras?.keySet().orEmpty().any {
@@ -165,6 +180,10 @@ class FirstRunSignInRuntimeTest {
                             it.contains("credential", ignoreCase = true) ||
                             it.contains("session", ignoreCase = true)
                     })
+                    assertEquals(
+                        SignupContinuationRegistry.ClaimResult.SAME_FLOW_HANDLED,
+                        SignupContinuationRegistry.claim(owningToken, ownerFlow),
+                    )
                 }
 
                 val frozenNow = SetupElapsedClock.now()
