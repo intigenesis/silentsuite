@@ -24,7 +24,7 @@ jobs:
   analytics-boundary:
     name: Public Analytics Boundary
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,6 +37,13 @@ jobs:
           cache: 'pnpm'
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      # Baseline signup pageviews are independent of the commercial event flag, so the
+      # emitted signup layout transport is verified in the disabled build mode too. The
+      # enabled build below then overwrites .next for the final enabled-mode check.
+      - name: Verify disabled-mode web analytics artifacts
+        run: |
+          NEXT_PUBLIC_SIGNUP_ANALYTICS_ENABLED=false pnpm --filter @silentsuite/web build
+          node scripts/check-public-analytics.mjs
       - name: Build public surfaces
         run: |
           NEXT_PUBLIC_SIGNUP_ANALYTICS_ENABLED=true pnpm --filter @silentsuite/web build

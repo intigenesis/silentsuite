@@ -67,30 +67,42 @@ describe('public analytics privacy contract', () => {
     expect(classifyReferrer('bad url')).toBeUndefined()
   })
 
-  it('builds the exact identity-free signup pageview payload', () => {
-    expect(buildSignupPageviewPayload(
+  it('builds the exact identity-free signup pageview payload without custom properties', () => {
+    const payload = buildSignupPageviewPayload(
       'https://app.silentsuite.io/signup?utm_source=github&utm_content=user@example.com&returnTo=/calendar',
       'https://github.com/silent-suite/silentsuite/issues/123?token=secret',
-    )).toEqual({
+    )
+
+    expect(payload).toEqual({
       domain: 'app.silentsuite.io',
       name: 'pageview',
       url: 'https://app.silentsuite.io/signup',
       referrer: 'https://github.com/',
-      props: { referrer_category: 'github', utm_source: 'github' },
     })
+    expect(payload).not.toHaveProperty('props')
+    expect(Object.keys(payload)).toEqual(['domain', 'name', 'url', 'referrer'])
   })
 
   it('sends the fixed Google referrer for a recognized regional Google source', () => {
-    expect(buildSignupPageviewPayload(
+    const payload = buildSignupPageviewPayload(
       'https://app.silentsuite.io/signup',
       'https://www.google.co.uk/search?q=silentsuite',
-    )).toEqual({
+    )
+
+    expect(payload).toEqual({
       domain: 'app.silentsuite.io',
       name: 'pageview',
       url: 'https://app.silentsuite.io/signup',
       referrer: 'https://www.google.com/',
-      props: { referrer_category: 'search' },
     })
+    expect(payload).not.toHaveProperty('props')
+  })
+
+  it.each([
+    'https://app.silentsuite.io/signup?utm_source=paid&utm_medium=cpc&utm_campaign=beta-2026-q2',
+    'https://app.silentsuite.io/signup?utm_source=github',
+  ])('never attaches campaign properties to the baseline pageview for %s', (rawUrl) => {
+    expect(buildSignupPageviewPayload(rawUrl, '')).not.toHaveProperty('props')
   })
 
   it.each([
