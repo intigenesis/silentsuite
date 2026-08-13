@@ -1,9 +1,34 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, resolve } from 'node:path'
 import { collectBillingCopyViolations } from './check-billing-copy.mjs'
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 test('annual-only billing copy guard accepts the repository', () => {
   assert.deepEqual(collectBillingCopyViolations(), [])
+})
+
+test('getting-started docs preserve the mandatory hosted email-verification signup sequence', () => {
+  for (const file of ['docs/user-guide/getting-started.md', 'apps/docs/user-guide/getting-started.md']) {
+    const content = readFileSync(resolve(repoRoot, file), 'utf8')
+    assert.match(content, /verification link/i,
+      `${file} must describe the emailed verification link required for hosted signup`)
+    assert.match(content, /same browser/i,
+      `${file} must direct users to open the verification link in the same browser they signed up in`)
+    assert.match(content, /plan[^.\n]{0,160}(?:unlocks?|locked)|(?:unlocks?|locked)[^.\n]{0,160}plan/i,
+      `${file} must state that plan selection stays locked until the emailed link is opened`)
+    assert.match(content, /re-?enter[^.\n]{0,80}password|password[^.\n]{0,80}re-?enter/i,
+      `${file} must describe password re-entry after the email-link continuation`)
+    const verifyIndex = content.search(/verification link/i)
+    const planChoiceIndex = content.search(/choose[^.\n]{0,60}(?:plan|trial)/i)
+    assert.ok(verifyIndex !== -1 && planChoiceIndex > verifyIndex,
+      `${file} must describe email verification before plan/trial selection`)
+    assert.doesNotMatch(content, /verify your email[^.\n]{0,140}banner|banner[^.\n]{0,140}until you (?:click|open)/i,
+      `${file} must not present hosted email verification as an optional post-signup banner`)
+  }
 })
 
 test('annual-only billing copy guard catches prohibited purchase copy', () => {
