@@ -116,6 +116,12 @@ jobs:
       - name: Enforce public analytics boundary
         run: pnpm run check:public-analytics
 
+      - name: Enforce annual billing copy
+        run: pnpm run check:billing-copy
+
+      - name: Test closed annual-only public Stage A to Stage B handshake
+        run: pnpm run check:annual-public-handshake
+
       - name: Run tests
         run: pnpm run test
 

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from 'react'
 import { buildCheckoutInitiatedPayload, buildCheckoutReturnedPayload, buildPlanSelectedPayload, type CommercialEventPayload } from '@/app/lib/public-analytics'
+import type { AnnualOffer } from '@/app/lib/billing-v2'
 
 const PLAUSIBLE_EVENT_ENDPOINT = 'https://plausible.silentsuite.io/api/event'
 
@@ -24,5 +25,5 @@ export function CheckoutReturnAnalytics({ outcome, paymentMethod }: { outcome: '
   useEffect(() => { if (!sent.current) { sent.current = true; sendCommercialEvent(buildCheckoutReturnedPayload(outcome, paymentMethod)) } }, [outcome, paymentMethod])
   return null
 }
-export function trackPlanSelected(planClass: 'monthly' | 'annual') { sendCommercialEvent(buildPlanSelectedPayload(planClass)) }
-export function trackCheckoutInitiated(planClass: 'monthly' | 'annual', paymentMethod: 'stripe' | 'btcpay') { sendCommercialEvent(buildCheckoutInitiatedPayload(planClass, paymentMethod)) }
+export function trackPlanSelected(offer: AnnualOffer) { sendCommercialEvent(buildPlanSelectedPayload(offer)) }
+export function trackCheckoutInitiated(offer: AnnualOffer, paymentMethod: 'stripe' | 'btcpay') { sendCommercialEvent(buildCheckoutInitiatedPayload(offer, paymentMethod)) }

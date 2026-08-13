@@ -1,11 +1,11 @@
 'use client'
 
 import { useEffect, useState, useCallback, useRef } from 'react'
-import { Crown, Loader2, Check } from 'lucide-react'
 import { Button } from '@silentsuite/ui'
 import { BILLING_API_URL } from '@/app/lib/config'
 import { formatDate as formatDateUtil } from '@/app/lib/date'
 import AddCardBanner from '@/app/components/add-card-banner'
+import { ModalDialog } from '@/app/components/modal-dialog'
 import PaymentChoicePanel from '@/app/components/payment-choice-panel'
 import { getPaidBonusAccessDate } from './bonus-access'
 import { SubscriptionEntry } from './subscription-entry'
@@ -36,6 +36,24 @@ interface SubscriptionData {
   trialPath: '7day' | '30day' | 'immediate' | null
   earlyAdopter: boolean
   capabilities?: SubscriptionCapabilities
+}
+
+function isSubscriptionData(value: unknown): value is SubscriptionData {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const subscription = value as Record<string, unknown>
+  const trial = subscription.trial
+  return (typeof subscription.plan === 'string' || subscription.plan === null)
+    && typeof subscription.planLabel === 'string'
+    && (subscription.billingInterval === 'monthly' || subscription.billingInterval === 'annual')
+    && ['none', 'trialing', 'active', 'past_due', 'cancelled', 'expired'].includes(String(subscription.status))
+    && (typeof subscription.renewalDate === 'string' || subscription.renewalDate === null)
+    && !!trial && typeof trial === 'object' && !Array.isArray(trial)
+    && typeof (trial as Record<string, unknown>).active === 'boolean'
+    && (typeof (trial as Record<string, unknown>).endsAt === 'string' || (trial as Record<string, unknown>).endsAt === null)
+    && (typeof (trial as Record<string, unknown>).daysRemaining === 'number' || (trial as Record<string, unknown>).daysRemaining === null)
+    && typeof subscription.cancelAtPeriodEnd === 'boolean'
+    && (subscription.trialPath === '7day' || subscription.trialPath === '30day' || subscription.trialPath === 'immediate' || subscription.trialPath === null)
+    && typeof subscription.earlyAdopter === 'boolean'
 }
 
 const STATUS_STYLES: Record<string, string> = {
@@ -98,16 +116,24 @@ function CancelDialog({
   cancelling,
   onConfirm,
   onClose,
+  restoreFocusTo,
 }: {
   accessUntil: string
   cancelling: boolean
   onConfirm: () => void
   onClose: () => void
+  restoreFocusTo: HTMLElement | null
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[rgb(var(--background))]/80 backdrop-blur-sm">
-      <div className="mx-4 w-full max-w-md rounded-lg border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-6 space-y-4">
-        <h2 className="text-lg font-semibold text-[rgb(var(--foreground))]">Cancel your subscription</h2>
+    <ModalDialog
+      title="Cancel your subscription"
+      description={`Your access continues until ${accessUntil}. After that, your account becomes read-only. Your encrypted data remains safe and can be exported or reactivated.`}
+      onClose={onClose}
+      closeOnEscape={!cancelling}
+      closeOnBackdrop={!cancelling}
+      restoreFocusTo={restoreFocusTo}
+    >
+      <div className="space-y-4">
         <div className="space-y-2 text-sm text-[rgb(var(--foreground))]">
           <p>Your access continues until {accessUntil}. After that, your account becomes read-only.</p>
           <p>Your data stays safe and encrypted. You can export anytime. You can reactivate anytime.</p>
@@ -131,16 +157,9 @@ function CancelDialog({
           </Button>
         </div>
       </div>
-    </div>
+    </ModalDialog>
   )
 }
-
-const REACTIVATION_PLANS = [
-  { id: 'early_monthly', name: 'Early Adopter Monthly', price: '3.60', period: '/mo', description: 'Locked-in early adopter pricing', icon: Crown, earlyOnly: true },
-  { id: 'early_annual', name: 'Early Adopter Annual', price: '36', period: '/yr', description: 'Save with annual billing', icon: Crown, badge: 'Best value', earlyOnly: true },
-  { id: 'standard_monthly', name: 'Standard Monthly', price: '4.80', period: '/mo', description: 'Full access, billed monthly', icon: Crown, earlyOnly: false },
-  { id: 'standard_annual', name: 'Standard Annual', price: '48', period: '/yr', description: 'Save with annual billing', icon: Crown, badge: 'Best value', earlyOnly: false },
-] as const
 
 const PAYMENT_CONFIRMATION_POLL_DELAYS_MS = [2000, 5000, 10000] as const
 
@@ -161,6 +180,38 @@ function getStripePaymentReturn(search: string): StripePaymentReturn {
   }
 }
 
+function PaymentChoiceDialog({
+  dismissible,
+  onClose,
+  onSuccess,
+  onDismissibilityChange,
+  restoreFocusTo,
+}: {
+  dismissible: boolean
+  onClose: () => void
+  onSuccess: () => void | Promise<void>
+  onDismissibilityChange: (dismissible: boolean) => void
+  restoreFocusTo: HTMLElement | null
+}) {
+  return (
+    <ModalDialog
+      title="Continue with silentsuite.io"
+      description="Review the current server-authorized annual payment options before choosing a payment method."
+      onClose={onClose}
+      closeOnEscape={dismissible}
+      closeOnBackdrop={dismissible}
+      restoreFocusTo={restoreFocusTo}
+    >
+      <PaymentChoicePanel
+        onSuccess={onSuccess}
+        onCancel={onClose}
+        onDismissibilityChange={onDismissibilityChange}
+        title="Payment options"
+      />
+    </ModalDialog>
+  )
+}
+
 export default function SubscriptionPage() {
   const [stripePaymentReturn] = useState<StripePaymentReturn>(() => (
     typeof window === 'undefined'
@@ -173,16 +224,14 @@ export default function SubscriptionPage() {
   const [showCancelDialog, setShowCancelDialog] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [showPlanSelection, setShowPlanSelection] = useState(false)
-  const [showChangePlanDialog, setShowChangePlanDialog] = useState(false)
-  const [changingPlan, setChangingPlan] = useState(false)
-  const [changePlanSuccess, setChangePlanSuccess] = useState<{ plan: string; effectiveDate: string; prorated: boolean } | null>(null)
-  const [selectedChangePlan, setSelectedChangePlan] = useState<string | null>(null)
-  const [changePlanError, setChangePlanError] = useState<string | null>(null)
-  const [changePlanToast, setChangePlanToast] = useState<string | null>(null)
-  const [billingInterval, setBillingInterval] = useState<'monthly' | 'annual'>('monthly')
+  const [paymentChoiceDismissible, setPaymentChoiceDismissible] = useState(false)
   const [paymentConfirmationPending, setPaymentConfirmationPending] = useState(false)
   const [paymentReturnFailure, setPaymentReturnFailure] = useState<string | null>(null)
   const [paymentConfirmationAttempt, setPaymentConfirmationAttempt] = useState(0)
+  // Captured while the CTA still holds focus. React marks the wrapper below
+  // `inert` in the same commit that mounts the dialog, and the browser blurs
+  // the CTA before any effect runs, so the dialog cannot discover it later.
+  const [modalOpener, setModalOpener] = useState<HTMLElement | null>(null)
   const stripeReturnHandledRef = useRef(false)
 
   const requestSubscription = useCallback(async (): Promise<SubscriptionData | null> => {
@@ -191,7 +240,8 @@ export default function SubscriptionPage() {
         credentials: 'include',
       })
       if (res.ok) {
-        return await res.json() as SubscriptionData
+        const body: unknown = await res.json().catch(() => null)
+        if (isSubscriptionData(body)) return body
       }
     } catch {
       // API may not be running in dev
@@ -307,10 +357,21 @@ export default function SubscriptionPage() {
     setPaymentConfirmationAttempt(attempt => attempt + 1)
   }
 
+  function captureModalOpener() {
+    setModalOpener(document.activeElement instanceof HTMLElement ? document.activeElement : null)
+  }
+
   function openPaymentRecovery() {
+    captureModalOpener()
     setPaymentConfirmationPending(false)
     setPaymentReturnFailure(null)
+    setPaymentChoiceDismissible(false)
     setShowPlanSelection(true)
+  }
+
+  function closePaymentRecovery() {
+    setPaymentChoiceDismissible(false)
+    setShowPlanSelection(false)
   }
 
   async function handleCancel() {
@@ -331,72 +392,47 @@ export default function SubscriptionPage() {
     }
   }
 
-  async function handleChangePlan(newPlanId: string) {
-    setChangingPlan(true)
-    setChangePlanError(null)
-    try {
-      const res = await fetch(`${BILLING_API_URL}/subscription/change-plan`, {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ planId: newPlanId }),
-      })
-      if (res.ok) {
-        const result = await res.json()
-        setChangePlanSuccess(result)
-        setSelectedChangePlan(null)
-        await fetchSubscription()
-        // Show toast and auto-dismiss
-        const planInfo = REACTIVATION_PLANS.find(p => p.id === newPlanId)
-        setChangePlanToast(`Switched to ${planInfo?.name ?? 'new plan'}`)
-        setTimeout(() => setChangePlanToast(null), 4000)
-      } else {
-        const body = await res.json().catch(() => null)
-        setChangePlanError(body?.error ?? 'Failed to change plan. Please try again.')
-      }
-    } catch {
-      setChangePlanError('Unable to reach billing service. Please try again.')
-    } finally {
-      setChangingPlan(false)
-    }
-  }
-
   if (loading) return <LoadingSkeleton />
 
   if (!data) {
     return (
-      <div className="space-y-6">
-        {paymentConfirmationPending && (
-          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
-            <p className="text-sm font-medium text-emerald-700 dark:text-emerald-400">Confirming your payment.</p>
-            <p className="mt-1 text-xs text-[rgb(var(--muted))]">This usually takes a few seconds. We will update this page automatically.</p>
-          </div>
-        )}
-        {paymentReturnFailure ? (
-          <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3">
-            <div>
-              <p className="text-sm font-medium text-amber-700 dark:text-amber-400">Payment needs attention.</p>
-              <p className="mt-1 text-xs text-[rgb(var(--muted))]">{paymentReturnFailure}</p>
+      <>
+        <div
+          className="space-y-6"
+          aria-hidden={showPlanSelection || undefined}
+          inert={showPlanSelection ? true : undefined}
+        >
+          {paymentConfirmationPending && (
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-3">
+              <p className="text-sm font-medium text-emerald-700 dark:text-emerald-400">Confirming your payment.</p>
+              <p className="mt-1 text-xs text-[rgb(var(--muted))]">This usually takes a few seconds. We will update this page automatically.</p>
             </div>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={startPaymentConfirmation}>Retry payment status</Button>
-              <Button size="sm" variant="outline" onClick={openPaymentRecovery}>Review payment options</Button>
+          )}
+          {paymentReturnFailure ? (
+            <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+              <div>
+                <p className="text-sm font-medium text-amber-700 dark:text-amber-400">Payment needs attention.</p>
+                <p className="mt-1 text-xs text-[rgb(var(--muted))]">{paymentReturnFailure}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" onClick={startPaymentConfirmation}>Retry payment status</Button>
+                <Button size="sm" variant="outline" onClick={openPaymentRecovery}>Review payment options</Button>
+              </div>
             </div>
-          </div>
-        ) : !paymentConfirmationPending && (
-          <p className="text-sm text-[rgb(var(--muted))]">Unable to load subscription details.</p>
-        )}
+          ) : !paymentConfirmationPending && (
+            <p className="text-sm text-[rgb(var(--muted))]">Unable to load subscription details.</p>
+          )}
+        </div>
         {showPlanSelection && (
-          <section className="rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-5">
-            <PaymentChoicePanel
-              initialInterval={billingInterval}
-              onSuccess={startPaymentConfirmation}
-              onCancel={() => setShowPlanSelection(false)}
-              title="Review payment options"
-            />
-          </section>
+          <PaymentChoiceDialog
+            dismissible={paymentChoiceDismissible}
+            onClose={closePaymentRecovery}
+            onSuccess={startPaymentConfirmation}
+            onDismissibilityChange={setPaymentChoiceDismissible}
+            restoreFocusTo={modalOpener}
+          />
         )}
-      </div>
+      </>
     )
   }
 
@@ -427,20 +463,14 @@ export default function SubscriptionPage() {
       : 'Subscribe'
   const accessUntilFormatted = data.renewalDate ? formatDateStr(data.renewalDate) : 'the end of your current period'
   const paidBonusAccessDate = getPaidBonusAccessDate(data)
-  // Only show Early Adopter plans — Standard plans will be enabled later
-  const availablePlans = REACTIVATION_PLANS.filter((p) => p.earlyOnly)
-
+  const modalIsOpen = showCancelDialog || showPlanSelection
   return (
-    <div className="space-y-6">
-      {/* Cancel confirmation dialog */}
-      {showCancelDialog && (
-        <CancelDialog
-          accessUntil={accessUntilFormatted}
-          cancelling={cancelling}
-          onConfirm={handleCancel}
-          onClose={() => setShowCancelDialog(false)}
-        />
-      )}
+    <>
+      <div
+        className="space-y-6"
+        aria-hidden={modalIsOpen || undefined}
+        inert={modalIsOpen ? true : undefined}
+      >
 
       {/* Trial banner */}
       {showTrialBanner && (
@@ -535,7 +565,7 @@ export default function SubscriptionPage() {
         && data.trial.daysRemaining != null
         && !paymentConfirmationPending
         && !paymentReturnFailure && (
-        <AddCardBanner daysRemaining={data.trial.daysRemaining} onCardAdded={startPaymentConfirmation} />
+        <AddCardBanner daysRemaining={data.trial.daysRemaining} onChoosePayment={openPaymentRecovery} />
       )}
 
       {paymentConfirmationPending && (
@@ -570,206 +600,43 @@ export default function SubscriptionPage() {
       {/* Action buttons */}
       <div className="flex gap-3">
         {hasLiveSubscriptionActions && (
-          <>
-            <Button variant="outline" size="sm" onClick={() => { setShowChangePlanDialog(true); setChangePlanSuccess(null); setSelectedChangePlan(null); setChangePlanError(null) }}>
-              Change plan
-            </Button>
             <Button
               variant="outline"
               size="sm"
               className="border-red-500/30 text-red-600 dark:text-red-400 hover:bg-red-500/10"
-              onClick={() => setShowCancelDialog(true)}
+              onClick={() => { captureModalOpener(); setShowCancelDialog(true) }}
             >
               Cancel subscription
             </Button>
-          </>
         )}
         {canOpenPaidRecovery && !capabilities.canSetupCard && !data.cancelAtPeriodEnd && (
-          <Button size="sm" onClick={() => setShowPlanSelection(true)}>
+          <Button size="sm" onClick={openPaymentRecovery}>
             {paidRecoveryLabel}
           </Button>
         )}
       </div>
 
-      {/* Shared payment dialog (subscribe/reactivate/retry) */}
+      </div>
+
+      {showCancelDialog && (
+        <CancelDialog
+          accessUntil={accessUntilFormatted}
+          cancelling={cancelling}
+          onConfirm={handleCancel}
+          onClose={() => setShowCancelDialog(false)}
+          restoreFocusTo={modalOpener}
+        />
+      )}
+
       {showPlanSelection && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[rgb(var(--background))]/80 backdrop-blur-sm">
-          <div className="mx-4 w-full max-w-md rounded-xl border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-6">
-            <PaymentChoicePanel
-              onSuccess={startPaymentConfirmation}
-              onCancel={() => setShowPlanSelection(false)}
-              title="Continue with silentsuite.io"
-            />
-          </div>
-        </div>
+        <PaymentChoiceDialog
+          dismissible={paymentChoiceDismissible}
+          onClose={closePaymentRecovery}
+          onSuccess={startPaymentConfirmation}
+          onDismissibilityChange={setPaymentChoiceDismissible}
+          restoreFocusTo={modalOpener}
+        />
       )}
-
-      {/* Change plan dialog */}
-      {showChangePlanDialog && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[rgb(var(--background))]/80 backdrop-blur-sm">
-          <div className="mx-4 w-full max-w-lg rounded-lg border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-6 space-y-4">
-            {changePlanSuccess ? (
-              <>
-                <h2 className="text-lg font-semibold text-[rgb(var(--foreground))]">Plan changed</h2>
-                <p className="text-sm text-[rgb(var(--foreground))]">
-                  You are now on the {changePlanSuccess.plan.endsWith('_annual') ? 'Annual' : 'Monthly'} plan.
-                  {changePlanSuccess.prorated
-                    ? ' The change is effective immediately and your account has been prorated.'
-                    : ` The change takes effect on ${formatDateStr(changePlanSuccess.effectiveDate)}.`}
-                </p>
-                <Button
-                  size="sm"
-                  onClick={() => { setShowChangePlanDialog(false); setChangePlanSuccess(null) }}
-                  className="w-full"
-                >
-                  Done
-                </Button>
-              </>
-            ) : selectedChangePlan ? (
-              /* Confirmation step */
-              (() => {
-                const targetPlan = REACTIVATION_PLANS.find(p => p.id === selectedChangePlan)!
-                const isAnnualSwitch = selectedChangePlan.endsWith('_annual')
-                return (
-                  <>
-                    <h2 className="text-lg font-semibold text-[rgb(var(--foreground))]">Confirm plan change</h2>
-                    <div className="rounded-lg border border-[rgb(var(--border))] bg-[rgb(var(--background))] p-4 space-y-2">
-                      <p className="text-sm text-[rgb(var(--foreground))]">
-                        Switch to <span className="font-medium">{targetPlan.name}</span> at{' '}
-                        <span className="font-medium">&euro;{targetPlan.price}{targetPlan.period}</span>
-                      </p>
-                      <p className="text-xs text-[rgb(var(--muted))]">
-                        {isAnnualSwitch
-                          ? 'You will be charged the prorated difference immediately.'
-                          : `Your new plan takes effect at your next billing date${data.renewalDate ? ` (${formatDateStr(data.renewalDate)})` : ''}.`}
-                      </p>
-                    </div>
-                    {changePlanError && (
-                      <p className="text-xs text-red-600 dark:text-red-400">{changePlanError}</p>
-                    )}
-                    <div className="flex gap-3 pt-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => { setSelectedChangePlan(null); setChangePlanError(null) }}
-                        disabled={changingPlan}
-                      >
-                        Back
-                      </Button>
-                      <button
-                        onClick={() => handleChangePlan(selectedChangePlan)}
-                        disabled={changingPlan}
-                        className="rounded-lg bg-emerald-600 px-6 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-600/25 transition-colors hover:bg-emerald-500 disabled:opacity-50"
-                      >
-                        {changingPlan ? (
-                          <span className="flex items-center gap-2">
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                            Switching&hellip;
-                          </span>
-                        ) : (
-                          'Confirm switch'
-                        )}
-                      </button>
-                    </div>
-                  </>
-                )
-              })()
-            ) : (
-              /* Plan selection step — monthly/annual toggle */
-              <>
-                <h2 className="text-lg font-semibold text-[rgb(var(--foreground))]">Change plan</h2>
-                {/* Billing interval toggle */}
-                <div className="flex items-center justify-center gap-1 rounded-full border border-[rgb(var(--border))] bg-[rgb(var(--surface))] p-1">
-                  <button
-                    onClick={() => setBillingInterval('monthly')}
-                    className={`rounded-full min-h-[44px] px-4 py-2 text-sm font-medium transition-colors ${
-                      billingInterval === 'monthly'
-                        ? 'bg-emerald-600 text-white'
-                        : 'text-[rgb(var(--muted))] hover:text-[rgb(var(--foreground))]'
-                    }`}
-                  >
-                    Monthly
-                  </button>
-                  <button
-                    onClick={() => setBillingInterval('annual')}
-                    className={`rounded-full min-h-[44px] px-4 py-2 text-sm font-medium transition-colors ${
-                      billingInterval === 'annual'
-                        ? 'bg-emerald-600 text-white'
-                        : 'text-[rgb(var(--muted))] hover:text-[rgb(var(--foreground))]'
-                    }`}
-                  >
-                    Annual
-                  </button>
-                </div>
-                {/* Selected plan card */}
-                {(() => {
-                  const plan = billingInterval === 'monthly'
-                    ? availablePlans.find(p => p.id === 'early_monthly')!
-                    : availablePlans.find(p => p.id === 'early_annual')!
-                  const Icon = plan.icon
-                  const isCurrent = plan.id === data.plan
-                  return (
-                    <div className={`rounded-lg border p-5 ${isCurrent ? 'border-emerald-500 bg-emerald-500/5' : 'border-emerald-500/30 bg-[rgb(var(--surface))]'}`}>
-                      <div className="flex items-start justify-between">
-                        <div className="flex items-start gap-3">
-                          <div className="mt-0.5 rounded-lg bg-emerald-500/10 p-2">
-                            <Icon className="h-5 w-5 text-emerald-400" />
-                          </div>
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <h3 className="font-medium text-[rgb(var(--foreground))]">{plan.name}</h3>
-                              {isCurrent && (
-                                <span className="flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                                  <Check className="h-3 w-3" /> Current
-                                </span>
-                              )}
-                              {'badge' in plan && plan.badge && !isCurrent && (
-                                <span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                                  {plan.badge}
-                                </span>
-                              )}
-                            </div>
-                            <p className="mt-0.5 text-sm text-[rgb(var(--muted))]">{plan.description}</p>
-                          </div>
-                        </div>
-                        <div className="text-right shrink-0">
-                          <span className={`text-2xl font-bold ${isCurrent ? 'text-emerald-600 dark:text-emerald-400' : 'text-[rgb(var(--foreground))]'}`}>
-                            &euro;{plan.price}
-                          </span>
-                          <span className="text-sm text-[rgb(var(--muted))]">{plan.period}</span>
-                        </div>
-                      </div>
-                      {!isCurrent && (
-                        <button
-                          onClick={() => { setSelectedChangePlan(plan.id); setChangePlanError(null) }}
-                          className="mt-5 w-full rounded-lg bg-emerald-600 px-6 py-3 text-base font-semibold text-white shadow-lg shadow-emerald-600/25 transition-colors hover:bg-emerald-500"
-                        >
-                          Switch to {billingInterval === 'annual' ? 'Annual' : 'Monthly'}
-                        </button>
-                      )}
-                    </div>
-                  )
-                })()}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowChangePlanDialog(false)}
-                  className="w-full"
-                >
-                  Cancel
-                </Button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Success toast */}
-      {changePlanToast && (
-        <div className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-4 py-2.5 shadow-lg backdrop-blur-sm">
-          <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">{changePlanToast}</p>
-        </div>
-      )}
-    </div>
+    </>
   )
 }
