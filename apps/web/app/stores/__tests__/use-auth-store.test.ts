@@ -113,16 +113,15 @@ function paidSignupRequestBody(callIndex = 0) {
   return JSON.parse(init?.body as string) as Record<string, unknown>
 }
 
-function currentPaidSignupRecoverySecret() {
-  return paidSignupRequestBody(vi.mocked(fetch).mock.calls.length - 1).recoverySecret as string
-}
-
 function persistedPaidSignupIdentities() {
   const raw = sessionStorage.getItem('silentsuite-paid-signup-recovery')
   if (!raw) return []
   const registry = JSON.parse(raw) as { identities?: Record<string, Record<string, unknown>> }
   return Object.values(registry.identities ?? {})
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const RECOVERY_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/
 
 describe('useAuthStore', () => {
   beforeEach(() => {
@@ -199,6 +198,20 @@ describe('useAuthStore', () => {
     expect(useAuthStore.getState().error).toMatch(/already signed in/i)
   })
 
+  it('reuses an Etebase account created by an ambiguous prior signup attempt', async () => {
+    const { etebaseSignUp, etebaseLogIn } = await import('@/app/lib/etebase-auth')
+    vi.mocked(etebaseSignUp).mockRejectedValueOnce(new Error('409 conflict'))
+
+    useAuthStore.getState().prepareSignupDraft('recover@example.com', true, true)
+    await useAuthStore.getState().createEtebaseAccount('recover@example.com', 'password123')
+
+    expect(etebaseLogIn).toHaveBeenCalledWith('recover@example.com', 'password123', undefined)
+    expect(useAuthStore.getState().pendingSignup).toMatchObject({
+      email: 'recover@example.com', wantsProductUpdates: true, rememberDevice: true,
+    })
+    expect(secureStore.etebase_session).toBe('mock-saved-session')
+  })
+
   it('keeps custom-server signup and finalization out of hosted Billing', async () => {
     const customServerUrl = 'https://sync.example.test'
     const { issueBillingLinkProof } = await import('@/app/lib/etebase-auth')
@@ -239,576 +252,368 @@ describe('useAuthStore', () => {
     expect(issueBillingLinkProof).not.toHaveBeenCalled()
   })
 
-  it('signup sends a trimmed promo code when provided', async () => {
-    secureStore.etebase_session = 'mock-saved-session'
-    useAuthStore.setState({
-      pendingSignup: {
-        email: 'promo@example.com',
-        wantsProductUpdates: true,
-      },
+  describe('annual v2 paid-signup recovery', () => {
+    const checkoutIntentToken = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG'
+    const stripePayment = (recoveryToken: string) => ({
+      contractVersion: 2,
+      kind: 'stripe',
+      clientSecret: 'pi_secret',
+      paymentSessionToken: recoveryToken,
+    })
+    const bitcoinPayment = (recoveryToken: string) => ({
+      contractVersion: 2,
+      kind: 'btcpay',
+      cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv_123',
+      cryptoInvoiceId: 'inv_123',
+      cryptoInvoiceLookupToken: recoveryToken,
+      paymentSessionToken: recoveryToken,
     })
 
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ id: 'user-1', isAdmin: false, clientSecret: 'cs_test' }),
-    } as Response)
+    function startAnnualPayment(provider: 'stripe' | 'btcpay' = 'stripe') {
+      return useAuthStore.getState().startAnnualSignupPayment(
+        checkoutIntentToken,
+        provider,
+        'http://localhost:3000/signup/return',
+      )
+    }
 
-    await useAuthStore.getState().signup('early_monthly', '30day', '  beta196  ')
+    it('uses a closed v2 Stripe payment request and keeps the recovery capability out of client pricing input', async () => {
+      useAuthStore.getState().prepareSignupDraft('paid@example.com', false, true)
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        const body = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(stripePayment(body.recoverySecret)))
+      })
 
-    expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining('/auth/provision'),
-      expect.objectContaining({
-        method: 'POST',
-        body: JSON.stringify({
-          etebaseLinkProof: 'mock-link-proof-value-with-at-least-43-characters',
-          planId: 'early_monthly',
-          trialPath: '30day',
-          promoCode: 'beta196',
-          wantsProductUpdates: true,
-          rememberDevice: false,
-        }),
-      }),
-    )
-  })
+      const result = await startAnnualPayment()
+      const body = paidSignupRequestBody()
 
-  it('signup omits an empty promo code', async () => {
-    secureStore.etebase_session = 'mock-saved-session'
-    useAuthStore.setState({
-      pendingSignup: {
-        email: 'promo@example.com',
-      },
-    })
-
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ id: 'user-1', isAdmin: false, clientSecret: 'cs_test' }),
-    } as Response)
-
-    await useAuthStore.getState().signup('early_monthly', '30day', '   ')
-
-    const [, init] = vi.mocked(fetch).mock.calls[0]
-    expect(JSON.parse(init?.body as string)).toEqual({
-      etebaseLinkProof: 'mock-link-proof-value-with-at-least-43-characters',
-      planId: 'early_monthly',
-      trialPath: '30day',
-      rememberDevice: false,
-    })
-  })
-
-  it('starts a paid signup payment session before an Etebase account exists', async () => {
-    useAuthStore.setState({
-      pendingSignup: {
-        email: 'paid@example.com',
-        wantsProductUpdates: false,
-      },
-    })
-
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        clientSecret: 'seti_secret',
+      expect(result).toEqual({
+        clientSecret: 'pi_secret',
         cryptoCheckoutUrl: null,
         cryptoInvoiceId: null,
         cryptoInvoiceLookupToken: null,
-        paymentSessionToken: currentPaidSignupRecoverySecret(),
-      }),
-    } as Response)
-
-    const result = await useAuthStore.getState().signup('early_monthly', '30day', ' BETA196 ')
-
-    expect(fetch).toHaveBeenCalledWith(
-      expect.stringContaining('/auth/signup/payment-session'),
-      expect.objectContaining({ method: 'POST' }),
-    )
-    expect(paidSignupRequestBody()).toMatchObject({
-      email: 'paid@example.com',
-      planId: 'early_monthly',
-      trialPath: '30day',
-      promoCode: 'BETA196',
-      wantsProductUpdates: false,
-      rememberDevice: false,
-      requestKey: expect.any(String),
-      recoverySecret: expect.any(String),
+        paymentSessionToken: body.recoverySecret,
+      })
+      expect(body).toEqual({
+        contractVersion: 2,
+        checkoutIntentToken,
+        email: 'paid@example.com',
+        requestKey: expect.stringMatching(UUID_PATTERN),
+        recoverySecret: expect.stringMatching(RECOVERY_TOKEN_PATTERN),
+        wantsProductUpdates: false,
+        rememberDevice: true,
+        returnUrl: 'http://localhost:3000/signup/return',
+      })
+      expect(JSON.stringify(body)).not.toMatch(/planId|amount|customerClass|promo|trialPath/)
+      expect(useAuthStore.getState().pendingSignup).toMatchObject({
+        billingContractVersion: 2,
+        paymentMethod: 'stripe',
+        paymentSessionToken: body.recoverySecret,
+        paymentSessionRequestKey: body.requestKey,
+      })
     })
-    expect(result.paymentSessionToken).toBe(currentPaidSignupRecoverySecret())
-    expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toBe(currentPaidSignupRecoverySecret())
-    expect(JSON.stringify(useAuthStore.getState().pendingSignup)).not.toContain('etebaseAuthToken')
-  })
 
-  it('retains a UUID request key and high-entropy recovery secret after an incomplete successful response', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret() }),
-    } as Response)
+    it('rejects cross-origin annual return URLs before contacting Billing', async () => {
+      useAuthStore.getState().prepareSignupDraft('origin@example.com')
+      await expect(useAuthStore.getState().startAnnualSignupPayment(
+        checkoutIntentToken, 'stripe', 'https://attacker.example/return',
+      )).rejects.toThrow('must stay on this origin')
+      expect(fetch).not.toHaveBeenCalled()
+    })
 
-    await expect(useAuthStore.getState().signup('early_monthly', '30day'))
-      .rejects.toThrow('incomplete provider continuation')
+    it('does not commit an in-flight authority into a superseding signup draft', async () => {
+      useAuthStore.getState().prepareSignupDraft('first@example.com', false, false)
+      let resolvePayment!: (response: Response) => void
+      vi.mocked(fetch).mockImplementation(async () => new Promise<Response>((resolve) => { resolvePayment = resolve }))
+      const payment = startAnnualPayment()
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce())
+      useAuthStore.getState().prepareSignupDraft('second@example.com', true, true)
+      const body = paidSignupRequestBody()
+      resolvePayment(new Response(JSON.stringify(stripePayment(String(body.recoverySecret)))))
 
-    const body = paidSignupRequestBody()
-    expect(body.requestKey).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
-    expect(body.recoverySecret).toMatch(/^[A-Za-z0-9_-]{43,}$/)
-    expect(body.recoverySecret).not.toBe(body.requestKey)
-    expect(persistedPaidSignupIdentities()).toHaveLength(1)
-  })
+      await expect(payment).rejects.toThrow('Signup was superseded')
+      expect(useAuthStore.getState().pendingSignup).toMatchObject({ email: 'second@example.com' })
+      expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toBeUndefined()
+    })
 
-  it('retains paid-signup recovery identity when a successful response has a non-string session token', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ paymentSessionToken: 123, clientSecret: 'seti_complete' }),
-    } as Response)
+    it('does not let an older same-scope payment response replace a newer attempt', async () => {
+      useAuthStore.getState().prepareSignupDraft('same@example.com', false, false)
+      const resolvers: Array<(response: Response) => void> = []
+      vi.mocked(fetch).mockImplementation(async () => new Promise<Response>((resolve) => { resolvers.push(resolve) }))
+      const first = startAnnualPayment()
+      await vi.waitFor(() => expect(resolvers).toHaveLength(1))
+      const second = startAnnualPayment()
+      await vi.waitFor(() => expect(resolvers).toHaveLength(2))
+      const secondBody = paidSignupRequestBody(1)
+      resolvers[1](new Response(JSON.stringify(stripePayment(String(secondBody.recoverySecret)))))
+      await second
+      const firstBody = paidSignupRequestBody(0)
+      resolvers[0](new Response(JSON.stringify(stripePayment(String(firstBody.recoverySecret)))))
+      await expect(first).rejects.toThrow('Signup was superseded')
+      expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toBe(secondBody.recoverySecret)
+    })
 
-    await expect(useAuthStore.getState().signup('early_monthly', '30day'))
-      .rejects.toThrow('invalid recovery token')
-
-    expect(persistedPaidSignupIdentities()).toHaveLength(1)
-    expect(paidSignupRequestBody().requestKey).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
-  })
-
-  it('retains the real recovery identity when a successful response returns a different nonempty token', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ paymentSessionToken: 'different-nonempty-token', clientSecret: 'seti_complete' }),
-    } as Response)
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day'))
-      .rejects.toThrow('invalid recovery token')
-
-    expect(persistedPaidSignupIdentities()).toHaveLength(1)
-    expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toBeUndefined()
-  })
-
-  it('retains the real Bitcoin recovery identity when the invoice lookup token is mismatched', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'crypto@example.com' } })
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        paymentSessionToken: currentPaidSignupRecoverySecret(),
-        cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv-mismatch',
-        cryptoInvoiceId: 'inv-mismatch',
-        cryptoInvoiceLookupToken: 'different-nonempty-token',
-      }),
-    } as Response)
-
-    await expect(useAuthStore.getState().signup('early_annual', 'crypto_annual'))
-      .rejects.toThrow('invalid invoice recovery token')
-
-    expect(persistedPaidSignupIdentities()).toHaveLength(1)
-    expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toBeUndefined()
-  })
-
-  it('reuses paid-signup recovery identity after ambiguous transport loss and a reload-like store reset', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch)
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-      } as Response)
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Failed to fetch')
-    const [persisted] = persistedPaidSignupIdentities()
-    expect(persisted.requestKey).toBe(paidSignupRequestBody(0).requestKey)
-    expect(persisted.recoverySecret).toBe(paidSignupRequestBody(0).recoverySecret)
-    resetStore()
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    await useAuthStore.getState().signup('early_monthly', '30day')
-
-    const first = paidSignupRequestBody(0)
-    const retry = paidSignupRequestBody(1)
-    expect(retry.requestKey).toBe(first.requestKey)
-    expect(retry.recoverySecret).toBe(first.recoverySecret)
-  })
-
-  it('uses one recovery identity for concurrent paid-signup calls', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-    } as Response)
-
-    const results = await Promise.allSettled([
-      useAuthStore.getState().signup('early_monthly', '30day'),
-      useAuthStore.getState().signup('early_monthly', '30day'),
-    ])
-
-    const first = paidSignupRequestBody(0)
-    const concurrent = paidSignupRequestBody(1)
-    expect(concurrent.requestKey).toBe(first.requestKey)
-    expect(concurrent.recoverySecret).toBe(first.recoverySecret)
-    expect(results.map((result) => result.status).sort()).toEqual(['fulfilled', 'rejected'])
-    const rejected = results.find((result) => result.status === 'rejected')
-    expect(rejected).toMatchObject({ reason: expect.objectContaining({ message: 'Paid signup request was superseded' }) })
-  })
-
-  it.each([
-    ['30day', 'crypto_annual', 'first'],
-    ['30day', 'crypto_annual', 'second'],
-    ['crypto_annual', '30day', 'first'],
-    ['crypto_annual', '30day', 'second'],
-  ] as const)(
-    'publishes only the latest %s → %s attempt when the %s response resolves first',
-    async (firstTrialPath, secondTrialPath, firstResolution) => {
-      useAuthStore.setState({ pendingSignup: { email: 'race@example.com' } })
-      const pendingResponses = new Map<string, { secret: string, resolve: (response: Response) => void }>()
-      vi.mocked(fetch).mockImplementation(async (_url, init) => {
-        const body = JSON.parse(init?.body as string) as { trialPath: string, recoverySecret: string }
-        return await new Promise<Response>((resolve) => {
-          pendingResponses.set(body.trialPath, { secret: body.recoverySecret, resolve })
-        })
+    it('accepts only a complete v2 BTCPay continuation bound to the recovery capability', async () => {
+      useAuthStore.getState().prepareSignupDraft('bitcoin@example.com')
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        const body = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(bitcoinPayment(body.recoverySecret)))
       })
 
-      const first = useAuthStore.getState().signup('early_annual', firstTrialPath)
-      const second = useAuthStore.getState().signup('early_annual', secondTrialPath)
-      await vi.waitFor(() => expect(pendingResponses.size).toBe(2))
-      const responseFor = (trialPath: string) => {
-        const pendingResponse = pendingResponses.get(trialPath)!
-        return {
-          ok: true,
-          status: 200,
-          json: async () => trialPath === '30day'
-            ? { paymentSessionToken: pendingResponse.secret, clientSecret: `seti_${trialPath}` }
-            : {
-                paymentSessionToken: pendingResponse.secret,
-                cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv-race',
-                cryptoInvoiceId: 'inv-race',
-                cryptoInvoiceLookupToken: pendingResponse.secret,
-              },
-        } as Response
-      }
-      const firstPending = pendingResponses.get(firstTrialPath)!
-      const secondPending = pendingResponses.get(secondTrialPath)!
-      if (firstResolution === 'first') {
-        firstPending.resolve(responseFor(firstTrialPath))
-        await Promise.resolve()
-        secondPending.resolve(responseFor(secondTrialPath))
-      } else {
-        secondPending.resolve(responseFor(secondTrialPath))
-        await Promise.resolve()
-        firstPending.resolve(responseFor(firstTrialPath))
-      }
+      const result = await startAnnualPayment('btcpay')
+      const body = paidSignupRequestBody()
 
-      const results = await Promise.allSettled([first, second])
-      expect(results[0]).toMatchObject({ status: 'rejected', reason: expect.objectContaining({ message: 'Paid signup request was superseded' }) })
-      expect(results[1].status).toBe('fulfilled')
-      expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toBe(secondPending.secret)
-    },
-  )
+      expect(result).toEqual({
+        clientSecret: null,
+        cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv_123',
+        cryptoInvoiceId: 'inv_123',
+        cryptoInvoiceLookupToken: body.recoverySecret,
+        paymentSessionToken: body.recoverySecret,
+      })
+      expect(body).not.toHaveProperty('provider')
+      expect(useAuthStore.getState().pendingSignup?.paymentMethod).toBe('btcpay')
+    })
 
-  it('rotates paid-signup recovery identity after a definitive rejection', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 400,
-        json: async () => ({ detail: 'Invalid signup' }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-      } as Response)
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Invalid signup')
-    await useAuthStore.getState().signup('early_monthly', '30day')
-
-    const rejected = paidSignupRequestBody(0)
-    const next = paidSignupRequestBody(1)
-    expect(next.requestKey).not.toBe(rejected.requestKey)
-    expect(next.recoverySecret).not.toBe(rejected.recoverySecret)
-  })
-
-  it('retains an ambiguous scope while a different signup draft uses its own identity', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'first@example.com' } })
-    vi.mocked(fetch)
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_recovered_first' }),
-      } as Response)
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Failed to fetch')
-    useAuthStore.getState().prepareSignupDraft('second@example.com')
-    await useAuthStore.getState().signup('early_monthly', '30day')
-    useAuthStore.getState().prepareSignupDraft('first@example.com')
-    await useAuthStore.getState().signup('early_monthly', '30day')
-
-    const first = paidSignupRequestBody(0)
-    const next = paidSignupRequestBody(1)
-    const recovered = paidSignupRequestBody(2)
-    expect(next.requestKey).not.toBe(first.requestKey)
-    expect(next.recoverySecret).not.toBe(first.recoverySecret)
-    expect(recovered.requestKey).toBe(first.requestKey)
-    expect(recovered.recoverySecret).toBe(first.recoverySecret)
-  })
-
-  it('does not reuse default marketing opt-in authority for an explicit opt-out retry', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'preferences@example.com' } })
-    vi.mocked(fetch)
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_opt_out' }),
-      } as Response)
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Failed to fetch')
-    useAuthStore.setState({ pendingSignup: { email: 'preferences@example.com', wantsProductUpdates: false } })
-    await useAuthStore.getState().signup('early_monthly', '30day')
-
-    const defaultOptIn = paidSignupRequestBody(0)
-    const explicitOptOut = paidSignupRequestBody(1)
-    expect(defaultOptIn.wantsProductUpdates).toBe(true)
-    expect(explicitOptOut.wantsProductUpdates).toBe(false)
-    expect(explicitOptOut.requestKey).not.toBe(defaultOptIn.requestKey)
-    expect(explicitOptOut.recoverySecret).not.toBe(defaultOptIn.recoverySecret)
-  })
-
-  it.each(['signup-in-progress', 'payment-reconciliation-required', 'bitcoin-invoice-active'])(
-    'retains paid-signup recovery identity for ambiguous 409 problem %s',
-    async (problemCode) => {
-      useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
+    it('fails closed on an incomplete provider response and reuses the same v2 capability on a retry', async () => {
+      useAuthStore.getState().prepareSignupDraft('retry@example.com')
       vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 409,
-          json: async () => ({ type: `https://api.silentsuite.io/problems/${problemCode}`, detail: 'Retry later' }),
-        } as Response)
-        .mockResolvedValueOnce({
-          ok: true,
-          status: 200,
-          json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-        } as Response)
+        .mockResolvedValueOnce(new Response(JSON.stringify({ contractVersion: 2, kind: 'stripe', clientSecret: 'pi_secret' })))
+        .mockImplementationOnce(async (_input, init) => {
+          const body = JSON.parse(String(init?.body))
+          return new Response(JSON.stringify(stripePayment(body.recoverySecret)))
+        })
 
-      await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Retry later')
-      await useAuthStore.getState().signup('early_monthly', '30day')
+      await expect(startAnnualPayment()).rejects.toThrow('valid payment session')
+      const first = paidSignupRequestBody(0)
+      expect(persistedPaidSignupIdentities()).toHaveLength(1)
 
-      expect(paidSignupRequestBody(1).requestKey).toBe(paidSignupRequestBody(0).requestKey)
-      expect(paidSignupRequestBody(1).recoverySecret).toBe(paidSignupRequestBody(0).recoverySecret)
-    },
-  )
-
-  it('retains paid-signup recovery identity when sessionStorage writes fail', async () => {
-    const originalSetItem = Storage.prototype.setItem
-    const storageSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (key, value) {
-      if (this === sessionStorage && key === 'silentsuite-paid-signup-recovery') {
-        throw new DOMException('quota exceeded', 'QuotaExceededError')
-      }
-      return originalSetItem.call(this, key, value)
-    })
-    useAuthStore.setState({ pendingSignup: { email: 'storage-failure@example.com' } })
-    vi.mocked(fetch)
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-      } as Response)
-
-    try {
-      await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Failed to fetch')
-      await useAuthStore.getState().signup('early_monthly', '30day')
-    } finally {
-      storageSpy.mockRestore()
-    }
-
-    expect(paidSignupRequestBody(1).requestKey).toBe(paidSignupRequestBody(0).requestKey)
-    expect(paidSignupRequestBody(1).recoverySecret).toBe(paidSignupRequestBody(0).recoverySecret)
-  })
-
-  it('does not resurrect a cleared recovery identity when sessionStorage removal fails', async () => {
-    const originalRemoveItem = Storage.prototype.removeItem
-    const storageSpy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function (key) {
-      if (this === sessionStorage && key === 'silentsuite-paid-signup-recovery') {
-        throw new DOMException('storage unavailable', 'SecurityError')
-      }
-      return originalRemoveItem.call(this, key)
-    })
-    useAuthStore.setState({ pendingSignup: { email: 'removal-failure@example.com' } })
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-    } as Response)
-
-    try {
-      await useAuthStore.getState().signup('early_monthly', '30day')
-      await useAuthStore.getState().signup('early_monthly', '30day')
-    } finally {
-      storageSpy.mockRestore()
-    }
-
-    expect(paidSignupRequestBody(1).requestKey).not.toBe(paidSignupRequestBody(0).requestKey)
-    expect(paidSignupRequestBody(1).recoverySecret).not.toBe(paidSignupRequestBody(0).recoverySecret)
-  })
-
-  it('clears recovery authority before storage-wide removal failures during signup completion', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'completed@example.com' } })
-    vi.mocked(fetch)
-      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_new_session' }),
-      } as Response)
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Failed to fetch')
-    const ambiguous = paidSignupRequestBody(0)
-    useAuthStore.setState({
-      pendingSignup: {
-        email: 'completed@example.com',
-        provisionedUser: { id: 'user-1', planId: 'early_monthly', isAdmin: false },
-        provisionedSubscriptionStatus: 'active',
-      },
-    })
-    const storageSpy = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(function () {
-      if (this === sessionStorage) throw new DOMException('storage unavailable', 'SecurityError')
+      await startAnnualPayment()
+      const retry = paidSignupRequestBody(1)
+      expect(retry.requestKey).toBe(first.requestKey)
+      expect(retry.recoverySecret).toBe(first.recoverySecret)
     })
 
-    try {
-      expect(() => useAuthStore.getState().completeSignup()).not.toThrow()
-      useAuthStore.setState({ pendingSignup: { email: 'completed@example.com' } })
-      await useAuthStore.getState().signup('early_monthly', '30day')
-    } finally {
-      storageSpy.mockRestore()
-    }
-
-    expect(useAuthStore.getState().isAuthenticated).toBe(true)
-    expect(paidSignupRequestBody(1).requestKey).not.toBe(ambiguous.requestKey)
-    expect(paidSignupRequestBody(1).recoverySecret).not.toBe(ambiguous.recoverySecret)
-  })
-
-  it.each(['account-exists', 'payment-intent-conflict', 'payment-already-confirmed'])(
-    'clears paid-signup recovery identity for definitive 409 problem %s',
-    async (problemCode) => {
-      useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
+    it('retains a retry capability for an ambiguous transport failure but isolates distinct email scopes', async () => {
+      useAuthStore.getState().prepareSignupDraft('first@example.com')
       vi.mocked(fetch)
-        .mockResolvedValueOnce({
-          ok: false,
-          status: 409,
-          json: async () => ({ type: `https://api.silentsuite.io/problems/${problemCode}`, detail: 'Terminal conflict' }),
-        } as Response)
-        .mockResolvedValueOnce({
-          ok: true,
-          status: 200,
-          json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-        } as Response)
+        .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+        .mockImplementation(async (_input, init) => {
+          const body = JSON.parse(String(init?.body))
+          return new Response(JSON.stringify(stripePayment(body.recoverySecret)))
+        })
 
-      await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Terminal conflict')
-      await useAuthStore.getState().signup('early_monthly', '30day')
+      await expect(startAnnualPayment()).rejects.toThrow('Failed to fetch')
+      const first = paidSignupRequestBody(0)
 
-      expect(paidSignupRequestBody(1).requestKey).not.toBe(paidSignupRequestBody(0).requestKey)
-      expect(paidSignupRequestBody(1).recoverySecret).not.toBe(paidSignupRequestBody(0).recoverySecret)
-    },
-  )
+      useAuthStore.getState().prepareSignupDraft('second@example.com')
+      await startAnnualPayment()
+      const second = paidSignupRequestBody(1)
 
-  it('preserves paid-signup recovery identity for an unknown 409 problem', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 409,
-        json: async () => ({ type: 'https://api.silentsuite.io/problems/future-reconciliation-state', detail: 'Retry later' }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-      } as Response)
+      useAuthStore.getState().prepareSignupDraft('first@example.com')
+      await startAnnualPayment()
+      const recovered = paidSignupRequestBody(2)
 
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Retry later')
-    await useAuthStore.getState().signup('early_monthly', '30day')
+      expect(second.requestKey).not.toBe(first.requestKey)
+      expect(second.recoverySecret).not.toBe(first.recoverySecret)
+      expect(recovered.requestKey).toBe(first.requestKey)
+      expect(recovered.recoverySecret).toBe(first.recoverySecret)
+    })
 
-    expect(paidSignupRequestBody(1).requestKey).toBe(paidSignupRequestBody(0).requestKey)
-    expect(paidSignupRequestBody(1).recoverySecret).toBe(paidSignupRequestBody(0).recoverySecret)
-  })
+    it('rotates the capability when privacy preferences change its v2 recovery scope', async () => {
+      useAuthStore.getState().prepareSignupDraft('preferences@example.com', true, false)
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        const body = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(stripePayment(body.recoverySecret)))
+      })
 
-  it('uses the same recovery identity for pre-account BTCPay after an ambiguous failure', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'crypto@example.com' } })
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        json: async () => ({ detail: 'Provider response uncertain' }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({
-          paymentSessionToken: currentPaidSignupRecoverySecret(),
-          cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv-123',
-          cryptoInvoiceId: 'inv-123',
-          cryptoInvoiceLookupToken: currentPaidSignupRecoverySecret(),
+      await startAnnualPayment()
+      const optedIn = paidSignupRequestBody(0)
+
+      useAuthStore.getState().prepareSignupDraft('preferences@example.com', false, false)
+      await startAnnualPayment()
+      const optedOut = paidSignupRequestBody(1)
+
+      expect(optedOut.wantsProductUpdates).toBe(false)
+      expect(optedOut.requestKey).not.toBe(optedIn.requestKey)
+      expect(optedOut.recoverySecret).not.toBe(optedIn.recoverySecret)
+    })
+
+    it('clears a completed payment recovery capability before a new signup attempt', async () => {
+      useAuthStore.getState().prepareSignupDraft('completed@example.com')
+      vi.mocked(fetch)
+        .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+        .mockImplementation(async (_input, init) => {
+          const body = JSON.parse(String(init?.body))
+          return new Response(JSON.stringify(stripePayment(body.recoverySecret)))
+        })
+
+      await expect(startAnnualPayment()).rejects.toThrow('Failed to fetch')
+      const oldAttempt = paidSignupRequestBody(0)
+      useAuthStore.setState({
+        pendingSignup: {
+          email: 'completed@example.com',
+          provisionedUser: { id: 'user-1', planId: 'early_annual', isAdmin: false },
+          provisionedSubscriptionStatus: 'active',
+        },
+      })
+      useAuthStore.getState().completeSignup()
+
+      useAuthStore.getState().prepareSignupDraft('completed@example.com')
+      await startAnnualPayment()
+      const nextAttempt = paidSignupRequestBody(1)
+
+      expect(nextAttempt.requestKey).not.toBe(oldAttempt.requestKey)
+      expect(nextAttempt.recoverySecret).not.toBe(oldAttempt.recoverySecret)
+    })
+
+    it('atomically releases only a verified terminal Bitcoin identity before a fresh invoice claim', async () => {
+      useAuthStore.getState().prepareSignupDraft('bitcoin-terminal@example.com')
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        const body = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(bitcoinPayment(body.recoverySecret)))
+      })
+
+      await startAnnualPayment('btcpay')
+      const closedAttempt = paidSignupRequestBody(0)
+      const pending = useAuthStore.getState().pendingSignup!
+
+      ;(useAuthStore.getState().clearPendingSignupPaymentRecovery as unknown as (identity: {
+        email: string
+        requestKey: string
+        recoverySecret: string
+        wantsProductUpdates?: boolean
+        rememberDevice?: boolean
+      }) => void)({
+        email: pending.email,
+        requestKey: String(pending.paymentSessionRequestKey),
+        recoverySecret: String(pending.paymentSessionToken),
+        wantsProductUpdates: pending.wantsProductUpdates,
+        rememberDevice: pending.rememberDevice,
+      })
+
+      expect(useAuthStore.getState().pendingSignup).toMatchObject({
+        email: 'bitcoin-terminal@example.com',
+        paymentSessionToken: undefined,
+        paymentSessionRequestKey: undefined,
+        paymentMethod: undefined,
+      })
+      expect(persistedPaidSignupIdentities()).toEqual([])
+
+      await startAnnualPayment('btcpay')
+      const restartedAttempt = paidSignupRequestBody(1)
+      expect(restartedAttempt.requestKey).not.toBe(closedAttempt.requestKey)
+      expect(restartedAttempt.recoverySecret).not.toBe(closedAttempt.recoverySecret)
+    })
+
+    it('will not let a stale terminal caller erase a replacement paid-signup identity', async () => {
+      useAuthStore.getState().prepareSignupDraft('racing-bitcoin@example.com')
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        const body = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(bitcoinPayment(body.recoverySecret)))
+      })
+
+      await startAnnualPayment('btcpay')
+      const staleAttempt = paidSignupRequestBody(0)
+      const replacement = {
+        requestKey: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+        recoverySecret: 'B'.repeat(43),
+      }
+      const scope = JSON.stringify({
+        email: 'racing-bitcoin@example.com',
+        contractVersion: 2,
+        wantsProductUpdates: true,
+        rememberDevice: false,
+      })
+      sessionStorage.setItem('silentsuite-paid-signup-recovery', JSON.stringify({
+        version: 1,
+        identities: { [scope]: { scope, ...replacement } },
+      }))
+      useAuthStore.setState({
+        pendingSignup: {
+          ...useAuthStore.getState().pendingSignup!,
+          paymentSessionToken: replacement.recoverySecret,
+          paymentSessionRequestKey: replacement.requestKey,
+        },
+      })
+
+      ;(useAuthStore.getState().clearPendingSignupPaymentRecovery as unknown as (identity: {
+        email: string
+        requestKey: string
+        recoverySecret: string
+      }) => void)({
+        email: 'racing-bitcoin@example.com',
+        requestKey: String(staleAttempt.requestKey),
+        recoverySecret: String(staleAttempt.recoverySecret),
+      })
+
+      expect(useAuthStore.getState().pendingSignup).toMatchObject({
+        paymentSessionToken: replacement.recoverySecret,
+        paymentSessionRequestKey: replacement.requestKey,
+      })
+      expect(persistedPaidSignupIdentities()).toEqual([expect.objectContaining(replacement)])
+    })
+
+    it('finalizes a v2 payment only from an exact annual completion response', async () => {
+      secureStore.etebase_session = 'mock-saved-session'
+      useAuthStore.setState({
+        pendingSignup: {
+          email: 'finalize@example.com',
+          paymentSessionToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG',
+          billingContractVersion: 2,
+        },
+      })
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+        contractVersion: 2,
+        id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+        email: 'finalize@example.com',
+        planId: 'early_annual',
+        provisioningStatus: 'active',
+        emailVerified: true,
+        isAdmin: false,
+        earlyAdopter: true,
+        rememberDevice: false,
+        createdAt: '2026-08-11T00:00:00Z',
+        clientSecret: null,
+        cryptoCheckoutUrl: null,
+        cryptoInvoiceId: null,
+        cryptoInvoiceLookupToken: null,
+      })))
+
+      await useAuthStore.getState().finalizePaidSignup()
+
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining('/auth/signup/finalize-payment/v2'),
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            contractVersion: 2,
+            etebaseLinkProof: 'mock-link-proof-value-with-at-least-43-characters',
+            paymentSessionToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG',
+          }),
         }),
-      } as Response)
+      )
+      expect(useAuthStore.getState().pendingSignup?.provisionedUser).toEqual({
+        id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+        planId: 'early_annual',
+        isAdmin: false,
+      })
+    })
 
-    await expect(useAuthStore.getState().signup('early_annual', 'crypto_annual')).rejects.toThrow('Provider response uncertain')
-    const recovered = await useAuthStore.getState().signup('early_annual', 'crypto_annual')
-
-    expect(paidSignupRequestBody(1).requestKey).toBe(paidSignupRequestBody(0).requestKey)
-    expect(paidSignupRequestBody(1).recoverySecret).toBe(paidSignupRequestBody(0).recoverySecret)
-    expect(recovered.cryptoInvoiceId).toBe('inv-123')
+    it('does not commit delayed finalization into a replacement payment capability', async () => {
+      secureStore.etebase_session = 'mock-saved-session'
+      useAuthStore.setState({ pendingSignup: { email: 'race@example.com', paymentSessionToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG', paymentSessionRequestKey: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f', billingContractVersion: 2 } })
+      let resolveFinalize!: (response: Response) => void
+      vi.mocked(fetch).mockImplementation(async () => new Promise<Response>((resolve) => { resolveFinalize = resolve }))
+      const finalization = useAuthStore.getState().finalizePaidSignup()
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce())
+      useAuthStore.setState({ pendingSignup: { email: 'race@example.com', paymentSessionToken: 'replacementabcdefghijklmnopqrstuvwxyz012345', paymentSessionRequestKey: 'e91a6d70-0d4e-4352-9bdc-426d1f76d771' } })
+      resolveFinalize(new Response(JSON.stringify({ contractVersion: 2, id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f', email: 'race@example.com', planId: 'early_annual', provisioningStatus: 'active', emailVerified: true, isAdmin: false, earlyAdopter: true, rememberDevice: false, createdAt: '2026-08-11T00:00:00Z', clientSecret: null, cryptoCheckoutUrl: null, cryptoInvoiceId: null, cryptoInvoiceLookupToken: null })))
+      await expect(finalization).rejects.toThrow('Signup was superseded')
+      expect(useAuthStore.getState().pendingSignup?.paymentSessionToken).toContain('replacement')
+      expect(useAuthStore.getState().pendingSignup?.provisionedUser).toBeUndefined()
+    })
   })
 
-  it('retains paid-signup recovery identity after an ambiguous server failure', async () => {
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 503,
-        json: async () => ({ detail: 'Temporarily unavailable' }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: async () => ({ paymentSessionToken: currentPaidSignupRecoverySecret(), clientSecret: 'seti_complete' }),
-      } as Response)
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Temporarily unavailable')
-    await useAuthStore.getState().signup('early_monthly', '30day')
-
-    const first = paidSignupRequestBody(0)
-    const retry = paidSignupRequestBody(1)
-    expect(retry.requestKey).toBe(first.requestKey)
-    expect(retry.recoverySecret).toBe(first.recoverySecret)
-  })
-
-  it('keeps paid-signup recovery capability out of Zustand, redirect state, localStorage, and logs', async () => {
-    const loggerSpies = [
-      vi.spyOn(logger, 'debug'),
-      vi.spyOn(logger, 'log'),
-      vi.spyOn(logger, 'warn'),
-      vi.spyOn(logger, 'error'),
-    ]
-    useAuthStore.setState({ pendingSignup: { email: 'paid@example.com' } })
-    vi.mocked(fetch).mockRejectedValueOnce(new TypeError('Failed to fetch'))
-
-    await expect(useAuthStore.getState().signup('early_monthly', '30day')).rejects.toThrow('Failed to fetch')
-    const body = paidSignupRequestBody()
-    useAuthStore.getState().saveSignupStateForRedirect('monthly')
-
-    expect(JSON.stringify(useAuthStore.getState())).not.toContain(body.recoverySecret as string)
-    expect(JSON.stringify(useAuthStore.getState())).not.toContain(body.requestKey as string)
-    expect(sessionStorage.getItem('silentsuite-signup-redirect-state')).not.toContain(body.recoverySecret as string)
-    expect(sessionStorage.getItem('silentsuite-signup-redirect-state')).not.toContain(body.requestKey as string)
-    expect(localStorage.getItem('silentsuite-paid-signup-recovery')).toBeNull()
-    expect(JSON.stringify(loggerSpies.flatMap((spy) => spy.mock.calls))).not.toContain(body.recoverySecret as string)
-    expect(JSON.stringify(loggerSpies.flatMap((spy) => spy.mock.calls))).not.toContain(body.requestKey as string)
-    loggerSpies.forEach((spy) => spy.mockRestore())
-  })
 
   it('clears stale payment state when the signup draft email changes', () => {
     useAuthStore.setState({
@@ -886,39 +691,116 @@ describe('useAuthStore', () => {
     expect(fetch).not.toHaveBeenCalled()
   })
 
-  it('signup returns crypto checkout details without authenticating', async () => {
-    secureStore.etebase_session = 'mock-saved-session'
-    useAuthStore.setState({
-      pendingSignup: {
-        email: 'crypto@example.com',
-      },
-    })
+  // --- onboardedAt hydration (issue #113) ---
 
-    vi.mocked(fetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 'user-1',
-        isAdmin: false,
-        clientSecret: null,
-        cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv-123',
-        cryptoInvoiceId: 'inv-123',
-        cryptoInvoiceLookupToken: 'lookup-token',
-      }),
-    } as Response)
-
-    const result = await useAuthStore.getState().signup('early_annual', 'crypto_annual')
-
-    expect(result).toEqual({
-      clientSecret: null,
-      cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/inv-123',
-      cryptoInvoiceId: 'inv-123',
-      cryptoInvoiceLookupToken: 'lookup-token',
-      paymentSessionToken: null,
-    })
-    expect(useAuthStore.getState().isAuthenticated).toBe(false)
+  it('refuses fresh hosted v1 signup before any Billing request', async () => {
+    useAuthStore.getState().prepareSignupDraft('customer@example.test')
+    await expect(useAuthStore.getState().signup('early_annual', '30day')).rejects.toThrow('fresh annual offer')
+    expect(fetch).not.toHaveBeenCalled()
   })
 
-  // --- onboardedAt hydration (issue #113) ---
+  it('starts a v2 annual signup payment without client plan, amount, class, or promotion', async () => {
+    useAuthStore.getState().prepareSignupDraft('customer@example.test', true, false)
+    vi.mocked(fetch).mockImplementationOnce(async (_input, init) => {
+      const request = JSON.parse(String(init?.body))
+      return new Response(JSON.stringify({
+        contractVersion: 2,
+        kind: 'stripe',
+        clientSecret: 'pi_secret',
+        paymentSessionToken: request.recoverySecret,
+      }))
+    })
+    const result = await useAuthStore.getState().startAnnualSignupPayment('abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG', 'stripe', 'http://localhost:3000/signup/success')
+    expect(result.clientSecret).toBe('pi_secret')
+    const [, init] = vi.mocked(fetch).mock.calls[0]
+    expect(JSON.parse(String(init?.body))).toMatchObject({ contractVersion: 2, checkoutIntentToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG', email: 'customer@example.test' })
+    expect(JSON.parse(String(init?.body))).not.toHaveProperty('provider')
+    expect(String(init?.body)).not.toMatch(/planId|amount|customerClass|promo/)
+  })
+
+  it('recovers no-card provisioning after account creation and an ambiguous Billing failure', async () => {
+    const { etebaseSignUp, etebaseLogIn } = await import('@/app/lib/etebase-auth')
+    useAuthStore.getState().prepareSignupDraft('recover-no-card@example.test', true, false)
+    await useAuthStore.getState().createEtebaseAccount('recover-no-card@example.test', 'password123')
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'temporary failure' }), { status: 503 }))
+    await expect(useAuthStore.getState().provisionAnnualNoCard('abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG')).rejects.toMatchObject({ billingStatus: 503 })
+
+    vi.mocked(etebaseSignUp).mockRejectedValueOnce(new Error('409 conflict'))
+    await useAuthStore.getState().createEtebaseAccount('recover-no-card@example.test', 'password123')
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      contractVersion: 2, id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f', email: 'recover-no-card@example.test',
+      provisioningStatus: 'trialing_no_card', emailVerified: true, earlyAdopter: true, rememberDevice: false,
+      createdAt: '2026-08-11T00:00:00Z', clientSecret: null, cryptoCheckoutUrl: null,
+      cryptoInvoiceId: null, cryptoInvoiceLookupToken: null,
+    })))
+    await useAuthStore.getState().provisionAnnualNoCard('abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG')
+
+    expect(etebaseLogIn).toHaveBeenCalledWith('recover-no-card@example.test', 'password123', undefined)
+    expect(useAuthStore.getState().pendingSignup?.provisionedUser?.id).toBe('5fd4d86d-34de-4b82-9a66-9598ddf6e02f')
+  })
+
+  it('recovers paid finalization after account creation and an ambiguous Billing failure', async () => {
+    const { etebaseSignUp, etebaseLogIn } = await import('@/app/lib/etebase-auth')
+    useAuthStore.setState({ pendingSignup: {
+      email: 'recover-paid@example.test', billingContractVersion: 2,
+      paymentSessionToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG',
+      paymentSessionRequestKey: '7823121e-8f4a-45ac-a217-82ba93209ca2',
+    } })
+    await useAuthStore.getState().createEtebaseAccount('recover-paid@example.test', 'password123')
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ detail: 'temporary failure' }), { status: 503 }))
+    await expect(useAuthStore.getState().finalizePaidSignup()).rejects.toThrow('temporary failure')
+
+    vi.mocked(etebaseSignUp).mockRejectedValueOnce(new Error('409 conflict'))
+    await useAuthStore.getState().createEtebaseAccount('recover-paid@example.test', 'password123')
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      contractVersion: 2, id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f', email: 'recover-paid@example.test',
+      planId: 'early_annual', provisioningStatus: 'active', emailVerified: true, earlyAdopter: true,
+      rememberDevice: false, isAdmin: false, createdAt: '2026-08-11T00:00:00Z', clientSecret: null,
+      cryptoCheckoutUrl: null, cryptoInvoiceId: null, cryptoInvoiceLookupToken: null,
+    })))
+    await useAuthStore.getState().finalizePaidSignup()
+
+    expect(etebaseLogIn).toHaveBeenCalledWith('recover-paid@example.test', 'password123', undefined)
+    expect(useAuthStore.getState().pendingSignup?.provisionedUser?.planId).toBe('early_annual')
+  })
+
+  it('claims a no-card v2 authority without a client plan fallback', async () => {
+    secureStore.etebase_session = 'session'
+    useAuthStore.getState().prepareSignupDraft('customer@example.test')
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      contractVersion: 2,
+      id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+      email: 'customer@example.test',
+      provisioningStatus: 'trialing_no_card',
+      emailVerified: true,
+      earlyAdopter: true,
+      rememberDevice: false,
+      createdAt: '2026-08-11T00:00:00Z',
+      clientSecret: null,
+      cryptoCheckoutUrl: null,
+      cryptoInvoiceId: null,
+      cryptoInvoiceLookupToken: null,
+    })))
+    await useAuthStore.getState().provisionAnnualNoCard('abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG')
+    expect(useAuthStore.getState().pendingSignup?.provisionedUser?.planId).toBeNull()
+    expect(JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body))).toMatchObject({ contractVersion: 2, checkoutIntentToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG' })
+  })
+
+  it('preserves renewable no-card Problem Details and ignores a stale completion', async () => {
+    secureStore.etebase_session = 'session'
+    useAuthStore.getState().prepareSignupDraft('first@example.test')
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ type: 'https://api.silentsuite.io/errors/plan-not-purchasable', detail: 'Offer expired' }), { status: 409 }))
+    await expect(useAuthStore.getState().provisionAnnualNoCard('abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG')).rejects.toMatchObject({ billingStatus: 409, billingProblemType: 'https://api.silentsuite.io/errors/plan-not-purchasable' })
+
+    let resolveProvision!: (response: Response) => void
+    vi.mocked(fetch).mockImplementationOnce(async () => new Promise<Response>((resolve) => { resolveProvision = resolve }))
+    const stale = useAuthStore.getState().provisionAnnualNoCard('abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG')
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
+    useAuthStore.getState().prepareSignupDraft('second@example.test')
+    resolveProvision(new Response(JSON.stringify({ contractVersion: 2, id: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f', email: 'first@example.test', provisioningStatus: 'trialing_no_card', emailVerified: true, earlyAdopter: true, rememberDevice: false, createdAt: '2026-08-11T00:00:00Z', clientSecret: null, cryptoCheckoutUrl: null, cryptoInvoiceId: null, cryptoInvoiceLookupToken: null })))
+    await expect(stale).rejects.toThrow('Signup was superseded')
+    expect(useAuthStore.getState().pendingSignup).toMatchObject({ email: 'second@example.test' })
+  })
 
   describe('onboardedAt hydration', () => {
     it('login hydrates onboardedAt from token-exchange response', async () => {
@@ -1773,6 +1655,100 @@ describe('useAuthStore', () => {
       expect(restored?.selectedInterval).toBe('annual')
       expect(restored?.pendingSignup.email).toBe('user@example.com')
       expect(sessionStorage.getItem('silentsuite-signup-redirect-state')).toBeNull()
+    })
+
+    it('persists only the permitted full-navigation continuation fields and restores the exact v2 authority', () => {
+      useAuthStore.setState({
+        pendingSignup: {
+          email: 'customer@example.test',
+          serverUrl: 'https://server.silentsuite.io',
+          paymentSessionToken: 'v2-payment-session-token',
+          paymentSessionRequestKey: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+          paymentMethod: 'btcpay',
+          billingContractVersion: 2,
+          earlyAdopter: true,
+          wantsProductUpdates: true,
+          rememberDevice: true,
+          provisionedUser: { id: 'user-1', planId: 'early_annual', isAdmin: false },
+          provisionedSubscriptionStatus: 'active',
+          password: 'must-not-persist',
+          cardNumber: '4242424242424242',
+          cvc: '123',
+          recoverySecret: 'must-not-persist',
+          clientSecret: 'must-not-persist',
+        } as any,
+      })
+
+      useAuthStore.getState().saveSignupStateForRedirect('annual')
+
+      const raw = sessionStorage.getItem('silentsuite-signup-redirect-state')!
+      expect(raw).not.toContain('must-not-persist')
+      expect(raw).not.toContain('4242424242424242')
+      expect(raw).not.toContain('"cvc"')
+      expect(JSON.parse(raw)).toEqual({
+        pendingSignup: {
+          email: 'customer@example.test',
+          serverUrl: 'https://server.silentsuite.io',
+          paymentSessionToken: 'v2-payment-session-token',
+          paymentSessionRequestKey: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+          paymentMethod: 'btcpay',
+          billingContractVersion: 2,
+          earlyAdopter: true,
+          wantsProductUpdates: true,
+          rememberDevice: true,
+          provisionedUser: { id: 'user-1', planId: 'early_annual', isAdmin: false },
+          provisionedSubscriptionStatus: 'active',
+        },
+        selectedInterval: 'annual',
+        savedAt: expect.any(Number),
+      })
+
+      useAuthStore.setState({ pendingSignup: null })
+      const restored = useAuthStore.getState().restoreSignupStateFromRedirect()
+
+      expect(restored?.pendingSignup).toEqual({
+        email: 'customer@example.test',
+        serverUrl: 'https://server.silentsuite.io',
+        paymentSessionToken: 'v2-payment-session-token',
+        paymentSessionRequestKey: '5fd4d86d-34de-4b82-9a66-9598ddf6e02f',
+        paymentMethod: 'btcpay',
+        billingContractVersion: 2,
+        earlyAdopter: true,
+        wantsProductUpdates: true,
+        rememberDevice: true,
+        provisionedUser: { id: 'user-1', planId: 'early_annual', isAdmin: false },
+        provisionedSubscriptionStatus: 'active',
+      })
+      expect(sessionStorage.getItem('silentsuite-signup-redirect-state')).toBeNull()
+    })
+
+    it('keeps an explicit historical v1 redirect version exact through restore', () => {
+      sessionStorage.setItem('silentsuite-signup-redirect-state', JSON.stringify({
+        pendingSignup: {
+          email: 'legacy@example.test',
+          paymentSessionToken: 'historical-v1-payment-token',
+          billingContractVersion: 1,
+          wantsProductUpdates: false,
+          rememberDevice: false,
+        },
+        selectedInterval: 'monthly',
+        savedAt: Date.now(),
+      }))
+
+      const restored = useAuthStore.getState().restoreSignupStateFromRedirect()
+
+      expect(restored).toEqual({
+        pendingSignup: {
+          email: 'legacy@example.test',
+          paymentSessionToken: 'historical-v1-payment-token',
+          billingContractVersion: 1,
+          wantsProductUpdates: false,
+          rememberDevice: false,
+        },
+        selectedInterval: 'monthly',
+        savedAt: expect.any(Number),
+      })
+      expect(useAuthStore.getState().pendingSignup).toEqual(restored?.pendingSignup)
     })
 
     it('ignores legacy localStorage entries left behind by older builds', () => {

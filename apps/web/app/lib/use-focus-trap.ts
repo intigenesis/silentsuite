@@ -1,4 +1,4 @@
-import { useEffect, type RefObject } from 'react'
+import { useEffect, useRef, type RefObject } from 'react'
 
 const FOCUSABLE_SELECTOR =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -7,22 +7,43 @@ const FOCUSABLE_SELECTOR =
  * Trap keyboard focus within a container element.
  * When the dialog is open, Tab and Shift+Tab cycle through focusable elements
  * inside the container, preventing focus from escaping to the background.
+ *
+ * `restoreFocusTo` is the element to return focus to on cleanup. Callers that
+ * inert the background must pass the opener captured in their own click
+ * handler: React applies `inert`/`aria-hidden` during the mutation phase, and
+ * the browser blurs the focused opener before this passive effect ever runs,
+ * so `document.activeElement` read from here is already `document.body`.
  */
-export function useFocusTrap(ref: RefObject<HTMLElement | null>, active: boolean = true) {
+export function useFocusTrap(
+  ref: RefObject<HTMLElement | null>,
+  active: boolean = true,
+  restoreFocusTo?: HTMLElement | null,
+) {
+  const restoreFocusToRef = useRef(restoreFocusTo)
+  restoreFocusToRef.current = restoreFocusTo
+
   useEffect(() => {
     if (!active) return
     const container = ref.current
     if (!container) return
 
     // Store the previously focused element to restore on cleanup
-    const previouslyFocused = document.activeElement as HTMLElement | null
+    const previouslyFocused = restoreFocusToRef.current ?? (document.activeElement as HTMLElement | null)
 
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key !== 'Tab' || !container) return
 
       const focusable = Array.from(
         container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-      ).filter((el) => el.offsetParent !== null) // visible only
+      ).filter((el) => {
+        // `offsetParent` is null for fixed-position controls, so using it
+        // alone lets focus escape otherwise valid modal dialogs. Preserve the
+        // normal visibility test while accepting rendered fixed descendants.
+        if (el.closest('[hidden], [aria-hidden="true"]')) return false
+        if (el.offsetParent !== null) return true
+        const style = window.getComputedStyle(el)
+        return style.display !== 'none' && style.visibility !== 'hidden'
+      })
 
       if (focusable.length === 0) {
         e.preventDefault()

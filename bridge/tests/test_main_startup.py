@@ -507,7 +507,10 @@ def test_remote_bind_warning_mentions_plaintext_when_ssl_disabled(monkeypatch, c
 
     text = caplog.text
     assert "DAV traffic is plaintext HTTP unless protected by your own proxy/VPN" in text
-    assert "Bridge dashboard disabled while remote bind is configured" in text
+    assert (
+        "Remote listener exposes DAV endpoints only; the bridge dashboard is disabled for this bind. "
+        "Use a loopback bind on the Bridge host to access the dashboard."
+    ) in caplog.messages
 
 
 def test_remote_bind_warning_avoids_plaintext_claim_when_ssl_enabled(monkeypatch, caplog, tmp_path):
@@ -528,4 +531,8 @@ def test_remote_bind_warning_avoids_plaintext_claim_when_ssl_enabled(monkeypatch
     text = caplog.text
     assert "exposes decrypted DAV data over the network" in text
     assert "without an intentional network/security design" in text
+    assert (
+        "Remote listener exposes DAV endpoints only; the bridge dashboard is disabled for this bind. "
+        "Use a loopback bind on the Bridge host to access the dashboard."
+    ) in caplog.messages
     assert "plaintext HTTP" not in text

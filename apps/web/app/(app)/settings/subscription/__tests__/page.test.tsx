@@ -1,6 +1,7 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { emulateInert, type InertEmulation } from '@/app/lib/__tests__/inert-test-utils'
 import SubscriptionPage from '../page'
 
 vi.mock('next/dynamic', () => ({
@@ -72,6 +73,28 @@ const pendingStripeFlow = {
   cancellable: true,
 }
 
+const annualOffer = {
+  contractVersion: 2,
+  requestId: 'e91a6d70-0d4e-4352-9bdc-426d1f76d771',
+  offer: {
+    planId: 'early_annual', customerClass: 'early', billingInterval: 'annual', annualAmountMinor: 3600,
+    monthlyEquivalentMinor: 300, currency: 'EUR', providers: ['stripe', 'btcpay'], offerRevision: 1,
+    offerToken: 'signed-offer', expiresAt: '2026-08-10T12:10:00Z',
+  },
+}
+const annualActivation = {
+  contractVersion: 2,
+  checkoutIntentToken: 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG',
+  expiresAt: '2026-08-10T12:05:00Z',
+  disclosure: {
+    kind: 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: 3600,
+    monthlyEquivalentMinor: 300, currency: 'EUR', trialEndsAt: null, firstChargeAt: null,
+    cancelBy: null, cancelByInclusive: false, autoRenew: true, prepaid: false, refundWindowDays: 30,
+    bonusDays: 0, periodEndRule: 'confirmation_plus_1_utc_calendar_year', renewalAt: null, entitlementEndsAt: null,
+  },
+}
+const annualStripePayment = { contractVersion: 2, kind: 'stripe', authorityId: annualOffer.requestId, clientSecret: 'cs_test' }
+
 function mockSubscription(
   subscription: Record<string, unknown>,
   currentFlow: Record<string, unknown> | null = null,
@@ -84,44 +107,32 @@ function mockSubscription(
     if (url === 'https://billing.test/subscription/payment-flows/current') {
       return { ok: true, json: async () => ({ flow: currentFlow }) }
     }
-    if (url === 'https://billing.test/subscription/payment-options?interval=monthly') {
-      return { ok: true, json: async () => ({
-        selectedInterval: 'monthly',
-        options: [
-          { id: 'stripe_pay_now', provider: 'stripe', planIds: ['early_monthly'], billingIntervals: ['monthly'], enabled: true },
-          { id: 'bitcoin_annual_switch', provider: 'notice', planIds: ['early_annual'], billingIntervals: ['annual'], enabled: true },
-        ],
-      }) }
+    if (url === 'https://billing.test/subscription/offers/v2') {
+      return { ok: true, json: async () => annualOffer }
     }
-    if (url === 'https://billing.test/subscription/payment-options?interval=annual') {
-      return { ok: true, json: async () => ({
-        selectedInterval: 'annual',
-        options: [
-          { id: 'stripe_pay_now', provider: 'stripe', planIds: ['early_annual'], billingIntervals: ['annual'], enabled: true },
-          { id: 'btcpay_annual', provider: 'btcpay', planIds: ['early_annual'], billingIntervals: ['annual'], enabled: true },
-        ],
-      }) }
+    if (url === 'https://billing.test/subscription/offers/v2/activate') {
+      return { ok: true, json: async () => annualActivation }
     }
-    if (url === 'https://billing.test/subscription/payment-flows') {
-      return { ok: true, json: async () => ({
-        clientSecret: 'cs_test',
-        planId: 'early_monthly',
-        billingInterval: 'monthly',
-        amount: '3.60',
-        currency: 'EUR',
-      }) }
+    if (url === 'https://billing.test/subscription/payment-flows/v2') {
+      return { ok: true, json: async () => annualStripePayment }
     }
     return { ok: false, status: 404, json: async () => ({ detail: 'not found' }) }
   }))
 }
 
 describe('SubscriptionPage billing recovery CTAs', () => {
+  let inert: InertEmulation
+
   beforeEach(() => {
     vi.unstubAllGlobals()
     window.history.replaceState({}, '', '/settings/subscription')
+    // Every dialog on this page inerts the background wrapper, so all of these
+    // tests must run against browser-accurate inert focus behaviour.
+    inert = emulateInert()
   })
 
   afterEach(() => {
+    inert.restore()
     vi.useRealTimers()
   })
 
@@ -142,8 +153,138 @@ describe('SubscriptionPage billing recovery CTAs', () => {
     render(<SubscriptionPage />)
 
     expect(await screen.findByRole('button', { name: /choose payment/i })).toBeInTheDocument()
-    expect(screen.getByText(/Subscribe by card or annual Bitcoin and get 14 bonus days/)).toBeInTheDocument()
+    expect(screen.getByText(/Review your server-owned annual payment options and get 14 bonus days/)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /cancel subscription/i })).not.toBeInTheDocument()
+  })
+
+  it('routes the no-card CTA through the sole labelled, inert, focus-restoring payment dialog and permits direct close only after no-flow verification', async () => {
+    mockSubscription({
+      status: 'trialing',
+      trial: { active: true, endsAt: '2026-07-03T00:00:00.000Z', daysRemaining: 3 },
+      trialPath: '7day',
+      renewalDate: null,
+      capabilities: {
+        ...baseSubscription.capabilities,
+        trialActive: true,
+        needsPaymentMethod: true,
+        canSetupCard: true,
+      },
+    })
+
+    render(<SubscriptionPage />)
+    const opener = await screen.findByRole('button', { name: /choose payment/i })
+    opener.focus()
+    fireEvent.click(opener)
+
+    const dialog = await screen.findByRole('dialog', { name: /continue with silentsuite\.io/i })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    expect(dialog).toHaveAttribute('aria-describedby')
+    expect(screen.getByText('Plan').closest('[aria-hidden="true"]')).toHaveAttribute('inert')
+    await screen.findByRole('button', { name: /continue to card payment/i })
+    await waitFor(() => expect(dialog).toContainElement(document.activeElement))
+    // The background really was inerted while the opener held focus, so the
+    // restoration assertion below cannot pass by jsdom's missing inert support.
+    expect(inert.blurred).not.toHaveLength(0)
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /continue with silentsuite\.io/i })).not.toBeInTheDocument())
+    expect(document.activeElement).toBe(opener)
+
+    fireEvent.click(opener)
+    const reopenedDialog = await screen.findByRole('dialog', { name: /continue with silentsuite\.io/i })
+    await screen.findByRole('button', { name: /continue to card payment/i })
+    fireEvent.click(reopenedDialog.previousElementSibling!)
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /continue with silentsuite\.io/i })).not.toBeInTheDocument())
+  })
+
+  it('keeps no-card payment authority visible on Escape/backdrop and uses the cancellation endpoint for active or unverified flows', async () => {
+    mockSubscription({
+      status: 'trialing',
+      trial: { active: true, endsAt: '2026-07-03T00:00:00.000Z', daysRemaining: 3 },
+      trialPath: '7day',
+      renewalDate: null,
+      capabilities: {
+        ...baseSubscription.capabilities,
+        trialActive: true,
+        needsPaymentMethod: true,
+        canSetupCard: true,
+      },
+    }, pendingStripeFlow)
+
+    render(<SubscriptionPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /choose payment/i }))
+    const dialog = await screen.findByRole('dialog', { name: /continue with silentsuite\.io/i })
+    await screen.findByText(/card payment in progress/i)
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.click(dialog.previousElementSibling!)
+    expect(screen.getByRole('dialog', { name: /continue with silentsuite\.io/i })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /cancel and choose another method/i }))
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) => (
+      url === 'https://billing.test/subscription/payment-flows/cancel'
+        && (init as RequestInit | undefined)?.method === 'POST'
+    ))).toBe(true))
+    expect(screen.getByRole('dialog', { name: /continue with silentsuite\.io/i })).toBeInTheDocument()
+  })
+
+  it('preserves no-card CTA payment success confirmation in the shared chooser', async () => {
+    mockSubscription({
+      status: 'trialing',
+      trial: { active: true, endsAt: '2026-07-03T00:00:00.000Z', daysRemaining: 3 },
+      trialPath: '7day',
+      renewalDate: null,
+      capabilities: {
+        ...baseSubscription.capabilities,
+        trialActive: true,
+        needsPaymentMethod: true,
+        canSetupCard: true,
+      },
+    })
+
+    render(<SubscriptionPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /choose payment/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /mock payment success/i }))
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /continue with silentsuite\.io/i })).not.toBeInTheDocument())
+    expect(screen.getByText(/confirming your payment/i)).toBeInTheDocument()
+  })
+
+  it('keeps the no-card dialog open when failed payment-status verification cannot be authoritatively cancelled', async () => {
+    const noCardSubscription = {
+      ...baseSubscription,
+      status: 'trialing',
+      trial: { active: true, endsAt: '2026-07-03T00:00:00.000Z', daysRemaining: 3 },
+      trialPath: '7day',
+      renewalDate: null,
+      capabilities: {
+        ...baseSubscription.capabilities,
+        trialActive: true,
+        needsPaymentMethod: true,
+        canSetupCard: true,
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === 'https://billing.test/subscription' && !init?.method) return { ok: true, json: async () => noCardSubscription }
+      if (url === 'https://billing.test/subscription/payment-flows/current') return { ok: false, json: async () => ({}) }
+      if (url === 'https://billing.test/subscription/offers/v2') return { ok: true, json: async () => annualOffer }
+      if (url === 'https://billing.test/subscription/payment-flows/cancel') return { ok: false, json: async () => ({ detail: 'Cancellation could not be confirmed.' }) }
+      return { ok: false, status: 404, json: async () => ({}) }
+    }))
+
+    render(<SubscriptionPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /choose payment/i }))
+    await screen.findByRole('button', { name: /retry payment status/i })
+    fireEvent.click(screen.getByRole('button', { name: /^cancel$/i }))
+
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url, init]) => (
+      url === 'https://billing.test/subscription/payment-flows/cancel'
+        && (init as RequestInit | undefined)?.method === 'POST'
+    ))).toBe(true))
+    expect(screen.getByRole('dialog', { name: /continue with silentsuite\.io/i })).toBeInTheDocument()
+    expect(await screen.findByText('Cancellation could not be confirmed.')).toBeInTheDocument()
   })
 
   it('shows subscribe recovery for expired no-card trials', async () => {
@@ -198,6 +339,55 @@ describe('SubscriptionPage billing recovery CTAs', () => {
     expect(await screen.findByRole('button', { name: /^subscribe$/i })).toBeInTheDocument()
   })
 
+  it('presents cancellation as a labelled modal, traps keyboard focus, and restores the opener on Escape', async () => {
+    mockSubscription({})
+    render(<SubscriptionPage />)
+
+    const opener = await screen.findByRole('button', { name: /cancel subscription/i })
+    opener.focus()
+    fireEvent.click(opener)
+
+    const dialog = await screen.findByRole('dialog', { name: /cancel your subscription/i })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    expect(dialog).toHaveAttribute('aria-describedby')
+    await waitFor(() => expect(document.activeElement).toHaveTextContent(/keep subscription/i))
+
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toHaveTextContent(/cancel subscription/i)
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /cancel your subscription/i })).not.toBeInTheDocument())
+    expect(document.activeElement).toBe(opener)
+  })
+
+  it('exposes the payment choice overlay as an isolated labelled modal', async () => {
+    mockSubscription({
+      status: 'cancelled',
+      capabilities: { ...baseSubscription.capabilities, canReactivate: true },
+    })
+    render(<SubscriptionPage />)
+
+    const opener = await screen.findByRole('button', { name: /reactivate/i })
+    opener.focus()
+    fireEvent.click(opener)
+    const dialog = await screen.findByRole('dialog', { name: /continue with silentsuite\.io/i })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    expect(dialog).toHaveAttribute('aria-describedby')
+    expect(dialog.parentElement?.previousElementSibling).toHaveAttribute('aria-hidden', 'true')
+    await screen.findByRole('button', { name: /continue to card payment/i })
+    await waitFor(() => expect(document.activeElement).toHaveTextContent(/continue to card payment/i))
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /continue with silentsuite\.io/i })).not.toBeInTheDocument())
+    expect(document.activeElement).toBe(opener)
+
+    fireEvent.click(opener)
+    const reopenedDialog = await screen.findByRole('dialog', { name: /continue with silentsuite\.io/i })
+    await screen.findByRole('button', { name: /continue to card payment/i })
+    fireEvent.click(reopenedDialog.previousElementSibling!)
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /continue with silentsuite\.io/i })).not.toBeInTheDocument())
+  })
+
   it('shows visible shared payment-flow errors and recovers the loading state', async () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
       if (url === 'https://billing.test/subscription' && !init?.method) {
@@ -208,10 +398,9 @@ describe('SubscriptionPage billing recovery CTAs', () => {
         }) }
       }
       if (url === 'https://billing.test/subscription/payment-flows/current') return { ok: true, json: async () => ({ flow: null }) }
-      if (url === 'https://billing.test/subscription/payment-options?interval=monthly') {
-        return { ok: true, json: async () => ({ selectedInterval: 'monthly', options: [{ id: 'stripe_pay_now', provider: 'stripe', planIds: ['early_monthly'], billingIntervals: ['monthly'], enabled: true }] }) }
-      }
-      if (url === 'https://billing.test/subscription/payment-flows') {
+      if (url === 'https://billing.test/subscription/offers/v2') return { ok: true, json: async () => annualOffer }
+      if (url === 'https://billing.test/subscription/offers/v2/activate') return { ok: true, json: async () => annualActivation }
+      if (url === 'https://billing.test/subscription/payment-flows/v2') {
         return { ok: false, status: 500, json: async () => ({ detail: 'Payment setup failed safely' }) }
       }
       return { ok: false, status: 404, json: async () => ({}) }
@@ -221,9 +410,10 @@ describe('SubscriptionPage billing recovery CTAs', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /reactivate/i }))
     fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
 
     expect(await screen.findByText('Payment setup failed safely')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole('button', { name: /continue to card payment/i })).not.toBeDisabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: /confirm annual terms and continue/i })).not.toBeDisabled())
   })
 
   it('suppresses retry CTA while payment confirmation is pending after client-side success', async () => {
@@ -244,12 +434,9 @@ describe('SubscriptionPage billing recovery CTAs', () => {
             } }
       }
       if (url === 'https://billing.test/subscription/payment-flows/current') return { ok: true, json: async () => ({ flow: null }) }
-      if (url === 'https://billing.test/subscription/payment-options?interval=monthly') {
-        return { ok: true, json: async () => ({ selectedInterval: 'monthly', options: [{ id: 'stripe_pay_now', provider: 'stripe', planIds: ['early_monthly'], billingIntervals: ['monthly'], enabled: true }] }) }
-      }
-      if (url === 'https://billing.test/subscription/payment-flows') {
-        return { ok: true, json: async () => ({ clientSecret: 'cs_test', planId: 'early_monthly', billingInterval: 'monthly', amount: '3.60', currency: 'EUR' }) }
-      }
+      if (url === 'https://billing.test/subscription/offers/v2') return { ok: true, json: async () => annualOffer }
+      if (url === 'https://billing.test/subscription/offers/v2/activate') return { ok: true, json: async () => annualActivation }
+      if (url === 'https://billing.test/subscription/payment-flows/v2') return { ok: true, json: async () => annualStripePayment }
       return { ok: false, status: 404, json: async () => ({}) }
     }))
 
@@ -257,6 +444,7 @@ describe('SubscriptionPage billing recovery CTAs', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /reactivate/i }))
     fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
     expect(await screen.findByText('Amount due')).toBeInTheDocument()
     expect(screen.getByText('Powered by Stripe')).toBeInTheDocument()
     vi.useFakeTimers()
@@ -468,7 +656,8 @@ describe('SubscriptionPage billing recovery CTAs', () => {
       await Promise.resolve()
     })
 
-    expect(screen.getByText(/card payment in progress/i)).toBeInTheDocument()
+    expect(screen.getByText(/^payment in progress$/i)).toBeInTheDocument()
+    expect(screen.queryByText(/card payment in progress/i)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /cancel and choose another method/i })).toBeInTheDocument()
   })
 
@@ -488,7 +677,8 @@ describe('SubscriptionPage billing recovery CTAs', () => {
 
     expect(await screen.findByText(/payment needs attention/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /review payment options/i }))
-    expect(await screen.findByText(/card payment in progress/i)).toBeInTheDocument()
+    expect(await screen.findByText(/^payment in progress$/i)).toBeInTheDocument()
+    expect(screen.queryByText(/card payment in progress/i)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /cancel and choose another method/i })).toBeInTheDocument()
     expect(window.location.search).toBe('')
   })

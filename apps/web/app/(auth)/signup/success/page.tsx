@@ -3,10 +3,8 @@
 import { useEffect, useState, useCallback, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { CheckCircle, AlertTriangle, Lock } from 'lucide-react'
-import { MS_PER_DAY } from '@/app/lib/constants'
 import { Button } from '@silentsuite/ui'
 import { useAuthStore } from '@/app/stores/use-auth-store'
-import { formatDate as formatDateUtil } from '@/app/lib/date'
 import { normalizeSignupReturnTo } from '@/app/lib/signup-return'
 import { StepCreateVault } from '../components/step-create-vault'
 import { StepCreatePaidAccount, type PaidAccountFormData } from '../components/step-create-paid-account'
@@ -200,8 +198,6 @@ function SignupSuccessInner() {
   }
 
   // --- Default: no Stripe params (direct navigation) ---
-  const trialEndDate = formatDateUtil(new Date(Date.now() + 30 * MS_PER_DAY), 'system', { day: 'numeric', month: 'long', year: 'numeric' })
-
   return (
     <div className="max-w-md mx-auto space-y-6 text-center">
       {checkoutReturn}
@@ -210,16 +206,15 @@ function SignupSuccessInner() {
           <CheckCircle className="h-12 w-12 text-[rgb(var(--primary))]" />
         </div>
         <h2 className="text-xl font-semibold text-[rgb(var(--foreground))]">
-          Payment successful!
+          Payment confirmation required
         </h2>
         <p className="text-sm leading-relaxed text-[rgb(var(--muted))]">
-          Your 30-day free trial has started. You won&apos;t be charged until{' '}
-          <span className="font-medium text-[rgb(var(--foreground))]">{trialEndDate}</span>.
+          Return to your signup flow to confirm payment with Billing before access is activated.
         </p>
       </div>
 
       <Button onClick={handleSuccessContinue} className="w-full">
-        {returnTo ? 'Return to Android app' : 'Set up your workspace'}
+        {returnTo ? 'Return to Android app' : 'Back to signup'}
       </Button>
       {showReturnFallback && returnTo && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-[rgb(var(--foreground))]">

@@ -7,6 +7,32 @@ on:
         description: Exact reviewed live main commit to publish and deploy
         required: true
         type: string
+      private_admission_run_id:
+        description: Exact private pre-public admission run ID
+        required: true
+        type: string
+      private_admission_run_attempt:
+        description: Exact private pre-public admission run attempt
+        required: true
+        type: string
+      private_admission_artifact_id:
+        description: Exact immutable private pre-public admission artifact ID
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      expected_sha: { required: true, type: string }
+      private_admission_run_id: { required: true, type: string }
+      private_admission_run_attempt: { required: true, type: string }
+      private_admission_artifact_id: { required: true, type: string }
+    secrets:
+      ANNUAL_PRIVATE_ADMISSION_APP_ID: { required: true }
+      ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY: { required: true }
+      ANNUAL_PRIVATE_ADMISSION_HMAC_KEY: { required: true }
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: { required: true }
+      VPS_HOST: { required: true }
+      VPS_USER: { required: true }
+      VPS_SSH_KEY: { required: true }
 
 concurrency:
   group: deploy-web-production
@@ -36,6 +62,41 @@ jobs:
         with:
           ref: ${{ inputs.expected_sha }}
           fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Enforce annual billing copy
+        run: pnpm run check:billing-copy
+
+      - name: Mint protected narrow token for the exact private admission artifact
+        id: private-admission-token
+        uses: actions/create-github-app-token@0f859bf9e69e887678d5bbfbee594437cb440ffe
+        with:
+          app-id: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_ID }}
+          private-key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY }}
+          owner: silent-suite
+          repositories: silentsuite-internal
+          permission-actions: read
+
+      - name: Fetch and verify exact timestamp-free Stage A before web publication
+        uses: ./.github/actions/verify-annual-pre-public-admission
+        with:
+          token: ${{ steps.private-admission-token.outputs.token }}
+          private_run_id: ${{ inputs.private_admission_run_id }}
+          private_run_attempt: ${{ inputs.private_admission_run_attempt }}
+          private_artifact_id: ${{ inputs.private_admission_artifact_id }}
+          expected_public_sha: ${{ inputs.expected_sha }}
+          private_admission_hmac_key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
 
       - name: Assert this is the live main commit
         shell: bash
@@ -102,8 +163,25 @@ jobs:
           ref: ${{ inputs.expected_sha }}
           fetch-depth: 0
 
-      - name: Require the non-bearer Billing handoff before web cutover
-        run: curl --fail --silent --show-error https://api.silentsuite.io/health/link-proof
+      - name: Mint protected narrow token for the exact private admission artifact
+        id: private-admission-token
+        uses: actions/create-github-app-token@0f859bf9e69e887678d5bbfbee594437cb440ffe
+        with:
+          app-id: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_ID }}
+          private-key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY }}
+          owner: silent-suite
+          repositories: silentsuite-internal
+          permission-actions: read
+
+      - name: Re-verify exact timestamp-free Stage A before web cutover
+        uses: ./.github/actions/verify-annual-pre-public-admission
+        with:
+          token: ${{ steps.private-admission-token.outputs.token }}
+          private_run_id: ${{ inputs.private_admission_run_id }}
+          private_run_attempt: ${{ inputs.private_admission_run_attempt }}
+          private_artifact_id: ${{ inputs.private_admission_artifact_id }}
+          expected_public_sha: ${{ inputs.expected_sha }}
+          private_admission_hmac_key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
 
       - name: Re-assert live main immediately before deployment
         shell: bash
@@ -204,10 +282,11 @@ jobs:
             echo "Web app deployed successfully"
             BASH
 
-      - name: Post-deploy health check
+      - name: Post-deploy health and served exact-SHA content check
         run: |
           for i in 1 2 3 4 5; do
-            if curl -sf https://app.silentsuite.io/; then
+            if curl -fsS https://app.silentsuite.io/ >/dev/null && \
+              curl -fsS https://app.silentsuite.io/api/deployment-identity | jq -e --arg sha '${{ inputs.expected_sha }}' '.publicSha == $sha' >/dev/null; then
               echo "Health check passed on attempt $i"
               exit 0
             fi

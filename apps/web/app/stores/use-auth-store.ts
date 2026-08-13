@@ -11,12 +11,13 @@ import { clearAll as clearOfflineQueue } from '@/app/lib/offline-queue'
 import { createLoginSessionPersistenceDiagnostics } from '@/app/lib/sync-restore-diagnostics'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
 import { bumpAccountEpoch } from '@/app/lib/account-epoch'
+import { BillingResponseError, startSignupAnnualPayment } from '@/app/lib/billing-v2'
 
 export interface User {
   isAdmin?: boolean
   id: string
   email: string
-  planId: string
+  planId: string | null
   emailVerified?: boolean
   rememberDevice?: boolean
   /**
@@ -31,14 +32,20 @@ interface PendingSignup {
   email: string
   serverUrl?: string
   paymentSessionToken?: string
+  /** Non-secret request lineage retained only for payment-session recovery. */
+  paymentSessionRequestKey?: string
+  paymentMethod?: 'stripe' | 'btcpay'
   earlyAdopter?: boolean
   wantsProductUpdates?: boolean
   rememberDevice?: boolean
   paidSignupAttemptId?: string
+  noCardProvisionAttemptId?: string
+  /** v1 remains readable only for a persisted historical redirect/retry. */
+  billingContractVersion?: 1 | 2
   /** Provisioned user data — stored here until the entire signup flow completes. */
   provisionedUser?: {
     id: string
-    planId: string
+    planId: string | null
     isAdmin: boolean
   }
   /** Subscription status determined during provisioning. */
@@ -53,9 +60,28 @@ interface SignupResult {
   paymentSessionToken: string | null
 }
 
-/** Shape of the data persisted to sessionStorage for surviving Stripe 3DS redirects. */
+/**
+ * Full-navigation continuation data. Deliberately allowlisted: redirect
+ * storage must never become a second persistence channel for credentials or
+ * provider secrets.
+ */
+type RedirectPendingSignup = Pick<PendingSignup,
+  | 'email'
+  | 'serverUrl'
+  | 'paymentSessionToken'
+  | 'paymentSessionRequestKey'
+  | 'paymentMethod'
+  | 'earlyAdopter'
+  | 'wantsProductUpdates'
+  | 'rememberDevice'
+  | 'billingContractVersion'
+  | 'provisionedUser'
+  | 'provisionedSubscriptionStatus'
+>
+
+/** Shape of the data persisted to sessionStorage for surviving full-page redirects. */
 export interface RedirectSignupState {
-  pendingSignup: PendingSignup
+  pendingSignup: RedirectPendingSignup
   selectedInterval: 'monthly' | 'annual'
   savedAt: number
 }
@@ -72,7 +98,12 @@ interface AuthState {
   canWrite: () => boolean
   prepareSignupDraft: (email: string, wantsProductUpdates?: boolean, rememberDevice?: boolean) => void
   createEtebaseAccount: (email: string, password: string, serverUrl?: string) => Promise<void>
-  signup: (planId: string, trialPath: string, promoCode?: string) => Promise<SignupResult>
+  /** Historical signature retained for callers; fresh hosted v1 creation rejects. */
+  signup: (planId: string, trialPath: string) => Promise<SignupResult>
+  provisionAnnualNoCard: (checkoutIntentToken: string) => Promise<void>
+  startAnnualSignupPayment: (checkoutIntentToken: string, provider: 'stripe' | 'btcpay', returnUrl: string) => Promise<SignupResult>
+  /** Clear only this exact authority after Billing proved it terminal/cancelled. */
+  clearPendingSignupPaymentRecovery: (identity: PaidSignupRecoveryRelease) => void
   finalizePaidSignup: () => Promise<SignupResult>
   /** Call after the entire signup flow (including payment + vault) to finalize authentication. */
   completeSignup: () => void
@@ -107,6 +138,136 @@ interface AuthState {
   restoreSignupStateFromRedirect: () => RedirectSignupState | null
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const UTC_TIMESTAMP = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/
+const REDIRECT_SIGNUP_STATE_KEY = 'silentsuite-signup-redirect-state'
+const REDIRECT_SIGNUP_STATE_TTL_MS = 2 * 60 * 60 * 1000
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Keep exactly one authoritative payment-session capability in the redirect
+ * snapshot. In particular, never spread `pendingSignup`: future runtime-only
+ * fields must not silently become persisted data.
+ */
+function makeRedirectPendingSignup(pending: PendingSignup): RedirectPendingSignup {
+  const redirect: RedirectPendingSignup = { email: pending.email }
+  if (typeof pending.serverUrl === 'string') redirect.serverUrl = pending.serverUrl
+  if (isNonEmptyString(pending.paymentSessionToken)) redirect.paymentSessionToken = pending.paymentSessionToken
+  if (isNonEmptyString(pending.paymentSessionRequestKey)) redirect.paymentSessionRequestKey = pending.paymentSessionRequestKey
+  if (pending.paymentMethod === 'stripe' || pending.paymentMethod === 'btcpay') redirect.paymentMethod = pending.paymentMethod
+  if (typeof pending.earlyAdopter === 'boolean') redirect.earlyAdopter = pending.earlyAdopter
+  if (typeof pending.wantsProductUpdates === 'boolean') redirect.wantsProductUpdates = pending.wantsProductUpdates
+  if (typeof pending.rememberDevice === 'boolean') redirect.rememberDevice = pending.rememberDevice
+  if (pending.billingContractVersion === 1 || pending.billingContractVersion === 2) redirect.billingContractVersion = pending.billingContractVersion
+  const user = pending.provisionedUser
+  if (user && isNonEmptyString(user.id) && (typeof user.planId === 'string' || user.planId === null) && typeof user.isAdmin === 'boolean') {
+    redirect.provisionedUser = { id: user.id, planId: user.planId, isAdmin: user.isAdmin }
+  }
+  if (typeof pending.provisionedSubscriptionStatus === 'string') redirect.provisionedSubscriptionStatus = pending.provisionedSubscriptionStatus
+  return redirect
+}
+
+function parseRedirectPendingSignup(value: unknown): RedirectPendingSignup | null {
+  if (!isRecord(value) || !isNonEmptyString(value.email) || !isNonEmptyString(value.paymentSessionToken)) return null
+  const redirect: RedirectPendingSignup = { email: value.email, paymentSessionToken: value.paymentSessionToken }
+  if (typeof value.serverUrl === 'string') redirect.serverUrl = value.serverUrl
+  if (isNonEmptyString(value.paymentSessionRequestKey)) redirect.paymentSessionRequestKey = value.paymentSessionRequestKey
+  if (value.paymentMethod === 'stripe' || value.paymentMethod === 'btcpay') redirect.paymentMethod = value.paymentMethod
+  if (typeof value.earlyAdopter === 'boolean') redirect.earlyAdopter = value.earlyAdopter
+  if (typeof value.wantsProductUpdates === 'boolean') redirect.wantsProductUpdates = value.wantsProductUpdates
+  if (typeof value.rememberDevice === 'boolean') redirect.rememberDevice = value.rememberDevice
+  if (value.billingContractVersion === 1 || value.billingContractVersion === 2) redirect.billingContractVersion = value.billingContractVersion
+  const user = value.provisionedUser
+  if (isRecord(user) && isNonEmptyString(user.id) && (typeof user.planId === 'string' || user.planId === null) && typeof user.isAdmin === 'boolean') {
+    redirect.provisionedUser = { id: user.id, planId: user.planId, isAdmin: user.isAdmin }
+  }
+  if (typeof value.provisionedSubscriptionStatus === 'string') redirect.provisionedSubscriptionStatus = value.provisionedSubscriptionStatus
+  return redirect
+}
+
+function isUtcTimestamp(value: unknown): value is string {
+  return typeof value === 'string' && UTC_TIMESTAMP.test(value) && !Number.isNaN(Date.parse(value))
+}
+
+function isExactNoCardProvision(value: unknown, email: string): value is {
+  contractVersion: 2
+  id: string
+  email: string
+  provisioningStatus: 'trialing_no_card'
+  emailVerified: true
+  earlyAdopter: boolean
+  rememberDevice: boolean
+  clientSecret: null
+  cryptoCheckoutUrl: null
+  cryptoInvoiceId: null
+  cryptoInvoiceLookupToken: null
+  createdAt: string
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const data = value as Record<string, unknown>
+  const expected = ['clientSecret', 'contractVersion', 'createdAt', 'cryptoCheckoutUrl', 'cryptoInvoiceId', 'cryptoInvoiceLookupToken', 'earlyAdopter', 'email', 'emailVerified', 'id', 'provisioningStatus', 'rememberDevice']
+  const keys = Object.keys(data).sort()
+  return keys.length === expected.length
+    && keys.every((key, index) => key === expected[index])
+    && data.contractVersion === 2
+    && typeof data.id === 'string' && UUID.test(data.id)
+    && data.email === email
+    && data.provisioningStatus === 'trialing_no_card'
+    && data.emailVerified === true
+    && typeof data.earlyAdopter === 'boolean'
+    && typeof data.rememberDevice === 'boolean'
+    && data.clientSecret === null
+    && data.cryptoCheckoutUrl === null
+    && data.cryptoInvoiceId === null
+    && data.cryptoInvoiceLookupToken === null
+    && isUtcTimestamp(data.createdAt)
+}
+
+function isExactV2PaidFinalization(value: unknown, email: string): value is {
+  contractVersion: 2
+  id: string
+  email: string
+  planId: 'early_annual' | 'standard_annual'
+  provisioningStatus: string
+  emailVerified: true
+  isAdmin: boolean
+  earlyAdopter: boolean
+  rememberDevice: boolean
+  createdAt: string
+  clientSecret: null
+  cryptoCheckoutUrl: null
+  cryptoInvoiceId: null
+  cryptoInvoiceLookupToken: null
+} {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const data = value as Record<string, unknown>
+  const expected = ['clientSecret', 'contractVersion', 'createdAt', 'cryptoCheckoutUrl', 'cryptoInvoiceId', 'cryptoInvoiceLookupToken', 'earlyAdopter', 'email', 'emailVerified', 'id', 'isAdmin', 'planId', 'provisioningStatus', 'rememberDevice']
+  const keys = Object.keys(data).sort()
+  return keys.length === expected.length
+    && keys.every((key, index) => key === expected[index])
+    && data.contractVersion === 2
+    && typeof data.id === 'string' && UUID.test(data.id)
+    && data.email === email
+    && (data.planId === 'early_annual' || data.planId === 'standard_annual')
+    && typeof data.provisioningStatus === 'string'
+    && data.emailVerified === true
+    && typeof data.isAdmin === 'boolean'
+    && typeof data.earlyAdopter === 'boolean'
+    && typeof data.rememberDevice === 'boolean'
+    && isUtcTimestamp(data.createdAt)
+    && data.clientSecret === null
+    && data.cryptoCheckoutUrl === null
+    && data.cryptoInvoiceId === null
+    && data.cryptoInvoiceLookupToken === null
+}
+
 
 const HOSTED_VALIDATION_SESSION_KEY = 'silentsuite-hosted-validation-session'
 const HOSTED_VALIDATION_REMEMBERED_KEY = 'silentsuite-hosted-validation-remembered'
@@ -134,6 +295,19 @@ interface PaidSignupRecoveryIdentity {
   recoverySecret: string
 }
 
+/**
+ * A closed anonymous recovery response is proof for exactly one capability.
+ * Carry all of its bindings into the store so a stale tab can never erase a
+ * same-email replacement that has since been created.
+ */
+interface PaidSignupRecoveryRelease {
+  email: string
+  requestKey: string
+  recoverySecret: string
+  wantsProductUpdates?: boolean
+  rememberDevice?: boolean
+}
+
 interface PaidSignupRecoveryRegistry {
   version: 1
   identities: Record<string, PaidSignupRecoveryIdentity>
@@ -144,17 +318,12 @@ let paidSignupStorageWriteUnavailable = false
 
 function paidSignupRecoveryScope(
   email: string,
-  planId: string,
-  trialPath: string,
-  promoCode?: string,
   wantsProductUpdates?: boolean,
   rememberDevice?: boolean,
 ): string {
   return JSON.stringify({
     email: email.trim().toLowerCase(),
-    planId,
-    trialPath,
-    promoCode: promoCode?.trim() || null,
+    contractVersion: 2,
     wantsProductUpdates: wantsProductUpdates !== false,
     rememberDevice: rememberDevice === true,
   })
@@ -243,6 +412,23 @@ function getOrCreatePaidSignupRecoveryIdentity(scope: string): PaidSignupRecover
   // loss, but never receive localStorage's cross-tab or long-lived persistence.
   writePaidSignupRecoveryRegistry(registry)
   return identity
+}
+
+function releaseExactPaidSignupRecoveryIdentity(release: PaidSignupRecoveryRelease): boolean {
+  const scope = paidSignupRecoveryScope(release.email, release.wantsProductUpdates, release.rememberDevice)
+  if (!isPaidSignupRecoveryIdentity({ scope, requestKey: release.requestKey, recoverySecret: release.recoverySecret }, scope)) {
+    return false
+  }
+  const registry = readPaidSignupRecoveryRegistry()
+  const stored = registry.identities[scope]
+  // Absence is safe to release: the caller still holds the same visible
+  // capability. A different valid identity means a newer checkout has won.
+  if (stored && (stored.requestKey !== release.requestKey || stored.recoverySecret !== release.recoverySecret)) return false
+  if (stored) {
+    delete registry.identities[scope]
+    writePaidSignupRecoveryRegistry(registry)
+  }
+  return true
 }
 
 function clearPaidSignupRecoveryIdentity(expectedRequestKey?: string) {
@@ -685,6 +871,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         email,
         wantsProductUpdates,
         rememberDevice: rememberDevice === true,
+        billingContractVersion: undefined,
+        paymentSessionToken: undefined,
+        paymentMethod: undefined,
+        paidSignupAttemptId: undefined,
+        provisionedUser: undefined,
+        provisionedSubscriptionStatus: undefined,
       },
       error: null,
     })
@@ -712,21 +904,6 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         localStorage.setItem('silentsuite-server-url', serverUrl)
       }
 
-      let earlyAdopter = false
-      if (!isSelfHosted && !isCustomServer(serverUrl)) {
-        try {
-          const res = await fetch(
-            `${BILLING_API_URL}/auth/check-eligibility?email=${encodeURIComponent(email)}`,
-          )
-          if (res.ok) {
-            const data = await res.json()
-            earlyAdopter = data.earlyAdopter === true
-          }
-        } catch (err) {
-          logger.warn('[auth-store] Failed to check early adopter eligibility:', err)
-        }
-      }
-
       // Mark signup as in progress so restoreSession won't authenticate mid-flow
       if (typeof window !== 'undefined') {
         sessionStorage.setItem('silentsuite-signup-in-progress', 'true')
@@ -735,7 +912,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       const pending = get().pendingSignup
       const reusablePending = pending?.email.toLowerCase() === email.toLowerCase() ? pending : null
       set({
-        pendingSignup: { ...(reusablePending ?? {}), email, serverUrl, earlyAdopter },
+        // Hosted annual-v2 eligibility is server-authoritative and is returned only
+        // by the closed provision/finalization responses. Do not infer it locally.
+        pendingSignup: { ...(reusablePending ?? {}), email, serverUrl },
         isLoading: false,
       })
     } catch (err) {
@@ -755,7 +934,95 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     }
   },
 
-  signup: async (planId: string, trialPath: string, promoCode?: string) => {
+  provisionAnnualNoCard: async (checkoutIntentToken: string) => {
+    const pending = get().pendingSignup
+    if (!pending || isSelfHosted || isCustomServer(pending.serverUrl)) throw new Error('No hosted annual signup is ready to provision.')
+    const savedEtebaseSession = await secureGet('etebase_session')
+    if (!savedEtebaseSession) throw new Error('Create your account before starting the no-card trial.')
+    const attemptId = crypto.randomUUID()
+    set({ pendingSignup: { ...pending, noCardProvisionAttemptId: attemptId }, isLoading: true, error: null })
+    try {
+      const { issueBillingLinkProof } = await import('@/app/lib/etebase-auth')
+      const etebaseLinkProof = await issueBillingLinkProof(savedEtebaseSession)
+      const response = await fetch(`${BILLING_API_URL}/auth/provision/v2`, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' }, body: JSON.stringify({ contractVersion: 2, checkoutIntentToken, etebaseLinkProof, wantsProductUpdates: pending.wantsProductUpdates !== false, rememberDevice: pending.rememberDevice === true }) })
+      const data = await response.json().catch(() => null)
+      if (!response.ok) throw new BillingResponseError(
+        typeof (data as { detail?: unknown } | null)?.detail === 'string' ? (data as { detail: string }).detail : 'Billing did not confirm the no-card annual trial.',
+        response.status,
+        typeof (data as { type?: unknown } | null)?.type === 'string' ? (data as { type: string }).type : null,
+      )
+      if (!isExactNoCardProvision(data, pending.email)) throw new Error('Billing did not confirm the no-card annual trial.')
+      const current = get().pendingSignup
+      if (!current || current.noCardProvisionAttemptId !== attemptId || current.email.trim().toLowerCase() !== pending.email.trim().toLowerCase()) throw new Error('Signup was superseded.')
+      syncAdminCookie(false, data.rememberDevice)
+      set({ pendingSignup: { ...current, noCardProvisionAttemptId: undefined, billingContractVersion: 2, earlyAdopter: data.earlyAdopter, provisionedUser: { id: data.id, planId: null, isAdmin: false }, provisionedSubscriptionStatus: data.provisioningStatus, rememberDevice: data.rememberDevice }, isLoading: false })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not start the no-card annual trial.'
+      if (get().pendingSignup?.noCardProvisionAttemptId === attemptId) set({ error: message, isLoading: false }); throw err
+    }
+  },
+
+  startAnnualSignupPayment: async (checkoutIntentToken: string, provider: 'stripe' | 'btcpay', returnUrl: string) => {
+    const pending = get().pendingSignup
+    if (!pending || isSelfHosted || isCustomServer(pending.serverUrl)) throw new Error('No hosted annual checkout is ready.')
+    const recoveryScope = paidSignupRecoveryScope(pending.email, pending.wantsProductUpdates, pending.rememberDevice)
+    const recovery = getOrCreatePaidSignupRecoveryIdentity(recoveryScope)
+    const attemptId = crypto.randomUUID()
+    set({ pendingSignup: { ...pending, paidSignupAttemptId: attemptId }, isLoading: true, error: null })
+    try {
+      const parsedReturnUrl = new URL(returnUrl, window.location.origin)
+      if (parsedReturnUrl.origin !== window.location.origin) throw new Error('Annual signup return URL must stay on this origin.')
+      const absoluteReturnUrl = parsedReturnUrl.toString()
+      const payment = await startSignupAnnualPayment({ fetcher: fetch, billingApiUrl: BILLING_API_URL, checkoutIntentToken, email: pending.email, requestKey: recovery.requestKey, recoverySecret: recovery.recoverySecret, wantsProductUpdates: pending.wantsProductUpdates !== false, rememberDevice: pending.rememberDevice === true, returnUrl: absoluteReturnUrl })
+      if (payment.kind !== provider) throw new Error('Billing returned the wrong payment provider.')
+      const current = get().pendingSignup
+      if (!current || current.paidSignupAttemptId !== attemptId || paidSignupRecoveryScope(current.email, current.wantsProductUpdates, current.rememberDevice) !== recoveryScope) throw new Error('Signup was superseded.')
+      set({
+        pendingSignup: {
+          ...current,
+          billingContractVersion: 2,
+          paymentSessionToken: payment.paymentSessionToken,
+          paymentSessionRequestKey: recovery.requestKey,
+          paymentMethod: payment.kind,
+          paidSignupAttemptId: undefined,
+        },
+        isLoading: false,
+      })
+      return { clientSecret: payment.kind === 'stripe' ? payment.clientSecret : null, cryptoCheckoutUrl: payment.kind === 'btcpay' ? payment.cryptoCheckoutUrl : null, cryptoInvoiceId: payment.kind === 'btcpay' ? payment.cryptoInvoiceId : null, cryptoInvoiceLookupToken: payment.kind === 'btcpay' ? payment.cryptoInvoiceLookupToken : null, paymentSessionToken: payment.paymentSessionToken }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Could not start annual payment.'
+      if (get().pendingSignup?.paidSignupAttemptId === attemptId) set({ error: message, isLoading: false }); throw err
+    }
+  },
+
+  clearPendingSignupPaymentRecovery: (release) => {
+    const pending = get().pendingSignup
+    if (!pending) return
+    // A terminal response must be bound to the currently visible recovery
+    // capability before either storage or UI state is released. This compare
+    // guards stale/reloaded tabs and async recovery races from deleting a
+    // replacement invoice for the same email scope.
+    if (pending.email.trim().toLowerCase() !== release.email.trim().toLowerCase()
+      || pending.paymentSessionRequestKey !== release.requestKey
+      || pending.paymentSessionToken !== release.recoverySecret) return
+    const exactRelease: PaidSignupRecoveryRelease = {
+      ...release,
+      wantsProductUpdates: release.wantsProductUpdates ?? pending.wantsProductUpdates,
+      rememberDevice: release.rememberDevice ?? pending.rememberDevice,
+    }
+    if (!releaseExactPaidSignupRecoveryIdentity(exactRelease)) return
+    set({
+      pendingSignup: {
+        ...pending,
+        paymentSessionToken: undefined,
+        paymentSessionRequestKey: undefined,
+        paymentMethod: undefined,
+        paidSignupAttemptId: undefined,
+      },
+    })
+  },
+
+  signup: async (planId: string, trialPath: string) => {
     const pending = get().pendingSignup
     if (!pending) throw new Error('No pending signup')
     const isLocalServerSignup = isSelfHosted || isCustomServer(pending.serverUrl) || planId === 'self-hosted'
@@ -788,173 +1055,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       return { clientSecret: null, cryptoCheckoutUrl: null, cryptoInvoiceId: null, cryptoInvoiceLookupToken: null, paymentSessionToken: null }
     }
 
-    if (!pending.email) {
-      throw new Error('No pending signup')
-    }
-    const savedEtebaseSession = await secureGet('etebase_session')
-    const isPaidSignupDraft = (trialPath === '30day' || trialPath === 'crypto_annual') && !savedEtebaseSession
-    if (isPaidSignupDraft) {
-      const recoveryIdentity = getOrCreatePaidSignupRecoveryIdentity(
-        paidSignupRecoveryScope(
-          pending.email,
-          planId,
-          trialPath,
-          promoCode,
-          pending.wantsProductUpdates,
-          pending.rememberDevice,
-        ),
-      )
-      const attemptId = crypto.randomUUID()
-      const isActiveAttempt = () => {
-        const current = get().pendingSignup
-        if (!current || current.paidSignupAttemptId !== attemptId) return false
-        const currentScope = paidSignupRecoveryScope(
-          current.email,
-          planId,
-          trialPath,
-          promoCode,
-          current.wantsProductUpdates,
-          current.rememberDevice,
-        )
-        if (currentScope !== recoveryIdentity.scope) return false
-        const currentIdentity = readPaidSignupRecoveryRegistry().identities[recoveryIdentity.scope]
-        return isPaidSignupRecoveryIdentity(currentIdentity, recoveryIdentity.scope)
-          && currentIdentity.requestKey === recoveryIdentity.requestKey
-          && currentIdentity.recoverySecret === recoveryIdentity.recoverySecret
-      }
-      set({
-        pendingSignup: {
-          ...pending,
-          paidSignupAttemptId: attemptId,
-        },
-        isLoading: true,
-        error: null,
-      })
-      try {
-        const res = await fetch(`${BILLING_API_URL}/auth/signup/payment-session`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-          body: JSON.stringify({
-            email: pending.email,
-            planId,
-            trialPath,
-            requestKey: recoveryIdentity.requestKey,
-            recoverySecret: recoveryIdentity.recoverySecret,
-            ...(promoCode?.trim() ? { promoCode: promoCode.trim() } : {}),
-            wantsProductUpdates: pending.wantsProductUpdates !== false,
-            rememberDevice: pending.rememberDevice === true,
-          }),
-          credentials: 'include',
-        })
-        if (!res.ok) {
-          const errData = await res.json().catch(() => null)
-          if (isActiveAttempt() && isDefinitivePaidSignupFailure(res.status, errData)) {
-            clearPaidSignupRecoveryIdentity(recoveryIdentity.requestKey)
-          }
-          throw new Error(errData?.detail ?? 'Payment setup failed')
-        }
-        const data = await res.json()
-        if (!isActiveAttempt()) throw new Error('Paid signup request was superseded')
-        const paymentSessionToken = data.paymentSessionToken
-        if (paymentSessionToken !== recoveryIdentity.recoverySecret) {
-          throw new Error('Paid signup response has an invalid recovery token')
-        }
-        const clientSecret = (data.clientSecret as string | null) ?? null
-        const cryptoCheckoutUrl = (data.cryptoCheckoutUrl as string | null) ?? null
-        const cryptoInvoiceId = (data.cryptoInvoiceId as string | null) ?? null
-        const cryptoInvoiceLookupToken = (data.cryptoInvoiceLookupToken as string | null) ?? null
-        const completeProviderContinuation = trialPath === '30day'
-          ? typeof clientSecret === 'string' && clientSecret.length > 0
-          : typeof cryptoCheckoutUrl === 'string' && cryptoCheckoutUrl.length > 0
-            && typeof cryptoInvoiceId === 'string' && cryptoInvoiceId.length > 0
-            && typeof cryptoInvoiceLookupToken === 'string' && cryptoInvoiceLookupToken.length > 0
-        if (!completeProviderContinuation) {
-          throw new Error('Payment setup returned an incomplete provider continuation')
-        }
-        if (trialPath === 'crypto_annual' && cryptoInvoiceLookupToken !== recoveryIdentity.recoverySecret) {
-          throw new Error('Paid signup response has an invalid invoice recovery token')
-        }
-        if (!isActiveAttempt()) throw new Error('Paid signup request was superseded')
-        clearPaidSignupRecoveryIdentity(recoveryIdentity.requestKey)
-        const currentPending = get().pendingSignup
-        if (!currentPending || currentPending.paidSignupAttemptId !== attemptId) {
-          throw new Error('Paid signup request was superseded')
-        }
-        set({
-          pendingSignup: {
-            ...currentPending,
-            paymentSessionToken,
-            paidSignupAttemptId: undefined,
-          },
-          isLoading: false,
-        })
-        return {
-          clientSecret,
-          cryptoCheckoutUrl,
-          cryptoInvoiceId,
-          cryptoInvoiceLookupToken,
-          paymentSessionToken,
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Payment setup failed'
-        if (get().pendingSignup?.paidSignupAttemptId === attemptId) {
-          set({ error: message, isLoading: false })
-        }
-        throw err
-      }
-    }
-
-    if (!savedEtebaseSession) {
-      throw new Error('No Etebase session. Please start signup again.')
-    }
-    set({ isLoading: true, error: null })
-
-    try {
-      const { issueBillingLinkProof } = await import('@/app/lib/etebase-auth')
-      const etebaseLinkProof = await issueBillingLinkProof(savedEtebaseSession)
-      const res = await fetch(`${BILLING_API_URL}/auth/provision`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-        body: JSON.stringify({
-          etebaseLinkProof,
-          planId,
-          trialPath,
-          ...(promoCode?.trim() ? { promoCode: promoCode.trim() } : {}),
-          wantsProductUpdates: pending.wantsProductUpdates,
-          rememberDevice: pending.rememberDevice === true,
-        }),
-        credentials: 'include',
-      })
-      if (!res.ok) {
-        const errData = await res.json().catch(() => null)
-        throw new Error(errData?.detail ?? 'Provisioning failed')
-      }
-      const data = await res.json()
-      const isAdmin = data.isAdmin === true
-      syncAdminCookie(isAdmin, data.rememberDevice === true)
-      // Store provisioned data in pendingSignup — do NOT set isAuthenticated yet.
-      // The user is still in the signup flow (payment + vault steps remain).
-      set({
-        pendingSignup: {
-          ...pending,
-          provisionedUser: { id: data.id, planId, isAdmin },
-            provisionedSubscriptionStatus: data.provisioningStatus ?? 'trialing',
-          rememberDevice: data.rememberDevice === true,
-        },
-        isLoading: false,
-      })
-      return {
-        clientSecret: (data.clientSecret as string | null) ?? null,
-        cryptoCheckoutUrl: (data.cryptoCheckoutUrl as string | null) ?? null,
-        cryptoInvoiceId: (data.cryptoInvoiceId as string | null) ?? null,
-        cryptoInvoiceLookupToken: (data.cryptoInvoiceLookupToken as string | null) ?? null,
-        paymentSessionToken: null,
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Signup failed'
-      set({ error: message, isLoading: false })
-      throw err
-    }
+    throw new Error('Hosted signup requires a fresh annual offer and checkout authority.')
   },
 
   finalizePaidSignup: async () => {
@@ -966,31 +1067,46 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     if (!pending || !savedEtebaseSession || !pending.paymentSessionToken) {
       throw new Error('No completed payment session. Please start signup again.')
     }
-    set({ isLoading: true, error: null })
+    const expectedPaymentSessionToken = pending.paymentSessionToken
+    const expectedRequestKey = pending.paymentSessionRequestKey
+    const attemptId = crypto.randomUUID()
+    set({ pendingSignup: { ...pending, paidSignupAttemptId: attemptId }, isLoading: true, error: null })
     try {
       const { issueBillingLinkProof } = await import('@/app/lib/etebase-auth')
       const etebaseLinkProof = await issueBillingLinkProof(savedEtebaseSession)
-      const res = await fetch(`${BILLING_API_URL}/auth/signup/finalize-payment`, {
+      const v2 = pending.billingContractVersion === 2
+      const res = await fetch(`${BILLING_API_URL}${v2 ? '/auth/signup/finalize-payment/v2' : '/auth/signup/finalize-payment'}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-        body: JSON.stringify({
-          etebaseLinkProof,
-          paymentSessionToken: pending.paymentSessionToken,
-        }),
+        body: JSON.stringify(v2 ? { contractVersion: 2, etebaseLinkProof, paymentSessionToken: pending.paymentSessionToken } : { etebaseLinkProof, paymentSessionToken: pending.paymentSessionToken }),
         credentials: 'include',
       })
       if (!res.ok) {
         const errData = await res.json().catch(() => null)
         throw new Error(errData?.detail ?? 'Could not finish signup')
       }
-      const data = await res.json()
-      const isAdmin = data.isAdmin === true
+      const data: unknown = await res.json().catch(() => null)
+      if (v2 && !isExactV2PaidFinalization(data, pending.email)) throw new Error('Billing did not confirm an annual signup.')
+      if (!data || typeof data !== 'object') throw new Error('Billing did not return signup completion.')
+      const completion = data as {
+        id?: unknown
+        planId?: unknown
+        isAdmin?: unknown
+        earlyAdopter?: unknown
+        provisioningStatus?: unknown
+        rememberDevice?: unknown
+      }
+      const isAdmin = completion.isAdmin === true
+      const current = get().pendingSignup
+      if (!current || current.paidSignupAttemptId !== attemptId || current.paymentSessionToken !== expectedPaymentSessionToken || current.paymentSessionRequestKey !== expectedRequestKey) throw new Error('Signup was superseded.')
       set({
         pendingSignup: {
-          ...pending,
-          provisionedUser: { id: data.id, planId: data.planId ?? 'early_annual', isAdmin },
-          provisionedSubscriptionStatus: data.provisioningStatus ?? 'active',
-          rememberDevice: data.rememberDevice === true,
+          ...current,
+          paidSignupAttemptId: undefined,
+          provisionedUser: { id: typeof completion.id === 'string' ? completion.id : '', planId: typeof completion.planId === 'string' ? completion.planId : null, isAdmin },
+          provisionedSubscriptionStatus: typeof completion.provisioningStatus === 'string' ? completion.provisioningStatus : 'active',
+          earlyAdopter: completion.earlyAdopter === true,
+          rememberDevice: completion.rememberDevice === true,
         },
         isLoading: false,
       })
@@ -1003,7 +1119,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Could not finish signup'
-      set({ error: message, isLoading: false })
+      if (get().pendingSignup?.paidSignupAttemptId === attemptId) set({ error: message, isLoading: false })
       throw err
     }
   },
@@ -1449,12 +1565,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       return
     }
     const data: RedirectSignupState = {
-      pendingSignup: pending,
+      pendingSignup: makeRedirectPendingSignup(pending),
       selectedInterval,
       savedAt: Date.now(),
     }
     try {
-      sessionStorage.setItem('silentsuite-signup-redirect-state', JSON.stringify(data))
+      sessionStorage.setItem(REDIRECT_SIGNUP_STATE_KEY, JSON.stringify(data))
     } catch (err) {
       logger.warn('[auth-store] Failed to save signup redirect state:', err)
     }
@@ -1462,33 +1578,41 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   restoreSignupStateFromRedirect: () => {
     try {
-      const raw = sessionStorage.getItem('silentsuite-signup-redirect-state')
+      const raw = sessionStorage.getItem(REDIRECT_SIGNUP_STATE_KEY)
       if (!raw) return null
       // Always remove immediately — one-time use
-      sessionStorage.removeItem('silentsuite-signup-redirect-state')
-      const data = JSON.parse(raw) as RedirectSignupState
-      // Basic shape validation — guard against corrupted or tampered storage data
-      if (!data.pendingSignup?.email || !data.pendingSignup?.paymentSessionToken) {
+      sessionStorage.removeItem(REDIRECT_SIGNUP_STATE_KEY)
+      const value = JSON.parse(raw) as unknown
+      if (!isRecord(value) || (value.selectedInterval !== 'monthly' && value.selectedInterval !== 'annual') || typeof value.savedAt !== 'number' || !Number.isFinite(value.savedAt)) {
+        logger.warn('[auth-store] Redirect signup state is malformed, discarding')
+        return null
+      }
+      const pendingSignup = parseRedirectPendingSignup(value.pendingSignup)
+      if (!pendingSignup) {
         logger.warn('[auth-store] Redirect signup state is malformed, discarding')
         return null
       }
       // Reject if older than 2 hours. Bitcoin settlement can outlive the old
       // 10-minute Stripe-only window, but this is still tab-scoped sessionStorage.
-      const TWO_HOURS = 2 * 60 * 60 * 1000
-      if (Date.now() - data.savedAt > TWO_HOURS) {
+      if (Date.now() - value.savedAt >= REDIRECT_SIGNUP_STATE_TTL_MS) {
         logger.warn('[auth-store] Redirect signup state expired (>2h old)')
         return null
       }
+      const data: RedirectSignupState = {
+        pendingSignup,
+        selectedInterval: value.selectedInterval,
+        savedAt: value.savedAt,
+      }
       // Restore pendingSignup into the Zustand store and re-set the signup-in-progress
       // flag so restoreSession() doesn't run concurrently and clobber the restored state.
-      set({ pendingSignup: data.pendingSignup })
+      set({ pendingSignup })
       if (typeof window !== 'undefined') {
         sessionStorage.setItem('silentsuite-signup-in-progress', 'true')
       }
       return data
     } catch (err) {
       logger.warn('[auth-store] Failed to restore signup redirect state:', err)
-      sessionStorage.removeItem('silentsuite-signup-redirect-state')
+      sessionStorage.removeItem(REDIRECT_SIGNUP_STATE_KEY)
       return null
     }
   },

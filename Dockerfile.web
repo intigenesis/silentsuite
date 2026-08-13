@@ -53,6 +53,7 @@ LABEL org.opencontainers.image.revision=$VCS_REF
 
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV SILENTSUITE_PUBLIC_BUILD_SHA=$VCS_REF
 
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs

@@ -36,6 +36,94 @@ async function checkGeneratedAppTree(root) {
   }
 }
 
+// The signup (auth) scan is baseline-specific: the pageview sender lives in
+// signup-analytics.tsx, which only the signup layout imports, so its transport
+// literals must survive into the emitted signup layout chunk. Commercial modules
+// reach only page entries, and the shared 'pageview' literal lives in the common
+// builder module — neither may satisfy this assertion.
+async function checkGeneratedAuthTree(root, extraArguments = []) {
+  try {
+    await execFileAsync(process.execPath, [
+      'scripts/check-public-analytics.mjs',
+      `--generated-app-root=${path.join(root, 'absent-app-root')}`,
+      `--generated-auth-root=${root}`,
+      ...extraArguments,
+    ])
+    return ''
+  } catch (error) {
+    return `${error.stdout}\n${error.stderr}`
+  }
+}
+
+const commercialPageChunk = `${endpoint} keepalive:!0 "pageview" buildSignupPageviewPayload`
+
+test('generated auth scan rejects a commercial page chunk standing in for the baseline sender', async () => {
+  await withGeneratedAppTree({
+    'signup/page-a.js': commercialPageChunk,
+  }, async (root) => {
+    assert.match(
+      await checkGeneratedAuthTree(root),
+      /signup layout chunk: expected baseline pageview transport absent/,
+    )
+  })
+})
+
+test('generated auth scan rejects a stub signup layout chunk alongside a populated commercial chunk', async () => {
+  await withGeneratedAppTree({
+    'signup/layout-a.js': 'console.log("layout")',
+    'signup/page-a.js': commercialPageChunk,
+  }, async (root) => {
+    assert.match(
+      await checkGeneratedAuthTree(root),
+      /signup layout chunk: expected baseline pageview transport absent/,
+    )
+  })
+})
+
+test('generated auth scan rejects a signup layout chunk missing the keepalive fallback', async () => {
+  await withGeneratedAppTree({
+    'signup/layout-a.js': endpoint,
+    'signup/page-a.js': commercialPageChunk,
+  }, async (root) => {
+    assert.match(
+      await checkGeneratedAuthTree(root),
+      /signup layout chunk: expected baseline pageview transport absent/,
+    )
+  })
+})
+
+test('generated auth scan permits a signup layout chunk carrying the baseline transport', async () => {
+  await withGeneratedAppTree({
+    'signup/layout-a.js': `${endpoint} keepalive:!0`,
+    'signup/page-a.js': commercialPageChunk,
+  }, async (root) => {
+    assert.equal(await checkGeneratedAuthTree(root), '')
+  })
+})
+
+test('generated auth scan enforces the baseline transport in both build flag modes', async () => {
+  await withGeneratedAppTree({
+    'signup/page-a.js': commercialPageChunk,
+  }, async (root) => {
+    assert.match(
+      await checkGeneratedAuthTree(root, ['--enabled-generated-build']),
+      /signup layout chunk: expected baseline pageview transport absent/,
+    )
+  })
+})
+
+test('generated auth scan rejects an unresolved signup analytics flag literal', async () => {
+  await withGeneratedAppTree({
+    'signup/layout-a.js': `${endpoint} keepalive:!0`,
+    'signup/page-a.js': 'process.env.NEXT_PUBLIC_SIGNUP_ANALYTICS_ENABLED',
+  }, async (root) => {
+    assert.match(
+      await checkGeneratedAuthTree(root),
+      /signup\/page-a\.js: unresolved signup analytics flag literal in public bundle/,
+    )
+  })
+})
+
 test('enabled generated app scan fails closed when the subscription route chunk lacks the approved endpoint', async () => {
   await withGeneratedAppTree({
     'settings/subscription/page-a.js': 'console.log("subscription")',

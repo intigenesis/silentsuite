@@ -6,12 +6,12 @@ import { buildSignupPageviewPayload, SIGNUP_ANALYTICS_PATHS } from '@/app/lib/pu
 
 const PLAUSIBLE_EVENT_ENDPOINT = 'https://plausible.silentsuite.io/api/event'
 
-export function shouldSendSignupAnalytics(
-  location: URL,
-  enabled = process.env.NEXT_PUBLIC_SIGNUP_ANALYTICS_ENABLED,
-): boolean {
-  return enabled === 'true'
-    && location.protocol === 'https:'
+// The baseline pageview gate is the canonical production origin plus the registered
+// route only. It is deliberately independent of NEXT_PUBLIC_SIGNUP_ANALYTICS_ENABLED,
+// which gates commercial/custom events; self-hosted and preview origins stay silent
+// because they never match app.silentsuite.io over https.
+export function shouldSendSignupAnalytics(location: URL): boolean {
+  return location.protocol === 'https:'
     && location.hostname === 'app.silentsuite.io'
     && SIGNUP_ANALYTICS_PATHS.includes(location.pathname as typeof SIGNUP_ANALYTICS_PATHS[number])
 }
@@ -33,8 +33,7 @@ export function sendSignupPageview({
 
   if (beacon) {
     const blob = new Blob([payload], { type: 'application/json' })
-    beacon(PLAUSIBLE_EVENT_ENDPOINT, blob)
-    return
+    if (beacon(PLAUSIBLE_EVENT_ENDPOINT, blob)) return
   }
 
   void fetcher(PLAUSIBLE_EVENT_ENDPOINT, {

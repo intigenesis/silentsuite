@@ -72,10 +72,13 @@ export function StepCreatePaidAccount({
   email,
   onNext,
   initialError,
+  continuation = 'payment-confirmed',
 }: {
   email: string
   onNext: (data: PaidAccountFormData) => Promise<void>
   initialError?: string | null
+  /** Passwords for a verified no-card continuation stay in this component only. */
+  continuation?: 'payment-confirmed' | 'verified-no-card'
 }) {
   const [submitError, setSubmitError] = useState<string | null>(initialError ?? null)
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -93,9 +96,13 @@ export function StepCreatePaidAccount({
   return (
     <div className="space-y-5 animate-in fade-in slide-in-from-right-4 duration-300 motion-reduce:animate-none">
       <div className="space-y-2 text-center">
-        <h2 className="text-lg sm:text-xl font-semibold text-[rgb(var(--foreground))]">Create your account</h2>
+        <h2 className="text-lg sm:text-xl font-semibold text-[rgb(var(--foreground))]">
+          {continuation === 'verified-no-card' ? 'Re-enter your account details' : 'Create your account'}
+        </h2>
         <p className="text-sm text-[rgb(var(--muted))]">
-          Payment is confirmed. Choose the password for <span className="font-medium text-[rgb(var(--foreground))]">{email}</span>.
+          {continuation === 'verified-no-card'
+            ? <>Your email is verified. Enter a password to continue with the 7-day no-card trial for <span className="font-medium text-[rgb(var(--foreground))]">{email}</span>.</>
+            : <>Payment is confirmed. Choose the password for <span className="font-medium text-[rgb(var(--foreground))]">{email}</span>.</>}
         </p>
       </div>
 
@@ -153,7 +160,7 @@ export function StepCreatePaidAccount({
         )}
 
         <Button type="submit" disabled={!isValid || isSubmitting} className="w-full">
-          {isSubmitting ? 'Creating account...' : 'Create account and continue'}
+          {isSubmitting ? 'Creating account...' : continuation === 'verified-no-card' ? 'Continue to trial options' : 'Create account and continue'}
         </Button>
       </form>
     </div>

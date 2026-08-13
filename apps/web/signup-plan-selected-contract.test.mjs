@@ -3,14 +3,11 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 const source = await readFile(new URL('./app/(auth)/signup/page.tsx', import.meta.url), 'utf8')
+function body(start, end) { return source.slice(source.indexOf(start), source.indexOf(end)) }
 
-function callbackBody(name, nextName) {
-  return source.slice(source.indexOf(`const ${name}`), source.indexOf(`const ${nextName}`))
-}
-
-test('Plan Selected is recorded on paid payment-method selection, not after signup succeeds', () => {
-  assert.match(callbackBody('handleSelectCard', 'handleSelectBitcoin'), /trackPlanSelected\(interval\)[\s\S]*onSelectPaid\(promoCode\)/)
-  assert.match(callbackBody('handleSelectBitcoin', 'hasEnteredPromoCode'), /trackPlanSelected\('annual'\)[\s\S]*onSelectCrypto\(interval !== 'annual'\)/)
-  assert.doesNotMatch(callbackBody('handleSelectPaid', 'handleSelectCrypto'), /trackPlanSelected/)
-  assert.doesNotMatch(callbackBody('handleSelectCrypto', 'handlePlanBack'), /trackPlanSelected/)
+test('annual Plan Selected is recorded before the chosen payment checkout starts', () => {
+  assert.match(body('const handleSelectCard', 'const handleSelectBitcoin'), /trackPlanSelected\(annualOfferDetails\)/)
+  assert.match(body('const handleConfirmAnnualClaim', 'const handlePlanBack'), /trackCheckoutInitiated\(annualOffer\.offer, 'stripe'\)/)
+  assert.match(body('const handleConfirmAnnualClaim', 'const handlePlanBack'), /trackCheckoutInitiated\(annualOffer\.offer, 'btcpay'\)/)
+  assert.doesNotMatch(source, /trackPlanSelected\('monthly'\)/)
 })

@@ -1,0 +1,120 @@
+name: Annual-only Public Cutover (Stage B)
+
+# The only public workflow that can emit Stage B. Stage A is consumed before
+# each protected component deployment; Stage C remains private-only.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha: { description: Exact reviewed live main SHA admitted by Stage A, required: true, type: string }
+      private_admission_run_id: { description: Exact private Stage A run ID, required: true, type: string }
+      private_admission_run_attempt: { description: Exact private Stage A run attempt, required: true, type: string }
+      private_admission_artifact_id: { description: Exact immutable private Stage A artifact ID, required: true, type: string }
+
+concurrency:
+  group: annual-only-public-cutover
+  cancel-in-progress: false
+
+jobs:
+  deploy-web:
+    if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
+    uses: ./.github/workflows/deploy-web.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
+      private_admission_run_id: ${{ inputs.private_admission_run_id }}
+      private_admission_run_attempt: ${{ inputs.private_admission_run_attempt }}
+      private_admission_artifact_id: ${{ inputs.private_admission_artifact_id }}
+    secrets:
+      ANNUAL_PRIVATE_ADMISSION_APP_ID: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_ID }}
+      ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY }}
+      ANNUAL_PRIVATE_ADMISSION_HMAC_KEY: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ secrets.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+
+  deploy-docs:
+    if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
+    uses: ./.github/workflows/deploy-docs.yml
+    with:
+      expected_sha: ${{ inputs.expected_sha }}
+      private_admission_run_id: ${{ inputs.private_admission_run_id }}
+      private_admission_run_attempt: ${{ inputs.private_admission_run_attempt }}
+      private_admission_artifact_id: ${{ inputs.private_admission_artifact_id }}
+    secrets:
+      ANNUAL_PRIVATE_ADMISSION_APP_ID: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_ID }}
+      ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY }}
+      ANNUAL_PRIVATE_ADMISSION_HMAC_KEY: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  attest:
+    name: Write truthful public-served Stage B after verified Web and Docs
+    needs: [deploy-web, deploy-docs]
+    if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: annual-public-cutover
+    permissions:
+      contents: read
+    env:
+      ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA: ${{ vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA }}
+    steps:
+      - name: Checkout exact approved commit for served attestation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_sha }}
+          fetch-depth: 0
+      - name: Re-assert exact owner-approved live main after Web and Docs checks
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ && "$ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          LIVE_MAIN_SHA=$(git rev-parse origin/main)
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_SHA" != "$LIVE_MAIN_SHA" ] || [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ] || [ "$EXPECTED_SHA" != "$LIVE_MAIN_SHA" ] || [ "$ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA" != "$EXPECTED_SHA" ]; then
+            echo "Refusing public served attestation: exact owner-approved live main identity is no longer present"
+            exit 1
+          fi
+      - name: Mint protected narrow token for the exact private admission artifact
+        id: private-admission-token
+        uses: actions/create-github-app-token@0f859bf9e69e887678d5bbfbee594437cb440ffe
+        with:
+          app-id: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_ID }}
+          private-key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_APP_PRIVATE_KEY }}
+          owner: silent-suite
+          repositories: silentsuite-internal
+          permission-actions: read
+      - name: Fetch and verify exact signed timestamp-free Stage A before Stage B
+        uses: ./.github/actions/verify-annual-pre-public-admission
+        with:
+          token: ${{ steps.private-admission-token.outputs.token }}
+          private_run_id: ${{ inputs.private_admission_run_id }}
+          private_run_attempt: ${{ inputs.private_admission_run_attempt }}
+          private_artifact_id: ${{ inputs.private_admission_artifact_id }}
+          expected_public_sha: ${{ inputs.expected_sha }}
+          private_admission_hmac_key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
+      - name: Freshly verify exact production Web and Docs served identities before Stage B
+        id: served-identities
+        shell: bash
+        env:
+          EXPECTED_PUBLIC_SHA: ${{ inputs.expected_sha }}
+        run: node scripts/verify-annual-public-served-identities.mjs
+      - name: Reserve, sign, and finalize immutable truthful served attestation
+        id: served-attestation
+        env:
+          ANNUAL_DEPLOYMENT_VERIFIED: 'true'
+          ANNUAL_PRE_PUBLIC_ADMISSION: .annual-only/pre-public/annual-only-pre-public-admission.json
+          ANNUAL_PRIVATE_ADMISSION_REPOSITORY: silent-suite/silentsuite-internal
+          ANNUAL_PRIVATE_ADMISSION_RUN_ID: ${{ inputs.private_admission_run_id }}
+          ANNUAL_PRIVATE_ADMISSION_RUN_ATTEMPT: ${{ inputs.private_admission_run_attempt }}
+          ANNUAL_PRIVATE_ADMISSION_ARTIFACT_ID: ${{ inputs.private_admission_artifact_id }}
+          ANNUAL_PRIVATE_ADMISSION_ARTIFACT_NAME: annual-only-pre-public-admission-${{ inputs.private_admission_run_id }}-${{ inputs.private_admission_run_attempt }}
+          ANNUAL_PRIVATE_ADMISSION_HMAC_KEY: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
+          ANNUAL_PUBLIC_SERVED_HMAC_KEY: ${{ secrets.ANNUAL_PUBLIC_SERVED_HMAC_KEY }}
+          ANNUAL_PUBLIC_SERVED_OUTPUT_DIRECTORY: .annual-only/public-served
+          ANNUAL_PUBLIC_SERVED_ARTIFACT_NAME: annual-only-public-served-attestation-${{ github.run_id }}-${{ github.run_attempt }}
+          ANNUAL_PUBLIC_SERVED_CLIENT_SERVED_AT: ${{ steps.served-identities.outputs.client_served_at }}
+          EXPECTED_PUBLIC_SHA: ${{ inputs.expected_sha }}
+        run: node scripts/publish-annual-public-served-attestation.mjs

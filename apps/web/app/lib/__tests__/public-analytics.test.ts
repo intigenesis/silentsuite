@@ -11,6 +11,19 @@ import {
   sanitizedSignupPageUrl,
 } from '../public-analytics'
 
+const annualOffer = {
+  planId: 'early_annual' as const,
+  customerClass: 'early' as const,
+  billingInterval: 'annual' as const,
+  annualAmountMinor: 3600 as const,
+  monthlyEquivalentMinor: 300 as const,
+  currency: 'EUR' as const,
+  providers: ['stripe', 'btcpay'] as ('stripe' | 'btcpay')[],
+  offerRevision: 1,
+  offerToken: 'signed-offer',
+  expiresAt: '2026-08-11T12:10:00Z',
+}
+
 describe('public analytics privacy contract', () => {
   it('canonicalizes only registered campaign parameters', () => {
     expect(
@@ -67,30 +80,42 @@ describe('public analytics privacy contract', () => {
     expect(classifyReferrer('bad url')).toBeUndefined()
   })
 
-  it('builds the exact identity-free signup pageview payload', () => {
-    expect(buildSignupPageviewPayload(
+  it('builds the exact identity-free signup pageview payload without custom properties', () => {
+    const payload = buildSignupPageviewPayload(
       'https://app.silentsuite.io/signup?utm_source=github&utm_content=user@example.com&returnTo=/calendar',
       'https://github.com/silent-suite/silentsuite/issues/123?token=secret',
-    )).toEqual({
+    )
+
+    expect(payload).toEqual({
       domain: 'app.silentsuite.io',
       name: 'pageview',
       url: 'https://app.silentsuite.io/signup',
       referrer: 'https://github.com/',
-      props: { referrer_category: 'github', utm_source: 'github' },
     })
+    expect(payload).not.toHaveProperty('props')
+    expect(Object.keys(payload)).toEqual(['domain', 'name', 'url', 'referrer'])
   })
 
   it('sends the fixed Google referrer for a recognized regional Google source', () => {
-    expect(buildSignupPageviewPayload(
+    const payload = buildSignupPageviewPayload(
       'https://app.silentsuite.io/signup',
       'https://www.google.co.uk/search?q=silentsuite',
-    )).toEqual({
+    )
+
+    expect(payload).toEqual({
       domain: 'app.silentsuite.io',
       name: 'pageview',
       url: 'https://app.silentsuite.io/signup',
       referrer: 'https://www.google.com/',
-      props: { referrer_category: 'search' },
     })
+    expect(payload).not.toHaveProperty('props')
+  })
+
+  it.each([
+    'https://app.silentsuite.io/signup?utm_source=paid&utm_medium=cpc&utm_campaign=beta-2026-q2',
+    'https://app.silentsuite.io/signup?utm_source=github',
+  ])('never attaches campaign properties to the baseline pageview for %s', (rawUrl) => {
+    expect(buildSignupPageviewPayload(rawUrl, '')).not.toHaveProperty('props')
   })
 
   it.each([
@@ -130,8 +155,8 @@ describe('public analytics privacy contract', () => {
   })
 
   it('creates only fixed commercial-funnel event payloads', () => {
-    expect(buildPlanSelectedPayload('monthly')).toEqual({
-      domain: 'app.silentsuite.io', name: 'Plan Selected', url: 'https://app.silentsuite.io/signup', props: { plan_class: 'monthly' },
+    expect(buildPlanSelectedPayload(annualOffer)).toEqual({
+      domain: 'app.silentsuite.io', name: 'Plan Selected', url: 'https://app.silentsuite.io/signup', props: { plan_id: 'early_annual', customer_class: 'early', billing_interval: 'annual', annual_amount_minor: 3600, monthly_equivalent_minor: 300, currency: 'EUR' },
     })
     expect(buildCheckoutReturnedPayload('cancelled', 'btcpay')).toEqual({
       domain: 'app.silentsuite.io', name: 'Checkout Returned', url: 'https://app.silentsuite.io/signup/cancel', props: { outcome: 'cancelled', payment_method: 'btcpay' },
