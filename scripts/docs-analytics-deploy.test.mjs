@@ -39,7 +39,13 @@ test('production workflow runs public analytics checks before build and immediat
   const workflow = await readFile('.github/workflows/deploy-docs.yml', 'utf8')
   assert.equal((workflow.match(/pnpm run check:public-analytics/g) ?? []).length, 2)
   assert.match(workflow, /Verify public analytics and relay contract before build[\s\S]*pnpm run check:public-analytics/)
-  assert.match(workflow, /Re-verify public analytics and relay topology immediately before deployment[\s\S]*pnpm run check:public-analytics[\s\S]*Deploy to production Worker/)
+  const analyticsIndex = workflow.indexOf('name: Re-verify public analytics and relay topology immediately before deployment')
+  const reauthorizationIndex = workflow.indexOf('name: Re-assert owner approval immediately before deployment')
+  const deployIndex = workflow.indexOf('name: Deploy to production Worker')
+  assert.ok(analyticsIndex >= 0)
+  assert.ok(reauthorizationIndex > analyticsIndex)
+  assert.equal(deployIndex, reauthorizationIndex + workflow.slice(reauthorizationIndex).indexOf('name: Deploy to production Worker'))
+  assert.match(workflow.slice(reauthorizationIndex), /Re-assert owner approval immediately before deployment[\s\S]*Deploy to production Worker/)
 })
 
 test('both deploy workflow setup-node actions use the exact immutable pin', async () => {

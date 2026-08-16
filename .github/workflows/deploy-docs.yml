@@ -219,6 +219,9 @@ jobs:
           expected_public_sha: ${{ inputs.expected_sha }}
           private_admission_hmac_key: ${{ secrets.ANNUAL_PRIVATE_ADMISSION_HMAC_KEY }}
 
+      - name: Re-verify public analytics and relay topology immediately before deployment
+        run: pnpm run check:public-analytics
+
       - name: Re-assert owner approval immediately before deployment
         shell: bash
         env:
@@ -237,9 +240,6 @@ jobs:
             echo "Refusing docs deploy: commit is no longer the exact owner-approved live main head"
             exit 1
           fi
-
-      - name: Re-verify public analytics and relay topology immediately before deployment
-        run: pnpm run check:public-analytics
 
       - name: Deploy to production Worker
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
