@@ -3,10 +3,13 @@ import { defineConfig } from 'vitepress'
 const hostedAnalytics = process.env.SILENTSUITE_HOSTED_DOCS_ANALYTICS === '1'
 
 export default defineConfig({
+
   vite: {
     define: {
+      // Same-origin first-party relay path only. The upstream analytics host lives in the
+      // production docs Worker, never in a browser artifact.
       __SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__: JSON.stringify(
-        hostedAnalytics ? 'https://plausible.silentsuite.io/api/event' : '',
+        hostedAnalytics ? '/api/event' : '',
       ),
     },
   },

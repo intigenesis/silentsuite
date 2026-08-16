@@ -88,6 +88,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify public analytics and relay contract before build
+        run: pnpm run check:public-analytics
+
       - name: Enforce annual billing copy
         run: pnpm run check:billing-copy
 
@@ -159,6 +162,18 @@ jobs:
           ref: ${{ inputs.expected_sha }}
           fetch-depth: 0
 
+      - name: Setup pnpm for final source and topology verification
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Setup Node.js for final source and topology verification
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies for final source and topology verification
+        run: pnpm install --frozen-lockfile
+
       - name: Download and verify admitted docs artifact
         shell: bash
         env:
@@ -222,6 +237,9 @@ jobs:
             echo "Refusing docs deploy: commit is no longer the exact owner-approved live main head"
             exit 1
           fi
+
+      - name: Re-verify public analytics and relay topology immediately before deployment
+        run: pnpm run check:public-analytics
 
       - name: Deploy to production Worker
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
