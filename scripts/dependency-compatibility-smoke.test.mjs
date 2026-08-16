@@ -15,7 +15,7 @@ const Ajv = requireFrom('node_modules/.pnpm/ajv@8.18.0/node_modules/ajv/package.
 const addFormats = requireFrom('node_modules/.pnpm/ajv-formats@2.1.1_ajv@8.18.0/node_modules/ajv-formats/package.json')('.')
 const { JSDOM } = requireFrom('apps/web/package.json')('jsdom')
 const yaml = requireFrom('node_modules/.pnpm/js-yaml@4.3.1/node_modules/js-yaml/package.json')('.')
-const { customAlphabet, nanoid } = requireFrom('node_modules/.pnpm/nanoid@3.3.17/node_modules/nanoid/package.json')('.')
+const { customAlphabet, nanoid } = requireFrom('node_modules/.pnpm/nanoid@3.3.18/node_modules/nanoid/package.json')('.')
 const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, '..', 'package.json'), 'utf8'))
 
 for (const [line, minimatch] of [['3', minimatch3], ['5', minimatch5], ['10', minimatch10]]) {
@@ -56,7 +56,7 @@ test('nanoid 3 patched generators preserve normal positive-size behavior', () =>
 
 test('security overrides remain scoped to compatible vulnerable major lines', () => {
   assert.equal(manifest.pnpm.overrides['js-yaml@>=4.0.0 <4.3.1'], '4.3.1')
-  assert.equal(manifest.pnpm.overrides['nanoid@>=3.0.0 <3.3.17'], '3.3.17')
+  assert.equal(manifest.pnpm.overrides['nanoid@>=3.0.0 <3.3.18'], '3.3.18')
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'js-yaml'), false)
-  assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.17'), false)
+  assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.18'), false)
 })
