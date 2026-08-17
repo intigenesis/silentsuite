@@ -86,15 +86,15 @@ const jobContracts: Record<string, Record<string, { steps: string; permissions: 
     deploy: { steps: 'bbd0c9a9415d24b319bf53201011b78485a5a22674d36336b252fa770e19cf4c', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
   },
   'deploy-docs.yml': {
-    build: { steps: 'e15924db3b0825955e90c09ecbac8e505329babe5418abdf7c4a9be666e0a502', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
-    deploy: { steps: '0e4756de0db4f4603184e412045bb71d711530a998cbe4fe8c862772880dbc0d', permissions: '551b70084a8244c7f3114d8603c3d2ddac6b642093a4b34cd2e3a00b7e4f8ee1' },
+    build: { steps: '735d78bbc35bf060c054dc608ad75baed8e7bfc05538c75cc1b88c0548d3b57a', permissions: 'd8d6aceb1abc41990618a503082c3badcca8897feee0976f222af5b74e30bec2' },
+    deploy: { steps: 'c8df0e46e9f4738c43c6cb0949570a0ae43382597754556db0d83c7897d8b88f', permissions: '551b70084a8244c7f3114d8603c3d2ddac6b642093a4b34cd2e3a00b7e4f8ee1' },
   },
 }
 
 const workflowContracts: Record<string, string> = {
   'deploy-web.yml': 'c09667e79ae905e923d21d18f7e50512b0badb07b8fa6daee9c89f6184ea047b',
   'deploy-server.yml': 'ee8015b23a29d0faa6b0ecb0371f049ae9189c37fe4c80591f82f0e844193312',
-  'deploy-docs.yml': '051ceb51b6eac4571828e9562d6569f69f2d5a302da86760571a906df2d40a6a',
+  'deploy-docs.yml': '94ecb2839f55f94469e5c24f3d58c166ab79c2c4f28c5c2711c0df4d6af4201e',
 }
 
 const approvedNode24ActionPins: Record<string, string> = {

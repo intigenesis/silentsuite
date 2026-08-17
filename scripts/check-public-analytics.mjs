@@ -19,6 +19,7 @@ const allowedAnalyticsFiles = new Set([
   path.join(appsRoot, 'web/next.config.js'),
   path.join(appsRoot, 'docs/.vitepress/config.mts'),
   path.join(appsRoot, 'docs/.vitepress/theme/index.mts'),
+  path.join(appsRoot, 'docs/worker/index.mts'),
 ])
 const violations = []
 
@@ -152,8 +153,9 @@ async function generatedText(directory) {
 try {
   const hostedBundle = await generatedText(path.join(appsRoot, 'docs/.vitepress/dist-hosted'))
   const selfHostedBundle = await generatedText(path.join(appsRoot, 'docs/.vitepress/dist-self'))
-  if (!hostedBundle.includes('plausible.silentsuite.io/api/event')) violations.push('hosted docs bundle: expected analytics endpoint absent')
-  if (selfHostedBundle.includes('plausible.silentsuite.io')) violations.push('self-hosted docs bundle: analytics endpoint present')
+  if (!hostedBundle.includes('/api/event')) violations.push('hosted docs bundle: expected same-origin analytics endpoint absent')
+  if (hostedBundle.includes('plausible.silentsuite.io')) violations.push('hosted docs bundle: direct upstream analytics endpoint present')
+  if (selfHostedBundle.includes('/api/event') || selfHostedBundle.includes('plausible.silentsuite.io')) violations.push('self-hosted docs bundle: analytics endpoint present')
   if (hostedBundle.includes('__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__') || selfHostedBundle.includes('__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__')) {
     violations.push('docs bundle: unresolved analytics compile constant')
   }
