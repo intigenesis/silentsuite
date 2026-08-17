@@ -3,7 +3,13 @@ import test from 'node:test'
 
 import { readFile } from 'node:fs/promises'
 
-import { buildDocsPageviewPayload, canonicalDocsPath, canonicalizeDocsReferrer, createDocsPageviewTracker } from './public-analytics.mts'
+import {
+  DOCS_CANONICAL_REFERRERS,
+  buildDocsPageviewPayload,
+  canonicalDocsPath,
+  canonicalizeDocsReferrer,
+  createDocsPageviewTracker,
+} from './public-analytics.mts'
 
 test('registers only repository-owned canonical document paths', () => {
   assert.equal(canonicalDocsPath('/user-guide/faq/?q=private#answer'), '/user-guide/faq')
@@ -43,8 +49,10 @@ test('maps all admitted docs sources to fixed Plausible referrers', () => {
     ['https://duckduckgo.com/?q=silentsuite', 'https://duckduckgo.com/'],
     ['https://search.brave.com/search?q=silentsuite', 'https://search.brave.com/'],
     ['https://www.ecosia.org/search?q=silentsuite', 'https://www.ecosia.org/'],
-    ['https://twitter.com/silentsuite/status/opaque', 'https://x.com/'],
-    ['https://t.co/opaque-id', 'https://x.com/'],
+    ['https://x.com/silentsuite/status/opaque', 'https://twitter.com/'],
+    ['https://twitter.com/silentsuite/status/opaque', 'https://twitter.com/'],
+    ['https://mobile.twitter.com/silentsuite', 'https://twitter.com/'],
+    ['https://t.co/opaque-id', 'https://twitter.com/'],
     ['https://new.reddit.com/r/privacy/comments/1/opaque', 'https://www.reddit.com/'],
     ['https://redd.it/opaque-id', 'https://www.reddit.com/'],
     ['https://github.com/silent-suite/silentsuite', 'https://github.com/'],
@@ -76,12 +84,33 @@ test('omits docs referrer for unsafe or unrecognized sources', () => {
   }
 })
 
+test('publishes a closed referrer vocabulary using the Plausible-recognized Twitter source', () => {
+  assert.equal(DOCS_CANONICAL_REFERRERS.includes('https://twitter.com/'), true)
+  assert.equal(DOCS_CANONICAL_REFERRERS.some((referrer) => referrer === 'https://x.com/'), false)
+  for (const referrer of DOCS_CANONICAL_REFERRERS) assert.equal(canonicalizeDocsReferrer(referrer), referrer)
+})
+
 test('runtime passes document.referrer into docs pageview construction', async () => {
   const source = await readFile(new URL('./index.mts', import.meta.url), 'utf8')
   assert.match(source, /sendDocsPageview\(path, document\.referrer\)/)
   assert.match(source, /buildDocsPageviewPayload\(path, rawReferrer\)/)
   assert.match(source, /if \(!pageview\) return/)
   assert.match(source, /JSON\.stringify\(pageview\)/)
+})
+
+test('runtime delivers every docs payload through the shared Beacon-then-keepalive transport', async () => {
+  const source = await readFile(new URL('./index.mts', import.meta.url), 'utf8')
+  assert.match(source, /deliverDocsAnalyticsPayload/)
+  assert.equal((source.match(/deliverDocsAnalyticsPayload\(/g) ?? []).length, 2)
+  assert.equal(source.includes('new Blob'), false)
+  assert.equal(source.includes('application/json'), false)
+  assert.equal(source.includes('navigator.sendBeacon'), false)
+})
+
+test('browser analytics constant resolves to the same-origin relay path only', async () => {
+  const config = await readFile(new URL('../config.mts', import.meta.url), 'utf8')
+  assert.match(config, /__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__[\s\S]*'\/api\/event'/)
+  assert.equal(config.includes('plausible.silentsuite.io'), false)
 })
 
 test('docs payload builder rejects paths outside the repository-owned registry', () => {

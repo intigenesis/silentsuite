@@ -15,3 +15,43 @@ test('CI verifies enabled and disabled docs artifacts across Turbo cache orderin
   assert.match(workflow, /pnpm run build:docs[\s\S]*--mode disabled/)
   assert.match(workflow, /--mode enabled/)
 })
+
+test('production wrangler topology binds the relay Worker and ASSETS fallback', async () => {
+  const config = await readFile('apps/docs/wrangler.jsonc', 'utf8')
+  assert.match(config, /"main"\s*:\s*"worker\/index\.mts"/)
+  assert.match(config, /"assets"\s*:\s*\{[\s\S]*"directory"\s*:\s*"\.vitepress\/dist"[\s\S]*"binding"\s*:\s*"ASSETS"/)
+  assert.match(config, /"observability"\s*:\s*\{[\s\S]*"enabled"\s*:\s*false/)
+})
+
+test('production Worker source is the sole upstream boundary', async () => {
+  const source = await readFile('apps/docs/worker/index.mts', 'utf8')
+  assert.equal((source.match(/plausible\.silentsuite\.io/g) ?? []).length, 1)
+  assert.match(source, /DOCS_PLAUSIBLE_ENDPOINT\s*=\s*'https:\/\/plausible\.silentsuite\.io\/api\/event'/)
+})
+
+test('preview wrangler topology stays assets-only without a Worker entrypoint', async () => {
+  const config = await readFile('apps/docs/wrangler.preview.jsonc', 'utf8')
+  assert.doesNotMatch(config, /"main"\s*:/)
+  assert.match(config, /"assets"\s*:\s*\{[\s\S]*"directory"\s*:\s*"\.vitepress\/dist"/)
+})
+
+test('production workflow runs public analytics checks before build and immediately before deploy', async () => {
+  const workflow = await readFile('.github/workflows/deploy-docs.yml', 'utf8')
+  assert.equal((workflow.match(/pnpm run check:public-analytics/g) ?? []).length, 2)
+  assert.match(workflow, /Verify public analytics and relay contract before build[\s\S]*pnpm run check:public-analytics/)
+  const analyticsIndex = workflow.indexOf('name: Re-verify public analytics and relay topology immediately before deployment')
+  const reauthorizationIndex = workflow.indexOf('name: Re-assert owner approval immediately before deployment')
+  const deployIndex = workflow.indexOf('name: Deploy to production Worker')
+  assert.ok(analyticsIndex >= 0)
+  assert.ok(reauthorizationIndex > analyticsIndex)
+  assert.equal(deployIndex, reauthorizationIndex + workflow.slice(reauthorizationIndex).indexOf('name: Deploy to production Worker'))
+  assert.match(workflow.slice(reauthorizationIndex), /Re-assert owner approval immediately before deployment[\s\S]*Deploy to production Worker/)
+})
+
+test('both deploy workflow setup-node actions use the exact immutable pin', async () => {
+  const workflow = await readFile('.github/workflows/deploy-docs.yml', 'utf8')
+  assert.deepEqual(
+    [...workflow.matchAll(/uses: actions\/setup-node@([0-9a-f]+)/g)].map((match) => match[1]),
+    ['820762786026740c76f36085b0efc47a31fe5020', '820762786026740c76f36085b0efc47a31fe5020'],
+  )
+})
