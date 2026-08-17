@@ -13,7 +13,7 @@ async function fixture(contents) {
 }
 
 test('admits only an enabled artifact with the approved endpoint and taxonomy', async () => {
-  const directory = await fixture('https://plausible.silentsuite.io/api/event docs.silentsuite.io pageview Hosted App Click Android Download Click GitHub Click')
+  const directory = await fixture('"/api/event" \'/api/event\' docs.silentsuite.io pageview Hosted App Click Android Download Click GitHub Click')
   try {
     await assert.doesNotReject(() => verifyDocsAnalyticsBuild(directory, 'enabled'))
   } finally { await rm(directory, { recursive: true }) }
@@ -21,10 +21,10 @@ test('admits only an enabled artifact with the approved endpoint and taxonomy', 
 
 test('fails closed for disabled endpoint, unresolved values, wrong endpoints, and forbidden properties', async () => {
   for (const [mode, contents] of [
-    ['disabled', 'https://plausible.silentsuite.io/api/event'],
+    ['disabled', '"/api/event"'],
     ['enabled', '__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__ docs.silentsuite.io pageview'],
     ['enabled', 'https://evil.example/api/event docs.silentsuite.io pageview'],
-    ['enabled', 'https://plausible.silentsuite.io/api/event docs.silentsuite.io pageview utm_content'],
+    ['enabled', '/api/event docs.silentsuite.io pageview utm_content'],
   ]) {
     const directory = await fixture(contents)
     try { await assert.rejects(() => verifyDocsAnalyticsBuild(directory, mode)) }
@@ -35,7 +35,6 @@ test('fails closed for disabled endpoint, unresolved values, wrong endpoints, an
 test('rejects every unapproved event occurrence in enabled and disabled artifacts', async () => {
   const taxonomy = 'docs.silentsuite.io pageview Hosted App Click Android Download Click GitHub Click'
   const unapprovedOccurrences = [
-    '/api/event',
     'http://plausible.silentsuite.io/api/event',
     '//plausible.silentsuite.io/api/event',
     'https://plausible.silentsuite.io/api/event/extra',
@@ -44,6 +43,13 @@ test('rejects every unapproved event occurrence in enabled and disabled artifact
     'https://plausible.silentsuite.io.evil.example/api/event',
     'https://plausible.silentsuite.io:8443/api/event',
     'https://plausible.silentsuite.io/api/event https://evil.example/api/event',
+    'https://very-long-attacker.example.invalid/api/event',
+    '//very-long-attacker.example.invalid/api/event',
+    'https://docs.silentsuite.io/api/event',
+    'https%3A%2F%2Fvery-long-attacker.example.invalid%2Fapi%2Fevent',
+    'https://very-long-attacker.example.invalid/api/event?source=docs',
+    'https://very-long-attacker.example.invalid/api/event#fragment',
+    'https://very-long-attacker.example.invalid/api/event/extra',
     '\\x2fapi\\x2fevent',
     'https:%2F%2Fevil.example%2Fapi%2Fevent',
   ]

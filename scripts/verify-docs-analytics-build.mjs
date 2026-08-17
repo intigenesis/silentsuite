@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 
-const ENDPOINT = 'https://plausible.silentsuite.io/api/event'
+const UPSTREAM = 'plausible.silentsuite.io'
 const REQUIRED_ENABLED_TEXT = ['docs.silentsuite.io', 'pageview', 'Hosted App Click', 'Android Download Click', 'GitHub Click']
 const PROHIBITED_TEXT = ['utm_content', 'utm_term', 'referrer_category']
 
@@ -17,21 +17,10 @@ function normalizeResolvableLiteralText(text) {
   return normalized
 }
 
-function isApprovedEndpointOccurrence(text, occurrenceIndex) {
-  const eventPath = '/api/event'
-  const endpointStart = occurrenceIndex - (ENDPOINT.length - eventPath.length)
-  if (text.slice(endpointStart, occurrenceIndex + eventPath.length) !== ENDPOINT) return false
-
-  const before = text[endpointStart - 1]
-  const after = text[occurrenceIndex + eventPath.length]
-  return (before === undefined || /[\s"'`<>()\[\]{},;=:]/.test(before))
-    && (after === undefined || /[\s"'`<>()\[\]{},;]/.test(after))
-}
-
 function approvedEndpointOccurrences(text) {
-  const eventPath = '/api/event'
-  return [...text.matchAll(/https:\/\/plausible\.silentsuite\.io\/api\/event/g)]
-    .filter(({ index }) => isApprovedEndpointOccurrence(text, index + ENDPOINT.length - eventPath.length))
+  // The enabled artifact contract is a quoted string literal containing exactly the
+  // same-origin relay path. This deliberately cannot match an absolute or encoded URL.
+  return [...text.matchAll(/(["'`])\/api\/event\1/g)]
 }
 
 async function artifactText(directory) {
@@ -58,6 +47,7 @@ export async function verifyDocsAnalyticsBuild(directory, mode) {
   if (text.includes('__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__')) throw new Error('docs artifact contains unresolved analytics compile constant')
   const literalText = normalizeResolvableLiteralText(text)
   const eventOccurrences = [...literalText.matchAll(/\/api\/event/g)]
+  if (literalText.includes(UPSTREAM)) throw new Error('docs artifact contains direct upstream analytics endpoint')
   if (mode === 'disabled') {
     if (eventOccurrences.length) throw new Error('disabled docs artifact contains analytics endpoint')
     return

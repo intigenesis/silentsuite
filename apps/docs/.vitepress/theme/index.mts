@@ -2,42 +2,31 @@ import DefaultTheme from 'vitepress/theme'
 import { useRouter, type EnhanceAppContext } from 'vitepress'
 import { defineComponent, h, onMounted, onUnmounted } from 'vue'
 import AppLogoStrip from './components/AppLogoStrip.vue'
-import { buildDocsPageviewPayload, classifyDocsOutboundEvent, createDocsPageviewTracker } from './public-analytics.mts'
+import { deliverDocsAnalyticsPayload } from './analytics-transport.mts'
+import {
+  DOCS_ANALYTICS_DOMAIN,
+  DOCS_ANALYTICS_ORIGIN,
+  buildDocsPageviewPayload,
+  classifyDocsOutboundEvent,
+  createDocsPageviewTracker,
+} from './public-analytics.mts'
 import './custom.css'
 
 declare const __SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__: string
 
-function sendDocsEvent(event: ReturnType<typeof classifyDocsOutboundEvent>) {
-  if (!event) return
-  const payload = JSON.stringify({
-    domain: 'docs.silentsuite.io',
-    name: event.event,
-    url: 'https://docs.silentsuite.io/',
-    props: event.props,
-  })
-  if (navigator.sendBeacon) {
-    navigator.sendBeacon(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, new Blob([payload], { type: 'application/json' }))
-    return
-  }
-  void fetch(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: payload,
-    keepalive: true,
-  })
+function sendDocsEvent(rawHref: string, docsPath: string) {
+  deliverDocsAnalyticsPayload(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, JSON.stringify({
+    domain: DOCS_ANALYTICS_DOMAIN,
+    name: 'outbound',
+    path: docsPath,
+    href: rawHref,
+  }))
 }
 
 function sendDocsPageview(path: string, rawReferrer: string) {
   const pageview = buildDocsPageviewPayload(path, rawReferrer)
   if (!pageview) return
-  const payload = JSON.stringify(pageview)
-  if (navigator.sendBeacon) {
-    navigator.sendBeacon(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, new Blob([payload], { type: 'application/json' }))
-    return
-  }
-  void fetch(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload, keepalive: true,
-  })
+  deliverDocsAnalyticsPayload(__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__, JSON.stringify(pageview))
 }
 
 export default {
@@ -54,8 +43,10 @@ export default {
       const handleClick = (event: MouseEvent) => {
         if (!__SILENTSUITE_DOCS_ANALYTICS_ENDPOINT__ || window.location.hostname !== 'docs.silentsuite.io') return
         const anchor = event.target instanceof Element ? event.target.closest('a[href]') : null
-        const analyticsEvent = anchor ? classifyDocsOutboundEvent(anchor.getAttribute('href') ?? '', window.location.pathname) : undefined
-        sendDocsEvent(analyticsEvent)
+        if (anchor) {
+          const href = anchor.getAttribute('href') ?? ''
+          if (classifyDocsOutboundEvent(href, window.location.pathname)) sendDocsEvent(href, window.location.pathname)
+        }
       }
 
       onMounted(() => {

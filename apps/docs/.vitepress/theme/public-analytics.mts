@@ -21,23 +21,31 @@ export const REGISTERED_DOCS_PATHS = new Set([
   '/user-guide/apps/thunderbird', '/user-guide/apps/windows',
 ])
 
-export type DocsCanonicalReferrer =
-  | 'https://www.google.com/'
-  | 'https://www.bing.com/'
-  | 'https://duckduckgo.com/'
-  | 'https://search.brave.com/'
-  | 'https://www.ecosia.org/'
-  | 'https://x.com/'
-  | 'https://www.reddit.com/'
-  | 'https://github.com/'
-  | 'https://mastodon.social/'
-  | 'https://bsky.app/'
-  | 'https://alternativeto.net/'
-  | 'https://www.privacyguides.org/'
-  | 'https://news.ycombinator.com/'
+export const DOCS_ANALYTICS_DOMAIN = 'docs.silentsuite.io'
+export const DOCS_ANALYTICS_ORIGIN = `https://${DOCS_ANALYTICS_DOMAIN}` as const
+
+// Closed referrer vocabulary. Plausible's source list still recognizes twitter.com/t.co
+// rather than x.com, so every X-family host collapses onto the twitter.com origin.
+export const DOCS_CANONICAL_REFERRERS = [
+  'https://www.google.com/',
+  'https://www.bing.com/',
+  'https://duckduckgo.com/',
+  'https://search.brave.com/',
+  'https://www.ecosia.org/',
+  'https://twitter.com/',
+  'https://www.reddit.com/',
+  'https://github.com/',
+  'https://mastodon.social/',
+  'https://bsky.app/',
+  'https://alternativeto.net/',
+  'https://www.privacyguides.org/',
+  'https://news.ycombinator.com/',
+] as const
+
+export type DocsCanonicalReferrer = (typeof DOCS_CANONICAL_REFERRERS)[number]
 
 export type DocsPageviewPayload = {
-  domain: 'docs.silentsuite.io'
+  domain: typeof DOCS_ANALYTICS_DOMAIN
   name: 'pageview'
   url: string
   referrer?: DocsCanonicalReferrer
@@ -94,7 +102,7 @@ export function canonicalizeDocsReferrer(raw: string): DocsCanonicalReferrer | u
     if (hostMatches(host, 'duckduckgo.com')) return 'https://duckduckgo.com/'
     if (hostMatches(host, 'search.brave.com')) return 'https://search.brave.com/'
     if (hostMatches(host, 'ecosia.org')) return 'https://www.ecosia.org/'
-    if (hostMatches(host, 'x.com') || hostMatches(host, 'twitter.com') || host === 't.co') return 'https://x.com/'
+    if (hostMatches(host, 'x.com') || hostMatches(host, 'twitter.com') || host === 't.co') return 'https://twitter.com/'
     if (hostMatches(host, 'reddit.com') || host === 'redd.it') return 'https://www.reddit.com/'
     if (hostMatches(host, 'github.com')) return 'https://github.com/'
     if (host === 'mastodon.social') return 'https://mastodon.social/'
@@ -118,9 +126,9 @@ export function buildDocsPageviewPayload(rawPath: string, rawReferrer: string): 
   if (!path) return undefined
   const referrer = canonicalizeDocsReferrer(rawReferrer)
   return {
-    domain: 'docs.silentsuite.io',
+    domain: DOCS_ANALYTICS_DOMAIN,
     name: 'pageview',
-    url: `https://docs.silentsuite.io${path}`,
+    url: `${DOCS_ANALYTICS_ORIGIN}${path}`,
     ...(referrer ? { referrer } : {}),
   }
 }
@@ -168,6 +176,13 @@ const ANDROID_DESTINATIONS: Readonly<Record<string, DocsOutboundEvent>> = {
     props: { surface: 'docs_android', channel: 'repository' },
   },
 }
+
+// Closed outbound event vocabulary. The relay rebuilds admitted events from these exact
+// signatures, so a browser can never widen the event name or property set.
+export const DOCS_OUTBOUND_EVENT_SIGNATURES: readonly DocsOutboundEvent[] = [
+  ...Object.values(APPROVED_DESTINATIONS),
+  ...Object.values(ANDROID_DESTINATIONS),
+]
 
 const HOSTED_APP_ROUTES = new Set([
   '/user-guide/getting-started',
