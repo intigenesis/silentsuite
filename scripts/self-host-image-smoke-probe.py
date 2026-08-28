@@ -65,7 +65,8 @@ def request(base: str, method: str, path: str, *, headers=None, body=None, timeo
         connection.request(method, path, body=body, headers=dict(headers or {}))
         response = connection.getresponse()
         payload = response.read()
-        return response.status, dict(response.getheaders()), payload
+        headers = {name.lower(): value for name, value in response.getheaders()}
+        return response.status, headers, payload
     finally:
         connection.close()
 
@@ -156,8 +157,8 @@ def check_trusted(base: str, token: str) -> None:
     status, headers, _ = request(base, "GET", "/")
     if status != 301:
         fail(f"trusted proxy: plain http without a forwarded scheme must redirect, got {status}")
-    if not headers.get("Location", "").startswith("https://"):
-        fail(f"trusted proxy: redirect target must be https, got {headers.get('Location')!r}")
+    if not headers.get("location", "").startswith("https://"):
+        fail(f"trusted proxy: redirect target must be https, got {headers.get('location')!r}")
 
     status, _, _ = request(base, "GET", "/admin/", headers={"X-Forwarded-Proto": "https"})
     if status != 404:
@@ -196,8 +197,8 @@ def check_untrusted(base: str) -> None:
             "trusted proxy: a forwarded scheme from an untrusted source must be ignored "
             f"(expected the plain-http redirect, got {status})"
         )
-    if not headers.get("Location", "").startswith("https://"):
-        fail(f"trusted proxy: redirect target must be https, got {headers.get('Location')!r}")
+    if not headers.get("location", "").startswith("https://"):
+        fail(f"trusted proxy: redirect target must be https, got {headers.get('location')!r}")
     print("untrusted forwarded identity correctly ignored")
 
 
