@@ -125,8 +125,10 @@ verified managed files.
 
 ## Manual Setup
 
-> `install.sh --version vX.Y.Z --stage-only ./staged` performs every check below
-> and writes the verified files out without installing or starting anything.
+> `install.sh --version vX.Y.Z --stage-only ./staged` performs the release-tag,
+> manifest, bundle, checksum, and archive checks, but not live registry image
+> verification. It writes the verified files out without installing or starting
+> anything.
 > Prefer it unless you specifically want to do this by hand.
 
 1. **Download and verify the release bundle** (replace `vX.Y.Z` with the release
@@ -358,9 +360,9 @@ Re-running `install.sh` is **not** the upgrade path. It refuses to touch an
 existing installation, because regenerating credentials and restarting a stack
 without backing up your database is not a safe upgrade.
 
-An unattended version-aware updater — one that schedules this work, backs up and
-restores state automatically, and recovers a failed migration — is separate,
-later work. It is not part of this release.
+There is no unattended scheduler for this work. The checked helper below is
+still deliberately operator-invoked, but it creates the durable cohort backup
+and performs bounded failure recovery around the migration.
 
 Until it ships, upgrade deliberately:
 
@@ -373,10 +375,12 @@ Until it ships, upgrade deliberately:
    cd silentsuite-server
    bash ./install.sh --version vX.Y.Z --stage-only "./silentsuite-vX.Y.Z"
    ```
-   Stage-only verifies the separately published manifest against the manifest
-   embedded in the checksummed bundle and verifies the registry image identity.
-   It retains the checksummed archive beside its extracted files so the upgrade
-   helper can repeat the archive checks after staging.
+   Stage-only verifies the release tag, manifest, checksum, and archive, but it
+   does not verify the live registry image. `upgrade.sh` performs the live pull,
+   platform, revision-label, and `RepoDigest` checks against the staged image
+   identity before mutating the installation. It retains the checksummed archive
+   beside its extracted files so the upgrade helper can repeat the archive checks
+   after staging.
 3. **Run the checked manual upgrade helper**:
    ```bash
    bash "./silentsuite-vX.Y.Z/upgrade.sh" \
@@ -397,14 +401,36 @@ Until it ships, upgrade deliberately:
    copied or recreated. The installed manifest and checksum must match the
    verified release identity or the helper stops.
 
-   The helper applies migrations only after that admission, then recreates the
-   stack and runs `verify.sh`. It is a deliberate, operator-invoked upgrade;
-   there is no unattended upgrade path.
+   Before replacing any managed file or `.env`, the helper creates a durable,
+   collision-safe snapshot under `.silentsuite-upgrade-backups/`. The snapshot
+   contains the previous `.env`, every existing managed file, the previous
+   manifest, every existing regular release checksum sidecar, non-secret
+   identity metadata naming the target and prior sidecars, and an exact restore
+   helper. Matching symlink or non-regular sidecars, like other managed
+   destinations, are rejected before backup or mutation. A successful upgrade
+   may retain both the prior and target sidecars. Do not delete this snapshot
+   until the upgrade is known to be healthy and the normal database backup is
+   safely retained.
 
-If the new version does not come up, put the previous digest back in
-`SILENTSUITE_SERVER_IMAGE` and run `docker compose up -d`. Note that rolling the
-image back does **not** roll back database migrations; recovering from a failed
-migration needs the database backup from step 1.
+   After admission and the snapshot, the helper replaces the new cohort, stops
+   only the `server` service (PostgreSQL remains running), applies migrations
+   with the admitted image, recreates only `server`, and runs `verify.sh`.
+   It is a deliberate, operator-invoked upgrade; there is no unattended upgrade
+   path.
+
+If anything fails before migrations begin, the helper restores the previous
+cohort automatically—including all backed-up prior sidecars—and leaves the
+previously running server untouched (or restarts and verifies it if stopping had
+already been requested). If the target sidecar was absent from the prior cohort,
+rollback removes only that newly installed target sidecar. If migration
+has begun, the helper restores the previous image and managed-file cohort where
+safe and attempts to restart and verify it, but migrations remain forward-applied
+and may require restoring the database backup. The helper reports whether that
+restart was actually verified; it never claims a full rollback. If automatic
+recovery cannot be confirmed, use the exact `restore-previous-cohort.sh` command
+printed by the helper from the durable backup directory, then recreate `server`
+and run `./verify.sh`. Restore the cohort and image together—do not perform a
+digest-only rollback against a newer managed-file cohort.
 
 ## Health Checks
 

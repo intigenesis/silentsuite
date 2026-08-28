@@ -23,8 +23,8 @@ fi
 #
 # Re-running install.sh is NOT the upgrade path — it refuses to touch an
 # existing installation. Use upgrade.sh with a verified stage for a deliberate
-# version change. Automated backup/recovery around migrations remains separate
-# work; this script only restarts the pinned version.
+# version change and its cohort backup/recovery; this script only restarts the
+# pinned version.
 echo "Pulling pinned images..."
 $COMPOSE pull
 

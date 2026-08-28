@@ -6,10 +6,10 @@ set -euo pipefail
 #
 # Contracts enforced:
 #   * the release tag resolves to an OCI image index;
-#   * the index exposes exactly one runnable linux/amd64 and one runnable
+#   * the index exposes exactly two descriptors: one linux/amd64 and one
 #     linux/arm64 child, with the expected child digests;
-#   * attestation manifests are classified separately and never counted as
-#     runnable platforms;
+#   * provenance is outside the registry index, so no attestation descriptor
+#     (especially one with a concrete runnable platform) is admitted;
 #   * every runnable child carries org.opencontainers.image.revision equal to
 #     the exact release commit, and reports the matching os/architecture;
 #   * the immutable version reference and the exact-commit reference both
@@ -203,15 +203,35 @@ verify_index_reference() {
     exit 1
   fi
 
-  # Runnable children are image manifests with a concrete linux platform.
-  # Attestation manifests are classified separately and never satisfy a platform.
+  local descriptor_count
+  descriptor_count="$(jq -r '(.manifests // []) | length' "$WORKDIR/index.json")"
+  if [ "$descriptor_count" != "2" ]; then
+    echo "ERROR: release index must contain exactly two descriptors (linux/amd64 and linux/arm64); found ${descriptor_count}" >&2
+    exit 1
+  fi
+
+  # Provenance is deliberately published outside this index. An annotation is
+  # not a security boundary: a concrete-platform attestation descriptor can be
+  # selected by a normal OCI resolver. Reject the annotation before comparing
+  # the two allowed child descriptors.
+  local attestation_descriptors
+  attestation_descriptors="$(jq -r '
+    [ .manifests[]
+      | select((.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest")
+      | "\(.platform.os // "unknown")/\(.platform.architecture // "unknown") \(.digest // "<missing-digest>")"
+    ] | .[]
+  ' "$WORKDIR/index.json")"
+  if [ -n "$attestation_descriptors" ]; then
+    echo "ERROR: release index contains an attestation-manifest descriptor; provenance must remain outside the release index" >&2
+    printf '%s\n' "$attestation_descriptors" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
   jq -r '
     [ .manifests[]
-      | select((.platform.os // "unknown") != "unknown")
-      | select((.platform.architecture // "unknown") != "unknown")
-      | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
-      | "\(.platform.os)/\(.platform.architecture) \(.digest)"
-    ] | sort | .[]
+      | {os: (.platform.os // ""), architecture: (.platform.architecture // ""), digest: (.digest // "")}
+    ] | sort_by([.os, .architecture]) | .[]
+    | "\(.os)/\(.architecture) \(.digest)"
   ' "$WORKDIR/index.json" > "$WORKDIR/runnable.txt"
 
   # A surprise CPU variant would silently change what an operator runs, so only
@@ -230,21 +250,8 @@ verify_index_reference() {
     exit 1
   fi
 
-  jq -r '
-    [ .manifests[]
-      | select(((.platform.os // "unknown") == "unknown")
-               or ((.platform.architecture // "unknown") == "unknown")
-               or ((.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest"))
-      | "\(.digest) \(.annotations["vnd.docker.reference.type"] // "unclassified")"
-    ] | .[]
-  ' "$WORKDIR/index.json" > "$WORKDIR/attestations.txt"
-
   echo "runnable children:"
   sed 's/^/  /' "$WORKDIR/runnable.txt"
-  if [ -s "$WORKDIR/attestations.txt" ]; then
-    echo "non-runnable (attestation) manifests:"
-    sed 's/^/  /' "$WORKDIR/attestations.txt"
-  fi
 
   local expected_runnable
   expected_runnable="$(printf 'linux/amd64 %s\nlinux/arm64 %s\n' "$AMD64_DIGEST" "$ARM64_DIGEST" | LC_ALL=C sort)"

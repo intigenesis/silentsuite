@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 UPGRADE = ROOT / "self-host" / "upgrade.sh"
 TAG = "v10.0.0-beta"
+OLD_TAG = "v9.9.9"
 COMMIT = "b" * 40
 INDEX_DIGEST = "sha256:" + "4" * 64
 AMD64_DIGEST = "sha256:" + "5" * 64
@@ -22,6 +23,8 @@ ARM64_DIGEST = "sha256:" + "6" * 64
 TARGET_IMAGE = f"ghcr.io/silent-suite/silentsuite-server@{INDEX_DIGEST}"
 BUNDLE_NAME = f"silentsuite-self-host-{TAG}.tar.gz"
 BUNDLE_PREFIX = f"silentsuite-self-host-{TAG}"
+OLD_CHECKSUM_NAME = f"silentsuite-self-host-{OLD_TAG}.tar.gz.sha256"
+OLD_BUNDLE_NAME = f"silentsuite-self-host-{OLD_TAG}.tar.gz"
 
 MANAGED_FILES = (
     ".env.example",
@@ -127,13 +130,38 @@ def upgrade_workspace(tmp_path: Path):
     (install / "etebase-server.ini").write_bytes(b"operator ini\x00\xff\n")
     (install / "docker-compose.override.yml").write_bytes(b"operator override\n")
     (install / "operator-data.txt").write_bytes(b"operator data\x00\xff\n")
+    (install / "server-image.json").write_bytes(b"previous manifest bytes\n")
+    (install / OLD_CHECKSUM_NAME).write_text(
+        f"{'a' * 64}  {OLD_BUNDLE_NAME}\n", encoding="utf-8"
+    )
 
     docker_stub = f"""#!/usr/bin/env bash
+if [ "$1" = compose ]; then
+  case "$*" in
+    *"stop server"*)
+      if [ -d "${{UPGRADE_INSTALL_DIR:-}}/.silentsuite-upgrade-backups" ]; then
+        printf '%s\\n' 'backup-present-at-stop' >> "$UPGRADE_LOG"
+      fi
+      ;;
+  esac
+fi
 printf '%s\\n' "$*" >> "$UPGRADE_LOG"
 case "$1" in
   compose)
     case "$*" in
       *"config --images"*) printf '%s\\n' '{TARGET_IMAGE}' 'postgres:16.9-alpine' ;;
+      *"pull server"*)
+        if [ "${{FAIL_COMPOSE_PULL:-0}}" = 1 ]; then exit 41; fi
+        ;;
+      *"run --rm --no-deps"*)
+        if [ "${{FAIL_MIGRATE:-0}}" = 1 ]; then exit 42; fi
+        ;;
+      *"up -d"*)
+        if [ "${{FAIL_FIRST_UP:-0}}" = 1 ] && [ ! -e "${{FAIL_FIRST_UP_MARKER:-}}" ]; then
+          touch "$FAIL_FIRST_UP_MARKER"
+          exit 43
+        fi
+        ;;
       *) exit 0 ;;
     esac
     ;;
@@ -166,10 +194,17 @@ def test_upgrade_advances_managed_files_and_preserves_operator_files(upgrade_wor
     tmp_path, install, staged, bin_dir = upgrade_workspace
     log = tmp_path / "docker.log"
     environment = dict(os.environ)
-    environment.update({"PATH": f"{bin_dir}:{environment['PATH']}", "UPGRADE_LOG": str(log)})
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "UPGRADE_LOG": str(log),
+            "UPGRADE_INSTALL_DIR": str(install),
+        }
+    )
 
     before_operator = {name: (install / name).read_bytes() for name in OPERATOR_FILES}
     before_env = (install / ".env").read_text(encoding="utf-8")
+    assert not (install / f"{BUNDLE_NAME}.sha256").exists()
 
     result = subprocess.run(
         ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
@@ -189,13 +224,31 @@ def test_upgrade_advances_managed_files_and_preserves_operator_files(upgrade_wor
     )
     assert (install / ".env").read_text(encoding="utf-8") == expected_env
     assert f"SILENTSUITE_SERVER_IMAGE={TARGET_IMAGE}" in (install / ".env").read_text()
+    assert "operator-password" not in result.stdout + result.stderr
+
+    backup_line = next(line for line in result.stdout.splitlines() if line.startswith("Durable previous cohort backup: "))
+    backup = Path(backup_line.split(": ", 1)[1])
+    assert backup.parent == install / ".silentsuite-upgrade-backups"
+    assert (backup / "files" / ".env").read_text(encoding="utf-8") == before_env
+    assert (backup / "files" / "server-image.json").read_bytes() == b"previous manifest bytes\n"
+    assert (install / OLD_CHECKSUM_NAME).read_text(encoding="utf-8").startswith("a" * 64)
+    assert (install / f"{BUNDLE_NAME}.sha256").is_file()
+    assert (backup / "files" / OLD_CHECKSUM_NAME).read_text(encoding="utf-8").startswith("a" * 64)
+    metadata = (backup / "metadata").read_text(encoding="utf-8")
+    assert "previousImage=ghcr.io/silent-suite/silentsuite-server@sha256:" + "0" * 64 in metadata
+    assert f"targetChecksumName={BUNDLE_NAME}.sha256" in metadata
+    assert f"previousChecksumName={OLD_CHECKSUM_NAME}" in metadata
+    assert (backup / "restore-previous-cohort.sh").stat().st_mode & 0o111
 
     commands = log.read_text(encoding="utf-8").splitlines()
     admission = next(index for index, command in enumerate(commands) if "config --images" in command)
     pull = next(index for index, command in enumerate(commands) if command.startswith("pull"))
+    backup_at_stop = commands.index("backup-present-at-stop")
+    stop = next(index for index, command in enumerate(commands) if "stop server" in command)
     migrate = next(index for index, command in enumerate(commands) if "run --rm --no-deps" in command)
     restart = next(index for index, command in enumerate(commands) if " up -d" in command)
-    assert admission < pull < migrate < restart
+    assert admission < pull < backup_at_stop < stop < migrate < restart
+    assert not any("stop" in command and "postgres" in command for command in commands)
 
 
 @pytest.mark.parametrize("tamper", ["staged", "archive"])
@@ -229,4 +282,162 @@ def test_upgrade_rejects_tampering_before_operator_state_mutation(upgrade_worksp
     assert "checksum" in result.stderr or "differs from the verified archive" in result.stderr
     assert {path.name: path.read_bytes() for path in install.iterdir() if path.is_file()} == before_install
     assert {name: (install / name).read_bytes() for name in OPERATOR_FILES} == before_operator
+    assert not log.exists()
+
+
+def test_pre_migration_failure_restores_the_previous_cohort_without_stopping_server(upgrade_workspace):
+    tmp_path, install, staged, bin_dir = upgrade_workspace
+    old_managed = b"previous managed cohort\n"
+    (install / "SELF-HOSTING.md").write_bytes(old_managed)
+    old_env = (install / ".env").read_bytes()
+    log = tmp_path / "docker.log"
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "UPGRADE_LOG": str(log),
+            "UPGRADE_INSTALL_DIR": str(install),
+            "FAIL_COMPOSE_PULL": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert (install / "SELF-HOSTING.md").read_bytes() == old_managed
+    assert (install / ".env").read_bytes() == old_env
+    assert (install / "server-image.json").read_bytes() == b"previous manifest bytes\n"
+    assert (install / OLD_CHECKSUM_NAME).read_text(encoding="utf-8").startswith("a" * 64)
+    assert not (install / f"{BUNDLE_NAME}.sha256").exists()
+    commands = log.read_text(encoding="utf-8").splitlines()
+    assert any("pull server" in command for command in commands)
+    assert not any("stop server" in command for command in commands)
+    assert "previous cohort restored" in result.stderr
+    assert "operator-password" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("failure_env", [{"FAIL_MIGRATE": "1"}, {"FAIL_FIRST_UP": "1"}])
+def test_post_migration_failure_restores_previous_cohort_and_truthfully_reports_database_state(
+    upgrade_workspace, failure_env
+):
+    tmp_path, install, staged, bin_dir = upgrade_workspace
+    old_env = (install / ".env").read_bytes()
+    log = tmp_path / "docker.log"
+    marker = tmp_path / "first-up.failed"
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "UPGRADE_LOG": str(log),
+            "UPGRADE_INSTALL_DIR": str(install),
+            "FAIL_FIRST_UP_MARKER": str(marker),
+            **failure_env,
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert (install / ".env").read_bytes() == old_env
+    assert "Django migrations remain forward-applied" in result.stderr
+    assert "previous image/cohort restored and its service is healthy" in result.stderr
+    assert "operator-password" not in result.stdout + result.stderr
+    commands = log.read_text(encoding="utf-8").splitlines()
+    stop = next(index for index, command in enumerate(commands) if "stop server" in command)
+    migrate = next(index for index, command in enumerate(commands) if "run --rm --no-deps" in command)
+    assert stop < migrate
+    assert any(index > migrate and "up -d" in command for index, command in enumerate(commands))
+
+
+def test_same_version_retry_restores_existing_target_sidecar(upgrade_workspace):
+    tmp_path, install, staged, bin_dir = upgrade_workspace
+    target_checksum = install / f"{BUNDLE_NAME}.sha256"
+    target_checksum.write_bytes(b"previous target checksum bytes\n")
+    log = tmp_path / "docker.log"
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "UPGRADE_LOG": str(log),
+            "UPGRADE_INSTALL_DIR": str(install),
+            "FAIL_COMPOSE_PULL": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert target_checksum.read_bytes() == b"previous target checksum bytes\n"
+    assert (install / OLD_CHECKSUM_NAME).is_file()
+    backup_line = next(line for line in result.stdout.splitlines() if line.startswith("Durable previous cohort backup: "))
+    backup = Path(backup_line.split(": ", 1)[1])
+    assert (backup / "files" / OLD_CHECKSUM_NAME).is_file()
+    assert (backup / "files" / target_checksum.name).read_bytes() == b"previous target checksum bytes\n"
+
+
+def test_symlinked_managed_destination_is_rejected_without_touching_its_referent(upgrade_workspace):
+    tmp_path, install, staged, bin_dir = upgrade_workspace
+    outside = tmp_path / "outside-managed-file"
+    outside.write_bytes(b"must remain unchanged\n")
+    (install / "docker-compose.yml").unlink()
+    (install / "docker-compose.yml").symlink_to(outside)
+    log = tmp_path / "docker.log"
+    environment = dict(os.environ)
+    environment.update({"PATH": f"{bin_dir}:{environment['PATH']}", "UPGRADE_LOG": str(log)})
+
+    result = subprocess.run(
+        ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "symlink" in result.stderr
+    assert outside.read_bytes() == b"must remain unchanged\n"
+    assert not (install / ".silentsuite-upgrade-backups").exists()
+    assert not log.exists()
+
+
+def test_symlinked_release_checksum_sidecar_is_rejected_without_touching_its_referent(upgrade_workspace):
+    tmp_path, install, staged, bin_dir = upgrade_workspace
+    outside = tmp_path / "outside-checksum"
+    outside.write_bytes(b"must remain unchanged\n")
+    (install / OLD_CHECKSUM_NAME).unlink()
+    (install / OLD_CHECKSUM_NAME).symlink_to(outside)
+    log = tmp_path / "docker.log"
+    environment = dict(os.environ)
+    environment.update({"PATH": f"{bin_dir}:{environment['PATH']}", "UPGRADE_LOG": str(log)})
+
+    result = subprocess.run(
+        ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "checksum sidecar" in result.stderr
+    assert outside.read_bytes() == b"must remain unchanged\n"
+    assert not (install / ".silentsuite-upgrade-backups").exists()
     assert not log.exists()
