@@ -381,6 +381,7 @@ Until it ships, upgrade deliberately:
    value in `.env` as it is — those are your credentials.
 5. **Confirm the effective image, apply migrations, then restart**:
    ```bash
+   set -euo pipefail
    target_image="$(sed -n 's/^SILENTSUITE_SERVER_IMAGE=//p' .env)"
    test -n "$target_image"
    docker compose config --images | grep -Fx "$target_image"

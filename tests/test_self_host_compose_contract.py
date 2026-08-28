@@ -21,6 +21,7 @@ COMPOSE = SELF_HOST / "docker-compose.yml"
 INSTALLER = SELF_HOST / "install.sh"
 ENV_EXAMPLE = SELF_HOST / ".env.example"
 EFFECTIVE_CHECK = ROOT / "scripts" / "self-host-compose-effective-check.sh"
+SELF_HOSTING = SELF_HOST / "SELF-HOSTING.md"
 
 MANAGED_IMAGE = "${SILENTSUITE_SERVER_IMAGE:?Set by the verified SilentSuite installer or updater}"
 IMAGE_REPOSITORY = "ghcr.io/silent-suite/silentsuite-server"
@@ -237,3 +238,11 @@ def test_effective_config_check_uses_only_placeholder_values():
     source = EFFECTIVE_CHECK.read_text(encoding="utf-8")
     assert "placeholder-value-not-a-secret" in source
     assert "sha256:" + "0" * 64 in source
+
+
+def test_manual_upgrade_stops_before_mutation_when_image_admission_fails():
+    guide = SELF_HOSTING.read_text(encoding="utf-8")
+    block = guide.split("5. **Confirm the effective image", 1)[1].split("```", 2)[1]
+    assert "set -euo pipefail" in block
+    assert block.index("set -euo pipefail") < block.index("docker compose config --images")
+    assert block.index("docker compose config --images") < block.index("docker compose pull")
