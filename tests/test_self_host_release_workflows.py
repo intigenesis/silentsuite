@@ -580,9 +580,32 @@ def test_queue_max_is_never_paired_with_cancellation(path, job_name, attach_step
             assert declaration.get("cancel-in-progress") == "false"
 
 
+# Android runs its gate in a separate read-only prerequisite job so the
+# network-capable helper never executes beside the decoded keystore. The lane is
+# still gated — build-release cannot start until that job succeeds — the gate
+# just is not one of its steps.
+GATE_JOBS = {"build-android.yml": "release-immutability"}
+
+
 @pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
 def test_no_asset_is_attached_before_immutability_is_proven(path, job_name, attach_step):
-    job = load(path)["jobs"][job_name]
+    workflow = load(path)
+    job = workflow["jobs"][job_name]
+    gate_job = GATE_JOBS.get(path.name)
+
+    if gate_job is not None:
+        needs = job["needs"]
+        assert gate_job in ([needs] if isinstance(needs, str) else needs), (
+            f"{path.name}:{job_name} can attach without the immutability gate"
+        )
+        gate = workflow["jobs"][gate_job]
+        assert step_named(gate, GUARD_STEP)["run"].strip() == EXPECTED_GUARD_RUN[path.name]
+        assert GUARD_STEP not in step_names(job), (
+            "the gate must not also run beside signing material"
+        )
+        assert attach_step in step_names(job)
+        return
+
     names = step_names(job)
     assert GUARD_STEP in names, f"{path.name}:{job_name} has no immutability gate"
     guard_index = names.index(GUARD_STEP)
@@ -626,7 +649,8 @@ def test_no_lane_authenticates_the_settings_read_with_the_workflow_token():
     """
 
     for path, job_name, _ in ATTACHMENT_JOBS:
-        job = load(path)["jobs"][job_name]
+        workflow = load(path)
+        job = workflow["jobs"][GATE_JOBS.get(path.name, job_name)]
         assert "GITHUB_TOKEN" not in step_named(job, GUARD_STEP)["env"], path.name
     admit_gate = step_named(RELEASE["jobs"]["admit"], GUARD_STEP)
     assert "GITHUB_TOKEN" not in admit_gate["env"]
@@ -687,3 +711,22 @@ def test_production_deploy_remains_the_only_lane_running_in_its_environment():
             if job.get("environment") == "server-production":
                 owners.append(f"{path.name}:{job_name}")
     assert owners == ["deploy-server.yml:build-and-push", "deploy-server.yml:deploy"]
+
+
+def test_the_android_gate_job_is_isolated_from_signing_material():
+    """Cross-checked here as well as in the Android signing policy.
+
+    The gate runs a network-capable helper; the point of the separate job is
+    that it has no signing secrets, no release environment, and no write scope
+    to reach with them.
+    """
+
+    gate = load(ANDROID_WORKFLOW)["jobs"]["release-immutability"]
+    assert gate["permissions"] == {"contents": "read"}
+    assert "environment" not in gate
+    assert "ANDROID_" not in str(gate), "no Android signing secret may appear in the gate job"
+    checkout = step_named(gate, "Checkout release policy source")
+    assert checkout["with"]["persist-credentials"] == "false"
+    assert step_named(gate, GUARD_STEP)["env"] == {
+        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
+    }

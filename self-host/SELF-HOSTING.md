@@ -30,7 +30,7 @@ You provide your own reverse proxy (Caddy, nginx, Traefik, Cloudflare Tunnel) to
 | Service | Image | Role |
 |---------|-------|------|
 | **SilentSuite Server** | `ghcr.io/silent-suite/silentsuite-server`, pinned to the immutable OCI index digest of the release you installed | Sync server (Etebase protocol). All data is E2E encrypted. |
-| **PostgreSQL** | `postgres:16.9-alpine` | Database for encrypted sync data and user accounts. |
+| **PostgreSQL** | `postgres`, pinned to the immutable OCI index digest of 16.9-alpine | Database for encrypted sync data and user accounts. |
 
 ## Prerequisites
 
@@ -66,11 +66,17 @@ replaced after publication. The installer requires that of the release it
 selects: a checksum published beside the bundle it authenticates only proves
 something if neither can be rewritten afterwards.
 
-`docker-compose.yml` contains no image digest. It reads
+`docker-compose.yml` contains no *server* image digest. It reads
 `SILENTSUITE_SERVER_IMAGE` from `.env`, which the installer writes as
 `ghcr.io/silent-suite/silentsuite-server@sha256:<index digest>` only after every
 check above has passed. A mutable `:version` tag is used to *find* a release,
 never to decide what runs.
+
+PostgreSQL is different: it is fixed source data rather than release data, so its
+immutable index digest is written directly in the bundled `docker-compose.yml`
+and travels inside the checksummed bundle. Neither container is ever started
+from a mutable tag, and the installer refuses a bundle whose Compose file
+unpins the database.
 
 ## Quick Start
 

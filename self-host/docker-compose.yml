@@ -1,6 +1,16 @@
 services:
   postgres:
-    image: postgres:16.9-alpine
+    # PostgreSQL 16.9-alpine, pinned to its immutable multi-platform OCI index
+    # digest rather than the tag. The tag is how the image was found once; the
+    # digest is what runs. This container holds the database password and every
+    # account and sync row, so "restart the version you have" has to mean the
+    # same bytes — a republished or compromised tag must not be able to change
+    # them under an unchanged SilentSuite release.
+    #
+    # Source: docker.io/library/postgres:16.9-alpine
+    #   linux/amd64    sha256:b441677c946de564fe88ae4245ba80fe84a69485b22bf560e9c7c3710cd5e21d
+    #   linux/arm64/v8 sha256:a833a42d2f60170d90d8fb46b99e80f29b083a173c85ffd1e7e366730dc5529c
+    image: postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7
     container_name: silentsuite-postgres
     restart: unless-stopped
     expose:

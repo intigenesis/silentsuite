@@ -94,11 +94,15 @@ EXPECTED_RELEASE_CONCURRENCY: dict[str, Any] = {
     "queue": "max",
 }
 
-# The release-immutability gate. It holds a credential, so it is reviewed to the
-# same standard as the signing steps: exact name, exact command, exact
-# environment, closed key set. Its secret is a repository Administration:read
-# token — deliberately not an Android signing secret, and the boundary below
-# still refuses to see any signing secret anywhere near it.
+# The release-immutability gate, which lives in its own job on purpose.
+#
+# It runs a network-capable helper. Inside the signed release job that helper
+# would execute alongside the decoded keystore, the plaintext bundletool
+# password file, and a persisted contents:write credential — reachable without
+# ever naming a signing secret in an `env:`. Isolating it into a read-only job
+# with a non-persisting checkout removes that reach, so the whole job is
+# reviewed here as an exact literal and the helper's bytes are pinned.
+IMMUTABILITY_JOB = "release-immutability"
 IMMUTABLE_GUARD_STEP_NAME = "Require immutable published releases"
 IMMUTABLE_GUARD_STEP_RUN = 'bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"'
 IMMUTABLE_GUARD_STEP_ENV: dict[str, str] = {
@@ -110,6 +114,28 @@ EXPECTED_IMMUTABLE_GUARD_STEP: dict[str, Any] = {
     "run": IMMUTABLE_GUARD_STEP_RUN,
 }
 ALLOWED_IMMUTABLE_GUARD_STEP_KEYS = set(EXPECTED_IMMUTABLE_GUARD_STEP)
+EXPECTED_IMMUTABILITY_JOB: dict[str, Any] = {
+    "name": "Require immutable published releases",
+    "if": TAG_GUARD,
+    "runs-on": "ubuntu-latest",
+    "permissions": {"contents": "read"},
+    "steps": [
+        {
+            "name": "Checkout release policy source",
+            "uses": CHECKOUT_ACTION,
+            "with": {"clean": "true", "persist-credentials": "false"},
+        },
+        EXPECTED_IMMUTABLE_GUARD_STEP,
+    ],
+}
+ALLOWED_IMMUTABILITY_JOB_KEYS = set(EXPECTED_IMMUTABILITY_JOB)
+
+# The helper the gate executes. Hashing the step is not enough: the step text is
+# stable while the file it runs is what actually reaches the network.
+IMMUTABLE_GUARD_HELPER = Path("scripts/require-immutable-releases.sh")
+EXPECTED_IMMUTABLE_GUARD_HELPER_SHA256 = (
+    "3931553362434d6f393606c9a0fb5bbc0acd09658dca3c317b663d8b8370045b"
+)
 
 EXPECTED_SECRET_STEP_SHA256 = {
     "Decode release keystore": "44c1231395b5f7347980a05fa641b0e7d866451e10ddb88958e61459f649ffba",
@@ -118,19 +144,25 @@ EXPECTED_SECRET_STEP_SHA256 = {
         "69ded7eab4c4ff48deff2da950aacf8e627da05373ffa507f358fbcc986a7a6a"
     ),
 }
-REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
-    **EXPECTED_RELEASE_STEP_ENVIRONMENTS,
-    IMMUTABLE_GUARD_STEP_NAME: IMMUTABLE_GUARD_STEP_ENV,
-}
+# The gate moved out of the release job, so signing steps are once again the
+# only steps there permitted to carry an environment.
+REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = dict(
+    EXPECTED_RELEASE_STEP_ENVIRONMENTS
+)
 # sha256 of EXPECTED_IMMUTABLE_GUARD_STEP under semantic_sha256, recomputed
 # from the reviewed literal above rather than from whatever the file holds.
 EXPECTED_IMMUTABLE_GUARD_STEP_SHA256 = (
     "739d2df546032005051095e891d4881b149c2938f0cc2e1410100c7312ccfa80"
 )
+# sha256 of EXPECTED_IMMUTABILITY_JOB under semantic_sha256, computed from the
+# reviewed literal above rather than from whatever the workflow currently holds.
+EXPECTED_IMMUTABILITY_JOB_SHA256 = (
+    "e0e55f1ee2eae73b3738bca2dbe33a3cd34f11662607ceeba65f5cb6891f54b0"
+)
 # Covers the whole reviewed job, concurrency included: the explicit literal
 # check above states the intent, this digest makes any other edit to the job
 # fail closed as well.
-EXPECTED_RELEASE_JOB_SHA256 = "c0b9fa3472f17bbe22660b02f1957d796800c4eec8327c6f6d9c6060f6a6b5d1"
+EXPECTED_RELEASE_JOB_SHA256 = "a1960a6f679fe9839c79f6657b0784dfe25c1a89ec3e1b0fc9ceef7126287660"
 EXPECTED_CONSCRYPT_JOB_SHA256 = "ed27963320252615ff159bbc388c858fdc872516fc0ea2aa5f50d905f4a5063b"
 EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256 = (
     "0ee234f2ced343c4167bd1efad134a77853f288eb9c5210c1e1173594a014b8b"
@@ -386,6 +418,50 @@ def check(root: Path) -> list[str]:
     elif hashlib.sha256(conscrypt_script.read_bytes()).hexdigest() != EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256:
         violations.append(f"{CONSCRYPT_BUILD_SCRIPT} must match its exact reviewed digest")
 
+    guard_helper = root / IMMUTABLE_GUARD_HELPER
+    if not guard_helper.is_file():
+        violations.append(f"{IMMUTABLE_GUARD_HELPER} is missing")
+    elif hashlib.sha256(guard_helper.read_bytes()).hexdigest() != EXPECTED_IMMUTABLE_GUARD_HELPER_SHA256:
+        violations.append(
+            f"{IMMUTABLE_GUARD_HELPER} must match its exact reviewed digest; the gate job "
+            "executes these bytes with network access"
+        )
+
+    immutability = root_workflow.get("jobs", {}).get(IMMUTABILITY_JOB)
+    if not isinstance(immutability, Mapping):
+        violations.append(f"{ROOT_WORKFLOW} must define the {IMMUTABILITY_JOB} job")
+    else:
+        unexpected_keys = set(immutability) - ALLOWED_IMMUTABILITY_JOB_KEYS
+        if unexpected_keys:
+            violations.append(
+                f"{IMMUTABILITY_JOB} has unreviewed job keys: {', '.join(sorted(unexpected_keys))}"
+            )
+        if immutability.get("if") != TAG_GUARD:
+            violations.append(f"{IMMUTABILITY_JOB} must use the exact release tag guard")
+        if immutability.get("runs-on") != "ubuntu-latest":
+            violations.append(f"{IMMUTABILITY_JOB} must run exactly on GitHub-hosted ubuntu-latest")
+        if immutability.get("permissions") != {"contents": "read"}:
+            violations.append(f"{IMMUTABILITY_JOB} must declare exactly contents: read")
+        if environment_name(immutability) is not None:
+            violations.append(f"{IMMUTABILITY_JOB} must not bind any deployment environment")
+        refs = signing_references(immutability)
+        if refs:
+            violations.append(
+                f"{IMMUTABILITY_JOB} must never reference Android signing secrets: "
+                f"{', '.join(sorted(refs))}"
+            )
+        if contains_unsafe_secret_expression(immutability) or contains_secret_inheritance(immutability):
+            violations.append(f"{IMMUTABILITY_JOB} must not use dynamic secret access")
+        for target in action_uses(immutability):
+            if target.startswith("./"):
+                violations.append(f"{IMMUTABILITY_JOB} must not invoke local actions")
+            elif unpinned_action(target):
+                violations.append(f"{IMMUTABILITY_JOB} action {target} must be SHA-pinned")
+        if semantic_sha256(immutability) != EXPECTED_IMMUTABILITY_JOB_SHA256:
+            violations.append(
+                f"{IMMUTABILITY_JOB} must match the exact reviewed gate-job specification"
+            )
+
     top_permissions = root_workflow.get("permissions")
     if top_permissions is not None and not permissions_read_only(top_permissions):
         violations.append(f"{ROOT_WORKFLOW} must not grant dynamic or write permissions at workflow scope")
@@ -417,9 +493,14 @@ def check(root: Path) -> list[str]:
         violations.append(f"{ALLOWED_JOB} is missing signing references: {', '.join(sorted(missing_refs))}")
     if release.get("if") != TAG_GUARD:
         violations.append(f"{ALLOWED_JOB} must use the exact push-triggered version-tag guard")
-    if release.get("needs") != [POLICY_JOB, "conscrypt-r28"]:
+    if release.get("needs") != [POLICY_JOB, "conscrypt-r28", IMMUTABILITY_JOB]:
         violations.append(
-            f"{ALLOWED_JOB} must require successful {POLICY_JOB} and conscrypt-r28"
+            f"{ALLOWED_JOB} must require successful {POLICY_JOB}, conscrypt-r28 "
+            f"and {IMMUTABILITY_JOB}"
+        )
+    if "IMMUTABLE_RELEASES_READ_TOKEN" in json.dumps(release, sort_keys=True):
+        violations.append(
+            f"{ALLOWED_JOB} must not carry the settings-read secret; {IMMUTABILITY_JOB} holds it"
         )
     if release.get("environment") != ENVIRONMENT_NAME:
         violations.append(f"{ALLOWED_JOB} must bind the {ENVIRONMENT_NAME} environment")
@@ -477,43 +558,14 @@ def check(root: Path) -> list[str]:
                     violations.append(
                         f"{ALLOWED_JOB} step {step_name!r} must use its exact reviewed environment"
                     )
-        guard_steps = [
-            step
+        if any(
+            isinstance(step, Mapping) and step.get("name") == IMMUTABLE_GUARD_STEP_NAME
             for step in release_steps
-            if isinstance(step, Mapping) and step.get("name") == IMMUTABLE_GUARD_STEP_NAME
-        ]
-        if len(guard_steps) != 1:
+        ):
             violations.append(
-                f"{ALLOWED_JOB} must contain exactly one {IMMUTABLE_GUARD_STEP_NAME!r} step"
+                f"{ALLOWED_JOB} must not run the immutability gate beside signing material; "
+                f"it belongs in {IMMUTABILITY_JOB}"
             )
-        else:
-            guard = guard_steps[0]
-            unexpected_guard_keys = set(guard) - ALLOWED_IMMUTABLE_GUARD_STEP_KEYS
-            if unexpected_guard_keys:
-                violations.append(
-                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} has unreviewed keys: "
-                    f"{', '.join(sorted(unexpected_guard_keys))}"
-                )
-            if guard.get("run") != IMMUTABLE_GUARD_STEP_RUN:
-                violations.append(
-                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must run exactly "
-                    f"{IMMUTABLE_GUARD_STEP_RUN}"
-                )
-            if guard.get("env") != IMMUTABLE_GUARD_STEP_ENV:
-                violations.append(
-                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must use exactly the "
-                    "reviewed settings-read environment"
-                )
-            if signing_references(guard):
-                violations.append(
-                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must not reference "
-                    "Android signing secrets"
-                )
-            if semantic_sha256(guard) != EXPECTED_IMMUTABLE_GUARD_STEP_SHA256:
-                violations.append(
-                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must match its exact "
-                    "reviewed execution"
-                )
 
         for step_name, expected_env in EXPECTED_RELEASE_STEP_ENVIRONMENTS.items():
             matching_steps = [

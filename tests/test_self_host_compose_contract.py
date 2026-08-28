@@ -23,6 +23,7 @@ ENV_EXAMPLE = SELF_HOST / ".env.example"
 EFFECTIVE_CHECK = ROOT / "scripts" / "self-host-compose-effective-check.sh"
 SELF_HOSTING = SELF_HOST / "SELF-HOSTING.md"
 
+POSTGRES_IMAGE = "postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7"
 MANAGED_IMAGE = "${SILENTSUITE_SERVER_IMAGE:?Set by the verified SilentSuite installer or updater}"
 IMAGE_REPOSITORY = "ghcr.io/silent-suite/silentsuite-server"
 
@@ -150,8 +151,50 @@ def test_no_tracked_self_host_file_makes_a_mutable_tag_the_runtime_authority():
     assert offenders == [], "the server image must always be selected by digest"
 
 
-def test_postgres_stays_pinned_to_its_exact_upstream_tag():
-    assert COMPOSE_DOCUMENT["services"]["postgres"]["image"] == "postgres:16.9-alpine"
+def test_postgres_runs_an_immutable_index_digest_not_a_tag():
+    """A tag is a name, not an identity.
+
+    The database container holds the password and every account and sync row, so
+    a republished upstream tag must not be able to change what runs under an
+    unchanged SilentSuite release.
+    """
+
+    image = COMPOSE_DOCUMENT["services"]["postgres"]["image"]
+    assert image == POSTGRES_IMAGE
+    assert "@sha256:" in image and ":16.9-alpine" not in image
+    assert "${" not in image, "the database identity is fixed source, not release or env data"
+
+
+@pytest.mark.parametrize("service", ["postgres", "server"])
+def test_no_service_can_be_started_from_a_mutable_tag(service):
+    image = COMPOSE_DOCUMENT["services"][service]["image"]
+    assert "@sha256:" in image or image.startswith("${SILENTSUITE_SERVER_IMAGE"), image
+
+
+def test_no_tracked_self_host_surface_starts_postgres_from_a_tag():
+    """Including CI: the smoke fixture must exercise the operator's database."""
+
+    for path in (COMPOSE, ROOT / "scripts" / "self-host-image-smoke.sh"):
+        text = path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "postgres:16" not in stripped, f"{path.name}: {stripped}"
+    smoke = (ROOT / "scripts" / "self-host-image-smoke.sh").read_text(encoding="utf-8")
+    assert POSTGRES_IMAGE in smoke
+
+
+def test_the_pinned_postgres_digest_is_traceable_to_its_source_tag():
+    """The digest is unreadable on its own; the source comment is the provenance."""
+
+    source = COMPOSE_SOURCE
+    assert "docker.io/library/postgres:16.9-alpine" in source
+    for child in (
+        "sha256:b441677c946de564fe88ae4245ba80fe84a69485b22bf560e9c7c3710cd5e21d",
+        "sha256:a833a42d2f60170d90d8fb46b99e80f29b083a173c85ffd1e7e366730dc5529c",
+    ):
+        assert child in source, "both platform children stay recorded beside the index digest"
 
 
 def test_env_example_documents_the_managed_image_variable():

@@ -24,6 +24,12 @@ set -euo pipefail
 
 REPO="silent-suite/silentsuite"
 IMAGE_REPOSITORY="ghcr.io/silent-suite/silentsuite-server"
+# The database image is fixed source data, not release data: it ships inside the
+# checksummed bundle rather than in server-image.json, so it needs no per-release
+# manifest field. It is still an immutable digest — the container holds the
+# database password and every account row, so a republished upstream tag must
+# not be able to change what runs.
+POSTGRES_IMAGE="postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7"
 INSTALL_DIR="${SILENTSUITE_DIR:-silentsuite-server}"
 REQUESTED_VERSION=""
 STAGE_DIR=""
@@ -637,6 +643,15 @@ if ! grep -q 'SILENTSUITE_SERVER_IMAGE' "$BUNDLE_ROOT/docker-compose.yml"; then
   echo "ERROR: the bundled compose file does not use the managed server image." >&2
   exit 1
 fi
+if [ "$(grep -cF "image: $POSTGRES_IMAGE" "$BUNDLE_ROOT/docker-compose.yml" | tr -d ' ')" != "1" ]; then
+  echo "ERROR: the bundled compose file does not pin PostgreSQL to the expected" >&2
+  echo "       immutable digest ($POSTGRES_IMAGE)." >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]*image:[[:space:]]*postgres:' "$BUNDLE_ROOT/docker-compose.yml"; then
+  echo "ERROR: the bundled compose file starts PostgreSQL from a mutable tag." >&2
+  exit 1
+fi
 
 echo "Bundle contents verified."
 echo ""
@@ -687,6 +702,32 @@ case "$PULLED_DIGESTS" in
     ;;
 esac
 echo "Registry identity verified: $SERVER_IMAGE ($PULLED_PLATFORM, revision $PULLED_REVISION)"
+
+# The database image gets the same treatment, and for the same reason: it is
+# about to hold the database password and every account row. Still before any
+# operator state exists — pulling only populates the local image cache.
+echo "Verifying the pinned PostgreSQL image..."
+if ! docker pull "$POSTGRES_IMAGE" >/dev/null; then
+  echo "ERROR: could not pull $POSTGRES_IMAGE." >&2
+  echo "       The database image is pinned by digest; a tag will not be substituted." >&2
+  exit 1
+fi
+
+PG_PLATFORM="$(docker image inspect "$POSTGRES_IMAGE" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || echo "")"
+PG_DIGESTS="$(docker image inspect "$POSTGRES_IMAGE" --format '{{json .RepoDigests}}' 2>/dev/null || echo "")"
+
+if [ "$PG_PLATFORM" != "$HOST_PLATFORM" ]; then
+  echo "ERROR: the pulled PostgreSQL image is $PG_PLATFORM, expected $HOST_PLATFORM." >&2
+  exit 1
+fi
+case "$PG_DIGESTS" in
+  *"${POSTGRES_IMAGE#*@}"*) ;;
+  *)
+    echo "ERROR: the pulled image is not $POSTGRES_IMAGE." >&2
+    exit 1
+    ;;
+esac
+echo "Database identity verified: $POSTGRES_IMAGE ($PG_PLATFORM)"
 echo ""
 
 # ── Set up install directory ──────────────────────────────────────────

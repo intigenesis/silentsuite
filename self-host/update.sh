@@ -16,10 +16,12 @@ else
   exit 1
 fi
 
-# This script only restarts the stack against the image identity already pinned
-# in .env (SILENTSUITE_SERVER_IMAGE). It does NOT move between SilentSuite
-# versions: the digest in .env is immutable, so `docker compose pull` is a no-op
-# across versions by design.
+# This script only restarts the stack against the image identities the release
+# already fixed: SILENTSUITE_SERVER_IMAGE from .env, and the PostgreSQL index
+# digest pinned in docker-compose.yml. Both are immutable OCI digests, so
+# `docker compose pull` re-fetches exactly the same bytes and is a no-op across
+# versions by design — including for the database, which is not selected by a
+# mutable upstream tag.
 #
 # Re-running install.sh is NOT the upgrade path either — it refuses to touch an
 # existing installation. A version-aware cross-version updater is not supplied
@@ -63,7 +65,7 @@ if [ "$HEALTHY" -lt 2 ]; then
 fi
 
 echo ""
-echo "Restart complete — the stack is running the image already pinned in .env."
+echo "Restart complete — the stack is running the exact images this release pinned."
 echo "This script does not change SilentSuite versions."
 echo ""
 echo "If your reverse proxy reaches the server over a Docker network,"

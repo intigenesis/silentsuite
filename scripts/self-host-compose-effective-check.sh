@@ -21,6 +21,8 @@ WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 PLACEHOLDER_IMAGE="ghcr.io/silent-suite/silentsuite-server@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# The fixed database identity, asserted against what Compose actually renders.
+EXPECTED_POSTGRES_IMAGE="postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7"
 PROXY_NETWORK="silentsuite-effective-config-proxy"
 
 cp "$ROOT/self-host/docker-compose.yml" "$WORKDIR/docker-compose.yml"
@@ -65,7 +67,9 @@ echo "== Rendering the effective configuration =="
   docker compose -f docker-compose.yml -f docker-compose.override.yml config --format json > effective.json
 )
 
-PLACEHOLDER_IMAGE="$PLACEHOLDER_IMAGE" PROXY_NETWORK="$PROXY_NETWORK" python3 - "$WORKDIR/effective.json" <<'PY'
+PLACEHOLDER_IMAGE="$PLACEHOLDER_IMAGE" PROXY_NETWORK="$PROXY_NETWORK" \
+  EXPECTED_POSTGRES_IMAGE="$EXPECTED_POSTGRES_IMAGE" \
+  python3 - "$WORKDIR/effective.json" <<'PY'
 import json
 import os
 import sys
@@ -94,6 +98,20 @@ check(
 )
 check(server.get("container_name") == "silentsuite-server", "server container_name changed")
 check(postgres.get("container_name") == "silentsuite-postgres", "postgres container_name changed")
+
+# The database identity has to survive the real renderer too: a tag reintroduced
+# through an override would resolve here even though the static file looks fine.
+postgres_image = postgres.get("image", "")
+check(
+    postgres_image == os.environ["EXPECTED_POSTGRES_IMAGE"],
+    f"postgres image resolved to {postgres_image!r}, expected the pinned index digest",
+)
+for service_name, service in services.items():
+    image = service.get("image", "")
+    check(
+        "@sha256:" in image,
+        f"{service_name} resolved to {image!r}, which is not an immutable digest reference",
+    )
 
 server_volumes = {
     (volume.get("source"), volume.get("target"))

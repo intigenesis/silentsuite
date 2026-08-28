@@ -132,7 +132,10 @@ case "$1" in
     exit 0
     ;;
   pull)
-    if [ "${SILENTSUITE_FAKE_PULL_FAILS:-0}" = "1" ]; then exit 1; fi
+    case "$2" in
+      postgres@*) if [ "${SILENTSUITE_FAKE_PG_PULL_FAILS:-0}" = "1" ]; then exit 1; fi ;;
+      *) if [ "${SILENTSUITE_FAKE_PULL_FAILS:-0}" = "1" ]; then exit 1; fi ;;
+    esac
     # Race hook: the image pull is the longest window between the target check
     # and the target claim, so this is where a planted path would appear.
     if [ "${SILENTSUITE_PLANT_ON_PULL:-0}" = "1" ]; then
@@ -146,12 +149,24 @@ case "$1" in
     ;;
   image)
     # docker image inspect REF --format FORMAT
+    reference="$3"
     format="$5"
-    case "$format" in
-      *revision*) printf '%s\\n' "${SILENTSUITE_FAKE_REVISION:-REVISION}" ;;
-      *Architecture*) printf '%s\\n' "${SILENTSUITE_FAKE_PLATFORM:-linux/amd64}" ;;
-      *RepoDigests*) printf '["%s"]\\n' "${SILENTSUITE_FAKE_REPO_DIGEST:-REPODIGEST}" ;;
-      *) printf '\\n' ;;
+    case "$reference" in
+      postgres@*)
+        case "$format" in
+          *Architecture*) printf '%s\\n' "${SILENTSUITE_FAKE_PG_PLATFORM:-linux/amd64}" ;;
+          *RepoDigests*) printf '["%s"]\\n' "${SILENTSUITE_FAKE_PG_REPO_DIGEST:-$reference}" ;;
+          *) printf '\\n' ;;
+        esac
+        ;;
+      *)
+        case "$format" in
+          *revision*) printf '%s\\n' "${SILENTSUITE_FAKE_REVISION:-REVISION}" ;;
+          *Architecture*) printf '%s\\n' "${SILENTSUITE_FAKE_PLATFORM:-linux/amd64}" ;;
+          *RepoDigests*) printf '["%s"]\\n' "${SILENTSUITE_FAKE_REPO_DIGEST:-REPODIGEST}" ;;
+          *) printf '\\n' ;;
+        esac
+        ;;
     esac
     exit 0
     ;;
@@ -183,6 +198,7 @@ def build_bundle(
     unsafe: str | None = None,
     extra: str | None = None,
     omit: str | None = None,
+    replace_compose: str | None = None,
 ) -> None:
     """Assemble a release bundle from the tracked self-host files."""
 
@@ -194,7 +210,10 @@ def build_bundle(
         for name in BUNDLE_FILES:
             if name == omit:
                 continue
-            payload = (ROOT / "self-host" / name).read_bytes()
+            if name == "docker-compose.yml" and replace_compose is not None:
+                payload = replace_compose.encode("utf-8")
+            else:
+                payload = (ROOT / "self-host" / name).read_bytes()
             info = tarfile.TarInfo(f"{PREFIX}/{name}")
             info.size = len(payload)
             info.mode = 0o755 if name.endswith(".sh") else 0o644
@@ -247,9 +266,17 @@ class Release:
         omit: str | None = None,
         compare: str | None = IDENTICAL_COMPARE,
         immutable: str | None = IMMUTABLE_TRUE,
+        replace_compose: str | None = None,
     ) -> None:
         archive = self.fixtures / BUNDLE_NAME
-        build_bundle(archive, self.manifest_text, unsafe=unsafe, extra=extra, omit=omit)
+        build_bundle(
+            archive,
+            self.manifest_text,
+            unsafe=unsafe,
+            extra=extra,
+            omit=omit,
+            replace_compose=replace_compose,
+        )
         digest = sha256_file(archive)
 
         if compare is not None:
@@ -1040,6 +1067,137 @@ def test_the_target_is_claimed_only_after_the_registry_image_is_verified(workspa
 
     assert result.returncode != 0
     assert not install_dir(workspace).exists()
+
+# ── Pinned PostgreSQL runtime identity ────────────────────────────────
+
+
+POSTGRES_IMAGE = "postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7"
+
+
+def test_a_valid_release_verifies_the_pinned_database_image(workspace):
+    """The database holds the password and every account row, so it is verified
+    to the same standard as the server image."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace)
+
+    assert result.returncode == 0, result.stderr
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert f"pull {POSTGRES_IMAGE}" in docker_log
+    assert "Database identity verified" in result.stdout
+
+
+def test_an_arm64_host_installs_with_both_images_verified_for_arm64(workspace):
+    """The published index carries an arm64/v8 child; the install must use it.
+
+    The stage-only arm64 test stops before any pull, so this is the only place
+    that proves both identity checks are platform-aware rather than amd64-only.
+    """
+
+    workspace["release"].publish()
+
+    result = run_installer(
+        workspace,
+        env={
+            "SILENTSUITE_FAKE_MACHINE": "aarch64",
+            "SILENTSUITE_FAKE_PLATFORM": "linux/arm64",
+            "SILENTSUITE_FAKE_PG_PLATFORM": "linux/arm64",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Registry identity verified" in result.stdout
+    assert f"Database identity verified: {POSTGRES_IMAGE} (linux/arm64)" in result.stdout
+    assert (install_dir(workspace) / ".env").exists()
+
+
+def test_an_arm64_host_rejects_an_amd64_database_image(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(
+        workspace,
+        env={
+            "SILENTSUITE_FAKE_MACHINE": "aarch64",
+            "SILENTSUITE_FAKE_PLATFORM": "linux/arm64",
+            "SILENTSUITE_FAKE_PG_PLATFORM": "linux/amd64",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "is linux/amd64, expected linux/arm64" in result.stderr
+    assert not install_dir(workspace).exists()
+
+
+def test_a_database_pull_failure_stops_before_the_target_exists(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env={"SILENTSUITE_FAKE_PG_PULL_FAILS": "1"})
+
+    assert result.returncode != 0
+    assert "could not pull" in result.stderr
+    assert not install_dir(workspace).exists()
+    assert "compose up" not in (workspace["fixtures"] / "docker.log").read_text()
+    assert leftover_temporaries(workspace) == []
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"SILENTSUITE_FAKE_PG_PLATFORM": "linux/arm64"}, "is linux/arm64, expected linux/amd64"),
+        (
+            {"SILENTSUITE_FAKE_PG_REPO_DIGEST": "postgres@sha256:" + "9" * 64},
+            "is not postgres@sha256:",
+        ),
+    ],
+    ids=["wrong-platform", "wrong-identity"],
+)
+def test_database_identity_mismatches_stop_before_the_target_exists(workspace, env, expected):
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env=env)
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not install_dir(workspace).exists()
+    assert "compose up" not in (workspace["fixtures"] / "docker.log").read_text()
+
+
+def test_the_database_is_verified_before_the_target_is_claimed(workspace):
+    """Ordering, not just presence: both images are proven before any mutation."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace)
+
+    assert result.returncode == 0, result.stderr
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    pg_pull = docker_log.index(f"pull {POSTGRES_IMAGE}")
+    compose_up = docker_log.index("compose up") if "compose up" in docker_log else len(docker_log)
+    assert pg_pull < compose_up
+    # And the announcement of the claim comes after both verifications.
+    assert result.stdout.index("Database identity verified") < result.stdout.index(
+        "Creating install directory"
+    )
+    assert result.stdout.index("Registry identity verified") < result.stdout.index(
+        "Database identity verified"
+    )
+
+
+def test_a_bundle_whose_compose_unpins_the_database_is_rejected(workspace):
+    """A bundle that passes checksum and inventory can still be refused here."""
+
+    compose = (ROOT / "self-host" / "docker-compose.yml").read_text(encoding="utf-8")
+    workspace["release"].publish(
+        replace_compose=compose.replace(f"image: {POSTGRES_IMAGE}", "image: postgres:16.9-alpine")
+    )
+
+    result = run_installer(workspace)
+
+    assert result.returncode != 0
+    assert "PostgreSQL" in result.stderr
+    assert not install_dir(workspace).exists()
+    assert "pull" not in (workspace["fixtures"] / "docker.log").read_text()
 
 # ── Static guarantees ─────────────────────────────────────────────────
 

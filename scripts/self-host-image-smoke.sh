@@ -114,11 +114,15 @@ echo "platform=$ACTUAL_PLATFORM revision=$ACTUAL_REVISION"
 echo "== Fixture stack =="
 docker network create --subnet "$SUBNET" "$NETWORK" >/dev/null
 
+# The same immutable digest self-host/docker-compose.yml pins, so the smoke runs
+# against the database bytes operators actually get rather than whatever the
+# 16.9-alpine tag points at today.
+POSTGRES_IMAGE="postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7"
 docker run -d --name "$POSTGRES" --network "$NETWORK" \
   -e POSTGRES_DB=silentsuite \
   -e POSTGRES_USER=silentsuite \
   -e POSTGRES_PASSWORD="$DATABASE_PASSWORD" \
-  postgres:16.9-alpine >/dev/null
+  "$POSTGRES_IMAGE" >/dev/null
 
 for _ in $(seq 1 60); do
   if docker exec "$POSTGRES" pg_isready -U silentsuite -d silentsuite >/dev/null 2>&1; then
