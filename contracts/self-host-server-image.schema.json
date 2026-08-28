@@ -19,6 +19,7 @@
   "properties": {
     "schemaVersion": {
       "description": "Contract version. Bump only for an incompatible field change.",
+      "type": "integer",
       "const": 1
     },
     "tag": {

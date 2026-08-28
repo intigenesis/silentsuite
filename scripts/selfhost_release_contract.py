@@ -40,7 +40,7 @@ BUNDLE_SOURCE_FILES = (
 EXECUTABLE_SUFFIXES = (".sh",)
 
 # One record, two spaces, exact basename, single terminating newline.
-CHECKSUM_RECORD = re.compile(r"^(?P<digest>[0-9a-fA-F]{64})  (?P<name>[^\s/][^\n]*)\n$")
+CHECKSUM_RECORD = re.compile(r"(?P<digest>[0-9a-fA-F]{64})  (?P<name>[^\s/][^\n]*)\n\Z")
 
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -212,7 +212,7 @@ def assert_manifest_matches(document: dict, identity: ReleaseIdentity) -> None:
 def parse_checksum_file(text: str, expected_name: str) -> str:
     """Return the digest from a strict one-record sha256 sidecar."""
 
-    match = CHECKSUM_RECORD.match(text)
+    match = CHECKSUM_RECORD.fullmatch(text)
     if match is None:
         raise ContractError(
             "checksum sidecar must contain exactly one '<64 hex>  <name>' record "

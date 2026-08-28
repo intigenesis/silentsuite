@@ -135,7 +135,11 @@ def test_installer_enforces_every_manifest_field_the_schema_requires():
         "platforms",
         "expectedRevision",
     ):
-        assert f'"{field}"' in installer, f"install.sh does not validate {field}"
+        quoted = f'"{field}"'
+        shell_escaped = f'\\"{field}\\"'
+        assert quoted in installer or shell_escaped in installer, (
+            f"install.sh does not validate {field}"
+        )
     assert '"14"' in installer, "install.sh should pin the manifest line count"
     assert '"9"' in installer, "install.sh should pin the manifest field count"
 

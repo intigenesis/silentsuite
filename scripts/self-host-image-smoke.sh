@@ -155,6 +155,7 @@ INI
 chmod 644 "$WORKDIR/etebase-server.ini"
 
 MOUNTS=(
+  -e PYTHONPATH=/app
   -v "$WORKDIR/etebase-server.ini:/etc/etebase-server/etebase-server.ini:ro"
   -v "$SCRIPT_DIR/$PROBE_NAME:/smoke/$PROBE_NAME:ro"
 )
