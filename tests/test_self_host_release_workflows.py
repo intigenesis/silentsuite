@@ -489,6 +489,17 @@ GUARD_STEP = "Require immutable published releases"
 
 # Every job that appends assets to the shared umbrella draft, and the step in it
 # that actually creates or uploads.
+# Exact gate command per lane. Android's `build-release` defaults to android/
+# and its signing boundary forbids a per-step working-directory, so that lane
+# addresses the guard by workspace-absolute path instead. Still exact, per lane
+# — never a substring, which would let a wrapper or a `|| true` slip past.
+WORKSPACE_GUARD_RUN = 'bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"'
+EXPECTED_GUARD_RUN = {
+    "release-server-image.yml": GUARD_SCRIPT,
+    "build-bridge.yml": GUARD_SCRIPT,
+    "build-android.yml": WORKSPACE_GUARD_RUN,
+}
+
 ATTACHMENT_JOBS = [
     (RELEASE_WORKFLOW, "attach-release-assets", "Attach the verified assets to the shared draft release"),
     (ANDROID_WORKFLOW, "build-release", "Attach Android artifacts to umbrella GitHub Release"),
@@ -576,7 +587,7 @@ def test_no_asset_is_attached_before_immutability_is_proven(path, job_name, atta
     assert GUARD_STEP in names, f"{path.name}:{job_name} has no immutability gate"
     guard_index = names.index(GUARD_STEP)
     assert guard_index < names.index(attach_step)
-    assert step_named(job, GUARD_STEP)["run"].strip() == GUARD_SCRIPT
+    assert step_named(job, GUARD_STEP)["run"].strip() == EXPECTED_GUARD_RUN[path.name]
     # Every gate authenticates with the dedicated settings-read secret. The
     # workflow token cannot hold repository Administration: read, so a lane that
     # passed GITHUB_TOKEN here would fail in production for a permission reason

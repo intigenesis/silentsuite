@@ -1005,11 +1005,14 @@ jobs:
       # Reads the setting with the dedicated Administration:read secret. The
       # workflow token cannot hold that permission, and is left to the release
       # action's contents write.
+      #
+      # Invoked by workspace-absolute path rather than a per-step
+      # working-directory: the signing boundary forbids that key on any step in
+      # this job, so the path carries the job's `defaults` override instead.
       - name: Require immutable published releases
-        working-directory: ${{ github.workspace }}
         env:
           IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
-        run: scripts/require-immutable-releases.sh
+        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"
 
       - name: Attach Android artifacts to umbrella GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

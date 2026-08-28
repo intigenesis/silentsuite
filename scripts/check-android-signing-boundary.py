@@ -83,6 +83,34 @@ EXPECTED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     },
 }
+# The umbrella-draft attachment lock. Reviewed as an exact literal so a release
+# cannot be quietly re-scoped: a different group would stop serializing against
+# the sibling component lanes, cancel-in-progress would drop an attachment
+# mid-upload, and anything other than queue: max lets the scheduler discard a
+# pending attachment without failing anything.
+EXPECTED_RELEASE_CONCURRENCY: dict[str, Any] = {
+    "group": "umbrella-release-${{ github.ref_name }}",
+    "cancel-in-progress": "false",
+    "queue": "max",
+}
+
+# The release-immutability gate. It holds a credential, so it is reviewed to the
+# same standard as the signing steps: exact name, exact command, exact
+# environment, closed key set. Its secret is a repository Administration:read
+# token — deliberately not an Android signing secret, and the boundary below
+# still refuses to see any signing secret anywhere near it.
+IMMUTABLE_GUARD_STEP_NAME = "Require immutable published releases"
+IMMUTABLE_GUARD_STEP_RUN = 'bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"'
+IMMUTABLE_GUARD_STEP_ENV: dict[str, str] = {
+    "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}",
+}
+EXPECTED_IMMUTABLE_GUARD_STEP: dict[str, Any] = {
+    "name": IMMUTABLE_GUARD_STEP_NAME,
+    "env": IMMUTABLE_GUARD_STEP_ENV,
+    "run": IMMUTABLE_GUARD_STEP_RUN,
+}
+ALLOWED_IMMUTABLE_GUARD_STEP_KEYS = set(EXPECTED_IMMUTABLE_GUARD_STEP)
+
 EXPECTED_SECRET_STEP_SHA256 = {
     "Decode release keystore": "44c1231395b5f7347980a05fa641b0e7d866451e10ddb88958e61459f649ffba",
     "Build signed release APK and AAB": "e9e02db295ff745dfe2ead024747b996b246ddb2fc2cc0f195ed2244b1a86776",
@@ -90,7 +118,19 @@ EXPECTED_SECRET_STEP_SHA256 = {
         "69ded7eab4c4ff48deff2da950aacf8e627da05373ffa507f358fbcc986a7a6a"
     ),
 }
-EXPECTED_RELEASE_JOB_SHA256 = "e93b5f55523ad24dc208392f575a84b46e54576e5f2ab0921b61d68f13ff9a60"
+REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
+    **EXPECTED_RELEASE_STEP_ENVIRONMENTS,
+    IMMUTABLE_GUARD_STEP_NAME: IMMUTABLE_GUARD_STEP_ENV,
+}
+# sha256 of EXPECTED_IMMUTABLE_GUARD_STEP under semantic_sha256, recomputed
+# from the reviewed literal above rather than from whatever the file holds.
+EXPECTED_IMMUTABLE_GUARD_STEP_SHA256 = (
+    "739d2df546032005051095e891d4881b149c2938f0cc2e1410100c7312ccfa80"
+)
+# Covers the whole reviewed job, concurrency included: the explicit literal
+# check above states the intent, this digest makes any other edit to the job
+# fail closed as well.
+EXPECTED_RELEASE_JOB_SHA256 = "c0b9fa3472f17bbe22660b02f1957d796800c4eec8327c6f6d9c6060f6a6b5d1"
 EXPECTED_CONSCRYPT_JOB_SHA256 = "ed27963320252615ff159bbc388c858fdc872516fc0ea2aa5f50d905f4a5063b"
 EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256 = (
     "0ee234f2ced343c4167bd1efad134a77853f288eb9c5210c1e1173594a014b8b"
@@ -103,6 +143,7 @@ ALLOWED_RELEASE_JOB_KEYS = {
     "environment",
     "permissions",
     "defaults",
+    "concurrency",
     "steps",
 }
 ALLOWED_RELEASE_STEP_KEYS = {"name", "uses", "with", "run", "env", "if"}
@@ -386,6 +427,11 @@ def check(root: Path) -> list[str]:
         violations.append(f"{ALLOWED_JOB} must run exactly on GitHub-hosted ubuntu-latest")
     if release.get("defaults") != {"run": {"working-directory": "android"}}:
         violations.append(f"{ALLOWED_JOB} must use the exact Android working-directory defaults")
+    if release.get("concurrency") != EXPECTED_RELEASE_CONCURRENCY:
+        violations.append(
+            f"{ALLOWED_JOB} must declare exactly the reviewed umbrella-release concurrency "
+            f"{EXPECTED_RELEASE_CONCURRENCY}"
+        )
     if semantic_sha256(release) != EXPECTED_RELEASE_JOB_SHA256:
         violations.append(f"{ALLOWED_JOB} must match the exact reviewed release-job specification")
     for forbidden_key in ("container", "services", "strategy", "env", "continue-on-error"):
@@ -426,11 +472,49 @@ def check(root: Path) -> list[str]:
                         f"{ALLOWED_JOB} step {step_name!r} must not define {forbidden_key}"
                     )
             if "env" in step:
-                expected_env = EXPECTED_RELEASE_STEP_ENVIRONMENTS.get(str(step_name))
+                expected_env = REVIEWED_RELEASE_STEP_ENVIRONMENTS.get(str(step_name))
                 if step.get("env") != expected_env:
                     violations.append(
                         f"{ALLOWED_JOB} step {step_name!r} must use its exact reviewed environment"
                     )
+        guard_steps = [
+            step
+            for step in release_steps
+            if isinstance(step, Mapping) and step.get("name") == IMMUTABLE_GUARD_STEP_NAME
+        ]
+        if len(guard_steps) != 1:
+            violations.append(
+                f"{ALLOWED_JOB} must contain exactly one {IMMUTABLE_GUARD_STEP_NAME!r} step"
+            )
+        else:
+            guard = guard_steps[0]
+            unexpected_guard_keys = set(guard) - ALLOWED_IMMUTABLE_GUARD_STEP_KEYS
+            if unexpected_guard_keys:
+                violations.append(
+                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} has unreviewed keys: "
+                    f"{', '.join(sorted(unexpected_guard_keys))}"
+                )
+            if guard.get("run") != IMMUTABLE_GUARD_STEP_RUN:
+                violations.append(
+                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must run exactly "
+                    f"{IMMUTABLE_GUARD_STEP_RUN}"
+                )
+            if guard.get("env") != IMMUTABLE_GUARD_STEP_ENV:
+                violations.append(
+                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must use exactly the "
+                    "reviewed settings-read environment"
+                )
+            if signing_references(guard):
+                violations.append(
+                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must not reference "
+                    "Android signing secrets"
+                )
+            if semantic_sha256(guard) != EXPECTED_IMMUTABLE_GUARD_STEP_SHA256:
+                violations.append(
+                    f"{ALLOWED_JOB} step {IMMUTABLE_GUARD_STEP_NAME!r} must match its exact "
+                    "reviewed execution"
+                )
+
         for step_name, expected_env in EXPECTED_RELEASE_STEP_ENVIRONMENTS.items():
             matching_steps = [
                 step
