@@ -7,11 +7,12 @@ How to remove SilentSuite from your server.
 To completely remove SilentSuite and all its data:
 
 ```bash
-# Stop the stack
+# Stop and remove the containers
 cd silentsuite-server
+docker compose down
 
-# Remove the stack and its data volumes (THIS DELETES ALL DATA)
-docker compose down -v
+# Remove all data volumes (THIS DELETES ALL DATA)
+docker volume rm self-host_pgdata self-host_server_data
 
 # Remove the Docker images (the silentsuite-server tag/digest may differ — list yours with `docker image ls`)
 docker image rm postgres:16.9-alpine

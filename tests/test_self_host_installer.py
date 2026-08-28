@@ -58,12 +58,10 @@ PREFIX = bundle_prefix(TAG)
 BUNDLE_FILES = (
     ".env.example",
     "SELF-HOSTING.md",
-    "backup-restore.sh",
     "close-signups.sh",
     "docker-compose.yml",
     "install.sh",
     "success.html",
-    "upgrade.sh",
     "update.sh",
     "verify.sh",
 )
@@ -369,7 +367,6 @@ def test_a_valid_release_installs_and_pins_the_immutable_index_digest(workspace)
         "SELF-HOSTING.md",
         "update.sh",
         "verify.sh",
-        "upgrade.sh",
         "close-signups.sh",
         "success.html",
         MANIFEST_NAME,

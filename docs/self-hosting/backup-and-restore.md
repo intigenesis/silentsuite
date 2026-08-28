@@ -12,64 +12,79 @@ There are three things to back up:
 
 ---
 
-## Create a Backup
+## Back Up the Database
 
-Run the bundled helper from the installation directory, using a new private
-directory for each backup:
+Create a full PostgreSQL dump:
 
 ```bash
-BACKUP_DIR="$PWD/backups/$(date -u +%Y%m%dT%H%M%SZ)"
-./backup-restore.sh backup --backup-dir "$BACKUP_DIR" --install-dir "$PWD"
+docker exec silentsuite-postgres pg_dump -U silentsuite silentsuite > backup-$(date +%Y%m%d-%H%M%S).sql
 ```
 
-The helper derives the actual named volumes from the running containers: the
-PostgreSQL mount at `/var/lib/postgresql/data` and the server mount at `/data`.
-Each must have exactly one `volume` mount and a strict nonempty Docker volume
-name. The underlying volume object must also use Docker's ordinary `local`
-driver with null or empty options, because restore recreates it with plain
-`docker volume create`. It records those names and this recreation contract in
-mode-600 `metadata` before creating the container-based database dump or
-server-data archive. Bind mounts, missing or ambiguous mounts, custom drivers,
-and local-driver options fail with custom-backup guidance; use operator-specific
-backup/restore tooling for those volumes. The helper only supports ordinary
-local named volumes. `.env.backup` is included when `.env` is a regular file;
-its contents are never printed. The archive utility is the exact immutable
-digest recorded by the running `silentsuite-server` container, and its
-networking is disabled. After all artifacts are written, the helper creates a
-mode-600 `checksums` manifest with one SHA-256 record per artifact in fixed
-sorted order.
+## Back Up the Server Data Volume
+
+```bash
+docker run --rm \
+  -v self-host_server_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar czf /backup/server-data-$(date +%Y%m%d-%H%M%S).tar.gz -C /data .
+```
+
+## Back Up the .env File
+
+Your `.env` file contains all secrets. Keep a secure, encrypted copy:
+
+```bash
+cp .env backups/.env.backup
+```
 
 ## Automated Backups
 
 For production deployments, set up a cron job:
 
 ```bash
-# Run a full backup daily at 2:00 AM; use a unique directory per run
-0 2 * * * cd /path/to/silentsuite/self-host && d="$PWD/backups/$(date -u +\%Y\%m\%dT\%H\%M\%SZ)" && ./backup-restore.sh backup --backup-dir "$d" --install-dir "$PWD"
+# Run a full backup daily at 2:00 AM
+0 2 * * * cd /path/to/silentsuite/self-host && docker exec silentsuite-postgres pg_dump -U silentsuite silentsuite > /path/to/backups/silentsuite-$(date +\%Y\%m\%d).sql
 ```
 
 ---
 
-## Restore
+## Restore the Database
 
-From the installation directory, restore from the same backup directory:
+To restore from a backup, stop the stack, replace the database, and restart:
 
 ```bash
-./backup-restore.sh restore --backup-dir "$BACKUP_DIR" --install-dir "$PWD"
+# Stop all services
+docker compose down
+
+# Remove the existing database volume
+docker volume rm self-host_pgdata
+
+# Start only PostgreSQL
+docker compose up -d postgres
+
+# Wait for it to be healthy
+sleep 10
+docker compose exec postgres pg_isready -U silentsuite
+
+# Restore the backup
+docker exec -i silentsuite-postgres psql -U silentsuite silentsuite < backup-20260101-020000.sql
+
+# Start the rest of the stack
+docker compose up -d
 ```
 
-Before any Compose down or volume removal/creation, restore validates the
-mode-600 metadata, the strict `checksums` manifest, and every artifact's
-SHA-256 digest. Missing, extra, malformed, reordered, or mismatched records,
-artifact symlinks, and nonregular artifacts fail closed. It then uses the exact
-recorded names for external-volume mapping, removal/creation, and server-data
-extraction. It pulls the recorded immutable archive utility digest before
-Compose down and uses that image with networking disabled. It does not derive
-names from the current Compose project, so a
-changed project name cannot redirect the restore to an empty volume. An
-existing regular `docker-compose.override.yml` is included in every restore
-Compose command; symlinked or nonregular overrides are rejected before down.
-The recorded local-empty-options proof is mandatory, so old or tampered
-metadata without it is rejected before pull, down, removal, or creation. For
-binds or other custom drivers/options, use operator-specific tooling to restore
-the host paths; this helper refuses them.
+## Restore the Server Data Volume
+
+```bash
+docker compose down
+
+docker volume rm self-host_server_data
+docker volume create self-host_server_data
+
+docker run --rm \
+  -v self-host_server_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar xzf /backup/server-data-20260101-020000.tar.gz -C /data
+
+docker compose up -d
+```

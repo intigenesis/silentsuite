@@ -21,10 +21,9 @@ fi
 # versions: the digest in .env is immutable, so `docker compose pull` is a no-op
 # across versions by design.
 #
-# Re-running install.sh is NOT the upgrade path — it refuses to touch an
-# existing installation. Use upgrade.sh with a verified stage for a deliberate
-# version change and its cohort backup/recovery; this script only restarts the
-# pinned version.
+# Re-running install.sh is NOT the upgrade path either — it refuses to touch an
+# existing installation. A version-aware cross-version updater is not supplied
+# yet; see SELF-HOSTING.md.
 echo "Pulling pinned images..."
 $COMPOSE pull
 

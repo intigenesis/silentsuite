@@ -18,6 +18,7 @@ on:
       - 'scripts/verify-server-image-release.sh'
       - 'scripts/publish-self-host-release-assets.sh'
       - 'tests/test_self_host_*.py'
+      - 'tests/test_server_image_verifier.py'
       - '.github/workflows/ci-server.yml'
       - '.github/workflows/release-server-image.yml'
   pull_request:
@@ -37,6 +38,7 @@ on:
       - 'scripts/verify-server-image-release.sh'
       - 'scripts/publish-self-host-release-assets.sh'
       - 'tests/test_self_host_*.py'
+      - 'tests/test_server_image_verifier.py'
       - '.github/workflows/ci-server.yml'
       - '.github/workflows/release-server-image.yml'
 
@@ -131,7 +133,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check pytest PyYAML==6.0.3
 
       - name: Run self-host release contract tests
-        run: python -m pytest tests/test_self_host_*.py -q
+        run: python -m pytest tests/test_self_host_*.py tests/test_server_image_verifier.py -q
 
       - name: Verify the effective self-host Compose configuration
         run: scripts/self-host-compose-effective-check.sh
@@ -143,8 +145,6 @@ jobs:
             self-host/update.sh \
             self-host/verify.sh \
             self-host/close-signups.sh \
-            self-host/backup-restore.sh \
-            self-host/upgrade.sh \
             scripts/self-host-image-smoke.sh \
             scripts/self-host-compose-effective-check.sh \
             scripts/verify-server-image-release.sh \

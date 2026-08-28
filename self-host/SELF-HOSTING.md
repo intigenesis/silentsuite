@@ -57,7 +57,7 @@ Every SilentSuite release publishes three self-host assets:
 
 | Asset | Purpose |
 |-------|---------|
-| `silentsuite-self-host-<tag>.tar.gz` | the version-matched `docker-compose.yml`, helper scripts (including `backup-restore.sh`), and landing page; stage-only retains this archive for upgrade-time re-verification |
+| `silentsuite-self-host-<tag>.tar.gz` | the version-matched `docker-compose.yml`, helper scripts, and landing page; `--stage-only` keeps this archive and its sidecar beside the files it extracted |
 | `silentsuite-self-host-<tag>.tar.gz.sha256` | the bundle's checksum, as a single strict record |
 | `server-image.json` | the immutable image identity: release tag, source commit, OCI index digest, per-architecture digests, supported platforms, and the expected image revision label |
 
@@ -356,97 +356,30 @@ SilentSuite versions — the digest in `.env` is immutable by design.
 
 ## Upgrading to a new version
 
+**Cross-version upgrading is not supplied yet.** This release ships the
+installer, the immutable release image identity, and the version-matched
+bundle; a version-aware updater that moves an existing installation from one
+release to the next is deliberately deferred to a follow-up change.
+
 Re-running `install.sh` is **not** the upgrade path. It refuses to touch an
 existing installation, because regenerating credentials and restarting a stack
-without backing up your database is not a safe upgrade.
+without backing up its data is not a safe upgrade — and nothing in this release
+migrates an installed version for you.
 
-There is no unattended scheduler for this work. The checked helper below is
-still deliberately operator-invoked, but it creates the durable cohort backup
-and performs bounded failure recovery around the migration.
+`./update.sh` restarts the version you already have (above); it does not change
+versions. Until a supported updater ships, do not attempt a cross-version move
+by hand on an installation whose data you care about.
 
-Until it ships, upgrade deliberately:
-
-1. **Back up first** (see [Backup and Restore](#backup-and-restore)). The bundled
-   helper records the actual live Docker volume identities before writing the
-   dump or archive; copy `.env` somewhere safe as part of that backup.
-2. **Get the new release's verified bundle** without installing it. Run this
-   from the existing installation directory; the stage directory must be
-   nonexistent or empty:
-   ```bash
-   cd silentsuite-server
-   bash ./install.sh --version vX.Y.Z --stage-only "./silentsuite-vX.Y.Z"
-   ```
-   Stage-only verifies the release tag, manifest, checksum, and archive, but it
-   does not verify the live registry image. `upgrade.sh` performs the live pull,
-   platform, revision-label, and `RepoDigest` checks against the staged image
-   identity before mutating the installation. It retains the checksummed archive
-   beside its extracted files so the upgrade helper can repeat the archive checks
-   after staging.
-3. **Run the checked manual upgrade helper**:
-   ```bash
-   bash "./silentsuite-vX.Y.Z/upgrade.sh" \
-     --staged "$PWD/silentsuite-vX.Y.Z" \
-     --install-dir "$PWD"
-   ```
-
-   The helper derives the canonical `imageRepository@indexDigest` from the
-   verified manifest, then re-verifies the staged archive's strict checksum, closed
-   tar inventory, safe paths and file types, and embedded manifest. It compares
-   every retained extracted managed file with that freshly verified archive and
-   stops if staging changed any bytes. The archive is then the only source for
-   release-managed files: `.env.example`, `SELF-HOSTING.md`, `backup-restore.sh`,
-   `close-signups.sh`, `docker-compose.yml`, `install.sh`, `success.html`, `upgrade.sh`,
-   `update.sh`, `verify.sh`, and `server-image.json`. The existing `.env`
-   values other than the image entry, `etebase-server.ini`,
-   `docker-compose.override.yml`, named volumes, and operator data are not
-   copied or recreated. The installed manifest and checksum must match the
-   verified release identity or the helper stops.
-
-   Before replacing any managed file or `.env`, the helper creates a durable,
-   collision-safe snapshot under `.silentsuite-upgrade-backups/`. The snapshot
-   contains the previous `.env`, every existing managed file, the previous
-   manifest, every existing regular release checksum sidecar, non-secret
-   identity metadata naming the target, prior sidecars, and the validated live
-   Docker volume names and the immutable backup utility image, plus an exact
-   restore helper. Matching symlink or
-   non-regular sidecars, like other managed destinations, are rejected before
-   backup or mutation. A successful upgrade may retain both the prior and
-   target sidecars. Do not delete this snapshot until the upgrade is known to
-   be healthy and the normal data backup is safely retained.
-
-   The upgrade snapshot is a release-cohort snapshot, not a database or
-   server-data archive. Its metadata records the validated volume names and
-   immutable utility image; cohort restore only restores release files and does
-   not run the tar utility. A separately retained `backup-restore.sh` backup
-   can be restored against the same identities.
-
-   After admission and the snapshot, the helper replaces the new cohort, stops
-   only the `server` service (PostgreSQL remains running), applies migrations
-   with the admitted image, recreates only `server`, and runs `verify.sh`.
-   It is a deliberate, operator-invoked upgrade; there is no unattended upgrade
-   path.
-
-If anything fails before migrations begin, the helper restores the previous
-cohort automatically—including all backed-up prior sidecars—and leaves the
-previously running server untouched (or restarts and verifies it if stopping had
-already been requested). If the target sidecar was absent from the prior cohort,
-rollback removes only that newly installed target sidecar. If migration
-has begun, the helper restores the previous image and managed-file cohort where
-safe and attempts to restart and verify it, but migrations remain forward-applied
-and may require restoring the database backup. The helper reports whether that
-restart was actually verified; it never claims a full rollback. If automatic
-recovery cannot be confirmed, use the exact `restore-previous-cohort.sh` command
-printed by the helper from the durable backup directory, then recreate `server`
-and run `./verify.sh`. Restore the cohort and image together—do not perform a
-digest-only rollback against a newer managed-file cohort.
-
-If the forward migration requires data recovery, run the bundled data restore
-against the backup directory whose mode-600 metadata was created before the
-upgrade:
+You can still inspect a newer release safely without touching your
+installation, because staging only writes into a new directory:
 
 ```bash
-bash ./backup-restore.sh restore --backup-dir "$BACKUP_DIR" --install-dir "$PWD"
+bash ./install.sh --version vX.Y.Z --stage-only "./silentsuite-vX.Y.Z"
 ```
+
+Stage-only verifies the release tag, manifest, checksum sidecar, and archive
+contents. It does not verify the live registry image, install anything, or
+start a container.
 
 ## Health Checks
 
@@ -462,60 +395,41 @@ The advanced Django admin panel is disabled by default in self-host installs (`E
 
 ### Backup
 
-Run this from the installation directory. Use a new, private directory for
-each backup:
-
 ```bash
-BACKUP_DIR="$PWD/backups/$(date -u +%Y%m%dT%H%M%SZ)"
-./backup-restore.sh backup --backup-dir "$BACKUP_DIR" --install-dir "$PWD"
-```
+# Database
+docker exec silentsuite-postgres pg_dump -U silentsuite silentsuite > backup.sql
 
-The helper inspects the running `silentsuite-postgres` mount at
-`/var/lib/postgresql/data` and the running `silentsuite-server` mount at `/data`.
-Each must have exactly one `volume` mount with a nonempty strict Docker volume
-name. The underlying volume object must also use Docker's ordinary `local`
-driver with null or empty options, because restore recreates it with plain
-`docker volume create`. The validated names and recreation contract are written
-to mode-600 `metadata` before the dump or archive is started. A bind, other
-mount type, missing mount, ambiguous match, custom driver, or local-driver
-option fails with custom-backup guidance. The helper supports ordinary local
-named volumes only; use operator-specific backup/restore tooling for custom
-drivers/options or host binds. The database dump remains container-based; the
-server-data archive uses the recorded named volume. Its tar utility is the
-exact immutable digest reported by the running `silentsuite-server` container,
-and networking is disabled for the utility container. The backup also includes
-`.env.backup` when `.env` is a regular file and never prints its contents. After
-all artifacts are written, it creates a mode-600 `checksums` manifest containing
-one strict SHA-256 record per artifact in fixed sorted order.
+# Server data (secret key, media)
+docker run --rm \
+  -v self-host_server_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar czf /backup/server-data.tar.gz -C /data .
+
+# Environment file
+cp .env backups/.env.backup
+```
 
 ### Restore
 
-Restore from the same backup directory, from the installation directory:
-
 ```bash
-./backup-restore.sh restore --backup-dir "$BACKUP_DIR" --install-dir "$PWD"
+# Database
+docker compose down
+docker volume rm self-host_pgdata
+docker compose up -d postgres
+sleep 10
+docker exec -i silentsuite-postgres psql -U silentsuite silentsuite < backup.sql
+docker compose up -d
+
+# Server data
+docker compose down
+docker volume rm self-host_server_data
+docker volume create self-host_server_data
+docker run --rm \
+  -v self-host_server_data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar xzf /backup/server-data.tar.gz -C /data
+docker compose up -d
 ```
-
-Before any Compose down or volume removal/creation, restore validates the
-mode-600 metadata, the strict `checksums` manifest, and every artifact's
-SHA-256 digest. Missing, extra, malformed, reordered, or mismatched records,
-artifact symlinks, and nonregular artifacts fail closed. It then uses those
-exact recorded names for Compose's external-volume mapping, volume
-removal/creation, and server-data extraction. It pulls the recorded immutable
-utility digest before Compose down and uses that image with networking disabled.
-It does not inspect a changed stack to choose names, so a different Compose
-project name cannot redirect the restore to a new empty volume. An existing regular
-`docker-compose.override.yml` is included in every restore Compose command;
-symlinked or nonregular overrides are rejected before down. Keep the stack
-stopped until the command reports success; inspect the health checks afterward
-with `./verify.sh`. The recorded local-empty-options proof is mandatory, so old
-or tampered metadata without it is rejected before pull, down, removal, or
-creation. Custom drivers/options and binds require operator-specific tooling.
-
-If either installation uses a bind or other custom mount, this helper refuses
-to proceed. Use custom tooling that snapshots that host path and restore it
-manually before starting SilentSuite; never replace it with a newly created
-named volume.
 
 ## Troubleshooting
 

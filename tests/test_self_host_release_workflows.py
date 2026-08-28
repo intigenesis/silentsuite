@@ -326,6 +326,7 @@ def test_ci_server_covers_every_surface_that_can_change_the_image():
             "scripts/publish-self-host-release-assets.sh",
             "contracts/self-host-server-image.schema.json",
             "tests/test_self_host_*.py",
+            "tests/test_server_image_verifier.py",
             ".github/workflows/ci-server.yml",
             ".github/workflows/release-server-image.yml",
         ):
@@ -348,15 +349,15 @@ def test_ci_server_builds_and_smokes_both_native_architectures():
 
 def test_ci_server_runs_the_contract_suite_and_shell_syntax_checks():
     job = CI["jobs"]["self-host-contracts"]
-    assert "python -m pytest tests/test_self_host_*.py -q" in step_named(
-        job, "Run self-host release contract tests"
-    )["run"]
+    contract_tests = step_named(job, "Run self-host release contract tests")["run"]
+    # The verifier fixtures are not matched by the test_self_host_* glob, so the
+    # registry contract would silently go unrun if it were left implicit.
+    for target in ("tests/test_self_host_*.py", "tests/test_server_image_verifier.py"):
+        assert target in contract_tests, f"{target} is not run by the contract job"
     syntax = step_named(job, "Check release and self-host shell syntax")["run"]
     for script in (
         "self-host/install.sh",
         "self-host/update.sh",
-        "self-host/upgrade.sh",
-        "self-host/backup-restore.sh",
         "scripts/self-host-image-smoke.sh",
         "scripts/self-host-compose-effective-check.sh",
         "scripts/verify-server-image-release.sh",

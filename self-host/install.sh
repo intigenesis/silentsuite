@@ -181,7 +181,7 @@ if [ "$STAGE_ONLY" -eq 0 ]; then
     if docker container inspect "$container" >/dev/null 2>&1; then
       echo "ERROR: container '$container' already exists." >&2
       echo "       This installer will not stop or replace an existing SilentSuite stack." >&2
-      echo "       Use that installation's documented upgrade procedure instead." >&2
+      echo "       This installer only performs fresh installations (see SELF-HOSTING.md)." >&2
       exit 1
     fi
   done
@@ -473,13 +473,11 @@ done < "$MEMBER_LIST"
 EXPECTED_MEMBERS="$(printf '%s\n' \
   .env.example \
   SELF-HOSTING.md \
-  backup-restore.sh \
   close-signups.sh \
   docker-compose.yml \
   install.sh \
   server-image.json \
   success.html \
-  upgrade.sh \
   update.sh \
   verify.sh | LC_ALL=C sort)"
 ACTUAL_MEMBERS="$(sed 's#/$##' "$ENTRY_LIST" | LC_ALL=C sort)"
@@ -577,11 +575,10 @@ fi
 # local users on shared hosts — the install dir is a single-operator surface.
 chmod 750 "$INSTALL_DIR"
 
-for file in docker-compose.yml install.sh SELF-HOSTING.md backup-restore.sh update.sh upgrade.sh verify.sh close-signups.sh success.html .env.example "$MANIFEST_NAME"; do
+for file in docker-compose.yml install.sh SELF-HOSTING.md update.sh verify.sh close-signups.sh success.html .env.example "$MANIFEST_NAME"; do
   cp "$BUNDLE_ROOT/$file" "$INSTALL_DIR/$file"
 done
-cp "$CHECKSUM_FILE" "$INSTALL_DIR/$CHECKSUM_NAME"
-chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/upgrade.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh" "$INSTALL_DIR/backup-restore.sh"
+chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
 
 cd "$INSTALL_DIR"
 

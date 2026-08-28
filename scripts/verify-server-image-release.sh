@@ -5,9 +5,15 @@ set -euo pipefail
 # registry API — no Docker daemon state, no build-step self-reporting.
 #
 # Contracts enforced:
+#   * every digest this verifier trusts is the SHA-256 of bytes it actually
+#     read: index, child manifest, and image config bodies are hashed and
+#     matched against the registry's content-digest header and the digest that
+#     was requested, and descriptor sizes are matched against the exact byte
+#     counts served;
 #   * the release tag resolves to an OCI image index;
 #   * the index exposes exactly two descriptors: one linux/amd64 and one
-#     linux/arm64 child, with the expected child digests;
+#     linux/arm64 child, with the expected child digests, sizes, and a closed
+#     platform key set (arm64 may add only a canonical "v8" variant);
 #   * provenance is outside the registry index, so no attestation descriptor
 #     (especially one with a concrete runnable platform) is admitted;
 #   * every runnable child carries org.opencontainers.image.revision equal to
@@ -89,22 +95,54 @@ WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 # Fetch a manifest by reference. Writes the body to $2, sets MANIFEST_DIGEST to
-# the digest the registry reports, and returns 1 when the reference is absent.
-# Any other registry status is fatal: an unreadable registry must never be
-# mistaken for "not published yet".
+# the SHA-256 of the exact bytes received and MANIFEST_BYTES to their exact
+# length, and returns 1 when the reference is absent. Any other registry status
+# is fatal: an unreadable registry must never be mistaken for "not published
+# yet".
+#
+# The Docker-Content-Digest header is a claim about the response, not proof of
+# it. Every digest this verifier goes on to trust is the hash of bytes it read:
+# the header must agree with that hash, and a digest reference must be served
+# bytes that hash to the digest that was asked for. A registry that answers a
+# digest request with different content is rejected here rather than believed.
 MANIFEST_DIGEST=""
+MANIFEST_BYTES=""
 fetch_manifest() {
   local reference="$1" body="$2" headers="$WORKDIR/headers"
-  local status
+  local status header_digest
+  MANIFEST_DIGEST=""
+  MANIFEST_BYTES=""
+  : > "$body"
   status="$(curl -sS -o "$body" -D "$headers" -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT_TYPES" \
     "https://ghcr.io/v2/${IMAGE_PATH}/manifests/${reference}")"
-  MANIFEST_DIGEST="$(tr -d '\r' < "$headers" | awk 'tolower($1) == "docker-content-digest:" { print $2 }' | tail -1)"
   case "$status" in
-    200) return 0 ;;
-    404) MANIFEST_DIGEST=""; return 1 ;;
+    200) ;;
+    404) return 1 ;;
     *) echo "ERROR: registry returned HTTP $status for ${reference}" >&2; exit 1 ;;
   esac
+
+  MANIFEST_DIGEST="sha256:$(sha256sum "$body" | cut -d' ' -f1)"
+  MANIFEST_BYTES="$(wc -c < "$body" | tr -d ' ')"
+
+  header_digest="$(tr -d '\r' < "$headers" | awk 'tolower($1) == "docker-content-digest:" { print $2 }' | tail -1)"
+  if [ -z "$header_digest" ]; then
+    echo "ERROR: registry reported no content digest for ${reference}" >&2
+    exit 1
+  fi
+  if [ "$header_digest" != "$MANIFEST_DIGEST" ]; then
+    echo "ERROR: registry reports ${reference} as ${header_digest}, but the bytes it served hash to ${MANIFEST_DIGEST}" >&2
+    exit 1
+  fi
+  case "$reference" in
+    sha256:*)
+      if [ "$MANIFEST_DIGEST" != "$reference" ]; then
+        echo "ERROR: registry served bytes hashing to ${MANIFEST_DIGEST} for digest reference ${reference}" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  return 0
 }
 
 fetch_blob() {
@@ -141,7 +179,7 @@ if [ "$AMD64_DIGEST" = "$ARM64_DIGEST" ]; then
 fi
 
 verify_child() {
-  local expected_arch="$1" digest="$2"
+  local expected_arch="$1" digest="$2" descriptor_size="$3"
   local body="$WORKDIR/child-${expected_arch}.json"
   if ! fetch_manifest "$digest" "$body"; then
     echo "ERROR: child manifest ${digest} is not retrievable" >&2
@@ -149,6 +187,12 @@ verify_child() {
   fi
   if [ "$MANIFEST_DIGEST" != "$digest" ]; then
     echo "ERROR: registry returned ${MANIFEST_DIGEST} for child ${digest}" >&2
+    exit 1
+  fi
+  # The descriptor's size is part of the index's claim about this child, so it
+  # is checked against the bytes actually served, not merely well-formedness.
+  if [ "$MANIFEST_BYTES" != "$descriptor_size" ]; then
+    echo "ERROR: index descriptor for linux/${expected_arch} claims ${descriptor_size} bytes, but child ${digest} is ${MANIFEST_BYTES} bytes" >&2
     exit 1
   fi
   local child_media_type
@@ -164,10 +208,16 @@ verify_child() {
     exit 1
   fi
   fetch_blob "$config_digest" > "$WORKDIR/config-${expected_arch}.json"
-  local actual_config_digest
+  local actual_config_digest actual_config_size claimed_config_size
   actual_config_digest="sha256:$(sha256sum "$WORKDIR/config-${expected_arch}.json" | cut -d' ' -f1)"
   if [ "$actual_config_digest" != "$config_digest" ]; then
     echo "ERROR: child ${digest} config bytes hash to ${actual_config_digest}, expected ${config_digest}" >&2
+    exit 1
+  fi
+  claimed_config_size="$(jq -r '.config.size // ""' "$body")"
+  actual_config_size="$(wc -c < "$WORKDIR/config-${expected_arch}.json" | tr -d ' ')"
+  if [ "$claimed_config_size" != "$actual_config_size" ]; then
+    echo "ERROR: child ${digest} claims a ${claimed_config_size:-<unset>}-byte config, but the blob is ${actual_config_size} bytes" >&2
     exit 1
   fi
   local architecture os revision
@@ -233,10 +283,14 @@ verify_index_reference() {
     exit 1
   fi
 
-  # Descriptor identity is closed as well as counted. In particular, a
-  # linux/amd64 descriptor must not carry an arm-style v8 variant. The
-  # descriptor media type, digest, platform, and OCI size are all validated
-  # before the normalized runnable list is compared with the release inputs.
+  # Descriptor identity is closed as well as counted, and the platform object is
+  # a closed key set rather than a prefix match: linux/amd64 carries exactly
+  # {os, architecture}, linux/arm64 the same plus at most a canonical "v8"
+  # variant. Any other key — os.version, os.features, features, a stray
+  # annotation-style field — is a platform this release was never verified
+  # against, so it is rejected instead of ignored. The descriptor media type,
+  # digest, platform, and OCI size are all validated before the normalized
+  # runnable list is compared with the release inputs.
   local descriptor_contract_ok
   descriptor_contract_ok="$(jq -r --arg amd64 "$AMD64_DIGEST" --arg arm64 "$ARM64_DIGEST" '
     all(.manifests[];
@@ -245,15 +299,20 @@ verify_index_reference() {
       ((.size // -1) | type == "number") and
       ((.size // -1) >= 0) and
       (((.size // -1) | floor) == (.size // -1)) and
+      ((.platform | type) == "object") and
       (
-        ((.platform.os // "") == "linux" and
-         (.platform.architecture // "") == "amd64" and
-         (.digest // "") == $amd64 and
-         (.platform.variant // "") == "") or
-        ((.platform.os // "") == "linux" and
-         (.platform.architecture // "") == "arm64" and
-         (.digest // "") == $arm64 and
-         ((.platform.variant // "") == "" or (.platform.variant // "") == "v8"))
+        (.platform | keys) as $keys |
+        (
+          (.platform.os == "linux" and
+           .platform.architecture == "amd64" and
+           .digest == $amd64 and
+           $keys == ["architecture", "os"]) or
+          (.platform.os == "linux" and
+           .platform.architecture == "arm64" and
+           .digest == $arm64 and
+           ($keys == ["architecture", "os"] or
+            ($keys == ["architecture", "os", "variant"] and .platform.variant == "v8")))
+        )
       )
     )
   ' "$WORKDIR/index.json")"
@@ -282,8 +341,15 @@ verify_index_reference() {
   fi
 
   echo "== Verifying child identity =="
-  verify_child amd64 "$AMD64_DIGEST"
-  verify_child arm64 "$ARM64_DIGEST"
+  local amd64_size arm64_size
+  amd64_size="$(jq -r --arg d "$AMD64_DIGEST" '[.manifests[] | select(.digest == $d) | .size] | if length == 1 then (.[0] | tostring) else "" end' "$WORKDIR/index.json")"
+  arm64_size="$(jq -r --arg d "$ARM64_DIGEST" '[.manifests[] | select(.digest == $d) | .size] | if length == 1 then (.[0] | tostring) else "" end' "$WORKDIR/index.json")"
+  if [ -z "$amd64_size" ] || [ -z "$arm64_size" ]; then
+    echo "ERROR: index does not carry exactly one descriptor per verified platform digest" >&2
+    exit 1
+  fi
+  verify_child amd64 "$AMD64_DIGEST" "$amd64_size"
+  verify_child arm64 "$ARM64_DIGEST" "$arm64_size"
   if ! fetch_manifest "$INDEX_DIGEST" "$WORKDIR/by-digest.json"; then
     echo "ERROR: index digest ${INDEX_DIGEST} is not retrievable" >&2
     exit 1
