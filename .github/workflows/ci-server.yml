@@ -143,6 +143,8 @@ jobs:
             self-host/update.sh \
             self-host/verify.sh \
             self-host/close-signups.sh \
+            self-host/backup-restore.sh \
+            self-host/upgrade.sh \
             scripts/self-host-image-smoke.sh \
             scripts/self-host-compose-effective-check.sh \
             scripts/verify-server-image-release.sh \

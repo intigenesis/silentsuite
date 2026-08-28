@@ -58,6 +58,7 @@ PREFIX = bundle_prefix(TAG)
 BUNDLE_FILES = (
     ".env.example",
     "SELF-HOSTING.md",
+    "backup-restore.sh",
     "close-signups.sh",
     "docker-compose.yml",
     "install.sh",

@@ -473,6 +473,7 @@ done < "$MEMBER_LIST"
 EXPECTED_MEMBERS="$(printf '%s\n' \
   .env.example \
   SELF-HOSTING.md \
+  backup-restore.sh \
   close-signups.sh \
   docker-compose.yml \
   install.sh \
@@ -576,11 +577,11 @@ fi
 # local users on shared hosts — the install dir is a single-operator surface.
 chmod 750 "$INSTALL_DIR"
 
-for file in docker-compose.yml install.sh SELF-HOSTING.md update.sh upgrade.sh verify.sh close-signups.sh success.html .env.example "$MANIFEST_NAME"; do
+for file in docker-compose.yml install.sh SELF-HOSTING.md backup-restore.sh update.sh upgrade.sh verify.sh close-signups.sh success.html .env.example "$MANIFEST_NAME"; do
   cp "$BUNDLE_ROOT/$file" "$INSTALL_DIR/$file"
 done
 cp "$CHECKSUM_FILE" "$INSTALL_DIR/$CHECKSUM_NAME"
-chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/upgrade.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
+chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/upgrade.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh" "$INSTALL_DIR/backup-restore.sh"
 
 cd "$INSTALL_DIR"
 

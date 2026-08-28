@@ -151,6 +151,12 @@ verify_child() {
     echo "ERROR: registry returned ${MANIFEST_DIGEST} for child ${digest}" >&2
     exit 1
   fi
+  local child_media_type
+  child_media_type="$(jq -r '.mediaType // ""' "$body")"
+  if [ "$child_media_type" != "application/vnd.oci.image.manifest.v1+json" ]; then
+    echo "ERROR: child ${digest} is a ${child_media_type:-<unset>}, expected an OCI image manifest" >&2
+    exit 1
+  fi
   local config_digest
   config_digest="$(jq -r '.config.digest // ""' "$body")"
   if ! printf '%s' "$config_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
@@ -227,28 +233,41 @@ verify_index_reference() {
     exit 1
   fi
 
+  # Descriptor identity is closed as well as counted. In particular, a
+  # linux/amd64 descriptor must not carry an arm-style v8 variant. The
+  # descriptor media type, digest, platform, and OCI size are all validated
+  # before the normalized runnable list is compared with the release inputs.
+  local descriptor_contract_ok
+  descriptor_contract_ok="$(jq -r --arg amd64 "$AMD64_DIGEST" --arg arm64 "$ARM64_DIGEST" '
+    all(.manifests[];
+      (.mediaType == "application/vnd.oci.image.manifest.v1+json") and
+      ((.digest // "") | test("^sha256:[0-9a-f]{64}$")) and
+      ((.size // -1) | type == "number") and
+      ((.size // -1) >= 0) and
+      (((.size // -1) | floor) == (.size // -1)) and
+      (
+        ((.platform.os // "") == "linux" and
+         (.platform.architecture // "") == "amd64" and
+         (.digest // "") == $amd64 and
+         (.platform.variant // "") == "") or
+        ((.platform.os // "") == "linux" and
+         (.platform.architecture // "") == "arm64" and
+         (.digest // "") == $arm64 and
+         ((.platform.variant // "") == "" or (.platform.variant // "") == "v8"))
+      )
+    )
+  ' "$WORKDIR/index.json")"
+  if [ "$descriptor_contract_ok" != "true" ]; then
+    echo "ERROR: index descriptors do not match the exact OCI manifest/platform contract" >&2
+    exit 1
+  fi
+
   jq -r '
     [ .manifests[]
       | {os: (.platform.os // ""), architecture: (.platform.architecture // ""), digest: (.digest // "")}
     ] | sort_by([.os, .architecture]) | .[]
     | "\(.os)/\(.architecture) \(.digest)"
   ' "$WORKDIR/index.json" > "$WORKDIR/runnable.txt"
-
-  # A surprise CPU variant would silently change what an operator runs, so only
-  # the canonical arm64 variant spelling is tolerated.
-  local unexpected_variants
-  unexpected_variants="$(jq -r '
-    [ .manifests[]
-      | select((.platform.variant // "") != "")
-      | select((.platform.variant // "") != "v8")
-      | "\(.digest) variant=\(.platform.variant)"
-    ] | .[]
-  ' "$WORKDIR/index.json")"
-  if [ -n "$unexpected_variants" ]; then
-    echo "ERROR: index contains children with unexpected CPU variants:" >&2
-    printf '%s\n' "$unexpected_variants" | sed 's/^/  /' >&2
-    exit 1
-  fi
 
   echo "runnable children:"
   sed 's/^/  /' "$WORKDIR/runnable.txt"

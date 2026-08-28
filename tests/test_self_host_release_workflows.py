@@ -355,6 +355,8 @@ def test_ci_server_runs_the_contract_suite_and_shell_syntax_checks():
     for script in (
         "self-host/install.sh",
         "self-host/update.sh",
+        "self-host/upgrade.sh",
+        "self-host/backup-restore.sh",
         "scripts/self-host-image-smoke.sh",
         "scripts/self-host-compose-effective-check.sh",
         "scripts/verify-server-image-release.sh",

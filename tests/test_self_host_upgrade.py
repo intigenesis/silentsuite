@@ -21,6 +21,7 @@ INDEX_DIGEST = "sha256:" + "4" * 64
 AMD64_DIGEST = "sha256:" + "5" * 64
 ARM64_DIGEST = "sha256:" + "6" * 64
 TARGET_IMAGE = f"ghcr.io/silent-suite/silentsuite-server@{INDEX_DIGEST}"
+UTILITY_IMAGE = "ghcr.io/silent-suite/silentsuite-server@sha256:" + "a" * 64
 BUNDLE_NAME = f"silentsuite-self-host-{TAG}.tar.gz"
 BUNDLE_PREFIX = f"silentsuite-self-host-{TAG}"
 OLD_CHECKSUM_NAME = f"silentsuite-self-host-{OLD_TAG}.tar.gz.sha256"
@@ -29,6 +30,7 @@ OLD_BUNDLE_NAME = f"silentsuite-self-host-{OLD_TAG}.tar.gz"
 MANAGED_FILES = (
     ".env.example",
     "SELF-HOSTING.md",
+    "backup-restore.sh",
     "close-signups.sh",
     "docker-compose.yml",
     "install.sh",
@@ -70,6 +72,7 @@ def build_bundle(path: Path) -> None:
         for name in (
             ".env.example",
             "SELF-HOSTING.md",
+            "backup-restore.sh",
             "close-signups.sh",
             "docker-compose.yml",
             "install.sh",
@@ -102,6 +105,7 @@ def upgrade_workspace(tmp_path: Path):
     source_files = [
         ".env.example",
         "SELF-HOSTING.md",
+        "backup-restore.sh",
         "close-signups.sh",
         "docker-compose.yml",
         "install.sh",
@@ -175,9 +179,37 @@ case "$1" in
     ;;
   inspect)
     case "$*" in
+      *State.Running*) printf '%s\\n' 'true' ;;
+      *Config.Image*) printf '%s\\n' '{UTILITY_IMAGE}' ;;
+      *Mounts*)
+        case "$*" in
+          *silentsuite-postgres*) printf 'volume|%s|/var/lib/docker/volumes/%s/_data\\n' "${{UPGRADE_POSTGRES_VOLUME:-default-project_pgdata}}" "${{UPGRADE_POSTGRES_VOLUME:-default-project_pgdata}}" ;;
+          *silentsuite-server*) printf 'volume|%s|/var/lib/docker/volumes/%s/_data\\n' "${{UPGRADE_SERVER_VOLUME:-default-project_server_data}}" "${{UPGRADE_SERVER_VOLUME:-default-project_server_data}}" ;;
+        esac
+        ;;
       *State.Status*) printf '%s\\n' 'running' ;;
       *State.Health.Status*) printf '%s\\n' 'healthy' ;;
     esac
+    ;;
+  volume)
+    if [ "${2:-}" = inspect ]; then
+      if [ -n "${{FAIL_VOLUME_INSPECT:-}}" ]; then exit 45; fi
+      volume_name="${{@: -1}}"
+      if [[ "$volume_name" == *pgdata* ]]; then
+        driver="${{UPGRADE_POSTGRES_VOLUME_DRIVER-local}}"
+        options="${{UPGRADE_POSTGRES_VOLUME_OPTIONS-null}}"
+      else
+        driver="${{UPGRADE_SERVER_VOLUME_DRIVER-local}}"
+        options="${{UPGRADE_SERVER_VOLUME_OPTIONS-null}}"
+      fi
+      if [[ "$*" == *"{{.Driver}}"* ]]; then
+        printf '%s\n' "$driver"
+      elif [[ "$*" == *"{{json .Options}}"* ]]; then
+        printf '%s\n' "$options"
+      else
+        printf '{{}}\n'
+      fi
+    fi
     ;;
 esac
 """
@@ -235,6 +267,11 @@ def test_upgrade_advances_managed_files_and_preserves_operator_files(upgrade_wor
     assert (install / f"{BUNDLE_NAME}.sha256").is_file()
     assert (backup / "files" / OLD_CHECKSUM_NAME).read_text(encoding="utf-8").startswith("a" * 64)
     metadata = (backup / "metadata").read_text(encoding="utf-8")
+    assert "postgresVolume=default-project_pgdata\n" in metadata
+    assert "serverDataVolume=default-project_server_data\n" in metadata
+    assert f"utilityImage={UTILITY_IMAGE}\n" in metadata
+    assert metadata.count("schemaVersion=1\n") == 1
+    assert (backup / "metadata").stat().st_mode & 0o777 == 0o600
     assert "previousImage=ghcr.io/silent-suite/silentsuite-server@sha256:" + "0" * 64 in metadata
     assert f"targetChecksumName={BUNDLE_NAME}.sha256" in metadata
     assert f"previousChecksumName={OLD_CHECKSUM_NAME}" in metadata
@@ -249,6 +286,43 @@ def test_upgrade_advances_managed_files_and_preserves_operator_files(upgrade_wor
     restart = next(index for index, command in enumerate(commands) if " up -d" in command)
     assert admission < pull < backup_at_stop < stop < migrate < restart
     assert not any("stop" in command and "postgres" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    "failure_env",
+    [
+        {"UPGRADE_POSTGRES_VOLUME_DRIVER": "nfs"},
+        {"UPGRADE_SERVER_VOLUME_OPTIONS": '{"device":"secret-endpoint"}'},
+    ],
+    ids=["custom-driver", "custom-options"],
+)
+def test_upgrade_rejects_custom_volume_recreation_before_durable_backup(upgrade_workspace, failure_env):
+    tmp_path, install, staged, bin_dir = upgrade_workspace
+    log = tmp_path / "docker.log"
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "UPGRADE_LOG": str(log),
+            "UPGRADE_INSTALL_DIR": str(install),
+            **failure_env,
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(UPGRADE), "--staged", str(staged), "--install-dir", str(install)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "custom driver/options unsupported" in result.stderr
+    assert "secret-endpoint" not in result.stderr
+    assert not (install / ".silentsuite-upgrade-backups").exists()
+    commands = log.read_text(encoding="utf-8").splitlines()
+    assert not any("stop server" in command or "run --rm --no-deps" in command for command in commands)
 
 
 @pytest.mark.parametrize("tamper", ["staged", "archive"])

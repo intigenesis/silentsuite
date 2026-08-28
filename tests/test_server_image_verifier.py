@@ -24,7 +24,14 @@ def _digest(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def _registry_fixture(tmp_path: Path, *, extra_attestation: bool) -> tuple[Path, Path]:
+def _registry_fixture(
+    tmp_path: Path,
+    *,
+    extra_attestation: bool = False,
+    amd64_variant: str | None = None,
+    arm64_variant: str | None = "v8",
+    descriptor_media_type: str | None = "application/vnd.oci.image.manifest.v1+json",
+) -> tuple[Path, Path]:
     fixture = tmp_path / "registry-fixture"
     fixture.mkdir()
     manifests: dict[str, object] = {}
@@ -50,18 +57,24 @@ def _registry_fixture(tmp_path: Path, *, extra_attestation: bool) -> tuple[Path,
             "layers": [],
         }
 
+    amd64_platform = {"os": "linux", "architecture": "amd64"}
+    arm64_platform = {"os": "linux", "architecture": "arm64"}
+    if amd64_variant is not None:
+        amd64_platform["variant"] = amd64_variant
+    if arm64_variant is not None:
+        arm64_platform["variant"] = arm64_variant
     descriptors = [
         {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "mediaType": descriptor_media_type,
             "digest": AMD64_DIGEST,
             "size": 1,
-            "platform": {"os": "linux", "architecture": "amd64"},
+            "platform": amd64_platform,
         },
         {
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "mediaType": descriptor_media_type,
             "digest": ARM64_DIGEST,
             "size": 1,
-            "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"},
+            "platform": arm64_platform,
         },
     ]
     if extra_attestation:
@@ -142,9 +155,7 @@ print('200', end='')
     return fixture, curl
 
 
-@pytest.mark.parametrize("extra_attestation", [False, True])
-def test_verifier_requires_closed_two_descriptor_oci_index(tmp_path: Path, extra_attestation: bool):
-    fixture, curl = _registry_fixture(tmp_path, extra_attestation=extra_attestation)
+def _run_verifier(tmp_path: Path, fixture: Path, curl: Path) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.update(
         {
@@ -154,7 +165,7 @@ def test_verifier_requires_closed_two_descriptor_oci_index(tmp_path: Path, extra
             "REGISTRY_PASSWORD": "fixture-password",
         }
     )
-    result = subprocess.run(
+    return subprocess.run(
         [
             "bash",
             str(VERIFIER),
@@ -175,9 +186,35 @@ def test_verifier_requires_closed_two_descriptor_oci_index(tmp_path: Path, extra
         text=True,
     )
 
-    if extra_attestation:
-        assert result.returncode != 0
-        assert "exactly two descriptors" in result.stderr
-    else:
-        assert result.returncode == 0, result.stderr
-        assert "Release image verified" in result.stdout
+
+
+def test_verifier_accepts_exact_two_descriptors_with_canonical_variants(tmp_path: Path):
+    fixture, curl = _registry_fixture(tmp_path)
+    result = _run_verifier(tmp_path, fixture, curl)
+    assert result.returncode == 0, result.stderr
+    assert "Release image verified" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("fixture_kwargs", "error"),
+    [
+        ({"amd64_variant": "v8"}, "exact OCI manifest/platform contract"),
+        ({"arm64_variant": "v9"}, "exact OCI manifest/platform contract"),
+        ({"extra_attestation": True}, "exactly two descriptors"),
+        ({"descriptor_media_type": "application/vnd.docker.distribution.manifest.v2+json"}, "exact OCI manifest/platform contract"),
+        ({"descriptor_media_type": None}, "exact OCI manifest/platform contract"),
+    ],
+)
+def test_verifier_rejects_noncanonical_or_malformed_descriptors(
+    tmp_path: Path, fixture_kwargs: dict[str, object], error: str
+):
+    fixture, curl = _registry_fixture(tmp_path, **fixture_kwargs)
+    result = _run_verifier(tmp_path, fixture, curl)
+    assert result.returncode != 0
+    assert error in result.stderr
+
+
+def test_verifier_accepts_arm64_v8_and_absent_amd64_variant(tmp_path: Path):
+    fixture, curl = _registry_fixture(tmp_path, amd64_variant=None, arm64_variant="v8")
+    result = _run_verifier(tmp_path, fixture, curl)
+    assert result.returncode == 0, result.stderr

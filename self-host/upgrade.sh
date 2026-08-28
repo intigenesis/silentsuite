@@ -56,6 +56,7 @@ MANIFEST_NAME="server-image.json"
 MANAGED_FILES=(
   .env.example
   SELF-HOSTING.md
+  backup-restore.sh
   close-signups.sh
   docker-compose.yml
   install.sh
@@ -69,6 +70,7 @@ BACKUP_DIR=""
 SERVER_STOP_REQUESTED=0
 MIGRATION_STARTED=0
 RECOVERY_ATTEMPTED=0
+BACKUP_READY=0
 
 fail() {
   echo "ERROR: $1" >&2
@@ -223,6 +225,7 @@ done < "$MEMBER_LIST"
 EXPECTED_MEMBERS="$(printf '%s\n' \
   .env.example \
   SELF-HOSTING.md \
+  backup-restore.sh \
   close-signups.sh \
   docker-compose.yml \
   install.sh \
@@ -351,18 +354,43 @@ set -euo pipefail
 BACKUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(cd "$BACKUP_DIR/../.." && pwd)"
 RELEASE_CHECKSUM_BASENAME_RE='^silentsuite-self-host-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?\.tar\.gz\.sha256$'
+UTILITY_IMAGE_RE='^ghcr\.io/silent-suite/silentsuite-server@sha256:[0-9a-f]{64}$'
+VOLUME_RECREATION_CONTRACT='local-empty-options'
 METADATA="$BACKUP_DIR/metadata"
 [ -f "$METADATA" ] && [ ! -L "$METADATA" ] || { echo "ERROR: backup metadata is missing or not a regular file" >&2; exit 1; }
+[ "$(stat -c '%a' "$METADATA" 2>/dev/null || stat -f '%Lp' "$METADATA")" = "600" ] || { echo "ERROR: backup metadata must have mode 600" >&2; exit 1; }
+SCHEMA_ENTRIES="$(grep -Ec '^schemaVersion=1$' "$METADATA" || true)"
+[ "$SCHEMA_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must contain exactly one schema version" >&2; exit 1; }
 TARGET_CHECKSUM_ENTRIES="$(grep -Ec '^targetChecksumName=' "$METADATA" || true)"
 [ "$TARGET_CHECKSUM_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must contain exactly one target checksum name" >&2; exit 1; }
 TARGET_CHECKSUM_NAME="$(sed -n 's/^targetChecksumName=//p' "$METADATA")"
 [[ "$TARGET_CHECKSUM_NAME" =~ $RELEASE_CHECKSUM_BASENAME_RE ]] || { echo "ERROR: backup metadata has an invalid target checksum name" >&2; exit 1; }
+VOLUME_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$'
+POSTGRES_VOLUME_ENTRIES="$(grep -Ec '^postgresVolume=' "$METADATA" || true)"
+SERVER_VOLUME_ENTRIES="$(grep -Ec '^serverDataVolume=' "$METADATA" || true)"
+[ "$POSTGRES_VOLUME_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must contain exactly one postgres volume identity" >&2; exit 1; }
+[ "$SERVER_VOLUME_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must contain exactly one server-data volume identity" >&2; exit 1; }
+POSTGRES_VOLUME="$(sed -n 's/^postgresVolume=//p' "$METADATA")"
+SERVER_VOLUME="$(sed -n 's/^serverDataVolume=//p' "$METADATA")"
+[[ "$POSTGRES_VOLUME" =~ $VOLUME_NAME_RE ]] || { echo "ERROR: backup metadata has an invalid postgres volume identity" >&2; exit 1; }
+[[ "$SERVER_VOLUME" =~ $VOLUME_NAME_RE ]] || { echo "ERROR: backup metadata has an invalid server-data volume identity" >&2; exit 1; }
+POSTGRES_VOLUME_CONTRACT_ENTRIES="$(grep -Ec '^postgresVolumeRecreationContract=' "$METADATA" || true)"
+SERVER_VOLUME_CONTRACT_ENTRIES="$(grep -Ec '^serverDataVolumeRecreationContract=' "$METADATA" || true)"
+[ "$POSTGRES_VOLUME_CONTRACT_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must prove the postgres volume uses the local driver with empty options" >&2; exit 1; }
+[ "$SERVER_VOLUME_CONTRACT_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must prove the server-data volume uses the local driver with empty options" >&2; exit 1; }
+[ "$(sed -n 's/^postgresVolumeRecreationContract=//p' "$METADATA")" = "$VOLUME_RECREATION_CONTRACT" ] || { echo "ERROR: backup metadata has an unsupported postgres volume recreation contract" >&2; exit 1; }
+[ "$(sed -n 's/^serverDataVolumeRecreationContract=//p' "$METADATA")" = "$VOLUME_RECREATION_CONTRACT" ] || { echo "ERROR: backup metadata has an unsupported server-data volume recreation contract" >&2; exit 1; }
+UTILITY_IMAGE_ENTRIES="$(grep -Ec '^utilityImage=' "$METADATA" || true)"
+[ "$UTILITY_IMAGE_ENTRIES" = "1" ] || { echo "ERROR: backup metadata must contain exactly one utility image identity" >&2; exit 1; }
+UTILITY_IMAGE="$(sed -n 's/^utilityImage=//p' "$METADATA")"
+[[ "$UTILITY_IMAGE" =~ $UTILITY_IMAGE_RE ]] || { echo "ERROR: backup metadata has an invalid utility image identity" >&2; exit 1; }
 mapfile -t PREVIOUS_CHECKSUM_NAMES < <(sed -n 's/^previousChecksumName=//p' "$METADATA")
 
 FILES=(
   .env
   .env.example
   SELF-HOSTING.md
+  backup-restore.sh
   close-signups.sh
   docker-compose.yml
   install.sh
@@ -436,7 +464,16 @@ RESTORE_HELPER
 }
 
 backup_cohort() {
-  local backup_parent file checksum_name
+  local backup_parent file checksum_name recorded_metadata
+
+  # Validate the live volume identities and their plain-create contract before
+  # creating any durable cohort backup directory or changing the installation.
+  recorded_metadata="$WORKDIR/recorded-volume-metadata"
+  "$BUNDLE_ROOT/backup-restore.sh" record \
+    --metadata "$recorded_metadata" \
+    --install-dir "$INSTALL_DIR" \
+    || fail "could not validate and record the running data volume identities"
+
   backup_parent="$INSTALL_DIR/.silentsuite-upgrade-backups"
   if [ -L "$backup_parent" ]; then
     fail "backup directory '$backup_parent' is a symlink"
@@ -450,6 +487,7 @@ backup_cohort() {
   chmod 700 "$BACKUP_DIR"
   mkdir "$BACKUP_DIR/files"
   chmod 700 "$BACKUP_DIR/files"
+  cp -p -- "$recorded_metadata" "$BACKUP_DIR/metadata"
 
   PREVIOUS_IMAGE="$(sed -n 's/^SILENTSUITE_SERVER_IMAGE=//p' "$INSTALL_DIR/.env")"
   printf '%s' "$PREVIOUS_IMAGE" | grep -Eq "^${IMAGE_REPOSITORY//./\\.}@sha256:[0-9a-f]{64}$" \
@@ -465,7 +503,6 @@ backup_cohort() {
     cp -p -- "$INSTALL_DIR/$checksum_name" "$BACKUP_DIR/files/$checksum_name"
   done
   {
-    printf 'schemaVersion=1\n'
     printf 'createdAt=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'previousImage=%s\n' "$PREVIOUS_IMAGE"
     printf 'targetImage=%s\n' "$TARGET_IMAGE"
@@ -474,9 +511,10 @@ backup_cohort() {
     for checksum_name in "${PREVIOUS_CHECKSUM_NAMES[@]}"; do
       printf 'previousChecksumName=%s\n' "$checksum_name"
     done
-  } > "$BACKUP_DIR/metadata"
+  } >> "$BACKUP_DIR/metadata"
   chmod 600 "$BACKUP_DIR/metadata"
   write_restore_helper
+  BACKUP_READY=1
   echo "Durable previous cohort backup: $BACKUP_DIR"
 }
 
@@ -494,7 +532,7 @@ start_and_verify_previous_service() {
 on_exit() {
   local status="$?" restored=0 previous_running=0
   trap - EXIT
-  if [ "$status" -ne 0 ] && [ -n "$BACKUP_DIR" ] && [ "$RECOVERY_ATTEMPTED" -eq 0 ]; then
+  if [ "$status" -ne 0 ] && [ "$BACKUP_READY" -eq 1 ] && [ "$RECOVERY_ATTEMPTED" -eq 0 ]; then
     RECOVERY_ATTEMPTED=1
     if restore_previous_cohort; then
       restored=1
