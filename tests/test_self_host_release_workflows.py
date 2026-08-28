@@ -164,15 +164,21 @@ def test_immutability_is_proven_during_admission_before_any_registry_write():
 
     admit = RELEASE["jobs"]["admit"]
     names = step_names(admit)
-    checkout = names.index("Checkout exact tag commit")
+    source = names.index("Require an immutable tag reachable from protected main")
     guard = names.index("Require immutable published releases")
-    assert guard == checkout + 1, "the gate runs immediately after checkout"
-    assert guard < names.index("Require an immutable tag reachable from protected main")
+    # Source admission first, so the settings secret is never exposed to a run
+    # that was not going to be admitted; the gate then closes the job.
+    assert guard == source + 1
+    assert guard == len(names) - 1, "the gate is the last thing admission does"
 
     step = step_named(admit, "Require immutable published releases")
-    assert "scripts/require-immutable-releases.sh" in step["run"]
-    assert step["env"]["GITHUB_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
-    # Read-only token: the gate never needs, and must never acquire, write scope.
+    # Exact, not substring: a stray following line folds into this plain scalar
+    # and would silently turn the gate into a different command.
+    assert step["run"].strip() == GUARD_SCRIPT
+    assert step["env"] == {
+        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
+    }, "the gate reads with the dedicated Administration:read secret only"
+    # The job token stays read-only, and is not what authenticates the gate.
     assert admit["permissions"] == {"contents": "read"}
 
     for registry_writer in ("build", "publish-index"):
@@ -500,10 +506,17 @@ def test_every_umbrella_attachment_job_shares_one_tag_scoped_domain(path, job_na
     """
 
     job = load(path)["jobs"][job_name]
-    assert job["concurrency"]["group"] == UMBRELLA_GROUP
-    # Cancelling an attachment does not undo it; it just leaves the draft
-    # missing a component with no failure to notice.
-    assert job["concurrency"]["cancel-in-progress"] == "false"
+    # Exact three-way contract: same group, never cancels, and keeps every
+    # pending job. Under the default queue the scheduler retains one pending job
+    # per group and replaces it, so with three components one attachment would be
+    # dropped while merely waiting — silently, since a replaced pending job is
+    # not a failure. `queue: max` holds them FIFO and cannot be paired with
+    # cancel-in-progress: true.
+    assert job["concurrency"] == {
+        "group": UMBRELLA_GROUP,
+        "cancel-in-progress": "false",
+        "queue": "max",
+    }
 
 
 def test_the_umbrella_domain_is_scoped_to_the_tag_not_the_commit_or_workflow():
@@ -523,10 +536,37 @@ def test_a_manual_bridge_release_cannot_share_a_domain_with_a_real_umbrella_tag(
     assert bridge["jobs"]["release"]["concurrency"]["group"] == UMBRELLA_GROUP
 
 
-def test_the_bridge_build_matrix_keeps_its_own_unrelated_concurrency():
-    bridge = load(BRIDGE_WORKFLOW)
-    assert bridge["concurrency"]["group"] == "${{ github.workflow }}-${{ github.ref }}"
-    assert bridge["concurrency"]["cancel-in-progress"] == "true"
+def test_no_enclosing_concurrency_rule_can_cancel_a_tag_attachment():
+    """A workflow-level cancellation outranks the job-level umbrella lock.
+
+    Cancelling the workflow cancels the release job with it, so an outer
+    cancel-in-progress would undo "never cancel an attachment" for Bridge no
+    matter what the job declares. Same-ref runs queue instead of superseding.
+    """
+
+    for path in (BRIDGE_WORKFLOW, ANDROID_WORKFLOW, RELEASE_WORKFLOW):
+        workflow = load(path)
+        outer = workflow.get("concurrency")
+        if outer is None:
+            continue
+        assert outer.get("cancel-in-progress") == "false", (
+            f"{path.name}: a workflow-level cancellation group can cancel its own "
+            "umbrella attachment job"
+        )
+
+    bridge = load(BRIDGE_WORKFLOW)["concurrency"]
+    assert bridge["group"] == "${{ github.workflow }}-${{ github.ref }}"
+    assert bridge["queue"] == "max"
+
+
+@pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
+def test_queue_max_is_never_paired_with_cancellation(path, job_name, attach_step):
+    """GitHub rejects that combination; asserting it keeps the pair coherent."""
+
+    workflow = load(path)
+    for declaration in (workflow.get("concurrency"), workflow["jobs"][job_name].get("concurrency")):
+        if declaration and declaration.get("queue") == "max":
+            assert declaration.get("cancel-in-progress") == "false"
 
 
 @pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
@@ -536,13 +576,53 @@ def test_no_asset_is_attached_before_immutability_is_proven(path, job_name, atta
     assert GUARD_STEP in names, f"{path.name}:{job_name} has no immutability gate"
     guard_index = names.index(GUARD_STEP)
     assert guard_index < names.index(attach_step)
-    assert GUARD_SCRIPT in step_named(job, GUARD_STEP)["run"]
-    assert step_named(job, GUARD_STEP)["env"]["GITHUB_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    assert step_named(job, GUARD_STEP)["run"].strip() == GUARD_SCRIPT
+    # Every gate authenticates with the dedicated settings-read secret. The
+    # workflow token cannot hold repository Administration: read, so a lane that
+    # passed GITHUB_TOKEN here would fail in production for a permission reason
+    # that reads like "immutability is off".
+    assert step_named(job, GUARD_STEP)["env"] == {
+        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
+    }
 
     # Nothing that can create a draft or upload an asset may precede the gate.
     for step in steps(job)[:guard_index]:
         assert "softprops/action-gh-release" not in str(step.get("uses", ""))
         assert "publish-self-host-release-assets.sh" not in str(step.get("run", ""))
+
+
+def test_the_publish_helper_step_carries_both_credentials():
+    """One token to read the setting, a different one to write the release."""
+
+    step = step_named(
+        RELEASE["jobs"]["attach-release-assets"],
+        "Attach the verified assets to the shared draft release",
+    )
+    assert step["env"] == {
+        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}",
+    }
+    helper = PUBLISH_HELPER.read_text(encoding="utf-8")
+    assert 'IMMUTABLE_RELEASES_READ_TOKEN:?' in helper, "the helper requires it up front"
+    assert 'GITHUB_TOKEN:?' in helper
+
+
+def test_no_lane_authenticates_the_settings_read_with_the_workflow_token():
+    """The endpoint needs Administration: read, which GITHUB_TOKEN cannot hold.
+
+    Passing the workflow token would fail every release for a reason that looks
+    like "immutability is off", so no gate step may carry it.
+    """
+
+    for path, job_name, _ in ATTACHMENT_JOBS:
+        job = load(path)["jobs"][job_name]
+        assert "GITHUB_TOKEN" not in step_named(job, GUARD_STEP)["env"], path.name
+    admit_gate = step_named(RELEASE["jobs"]["admit"], GUARD_STEP)
+    assert "GITHUB_TOKEN" not in admit_gate["env"]
+    # And the guard itself never reaches for it, even if it were in scope.
+    guard = (ROOT / GUARD_SCRIPT).read_text(encoding="utf-8")
+    for expansion in ("$GITHUB_TOKEN", "${GITHUB_TOKEN"):
+        assert expansion not in guard
 
 
 def test_the_publish_helper_gates_on_immutability_before_it_can_write():

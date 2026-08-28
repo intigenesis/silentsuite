@@ -44,18 +44,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # First gate in the whole lane, before the tag is admitted and before any
-      # job that could push a GHCR child or move an alias. Immutable publication
-      # is what makes a released asset authenticate itself, so a disabled or
-      # unreadable setting stops the release here rather than after bytes have
-      # reached the registry. Uses only this job's contents:read token; the
-      # attachment job and the publish helper check again before they write.
-      - name: Require immutable published releases
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/require-immutable-releases.sh
-
       - name: Require an immutable tag reachable from protected main
         id: source
         shell: bash
@@ -88,6 +76,25 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "Admitted ${TAG} at ${GITHUB_SHA} (reachable from origin/main)"
+
+      # Last step of admission, and the gate for the whole lane: every other job
+      # needs `admit`, so a disabled or unreadable setting stops the release
+      # before any job that could push a GHCR child or move an alias.
+      #
+      # It runs after the tag has been proven to be a real release tag reachable
+      # from protected main, so the settings-read secret is never exposed to a
+      # run that was not going to be admitted anyway.
+      #
+      # This uses IMMUTABLE_RELEASES_READ_TOKEN, not GITHUB_TOKEN: the endpoint
+      # needs repository Administration: read, which no workflow token can hold.
+      # The owner supplies that read-only secret and enables the setting; nothing
+      # here changes either. The attachment job and the publish helper re-check
+      # before they write.
+      - name: Require immutable published releases
+        shell: bash
+        env:
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: scripts/require-immutable-releases.sh
 
   build:
     name: Build and smoke (${{ matrix.platform }})
@@ -432,9 +439,15 @@ jobs:
     # serialize them; this one can, because concurrency groups are repository
     # scoped by name. Never cancel: a cancelled attachment leaves the umbrella
     # draft missing a component rather than merely late.
+    #
+    # queue: max is what makes "never cancel" true for all three. The default
+    # (single) keeps one pending job per group and replaces it, so the third
+    # component to arrive would evict the second while it was still waiting.
+    # max queues them FIFO; it cannot be combined with cancel-in-progress: true.
     concurrency:
       group: umbrella-release-${{ github.ref_name }}
       cancel-in-progress: false
+      queue: max
     env:
       RELEASE_TAG: ${{ needs.admit.outputs.tag }}
       RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
@@ -470,16 +483,22 @@ jobs:
 
       # Before any draft is created or any byte is uploaded. A published asset
       # only authenticates itself if the release cannot be rewritten afterwards.
+      # Reads the setting with the dedicated Administration:read secret; the
+      # workflow token below stays scoped to the release write it performs.
       - name: Require immutable published releases
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
         run: scripts/require-immutable-releases.sh
 
+      # Both credentials, each for exactly one job: the read-only settings token
+      # for the helper's defense-in-depth re-check, the workflow token for the
+      # release writes themselves.
       - name: Attach the verified assets to the shared draft release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
         run: |
           set -euo pipefail
           scripts/publish-self-host-release-assets.sh \

@@ -793,9 +793,17 @@ jobs:
     # Shared tag-scoped domain with the Bridge and self-host attachment jobs, so
     # the three components never append to the same umbrella draft at once.
     # Never cancel: a cancelled attachment silently drops a component.
+    #
+    # queue: max is load-bearing, not decoration. Under the default (single) the
+    # scheduler keeps only one pending job per group and replaces it, so with
+    # three components one attachment would be cancelled while merely waiting —
+    # the umbrella draft would come out a component short with nothing failing.
+    # max holds them in FIFO instead. It cannot be combined with
+    # cancel-in-progress: true, which is fine: never cancelling is the point.
     concurrency:
       group: umbrella-release-${{ github.ref_name }}
       cancel-in-progress: false
+      queue: max
     defaults:
       run:
         working-directory: android
@@ -993,10 +1001,14 @@ jobs:
       # Assets that can be replaced after publication cannot authenticate
       # themselves, so the lane refuses to attach anything until immutable
       # releases are enabled.
+      #
+      # Reads the setting with the dedicated Administration:read secret. The
+      # workflow token cannot hold that permission, and is left to the release
+      # action's contents write.
       - name: Require immutable published releases
         working-directory: ${{ github.workspace }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
         run: scripts/require-immutable-releases.sh
 
       - name: Attach Android artifacts to umbrella GitHub Release

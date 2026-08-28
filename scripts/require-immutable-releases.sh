@@ -17,17 +17,35 @@ set -euo pipefail
 # This script never enables the setting and never writes anything: turning
 # immutability on is an owner decision, made outside this repository's code.
 #
+# Credential, and why it is a separate one:
+#   Reading this endpoint requires repository "Administration: read". That is
+#   not an available workflow-token permission — no `permissions:` block can
+#   grant it, and contents/packages write does not imply it. So the guard reads
+#   the setting with IMMUTABLE_RELEASES_READ_TOKEN, a dedicated fine-grained PAT
+#   or GitHub App installation token holding *only* repository Administration:
+#   read. There is deliberately no fallback to the workflow token: a workflow
+#   token would always fail this call, and silently degrading to it would turn a
+#   permission problem into an apparent "setting is off" or, worse, invite
+#   widening the publisher's credential. The workflow token stays scoped to what
+#   it is actually for — contents/release/package writes in publisher steps.
+#
+# External prerequisites, both owner actions this repository's code never takes:
+#   1. Enable immutable releases on the repository.
+#   2. Configure the IMMUTABLE_RELEASES_READ_TOKEN secret with Administration:
+#      read and nothing else.
+#   Until both exist, every release lane fails closed here. That is intended.
+#
 # Usage:
 #   scripts/require-immutable-releases.sh
 #
-# Requires GITHUB_TOKEN (contents:read is sufficient), GITHUB_REPOSITORY, curl
-# and jq. Nothing derived from the token is ever printed.
+# Requires IMMUTABLE_RELEASES_READ_TOKEN, GITHUB_REPOSITORY, curl and jq.
+# No token value, and nothing derived from one, is ever printed.
 
 for tool in curl jq; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' is required" >&2; exit 2; }
 done
 
-: "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
+: "${IMMUTABLE_RELEASES_READ_TOKEN:?IMMUTABLE_RELEASES_READ_TOKEN must be set (repository Administration: read)}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 API="${GITHUB_API_URL:-https://api.github.com}"
 
@@ -41,7 +59,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 BODY="$WORKDIR/immutable-releases.json"
 
 STATUS="$(curl -sS -o "$BODY" -w '%{http_code}' \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Authorization: Bearer $IMMUTABLE_RELEASES_READ_TOKEN" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" \
   "${API}/repos/${GITHUB_REPOSITORY}/immutable-releases")"
@@ -51,6 +69,10 @@ STATUS="$(curl -sS -o "$BODY" -w '%{http_code}' \
 if [ "$STATUS" != "200" ]; then
   echo "ERROR: could not read the release-immutability setting (HTTP ${STATUS})." >&2
   echo "       Refusing to create or attach release assets without that proof." >&2
+  if [ "$STATUS" = "401" ] || [ "$STATUS" = "403" ] || [ "$STATUS" = "404" ]; then
+    echo "       401/403/404 here usually means IMMUTABLE_RELEASES_READ_TOKEN lacks" >&2
+    echo "       repository Administration: read, or is not the workflow's secret." >&2
+  fi
   exit 1
 fi
 
@@ -66,8 +88,8 @@ if [ "$(jq -r '.enabled' "$BODY")" != "true" ]; then
   echo "       Published assets could be replaced after an operator verifies them," >&2
   echo "       so this lane refuses to create a draft or upload an asset." >&2
   echo "       A repository owner must enable immutable releases first. This script" >&2
-  echo "       never changes the setting, and GitHub does not apply it to releases" >&2
-  echo "       that were published before it was enabled." >&2
+  echo "       only reads the setting; it never changes it, and GitHub does not apply" >&2
+  echo "       it to releases that were published before it was enabled." >&2
   exit 1
 fi
 

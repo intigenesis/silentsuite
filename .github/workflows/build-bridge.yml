@@ -11,10 +11,15 @@ on:
         required: false
         default: "no"
 
-# Cancel in-progress runs on the same ref
+# Same-ref runs are serialized, never cancelled. An enclosing cancellation group
+# outranks the job-level umbrella lock below: cancelling the workflow cancels the
+# release job with it, so a second same-ref run (including a dispatch selecting a
+# tag) could interrupt an attachment that was mid-upload or merely pending. Queue
+# them in FIFO instead — supersession is not worth an incomplete umbrella draft.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -282,13 +287,18 @@ jobs:
     permissions:
       contents: write
     # Shared tag-scoped domain with the Android and self-host attachment jobs.
-    # The build matrix above keeps its own cancel-on-superseded group; this one
-    # only serializes umbrella-draft writes and never cancels. A manual dispatch
-    # groups on its dispatch ref and attaches to a synthetic
+    # This one only serializes umbrella-draft writes and never cancels. A manual
+    # dispatch groups on its dispatch ref and attaches to a synthetic
     # v0.0.0-bridge-manual-* release, so it never writes a real umbrella draft.
+    #
+    # queue: max keeps every waiting attachment. The default (single) retains one
+    # pending job per group and replaces it, which with three components would
+    # silently drop one from the draft. It cannot combine with
+    # cancel-in-progress: true, which is exactly the behaviour being avoided.
     concurrency:
       group: umbrella-release-${{ github.ref_name }}
       cancel-in-progress: false
+      queue: max
 
     steps:
       - name: Checkout
@@ -332,7 +342,7 @@ jobs:
       # themselves, so nothing is attached until immutable releases are enabled.
       - name: Require immutable published releases
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
         run: scripts/require-immutable-releases.sh
 
       # Create / append to the umbrella GitHub Release.

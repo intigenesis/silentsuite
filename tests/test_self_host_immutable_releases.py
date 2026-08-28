@@ -19,7 +19,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 GUARD = ROOT / "scripts" / "require-immutable-releases.sh"
 REPOSITORY = "silent-suite/silentsuite"
-TOKEN = "fixture-token-value-not-a-secret"
+READ_TOKEN = "fixture-admin-read-token-not-a-secret"
+WORKFLOW_TOKEN = "fixture-workflow-token-not-a-secret"
 
 CURL_STUB = r'''#!/usr/bin/env bash
 # Stand-in for the single curl invocation the guard makes.
@@ -58,7 +59,10 @@ def _run(tmp_path: Path, fixtures: Path, **overrides) -> subprocess.CompletedPro
         {
             "PATH": f"{tmp_path}:{environment['PATH']}",
             "GUARD_FIXTURES": str(fixtures),
-            "GITHUB_TOKEN": TOKEN,
+            "IMMUTABLE_RELEASES_READ_TOKEN": READ_TOKEN,
+            # Present but unusable for this endpoint: the guard must never
+            # reach for it, even when it is sitting right there.
+            "GITHUB_TOKEN": WORKFLOW_TOKEN,
             "GITHUB_REPOSITORY": REPOSITORY,
         }
     )
@@ -82,7 +86,7 @@ def test_the_live_disabled_setting_blocks_the_lane(tmp_path: Path):
     result = _run(tmp_path, fixtures)
     assert result.returncode == 1
     assert "release immutability is disabled" in result.stderr
-    assert "never changes the setting" in result.stderr
+    assert "only reads the setting; it never changes it" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -113,11 +117,12 @@ def test_an_unreadable_setting_is_not_a_passing_setting(tmp_path: Path, status: 
     assert "Refusing to create or attach" in result.stderr
 
 
-def test_the_guard_only_reads_and_never_leaks_the_token(tmp_path: Path):
+def test_the_guard_only_reads_and_never_leaks_either_token(tmp_path: Path):
     fixtures = _fixture(tmp_path, json.dumps({"enabled": False}))
     result = _run(tmp_path, fixtures)
-    assert TOKEN not in result.stdout
-    assert TOKEN not in result.stderr
+    for secret in (READ_TOKEN, WORKFLOW_TOKEN):
+        assert secret not in result.stdout
+        assert secret not in result.stderr
     calls = (fixtures / "curl.log").read_text().strip().split("\n")
     assert len(calls) == 1, "the guard should make exactly one request"
     assert f"/repos/{REPOSITORY}/immutable-releases" in calls[0]
@@ -125,9 +130,44 @@ def test_the_guard_only_reads_and_never_leaks_the_token(tmp_path: Path):
         assert mutation not in calls[0], f"the guard must not {mutation} anything"
 
 
+def test_the_settings_read_uses_the_dedicated_token_not_the_workflow_token(tmp_path: Path):
+    """The endpoint needs repository Administration: read.
+
+    No workflow `permissions:` block can grant that, so the guard authenticates
+    with a separate read-only credential. Proving *which* token went on the wire
+    is the whole point: sending the workflow token would fail in production and
+    would tempt someone to widen the publisher's credential instead.
+    """
+
+    fixtures = _fixture(tmp_path, json.dumps({"enabled": True}))
+    result = _run(tmp_path, fixtures)
+    assert result.returncode == 0, result.stderr
+    call = (fixtures / "curl.log").read_text()
+    assert f"Authorization: Bearer {READ_TOKEN}" in call
+    assert WORKFLOW_TOKEN not in call
+
+
+def test_there_is_no_fallback_to_the_workflow_token(tmp_path: Path):
+    """A missing read token must fail closed, never silently degrade."""
+
+    fixtures = _fixture(tmp_path, json.dumps({"enabled": True}))
+    result = _run(tmp_path, fixtures, IMMUTABLE_RELEASES_READ_TOKEN="")
+    assert result.returncode != 0
+    assert "IMMUTABLE_RELEASES_READ_TOKEN" in result.stderr
+    assert not (fixtures / "curl.log").exists(), "no request may be attempted"
+
+
+def test_the_workflow_token_is_never_expanded_by_the_guard():
+    """Static companion to the behavioural no-fallback test."""
+
+    source = GUARD.read_text(encoding="utf-8")
+    for expansion in ("$GITHUB_TOKEN", "${GITHUB_TOKEN"):
+        assert expansion not in source, f"the guard must not expand {expansion}"
+
+
 def test_a_missing_environment_fails_before_any_request(tmp_path: Path):
     fixtures = _fixture(tmp_path, json.dumps({"enabled": True}))
-    result = _run(tmp_path, fixtures, GITHUB_TOKEN="")
+    result = _run(tmp_path, fixtures, IMMUTABLE_RELEASES_READ_TOKEN="", GITHUB_TOKEN="")
     assert result.returncode != 0
     assert not (fixtures / "curl.log").exists()
 
