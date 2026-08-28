@@ -357,8 +357,18 @@ def test_a_valid_release_installs_and_pins_the_immutable_index_digest(workspace)
     environment = (target / ".env").read_text()
     assert f"SILENTSUITE_SERVER_IMAGE={SERVER_IMAGE}" in environment
     assert re.search(r"^SILENTSUITE_SERVER_IMAGE=\S+@sha256:[0-9a-f]{64}$", environment, re.MULTILINE)
-    for name in ("docker-compose.yml", "update.sh", "verify.sh", "close-signups.sh", "success.html", MANIFEST_NAME):
+    for name in (
+        "docker-compose.yml",
+        "install.sh",
+        "SELF-HOSTING.md",
+        "update.sh",
+        "verify.sh",
+        "close-signups.sh",
+        "success.html",
+        MANIFEST_NAME,
+    ):
         assert (target / name).exists(), name
+    assert (target / "install.sh").stat().st_mode & 0o111
     assert (target / "etebase-server.ini").read_text().count("sync.example.test") == 1
     assert oct((target / ".env").stat().st_mode & 0o777) == "0o600"
     assert leftover_temporaries(workspace) == []

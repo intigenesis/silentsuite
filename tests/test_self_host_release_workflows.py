@@ -202,7 +202,10 @@ def test_release_child_digest_is_only_exposed_after_its_smoke_passes():
 def test_release_merges_only_verified_children_into_immutable_references():
     run = step_named(RELEASE["jobs"]["publish-index"], "Merge verified children into the release index")["run"]
     assert '--tag "${IMAGE_NAME}:${RELEASE_TAG}"' in run
-    assert '--tag "${IMAGE_NAME}:${RELEASE_COMMIT}"' in run
+    assert 'COMMIT_REF="selfhost-${RELEASE_COMMIT}"' in run
+    assert '--tag "${IMAGE_NAME}:${COMMIT_REF}"' in run
+    assert 'existing="$(scripts/verify-server-image-release.sh' in run
+    assert '"$existing" != "absent"' in run
     assert "latest" not in run
 
 

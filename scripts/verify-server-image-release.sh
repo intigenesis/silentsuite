@@ -240,8 +240,9 @@ verify_child amd64 "$AMD64_DIGEST"
 verify_child arm64 "$ARM64_DIGEST"
 
 echo "== Verifying immutable references =="
-if ! fetch_manifest "$COMMIT" "$WORKDIR/commit.json"; then
-  echo "ERROR: exact-commit reference ${COMMIT} is not published" >&2
+COMMIT_REFERENCE="selfhost-${COMMIT}"
+if ! fetch_manifest "$COMMIT_REFERENCE" "$WORKDIR/commit.json"; then
+  echo "ERROR: exact self-host commit reference ${COMMIT_REFERENCE} is not published" >&2
   exit 1
 fi
 COMMIT_REF_DIGEST="$MANIFEST_DIGEST"
@@ -260,7 +261,7 @@ if [ "$DIGEST_REF_DIGEST" != "$INDEX_DIGEST" ]; then
 fi
 
 echo "  ${REPOSITORY}:${TAG}    -> ${INDEX_DIGEST}"
-echo "  ${REPOSITORY}:${COMMIT} -> ${COMMIT_REF_DIGEST}"
+echo "  ${REPOSITORY}:${COMMIT_REFERENCE} -> ${COMMIT_REF_DIGEST}"
 
 if [ -n "$INDEX_DIGEST_FILE" ]; then
   printf '%s\n' "$INDEX_DIGEST" > "$INDEX_DIGEST_FILE"

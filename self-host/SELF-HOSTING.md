@@ -157,7 +157,7 @@ pulling an image, or starting a container.
 3. **Install the verified files:**
    ```bash
    mkdir silentsuite-server && chmod 750 silentsuite-server
-   cp silentsuite-self-host-vX.Y.Z/* silentsuite-server/
+   cp -R silentsuite-self-host-vX.Y.Z/. silentsuite-server/
    cd silentsuite-server
    cp .env.example .env
    ```

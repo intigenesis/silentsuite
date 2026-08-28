@@ -562,11 +562,11 @@ fi
 # local users on shared hosts — the install dir is a single-operator surface.
 chmod 750 "$INSTALL_DIR"
 
-for file in docker-compose.yml update.sh verify.sh close-signups.sh success.html "$MANIFEST_NAME"; do
+for file in docker-compose.yml install.sh SELF-HOSTING.md update.sh verify.sh close-signups.sh success.html "$MANIFEST_NAME"; do
   cp "$BUNDLE_ROOT/$file" "$INSTALL_DIR/$file"
 done
 cp "$CHECKSUM_FILE" "$INSTALL_DIR/$CHECKSUM_NAME"
-chmod +x "$INSTALL_DIR/update.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
+chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
 
 cd "$INSTALL_DIR"
 

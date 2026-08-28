@@ -251,9 +251,17 @@ jobs:
           ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
         run: |
           set -euo pipefail
+          COMMIT_REF="selfhost-${RELEASE_COMMIT}"
+          for reference in "$RELEASE_TAG" "$COMMIT_REF"; do
+            existing="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve "$reference")"
+            if [ "$existing" != "absent" ]; then
+              echo "Refusing release: ${IMAGE_NAME}:${reference} already resolves to ${existing}"
+              exit 1
+            fi
+          done
           docker buildx imagetools create \
             --tag "${IMAGE_NAME}:${RELEASE_TAG}" \
-            --tag "${IMAGE_NAME}:${RELEASE_COMMIT}" \
+            --tag "${IMAGE_NAME}:${COMMIT_REF}" \
             "${IMAGE_NAME}@${AMD64_DIGEST}" \
             "${IMAGE_NAME}@${ARM64_DIGEST}"
 
