@@ -96,7 +96,7 @@ def main() -> int:
         ("--amd64-digest", arguments.amd64_digest, DIGEST_PATTERN),
         ("--arm64-digest", arguments.arm64_digest, DIGEST_PATTERN),
     ):
-        if not pattern.match(value):
+        if not pattern.fullmatch(value):
             raise ContractError(f"{label} value {value!r} is not immutable")
 
     if len({arguments.index_digest, arguments.amd64_digest, arguments.arm64_digest}) != 3:

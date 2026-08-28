@@ -368,13 +368,20 @@ Until it ships, upgrade deliberately:
    ```bash
    bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
    ```
-3. **Compare** the staged `docker-compose.yml` with the one you are running and
-   apply any changes you are happy with.
+3. **Replace the tracked Compose definition with the verified release copy.**
+   Keep your generated `docker-compose.override.yml` unchanged, but do not keep
+   an older base Compose file: earlier releases hard-coded an image and would
+   ignore the new digest in `.env`.
+   ```bash
+   cp docker-compose.yml "docker-compose.yml.before-vX.Y.Z"
+   cp ./silentsuite-vX.Y.Z/docker-compose.yml ./docker-compose.yml
+   ```
 4. **Pin the new image**: copy `indexDigest` from the staged `server-image.json`
    into `SILENTSUITE_SERVER_IMAGE` in your existing `.env`. Keep every other
    value in `.env` as it is — those are your credentials.
-5. **Apply migrations, then restart**:
+5. **Confirm the effective image, apply migrations, then restart**:
    ```bash
+   docker compose config | grep -F "$SILENTSUITE_SERVER_IMAGE"
    docker compose pull
    docker compose run --rm --no-deps server python manage.py migrate --noinput
    docker compose up -d

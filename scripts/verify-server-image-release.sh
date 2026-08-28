@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-for tool in curl jq; do
+for tool in curl jq sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' is required" >&2; exit 2; }
 done
 
@@ -215,6 +215,12 @@ verify_child() {
     exit 1
   fi
   fetch_blob "$config_digest" > "$WORKDIR/config-${expected_arch}.json"
+  local actual_config_digest
+  actual_config_digest="sha256:$(sha256sum "$WORKDIR/config-${expected_arch}.json" | cut -d' ' -f1)"
+  if [ "$actual_config_digest" != "$config_digest" ]; then
+    echo "ERROR: child ${digest} config bytes hash to ${actual_config_digest}, expected ${config_digest}" >&2
+    exit 1
+  fi
   local architecture os revision
   architecture="$(jq -r '.architecture // ""' "$WORKDIR/config-${expected_arch}.json")"
   os="$(jq -r '.os // ""' "$WORKDIR/config-${expected_arch}.json")"

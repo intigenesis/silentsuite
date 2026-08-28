@@ -134,7 +134,7 @@ def _validate(value: object, schema: dict, path: str) -> None:
         raise ContractError(f"{path}: {value!r} is not one of {schema['enum']}")
 
     if "pattern" in schema:
-        if not isinstance(value, str) or not re.match(schema["pattern"], value):
+        if not isinstance(value, str) or not re.fullmatch(schema["pattern"], value):
             raise ContractError(f"{path}: {value!r} does not match {schema['pattern']}")
 
     if isinstance(value, list):
@@ -234,13 +234,13 @@ def sha256_file(path: Path) -> str:
 
 
 def bundle_basename(tag: str) -> str:
-    if not TAG_PATTERN.match(tag):
+    if not TAG_PATTERN.fullmatch(tag):
         raise ContractError(f"tag {tag!r} is not an immutable release tag")
     return f"silentsuite-self-host-{tag}.tar.gz"
 
 
 def bundle_prefix(tag: str) -> str:
-    if not TAG_PATTERN.match(tag):
+    if not TAG_PATTERN.fullmatch(tag):
         raise ContractError(f"tag {tag!r} is not an immutable release tag")
     return f"silentsuite-self-host-{tag}"
 

@@ -132,6 +132,10 @@ case "$1" in
   inspect)
     case "$*" in
       *State.Health.Status*) printf 'healthy\\n'; exit 0 ;;
+      *silentsuite-postgres*|*silentsuite-server*)
+        if [ "${SILENTSUITE_FAKE_EXISTING_CONTAINER:-0}" = "1" ]; then exit 0; fi
+        exit 1
+        ;;
       *) exit 1 ;;
     esac
     ;;
@@ -661,6 +665,20 @@ def test_an_existing_installation_is_never_modified(workspace):
     after = {path.name: path.read_bytes() for path in target.iterdir()}
     assert after == before
     assert not (workspace["fixtures"] / "requests.log").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_existing_named_containers_are_never_stopped_or_replaced(workspace):
+    result = run_installer(workspace, env={"SILENTSUITE_FAKE_EXISTING_CONTAINER": "1"})
+
+    assert result.returncode != 0
+    assert "already exists" in result.stderr
+    assert "will not stop or replace" in result.stderr
+    assert not install_dir(workspace).exists()
+    assert not (workspace["fixtures"] / "requests.log").exists()
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert "stop" not in docker_log
+    assert "rm" not in docker_log
     assert leftover_temporaries(workspace) == []
 
 

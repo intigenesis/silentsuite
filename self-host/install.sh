@@ -155,11 +155,24 @@ if [ "$STAGE_ONLY" -eq 0 ] && [ -e "$INSTALL_DIR/.env" ]; then
   echo "your installation. Nothing has been changed." >&2
   echo "" >&2
   echo "  * to restart the current version:  cd $INSTALL_DIR && ./update.sh" >&2
-  echo "  * to install alongside it:         SILENTSUITE_DIR=<other-dir> bash install.sh" >&2
   echo "" >&2
   echo "A version-aware updater that backs up configuration and the database" >&2
   echo "before migrating is tracked separately; see SELF-HOSTING.md." >&2
   exit 1
+fi
+
+# Compose uses stable container names for upgrade compatibility. A second local
+# install cannot safely coexist with those names, so refuse before downloading
+# anything rather than stopping an existing stack later.
+if [ "$STAGE_ONLY" -eq 0 ]; then
+  for container in silentsuite-postgres silentsuite-server; do
+    if docker inspect "$container" >/dev/null 2>&1; then
+      echo "ERROR: container '$container' already exists." >&2
+      echo "       This installer will not stop or replace an existing SilentSuite stack." >&2
+      echo "       Use that installation's documented upgrade procedure instead." >&2
+      exit 1
+    fi
+  done
 fi
 
 # ── Host architecture ─────────────────────────────────────────────────
@@ -556,16 +569,6 @@ cp "$CHECKSUM_FILE" "$INSTALL_DIR/$CHECKSUM_NAME"
 chmod +x "$INSTALL_DIR/update.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
 
 cd "$INSTALL_DIR"
-
-# ── Clean up stale containers ─────────────────────────────────────────
-
-for container in silentsuite-postgres silentsuite-server; do
-  if docker inspect "$container" >/dev/null 2>&1; then
-    echo "Removing stale container: $container"
-    docker stop "$container" >/dev/null 2>&1 || true
-    docker rm "$container" >/dev/null 2>&1 || true
-  fi
-done
 
 # ── Gather configuration ──────────────────────────────────────────────
 

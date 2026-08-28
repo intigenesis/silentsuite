@@ -122,6 +122,20 @@ if [ -z "$RELEASE_ID" ] || ! printf '%s' "$RELEASE_ID" | grep -Eq '^[0-9]+$'; th
   exit 1
 fi
 
+# A sibling workflow can create a competing draft between our lookup and create.
+# Let the API settle, then require this ID to be the sole release claiming the
+# tag before any asset is uploaded.
+sleep "$RETRY_DELAY"
+if ! find_release; then
+  echo "ERROR: release ${RELEASE_ID} disappeared while resolving ${TAG}" >&2
+  exit 1
+fi
+CANONICAL_RELEASE_ID="$(jq -r '.id' "$WORKDIR/matches.json")"
+if [ "$CANONICAL_RELEASE_ID" != "$RELEASE_ID" ]; then
+  echo "ERROR: release ${RELEASE_ID} is not the sole draft claiming ${TAG}" >&2
+  exit 1
+fi
+
 api GET "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$WORKDIR/release.json"
 RELEASE_TAG="$(jq -r '.tag_name // ""' "$WORKDIR/release.json")"
 RELEASE_DRAFT="$(jq -r '.draft // false' "$WORKDIR/release.json")"
@@ -237,6 +251,17 @@ api GET "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$WORKDIR/release
 if [ "$(jq -r '.draft' "$WORKDIR/release-after.json")" != "true" ] \
    || [ "$(jq -r '.tag_name' "$WORKDIR/release-after.json")" != "$TAG" ]; then
   echo "ERROR: release identity or draft state changed while assets were being attached" >&2
+  exit 1
+fi
+
+# Recheck tag ownership after uploads as well. This catches a slower sibling
+# create/create race before this workflow reports a usable shared draft.
+if ! find_release; then
+  echo "ERROR: no release claims ${TAG} after asset upload" >&2
+  exit 1
+fi
+if [ "$(jq -r '.id' "$WORKDIR/matches.json")" != "$RELEASE_ID" ]; then
+  echo "ERROR: release ownership for ${TAG} changed during asset upload" >&2
   exit 1
 fi
 

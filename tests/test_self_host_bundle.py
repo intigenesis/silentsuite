@@ -182,6 +182,9 @@ def test_manifest_round_trips_through_the_schema():
         (lambda d: d.update(platforms=["linux/amd64", "linux/riscv64"]), "unknown platform"),
         (lambda d: d.update(platforms="linux/amd64"), "platforms not a list"),
         (lambda d: d.update(schemaVersion=True), "boolean schema version"),
+        (lambda d: d.update(tag=TAG + "\n"), "tag with trailing newline"),
+        (lambda d: d.update(sourceCommit=COMMIT + "\n"), "commit with trailing newline"),
+        (lambda d: d.update(indexDigest=INDEX_DIGEST + "\n"), "digest with trailing newline"),
     ],
 )
 def test_invalid_manifests_are_rejected(mutate, reason):

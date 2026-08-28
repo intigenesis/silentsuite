@@ -227,6 +227,9 @@ def test_release_verifies_the_registry_before_building_the_bundle():
     assert "scripts/verify-server-image-release.sh" in verify
     assert '--amd64-digest "$AMD64_DIGEST"' in verify
     assert '--arm64-digest "$ARM64_DIGEST"' in verify
+    verifier = (ROOT / "scripts" / "verify-server-image-release.sh").read_text(encoding="utf-8")
+    assert 'actual_config_digest="sha256:$(sha256sum' in verifier
+    assert '"$actual_config_digest" != "$config_digest"' in verifier
 
 
 def test_release_attests_provenance_without_mutating_the_index():
@@ -268,6 +271,8 @@ def test_shared_draft_helper_is_race_safe_and_fails_closed():
     assert "refusing to alter a published release" in helper
     assert "assets that existed before this upload are now missing" in helper
     assert "read back with a different digest" in helper
+    assert helper.count("if ! find_release; then") >= 2
+    assert "sole draft claiming" in helper
     # A release is only ever created as a draft, and never edited afterwards.
     assert "draft: true" in helper
     assert "-X PATCH" not in helper
