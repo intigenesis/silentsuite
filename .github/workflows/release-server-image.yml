@@ -1,0 +1,391 @@
+name: Release Self-Host Server Image
+
+# Publishes the multi-architecture self-host server image for an immutable v*
+# tag and attaches the verified self-host bundle to the shared draft umbrella
+# release.
+#
+# Boundaries this workflow keeps: it never publishes the release, never moves a
+# mutable tag, declares no deployment environment, holds no hosted-deployment
+# credentials, and neither calls nor changes the manual hosted-production
+# pipeline, which remains the only route to the hosted service.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-server-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE_NAME: ghcr.io/silent-suite/silentsuite-server
+
+jobs:
+  admit:
+    name: Admit release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require an immutable tag reachable from protected main
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "$TAG" = "$GITHUB_REF" ]; then
+            echo "Refusing release: this workflow only runs for tag pushes"
+            exit 1
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "Refusing release: '$TAG' is not an immutable SilentSuite release tag"
+            exit 1
+          fi
+          if ! printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Refusing release: tag commit is not a 40-hex SHA"
+            exit 1
+          fi
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          TAG_COMMIT="$(git rev-list -n 1 "refs/tags/${TAG}")"
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ] || [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
+            echo "Refusing release: the checked-out tree is not the exact tag commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Refusing release: ${GITHUB_SHA} is not reachable from protected main"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "Admitted ${TAG} at ${GITHUB_SHA} (reachable from origin/main)"
+
+  build:
+    name: Build and smoke (${{ matrix.platform }})
+    needs: admit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest only: no version or commit alias exists until both
+      # architectures have passed their native smoke, so a half-built release can
+      # never be selected by an operator. Attestations are disabled here on
+      # purpose — with push-by-digest they would make the recorded child digest an
+      # intermediate index rather than the platform manifest, and the published
+      # manifest identity is what the installer verifies.
+      - name: Build and push ${{ matrix.platform }} by digest
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.server
+          platforms: ${{ matrix.platform }}
+          build-args: VCS_REF=${{ github.sha }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-server-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-server-${{ matrix.arch }}
+
+      - name: Smoke the exact pushed content
+        shell: bash
+        env:
+          CHILD_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$CHILD_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "Build did not report an immutable child digest"
+            exit 1
+          fi
+          # Pull the published bytes back so the smoke runs against exactly what
+          # the index will reference, then give them a local-only name.
+          docker pull "${IMAGE_NAME}@${CHILD_DIGEST}"
+          LOCAL_TAG="silentsuite-server:release-smoke-${ARCH}"
+          docker tag "${IMAGE_NAME}@${CHILD_DIGEST}" "$LOCAL_TAG"
+          if ! docker image inspect "$LOCAL_TAG" --format '{{json .RepoDigests}}' | grep -Fq "${IMAGE_NAME}@${CHILD_DIGEST}"; then
+            echo "Local image is not the registry content for ${CHILD_DIGEST}"
+            exit 1
+          fi
+          scripts/self-host-image-smoke.sh \
+            --image "$LOCAL_TAG" \
+            --platform "$PLATFORM" \
+            --expect-revision "$GITHUB_SHA"
+
+      - name: Record the smoked child digest
+        shell: bash
+        env:
+          CHILD_DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          printf '%s\n' "$CHILD_DIGEST" > "digests/${ARCH}.digest"
+
+      - name: Publish the verified child digest to the merge job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-image-digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}.digest
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-index:
+    name: Merge, verify and bundle
+    needs: [admit, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      index-digest: ${{ steps.verify.outputs.index-digest }}
+      amd64-digest: ${{ steps.digests.outputs.amd64 }}
+      arm64-digest: ${{ steps.digests.outputs.arm64 }}
+    env:
+      RELEASE_TAG: ${{ needs.admit.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
+      REGISTRY_USERNAME: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download verified child digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: digests
+          pattern: server-image-digest-*
+          merge-multiple: true
+
+      - name: Read child digests
+        id: digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          AMD64="$(tr -d '\n' < digests/amd64.digest)"
+          ARM64="$(tr -d '\n' < digests/arm64.digest)"
+          for digest in "$AMD64" "$ARM64"; do
+            if ! printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+              echo "Refusing merge: '$digest' is not an immutable child digest"
+              exit 1
+            fi
+          done
+          if [ "$AMD64" = "$ARM64" ]; then
+            echo "Refusing merge: both architectures reported the same manifest"
+            exit 1
+          fi
+          echo "amd64=$AMD64" >> "$GITHUB_OUTPUT"
+          echo "arm64=$ARM64" >> "$GITHUB_OUTPUT"
+
+      - name: Record the current latest reference
+        id: latest-before
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
+          echo "digest=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "latest before merge: $BEFORE"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge verified children into the release index
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${RELEASE_TAG}" \
+            --tag "${IMAGE_NAME}:${RELEASE_COMMIT}" \
+            "${IMAGE_NAME}@${AMD64_DIGEST}" \
+            "${IMAGE_NAME}@${ARM64_DIGEST}"
+
+      - name: Verify the published release image
+        id: verify
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          scripts/verify-server-image-release.sh \
+            --repository "$IMAGE_NAME" \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --amd64-digest "$AMD64_DIGEST" \
+            --arm64-digest "$ARM64_DIGEST" \
+            --index-digest-file index.digest
+          echo "index-digest=$(cat index.digest)" >> "$GITHUB_OUTPUT"
+
+      - name: Assert latest was not moved
+        shell: bash
+        env:
+          LATEST_BEFORE: ${{ steps.latest-before.outputs.digest }}
+        run: |
+          set -euo pipefail
+          AFTER="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
+          if [ "$AFTER" != "$LATEST_BEFORE" ]; then
+            echo "Refusing release: latest moved from ${LATEST_BEFORE} to ${AFTER}"
+            exit 1
+          fi
+          echo "latest unchanged: $AFTER"
+
+      # Repository build provenance for the verified index. push-to-registry is
+      # left off so the attestation is stored by GitHub and the OCI index keeps
+      # exactly the two runnable children the manifest promises.
+      - name: Attest build provenance for the release index
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.verify.outputs.index-digest }}
+          push-to-registry: false
+
+      - name: Build the self-host release bundle
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
+          INDEX_DIGEST: ${{ steps.verify.outputs.index-digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/build-self-host-bundle.py \
+            --tag "$RELEASE_TAG" \
+            --source-commit "$RELEASE_COMMIT" \
+            --index-digest "$INDEX_DIGEST" \
+            --amd64-digest "$AMD64_DIGEST" \
+            --arm64-digest "$ARM64_DIGEST" \
+            --output-dir release-assets
+
+      - name: Verify the self-host release bundle
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
+          INDEX_DIGEST: ${{ steps.verify.outputs.index-digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-self-host-bundle.py \
+            --directory release-assets \
+            --tag "$RELEASE_TAG" \
+            --source-commit "$RELEASE_COMMIT" \
+            --index-digest "$INDEX_DIGEST" \
+            --amd64-digest "$AMD64_DIGEST" \
+            --arm64-digest "$ARM64_DIGEST"
+
+      - name: Upload the verified self-host assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silentsuite-self-host-release-assets
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  attach-release-assets:
+    name: Attach self-host assets to the draft release
+    needs: [admit, publish-index]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.admit.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download the verified self-host assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: silentsuite-self-host-release-assets
+          path: release-assets
+
+      - name: Re-verify the assets before they leave the workflow
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ needs.publish-index.outputs.amd64-digest }}
+          ARM64_DIGEST: ${{ needs.publish-index.outputs.arm64-digest }}
+          INDEX_DIGEST: ${{ needs.publish-index.outputs.index-digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-self-host-bundle.py \
+            --directory release-assets \
+            --tag "$RELEASE_TAG" \
+            --source-commit "$RELEASE_COMMIT" \
+            --index-digest "$INDEX_DIGEST" \
+            --amd64-digest "$AMD64_DIGEST" \
+            --arm64-digest "$ARM64_DIGEST"
+
+      - name: Attach the verified assets to the shared draft release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/publish-self-host-release-assets.sh \
+            --tag "$RELEASE_TAG" \
+            --directory release-assets \
+            --asset "silentsuite-self-host-${RELEASE_TAG}.tar.gz" \
+            --asset "silentsuite-self-host-${RELEASE_TAG}.tar.gz.sha256" \
+            --asset server-image.json

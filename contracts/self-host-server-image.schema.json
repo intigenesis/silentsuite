@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://silentsuite.io/contracts/self-host-server-image.schema.json",
+  "title": "SilentSuite self-host server image manifest",
+  "description": "Immutable identity of the server image a self-host release installs. Written by the tag release workflow and verified by the installer before any operator state is touched.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "tag",
+    "sourceCommit",
+    "imageRepository",
+    "indexDigest",
+    "amd64Digest",
+    "arm64Digest",
+    "platforms",
+    "expectedRevision"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "description": "Contract version. Bump only for an incompatible field change.",
+      "const": 1
+    },
+    "tag": {
+      "description": "Immutable umbrella release tag this bundle belongs to.",
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$"
+    },
+    "sourceCommit": {
+      "description": "Exact commit the tag resolves to, proven reachable from protected main.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "imageRepository": {
+      "description": "Canonical image repository. Runtime selection is always by index digest.",
+      "const": "ghcr.io/silent-suite/silentsuite-server"
+    },
+    "indexDigest": {
+      "description": "OCI index digest operators pin in SILENTSUITE_SERVER_IMAGE.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "amd64Digest": {
+      "description": "linux/amd64 child manifest digest inside the index.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "arm64Digest": {
+      "description": "linux/arm64 child manifest digest inside the index.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "platforms": {
+      "description": "Closed set of runnable platforms the index is verified to provide.",
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": ["linux/amd64", "linux/arm64"]
+      }
+    },
+    "expectedRevision": {
+      "description": "org.opencontainers.image.revision label every child must carry.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    }
+  }
+}

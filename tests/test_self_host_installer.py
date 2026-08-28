@@ -1,0 +1,707 @@
+"""Behavioural fixtures for the self-host installer.
+
+Every case below runs the real `self-host/install.sh` against a fabricated
+release served by stub `curl`/`docker`/`openssl`/`uname` executables on PATH.
+Nothing here touches the network or a container runtime.
+
+The point is the failure cases: an installer that verifies a release bundle is
+only worth anything if every malformed input stops it *before* it writes to the
+operator's disk, and if it leaves no temporary files behind when it does.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import re
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from selfhost_release_contract import (  # noqa: E402
+    MANIFEST_NAME,
+    ReleaseIdentity,
+    bundle_basename,
+    bundle_prefix,
+    render_manifest,
+    sha256_file,
+)
+
+INSTALLER = ROOT / "self-host" / "install.sh"
+
+TAG = "v9.9.9-beta"
+COMMIT = "a" * 40
+INDEX_DIGEST = "sha256:" + "1" * 64
+AMD64_DIGEST = "sha256:" + "2" * 64
+ARM64_DIGEST = "sha256:" + "3" * 64
+SERVER_IMAGE = f"ghcr.io/silent-suite/silentsuite-server@{INDEX_DIGEST}"
+IDENTITY = ReleaseIdentity(TAG, COMMIT, INDEX_DIGEST, AMD64_DIGEST, ARM64_DIGEST)
+
+API = "https://api.github.com/repos/silent-suite/silentsuite"
+DOWNLOAD = f"https://github.com/silent-suite/silentsuite/releases/download/{TAG}"
+COMPARE = f"{API}/compare/{COMMIT}...{TAG}"
+IDENTICAL_COMPARE = (
+    '{\n  "status": "identical",\n  "ahead_by": 0,\n  "behind_by": 0,\n  "total_commits": 0,\n'
+    '  "files": []\n}\n'
+)
+
+BUNDLE_NAME = bundle_basename(TAG)
+CHECKSUM_NAME = f"{BUNDLE_NAME}.sha256"
+PREFIX = bundle_prefix(TAG)
+
+BUNDLE_FILES = (
+    ".env.example",
+    "SELF-HOSTING.md",
+    "close-signups.sh",
+    "docker-compose.yml",
+    "install.sh",
+    "success.html",
+    "update.sh",
+    "verify.sh",
+)
+
+
+def url_key(url: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", url)
+
+
+CURL_STUB = """#!/usr/bin/env bash
+# Serves fixtures from $SILENTSUITE_FIXTURES keyed by a sanitised URL.
+url=""
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\\n' "$url" >> "$SILENTSUITE_FIXTURES/requests.log"
+key=$(printf '%s' "$url" | sed 's#[^A-Za-z0-9._-]#_#g')
+src="$SILENTSUITE_FIXTURES/$key"
+if [ ! -f "$src" ]; then
+  exit 22
+fi
+if [ -n "$out" ]; then
+  cp "$src" "$out"
+else
+  cat "$src"
+fi
+"""
+
+UNAME_STUB = """#!/usr/bin/env bash
+if [ "${1:-}" = "-m" ]; then
+  printf '%s\\n' "${SILENTSUITE_FAKE_MACHINE:-x86_64}"
+else
+  printf 'Linux\\n'
+fi
+"""
+
+OPENSSL_STUB = """#!/usr/bin/env bash
+# Deterministic stand-in for `openssl rand -base64 N`.
+printf 'fixedsecret%s\\n' "${3:-0}"
+"""
+
+DOCKER_STUB = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$SILENTSUITE_FIXTURES/docker.log"
+case "$1" in
+  compose)
+    exit 0
+    ;;
+  pull)
+    if [ "${SILENTSUITE_FAKE_PULL_FAILS:-0}" = "1" ]; then exit 1; fi
+    exit 0
+    ;;
+  image)
+    # docker image inspect REF --format FORMAT
+    format="$5"
+    case "$format" in
+      *revision*) printf '%s\\n' "${SILENTSUITE_FAKE_REVISION:-REVISION}" ;;
+      *Architecture*) printf '%s\\n' "${SILENTSUITE_FAKE_PLATFORM:-linux/amd64}" ;;
+      *RepoDigests*) printf '["%s"]\\n' "${SILENTSUITE_FAKE_REPO_DIGEST:-REPODIGEST}" ;;
+      *) printf '\\n' ;;
+    esac
+    exit 0
+    ;;
+  inspect)
+    case "$*" in
+      *State.Health.Status*) printf 'healthy\\n'; exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+esac
+exit 0
+"""
+
+
+def write_stub(directory: Path, name: str, body: str) -> None:
+    path = directory / name
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def build_bundle(
+    archive: Path,
+    manifest_text: str,
+    *,
+    unsafe: str | None = None,
+    extra: str | None = None,
+    omit: str | None = None,
+) -> None:
+    """Assemble a release bundle from the tracked self-host files."""
+
+    with tarfile.open(archive, "w:gz") as handle:
+        root = tarfile.TarInfo(PREFIX)
+        root.type = tarfile.DIRTYPE
+        root.mode = 0o755
+        handle.addfile(root)
+        for name in BUNDLE_FILES:
+            if name == omit:
+                continue
+            payload = (ROOT / "self-host" / name).read_bytes()
+            info = tarfile.TarInfo(f"{PREFIX}/{name}")
+            info.size = len(payload)
+            info.mode = 0o755 if name.endswith(".sh") else 0o644
+            handle.addfile(info, io.BytesIO(payload))
+        manifest = manifest_text.encode("utf-8")
+        info = tarfile.TarInfo(f"{PREFIX}/{MANIFEST_NAME}")
+        info.size = len(manifest)
+        info.mode = 0o644
+        handle.addfile(info, io.BytesIO(manifest))
+        if unsafe == "symlink":
+            link = tarfile.TarInfo(f"{PREFIX}/escape")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            handle.addfile(link)
+        elif unsafe == "traversal":
+            info = tarfile.TarInfo("../escaped.txt")
+            info.size = 0
+            handle.addfile(info, io.BytesIO(b""))
+        if extra is not None:
+            payload = b"# not part of the published inventory\n"
+            info = tarfile.TarInfo(f"{PREFIX}/{extra}")
+            info.size = len(payload)
+            info.mode = 0o644
+            handle.addfile(info, io.BytesIO(payload))
+
+
+class Release:
+    """A fabricated published release the stub curl can serve."""
+
+    def __init__(self, fixtures: Path):
+        self.fixtures = fixtures
+        self.fixtures.mkdir(parents=True, exist_ok=True)
+        self.manifest_text = render_manifest(IDENTITY)
+        self.tags = [TAG]
+        self.assets = [BUNDLE_NAME, CHECKSUM_NAME, MANIFEST_NAME]
+
+    def put(self, url: str, content: bytes | str) -> None:
+        path = self.fixtures / url_key(url)
+        if isinstance(content, str):
+            path.write_text(content, encoding="utf-8")
+        else:
+            path.write_bytes(content)
+
+    def publish(
+        self,
+        *,
+        checksum_text: str | None = None,
+        unsafe: str | None = None,
+        extra: str | None = None,
+        omit: str | None = None,
+        compare: str | None = IDENTICAL_COMPARE,
+    ) -> None:
+        archive = self.fixtures / BUNDLE_NAME
+        build_bundle(archive, self.manifest_text, unsafe=unsafe, extra=extra, omit=omit)
+        digest = sha256_file(archive)
+
+        if compare is not None:
+            self.put(COMPARE, compare)
+
+        self.put(f"{API}/releases?per_page=20", "".join(f'  "tag_name": "{tag}",\n' for tag in self.tags))
+        asset_json = "".join(f'      "name": "{name}",\n' for name in self.assets)
+        self.put(
+            f"{API}/releases/tags/{TAG}",
+            '{\n  "tag_name": "' + TAG + '",\n  "draft": false,\n  "assets": [\n' + asset_json + "  ]\n}\n",
+        )
+        self.put(f"{DOWNLOAD}/{BUNDLE_NAME}", archive.read_bytes())
+        self.put(f"{DOWNLOAD}/{CHECKSUM_NAME}", checksum_text if checksum_text is not None else f"{digest}  {BUNDLE_NAME}\n")
+        self.put(f"{DOWNLOAD}/{MANIFEST_NAME}", self.manifest_text)
+
+
+@pytest.fixture
+def workspace(tmp_path):
+    fixtures = tmp_path / "fixtures"
+    binaries = tmp_path / "bin"
+    tempdir = tmp_path / "tmp"
+    home = tmp_path / "home"
+    for directory in (fixtures, binaries, tempdir, home):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    write_stub(binaries, "curl", CURL_STUB)
+    write_stub(binaries, "uname", UNAME_STUB)
+    write_stub(binaries, "openssl", OPENSSL_STUB)
+    write_stub(binaries, "docker", DOCKER_STUB)
+
+    return {
+        "root": tmp_path,
+        "fixtures": fixtures,
+        "bin": binaries,
+        "tmp": tempdir,
+        "home": home,
+        "release": Release(fixtures),
+    }
+
+
+def run_installer(workspace, *arguments, env=None) -> subprocess.CompletedProcess:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{workspace['bin']}:{environment['PATH']}",
+            "TMPDIR": str(workspace["tmp"]),
+            "SILENTSUITE_FIXTURES": str(workspace["fixtures"]),
+            "SILENTSUITE_DIR": str(workspace["home"] / "silentsuite-server"),
+            "SILENTSUITE_DOMAIN": "sync.example.test",
+            "SILENTSUITE_PROXY_NETWORK": "",
+            "SILENTSUITE_FAKE_REVISION": COMMIT,
+            "SILENTSUITE_FAKE_PLATFORM": "linux/amd64",
+            "SILENTSUITE_FAKE_REPO_DIGEST": SERVER_IMAGE,
+        }
+    )
+    environment.pop("SILENTSUITE_VERSION", None)
+    if env:
+        environment.update(env)
+    return subprocess.run(
+        ["bash", str(INSTALLER), *arguments],
+        capture_output=True,
+        text=True,
+        cwd=workspace["root"],
+        env=environment,
+    )
+
+
+def leftover_temporaries(workspace) -> list[str]:
+    return [entry.name for entry in workspace["tmp"].iterdir()]
+
+
+def install_dir(workspace) -> Path:
+    return workspace["home"] / "silentsuite-server"
+
+
+# ── Success paths ─────────────────────────────────────────────────────
+
+
+def test_the_release_tag_is_confirmed_to_point_at_the_manifest_commit(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode == 0, result.stderr
+    assert COMPARE in (workspace["fixtures"] / "requests.log").read_text()
+    assert f"confirmed to point at {COMMIT}" in result.stdout
+
+
+def test_a_manifest_naming_an_untagged_commit_is_rejected(workspace):
+    workspace["release"].publish(
+        compare='{\n  "status": "diverged",\n  "ahead_by": 3,\n  "behind_by": 1,\n  "total_commits": 3\n}\n'
+    )
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "does not point at" in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+
+
+def test_an_unverifiable_tag_commit_binding_fails_closed(workspace):
+    workspace["release"].publish(compare=None)
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "could not confirm" in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+
+
+def test_a_valid_release_stages_the_exact_published_bytes(workspace):
+    workspace["release"].publish()
+    staged = workspace["root"] / "staged"
+
+    result = run_installer(workspace, "--stage-only", str(staged))
+
+    assert result.returncode == 0, result.stderr
+    assert (staged / "docker-compose.yml").read_bytes() == (ROOT / "self-host" / "docker-compose.yml").read_bytes()
+    assert (staged / MANIFEST_NAME).read_text() == workspace["release"].manifest_text
+    assert (staged / CHECKSUM_NAME).exists()
+    assert SERVER_IMAGE in result.stdout
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_valid_release_installs_and_pins_the_immutable_index_digest(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(workspace)
+
+    assert result.returncode == 0, result.stderr
+    target = install_dir(workspace)
+    environment = (target / ".env").read_text()
+    assert f"SILENTSUITE_SERVER_IMAGE={SERVER_IMAGE}" in environment
+    assert re.search(r"^SILENTSUITE_SERVER_IMAGE=\S+@sha256:[0-9a-f]{64}$", environment, re.MULTILINE)
+    for name in ("docker-compose.yml", "update.sh", "verify.sh", "close-signups.sh", "success.html", MANIFEST_NAME):
+        assert (target / name).exists(), name
+    assert (target / "etebase-server.ini").read_text().count("sync.example.test") == 1
+    assert oct((target / ".env").stat().st_mode & 0o777) == "0o600"
+    assert leftover_temporaries(workspace) == []
+
+
+def test_installation_verifies_the_registry_identity_before_writing_anything(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(workspace)
+
+    assert result.returncode == 0, result.stderr
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert f"pull {SERVER_IMAGE}" in docker_log
+
+
+def test_an_explicit_version_is_accepted(workspace):
+    workspace["release"].publish()
+    staged = workspace["root"] / "staged"
+
+    result = run_installer(workspace, "--version", TAG, "--stage-only", str(staged))
+
+    assert result.returncode == 0, result.stderr
+    assert (staged / MANIFEST_NAME).exists()
+
+
+# ── Release resolution failures ───────────────────────────────────────
+
+
+def test_a_release_without_self_host_assets_is_not_installable(workspace):
+    release = workspace["release"]
+    release.assets = ["silentsuite-android-v9.9.9-beta.apk"]
+    release.publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "no published SilentSuite release with self-host assets" in result.stderr
+
+
+def test_there_is_no_branch_fallback(workspace):
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "installing from a branch is" in result.stderr
+    requests = (workspace["fixtures"] / "requests.log").read_text()
+    assert "raw.githubusercontent.com" not in requests
+
+
+def test_an_unpublished_explicit_version_is_rejected(workspace):
+    result = run_installer(
+        workspace, "--version", "v1.2.3-beta", "--stage-only", str(workspace["root"] / "staged")
+    )
+
+    assert result.returncode != 0
+    assert "is not published" in result.stderr
+
+
+def test_a_non_release_version_reference_is_rejected(workspace):
+    result = run_installer(workspace, "--version", "main", "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "is not a SilentSuite release tag" in result.stderr
+
+
+# ── Architecture ──────────────────────────────────────────────────────
+
+
+def test_an_unsupported_host_architecture_stops_before_any_download(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(
+        workspace,
+        "--stage-only",
+        str(workspace["root"] / "staged"),
+        env={"SILENTSUITE_FAKE_MACHINE": "riscv64"},
+    )
+
+    assert result.returncode != 0
+    assert "unsupported host architecture 'riscv64'" in result.stderr
+    assert not (workspace["fixtures"] / "requests.log").exists()
+
+
+def test_an_arm64_host_is_supported(workspace):
+    workspace["release"].publish()
+    staged = workspace["root"] / "staged"
+
+    result = run_installer(
+        workspace,
+        "--stage-only",
+        str(staged),
+        env={"SILENTSUITE_FAKE_MACHINE": "aarch64"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "linux/arm64" in result.stdout
+
+
+# ── Checksum failures ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "checksum_text,expected",
+    [
+        (f"{'d' * 64}  {BUNDLE_NAME}\n", "does not match its published checksum"),
+        (f"{'d' * 64}  {BUNDLE_NAME}", "does not end with a newline"),
+        (f"{'d' * 64}  {BUNDLE_NAME}\n{'e' * 64}  {BUNDLE_NAME}\n", "exactly one record"),
+        (f"{'d' * 64}  some-other-file.tar.gz\n", "malformed or names a different file"),
+        (f"{'d' * 63}  {BUNDLE_NAME}\n", "malformed or names a different file"),
+        (f"{'d' * 64} {BUNDLE_NAME}\n", "malformed or names a different file"),
+        ("", "is empty"),
+        (f"\n{'d' * 64}  {BUNDLE_NAME}\n", "exactly one record"),
+    ],
+    ids=[
+        "wrong-digest",
+        "missing-newline",
+        "two-records",
+        "wrong-name",
+        "short-digest",
+        "single-space",
+        "empty",
+        "leading-blank-line",
+    ],
+)
+def test_bad_checksum_sidecars_stop_the_install(workspace, checksum_text, expected):
+    workspace["release"].publish(checksum_text=checksum_text)
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_tampered_bundle_is_rejected(workspace):
+    release = workspace["release"]
+    release.publish()
+    tampered = (release.fixtures / url_key(f"{DOWNLOAD}/{BUNDLE_NAME}"))
+    tampered.write_bytes(tampered.read_bytes() + b"tamper")
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "does not match its published checksum" in result.stderr
+
+
+# ── Manifest failures ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "mutate,expected",
+    [
+        (lambda text: text.replace(f'"tag": "{TAG}"', '"tag": "v0.0.1-beta"'), "tag mismatch"),
+        (lambda text: text.replace('"schemaVersion": 1', '"schemaVersion": 2'), "unsupported schema version"),
+        (
+            lambda text: text.replace(
+                '"imageRepository": "ghcr.io/silent-suite/silentsuite-server"',
+                '"imageRepository": "ghcr.io/attacker/silentsuite-server"',
+            ),
+            "image repository",
+        ),
+        (lambda text: text.replace(f'"indexDigest": "{INDEX_DIGEST}"', '"indexDigest": "latest"'), "index digest"),
+        (
+            lambda text: text.replace(f'"expectedRevision": "{COMMIT}"', f'"expectedRevision": "{"b" * 40}"'),
+            "revision does not match",
+        ),
+        (lambda text: text.replace('    "linux/arm64"', '    "linux/amd64"'), "platform list"),
+        (lambda text: text + "\n", "unexpected length"),
+        (lambda text: text.replace('"platforms": [', '"platforms2": ['), "platform list"),
+        (lambda text: text.replace('  "tag":', '  "tag ":'), "tag mismatch"),
+    ],
+    ids=[
+        "tag-mismatch",
+        "schema-version",
+        "repository",
+        "mutable-index-reference",
+        "revision-mismatch",
+        "duplicate-platform",
+        "extra-line",
+        "renamed-platforms-field",
+        "renamed-tag-field",
+    ],
+)
+def test_bad_manifests_stop_the_install(workspace, mutate, expected):
+    release = workspace["release"]
+    release.manifest_text = mutate(release.manifest_text)
+    release.publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+
+
+def test_a_manifest_that_disagrees_with_the_bundle_copy_is_rejected(workspace):
+    release = workspace["release"]
+    release.publish()
+    # The bundle keeps the correct manifest; the separately published one is
+    # swapped for a different but internally valid document.
+    other = ReleaseIdentity(TAG, COMMIT, INDEX_DIGEST, AMD64_DIGEST, "sha256:" + "4" * 64)
+    release.put(f"{DOWNLOAD}/{MANIFEST_NAME}", render_manifest(other))
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "differs from the published manifest" in result.stderr
+
+
+def test_a_manifest_without_the_host_platform_is_rejected(workspace):
+    release = workspace["release"]
+    release.manifest_text = release.manifest_text.replace('    "linux/arm64"', '    "linux/amd64"')
+    release.publish()
+
+    result = run_installer(
+        workspace,
+        "--stage-only",
+        str(workspace["root"] / "staged"),
+        env={"SILENTSUITE_FAKE_MACHINE": "aarch64"},
+    )
+
+    assert result.returncode != 0
+
+
+# ── Archive safety ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("unsafe,expected", [("symlink", "links or special files"), ("traversal", "unsafe path")])
+def test_unsafe_archive_members_stop_the_install(workspace, unsafe, expected):
+    workspace["release"].publish(unsafe=unsafe)
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_an_extra_archive_member_stops_the_install(workspace):
+    # Path-safe but not published: the inventory is closed, not a lower bound.
+    workspace["release"].publish(extra="extra-payload.sh")
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "does not contain the expected set of files" in result.stderr
+    assert "unexpected: extra-payload.sh" in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_missing_archive_member_stops_the_install(workspace):
+    workspace["release"].publish(omit="verify.sh")
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode != 0
+    assert "does not contain the expected set of files" in result.stderr
+    assert "missing:    verify.sh" in result.stderr
+    assert not (workspace["root"] / "staged").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+# ── Registry identity ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        ({"SILENTSUITE_FAKE_REVISION": "c" * 40}, "reports revision"),
+        ({"SILENTSUITE_FAKE_PLATFORM": "linux/arm64"}, "is linux/arm64, expected linux/amd64"),
+        ({"SILENTSUITE_FAKE_REPO_DIGEST": "ghcr.io/silent-suite/silentsuite-server@sha256:" + "9" * 64}, "is not"),
+        ({"SILENTSUITE_FAKE_PULL_FAILS": "1"}, "could not pull"),
+    ],
+    ids=["wrong-revision", "wrong-architecture", "wrong-digest", "pull-fails"],
+)
+def test_registry_identity_mismatches_stop_before_the_install_directory_exists(workspace, env, expected):
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env=env)
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    assert not install_dir(workspace).exists()
+    assert leftover_temporaries(workspace) == []
+
+
+# ── Existing installations ────────────────────────────────────────────
+
+
+def test_an_existing_installation_is_never_modified(workspace):
+    workspace["release"].publish()
+    target = install_dir(workspace)
+    target.mkdir(parents=True)
+    (target / ".env").write_text("SILENTSUITE_SERVER_IMAGE=ghcr.io/silent-suite/silentsuite-server@sha256:0\n")
+    (target / "docker-compose.yml").write_text("operator edited\n")
+    before = {path.name: path.read_bytes() for path in target.iterdir()}
+
+    result = run_installer(workspace)
+
+    assert result.returncode != 0
+    assert "Re-running the installer is NOT the upgrade path" in result.stderr
+    after = {path.name: path.read_bytes() for path in target.iterdir()}
+    assert after == before
+    assert not (workspace["fixtures"] / "requests.log").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_non_empty_staging_directory_is_refused(workspace):
+    workspace["release"].publish()
+    staged = workspace["root"] / "staged"
+    staged.mkdir()
+    (staged / "keep.txt").write_text("existing\n")
+
+    result = run_installer(workspace, "--stage-only", str(staged))
+
+    assert result.returncode != 0
+    assert "is not empty" in result.stderr
+    assert (staged / "keep.txt").read_text() == "existing\n"
+
+
+# ── Static guarantees ─────────────────────────────────────────────────
+
+
+def test_installer_never_falls_back_to_branch_sources():
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert "raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/docker-compose.yml" not in source
+    assert "GITHUB_RAW_BASE" not in source
+    assert 'echo "main"' not in source
+
+
+def test_installer_does_not_require_a_json_tool():
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert not re.search(r"\bjq\b", source)
+    assert "python3 -c" not in source
+
+
+def test_installer_cleans_up_its_temporary_workspace_on_every_exit():
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert "trap cleanup EXIT" in source
+    assert "trap 'cleanup; exit 130' INT" in source
+    assert "trap 'cleanup; exit 143' TERM" in source
+    assert 'mktemp -d "${TMPDIR:-/tmp}/silentsuite-install.XXXXXXXX"' in source
+
+
+def test_installer_bundle_inventory_is_closed_in_both_directions():
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert "does not contain the expected set of files" in source
+    assert 'ACTUAL_MEMBERS" != "$EXPECTED_MEMBERS' in source

@@ -16,11 +16,17 @@ else
   exit 1
 fi
 
-# The compose file pins the server image to a specific manifest digest, so
-# `docker compose pull` is a no-op for cross-version upgrades. To move to a
-# new SilentSuite version, re-run install.sh — it fetches the release-pinned
-# compose. This script just ensures the pinned images are present and the
-# stack is recreated against them.
+# This script only restarts the stack against the image identity already pinned
+# in .env (SILENTSUITE_SERVER_IMAGE). It does NOT move between SilentSuite
+# versions: the digest in .env is immutable, so `docker compose pull` is a no-op
+# across versions by design.
+#
+# Re-running install.sh is NOT the upgrade path — it refuses to touch an
+# existing installation. A version-aware updater that backs up configuration,
+# dumps the database before migrations, verifies the target release identity,
+# and can restore the previous image is a separate, later piece of work. Until
+# it ships, upgrades are a deliberate manual operation described in
+# SELF-HOSTING.md.
 echo "Pulling pinned images..."
 $COMPOSE pull
 
@@ -60,7 +66,8 @@ if [ "$HEALTHY" -lt 2 ]; then
 fi
 
 echo ""
-echo "Update complete."
+echo "Restart complete — the stack is running the image already pinned in .env."
+echo "This script does not change SilentSuite versions."
 echo ""
 echo "If your reverse proxy reaches the server over a Docker network,"
 echo "make sure TRUSTED_PROXY_IPS in .env contains that proxy container's"

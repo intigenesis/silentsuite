@@ -23,11 +23,12 @@ services:
       - silentsuite
 
   server:
-    # Pinned to a specific manifest digest. To upgrade, re-run install.sh,
-    # which fetches the latest compose (will become release-tag-pinned once
-    # the installer's --version flag lands). Editing this digest by hand
-    # decouples the compose from the rest of the release matrix.
-    image: ghcr.io/silent-suite/silentsuite-server@sha256:6d45c6750c5913bf0ab43eec8b85be2213c133eb8bd7c50e9aeb3fee80194509
+    # The image is release data, never source data. The installer verifies a
+    # signed-off release bundle and writes the exact OCI index digest into .env
+    # as SILENTSUITE_SERVER_IMAGE, so this file stays valid for every version.
+    # There is deliberately no default: an unset value must fail loudly rather
+    # than silently start a stale or mutable image.
+    image: ${SILENTSUITE_SERVER_IMAGE:?Set by the verified SilentSuite installer or updater}
     container_name: silentsuite-server
     restart: unless-stopped
     ports:
