@@ -16,8 +16,11 @@ set -euo pipefail
 #   * install from an unverified source — there is no branch fallback;
 #   * run a mutable image tag — the server image is selected by the immutable
 #     OCI index digest recorded in the release manifest;
-#   * touch an existing installation. Re-running the installer is not the
-#     upgrade path (see SELF-HOSTING.md).
+#   * install from a release whose assets can still be rewritten — the selected
+#     release must be published as an immutable GitHub release;
+#   * touch an existing path. The target must not exist; it is created once,
+#     atomically, after every verification has passed. Re-running the installer
+#     is not the upgrade path (see SELF-HOSTING.md).
 
 REPO="silent-suite/silentsuite"
 IMAGE_REPOSITORY="ghcr.io/silent-suite/silentsuite-server"
@@ -38,6 +41,8 @@ Usage: install.sh [--version <tag>] [--stage-only <dir>]
   --stage-only <dir>  Download and fully verify the release bundle into <dir>,
                       then stop. Nothing is installed and no container is
                       started. Useful for auditing a release before installing.
+                      <dir> must not exist yet and its parent must be a
+                      directory you own that other users cannot write.
   -h, --help          Show this message and exit.
 
 Environment:
@@ -142,36 +147,128 @@ else
 fi
 echo ""
 
-# ── Refuse to touch an occupied target ────────────────────────────────
+# ── Validate the target and the directory that will hold it ───────────
 #
-# Re-running the installer is not an upgrade path: it would regenerate
-# credentials and restart a stack whose data it does not back up. Stage-only
-# output is also an explicit new-directory operation. Check either target
-# before release resolution so a foreign or partial directory is never
-# inspected, chmodded, or overwritten.
+# The target must not exist at all: not as a file, not as a symlink, not even as
+# an empty directory. Re-running the installer is not an upgrade path, and an
+# existing empty directory cannot be trusted to still be the same empty
+# directory — or a directory at all — by the time the download, verification and
+# image pull have finished.
+#
+# The parent must already exist and be a real directory this user owns that no
+# other local principal can write. That is what makes the atomic claim further
+# down meaningful: without it, someone else could plant a symlink or a populated
+# directory under the target name during the long verification interval, and the
+# installer would write credentials and Compose state through it.
 
 TARGET_DIR="$INSTALL_DIR"
 if [ "$STAGE_ONLY" -eq 1 ]; then
   TARGET_DIR="$STAGE_DIR"
 fi
 
-if [ -L "$TARGET_DIR" ]; then
-  echo "ERROR: target '$TARGET_DIR' is a symbolic link; refusing to use it." >&2
-  exit 1
+while [ "$TARGET_DIR" != "/" ] && [ "${TARGET_DIR%/}" != "$TARGET_DIR" ]; do
+  TARGET_DIR="${TARGET_DIR%/}"
+done
+TARGET_PARENT="$(dirname -- "$TARGET_DIR")"
+TARGET_NAME="$(basename -- "$TARGET_DIR")"
+case "$TARGET_NAME" in
+  ""|"."|".."|"/")
+    echo "ERROR: target '$TARGET_DIR' does not name a new directory." >&2
+    exit 1
+    ;;
+esac
+
+TARGET_PARENT_CANONICAL=""
+
+assert_trusted_parent() {
+  local uid resolved
+  uid="$(id -u)"
+  if [ ! -d "$TARGET_PARENT" ]; then
+    echo "ERROR: the parent directory '$TARGET_PARENT' does not exist." >&2
+    echo "       Create it yourself first; the installer will not build a path it" >&2
+    echo "       cannot vouch for." >&2
+    exit 1
+  fi
+  resolved="$(CDPATH='' cd -P -- "$TARGET_PARENT" 2>/dev/null && pwd -P)" || resolved=""
+  if [ -z "$resolved" ] || [ ! -d "$resolved" ]; then
+    echo "ERROR: the parent directory '$TARGET_PARENT' does not resolve to a real directory." >&2
+    exit 1
+  fi
+  # Once canonicalised, the parent must keep resolving to the same real
+  # directory. A different answer means a path component was replaced while the
+  # release was being verified, which is exactly the substitution the claim
+  # below is meant to survive.
+  if [ -n "$TARGET_PARENT_CANONICAL" ] && [ "$resolved" != "$TARGET_PARENT_CANONICAL" ]; then
+    echo "ERROR: '$TARGET_PARENT' now resolves to '$resolved', not '$TARGET_PARENT_CANONICAL'." >&2
+    echo "       A path component changed while the release was being verified." >&2
+    exit 1
+  fi
+  TARGET_PARENT_REAL="$resolved"
+  # Owned by this user and writable by nobody else: the two properties that make
+  # the single mkdir below an actual claim rather than a hopeful one.
+  if [ -z "$(find "$TARGET_PARENT_REAL" -maxdepth 0 -uid "$uid" ! -perm /022 -print 2>/dev/null)" ]; then
+    echo "ERROR: '$TARGET_PARENT_REAL' must be owned by UID ${uid} and must not be" >&2
+    echo "       group- or world-writable." >&2
+    echo "       Another local user could otherwise replace '$TARGET_NAME' while the" >&2
+    echo "       release is being downloaded and verified." >&2
+    exit 1
+  fi
+}
+
+assert_trusted_parent
+
+# Address the target only through the resolved parent from here on. The original
+# path may run through symlinks, and a symlink can be re-pointed during the long
+# verification interval; a canonical absolute path cannot. This is what stops the
+# final mkdir from ever traversing the lexical path it was given.
+TARGET_PARENT_CANONICAL="$TARGET_PARENT_REAL"
+TARGET_PARENT="$TARGET_PARENT_REAL"
+if [ "$TARGET_PARENT_REAL" = "/" ]; then
+  TARGET_DIR="/$TARGET_NAME"
+else
+  TARGET_DIR="$TARGET_PARENT_REAL/$TARGET_NAME"
 fi
-if [ -e "$TARGET_DIR" ] && [ ! -d "$TARGET_DIR" ]; then
-  echo "ERROR: target '$TARGET_DIR' exists and is not a directory; refusing to use it." >&2
-  exit 1
-fi
-if [ -d "$TARGET_DIR" ] && [ -n "$(find "$TARGET_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
-  echo "ERROR: target directory '$TARGET_DIR' is not empty; refusing to use it." >&2
+
+if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
+  echo "ERROR: target directory '$TARGET_DIR' already exists; refusing to use it." >&2
+  echo "       This installer only ever creates a new directory." >&2
   if [ "$STAGE_ONLY" -eq 0 ]; then
     echo "       Re-running the installer is NOT the upgrade path and nothing was changed." >&2
   else
-    echo "       Stage-only output requires a nonexistent or explicitly empty directory." >&2
+    echo "       Stage-only output requires a target that does not exist yet." >&2
   fi
   exit 1
 fi
+
+# Everything downstream writes to the canonical path resolved above, never to
+# the path as it was typed.
+if [ "$STAGE_ONLY" -eq 1 ]; then
+  STAGE_DIR="$TARGET_DIR"
+else
+  INSTALL_DIR="$TARGET_DIR"
+fi
+
+claim_target() {
+  # The first write to the target, and deliberately the only way one happens.
+  # A single mkdir without -p is the claim: it is atomic, it fails if anything
+  # at all now exists under that name, and it never follows a symlink planted
+  # during verification. The canonical parent is re-validated first, and must
+  # still resolve to the same real directory, so the claim really is made inside
+  # the directory that was vetted.
+  assert_trusted_parent
+  if ! mkdir -- "$TARGET_DIR" 2>/dev/null; then
+    echo "ERROR: '$TARGET_DIR' appeared while the release was being verified." >&2
+    echo "       Nothing was written to it. Find out what created it before retrying." >&2
+    exit 1
+  fi
+  if [ -L "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+    echo "ERROR: '$TARGET_DIR' is not the directory this installer just created." >&2
+    exit 1
+  fi
+  # 0750 keeps secrets in .env and etebase-server.ini out of reach of other
+  # local users on shared hosts — the install dir is a single-operator surface.
+  chmod 750 "$TARGET_DIR"
+}
 
 # Compose uses stable container names for upgrade compatibility. A second local
 # install cannot safely coexist with those names, so refuse before downloading
@@ -286,7 +383,36 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-echo "Installing SilentSuite version: $VERSION"
+# ── Require an immutable published release ────────────────────────────
+#
+# The bundle is authenticated by a checksum sidecar published on the same
+# release, so that sidecar proves something only if the release cannot be
+# rewritten after publication. GitHub records immutability per release and never
+# applies the setting retroactively, which is exactly why this reads the
+# selected release object rather than a repository-wide setting: a release
+# published before immutability was enabled is still mutable, and is refused.
+
+release_is_immutable() {
+  # GitHub returns pretty-printed JSON, so a top-level release field sits at
+  # exactly two spaces. Nested objects (assets, author) are indented deeper, and
+  # string values such as the release body are single escaped lines, so this
+  # anchor cannot be satisfied from inside one. Exactly one declaration must
+  # exist and it must be the literal boolean true; absent, false, duplicated,
+  # quoted or otherwise malformed all fail closed.
+  local metadata="$1"
+  [ "$(printf '%s\n' "$metadata" | grep -cE '^  "immutable":' | tr -d ' ')" = "1" ] || return 1
+  printf '%s\n' "$metadata" | grep -qE '^  "immutable": true,?$'
+}
+
+if ! release_is_immutable "$RELEASE_METADATA"; then
+  echo "ERROR: release '$VERSION' is not published as an immutable GitHub release." >&2
+  echo "       Its assets can still be replaced after you verify them, so the" >&2
+  echo "       published checksum would prove nothing. Nothing was downloaded." >&2
+  echo "       See https://github.com/${REPO}/releases" >&2
+  exit 1
+fi
+
+echo "Installing SilentSuite version: $VERSION (immutable release)"
 echo ""
 
 BUNDLE_NAME="silentsuite-self-host-${VERSION}.tar.gz"
@@ -518,11 +644,9 @@ echo ""
 # ── Stage-only mode stops here ────────────────────────────────────────
 
 if [ "$STAGE_ONLY" -eq 1 ]; then
-  if [ -e "$STAGE_DIR" ] && [ -n "$(ls -A "$STAGE_DIR" 2>/dev/null || true)" ]; then
-    echo "ERROR: staging directory '$STAGE_DIR' is not empty." >&2
-    exit 1
-  fi
-  mkdir -p "$STAGE_DIR"
+  # Every asset, tag/commit, archive and manifest check has passed. Claim the
+  # target now, and populate only the directory this call created.
+  claim_target
   cp -R "$BUNDLE_ROOT/." "$STAGE_DIR/"
   cp "$BUNDLE_FILE" "$STAGE_DIR/$BUNDLE_NAME"
   cp "$CHECKSUM_FILE" "$STAGE_DIR/$CHECKSUM_NAME"
@@ -567,13 +691,11 @@ echo ""
 
 # ── Set up install directory ──────────────────────────────────────────
 
-if [ ! -d "$INSTALL_DIR" ]; then
-  echo "Creating install directory: $INSTALL_DIR"
-  mkdir -p "$INSTALL_DIR"
-fi
-# 0750 keeps secrets in .env and etebase-server.ini out of reach of other
-# local users on shared hosts — the install dir is a single-operator surface.
-chmod 750 "$INSTALL_DIR"
+# Release assets, the tag/commit binding, the archive, the manifest and the
+# registry image identity have all been verified by now. This is the first
+# write outside the temporary workspace.
+echo "Creating install directory: $INSTALL_DIR"
+claim_target
 
 for file in docker-compose.yml install.sh SELF-HOSTING.md update.sh verify.sh close-signups.sh success.html .env.example "$MANIFEST_NAME"; do
   cp "$BUNDLE_ROOT/$file" "$INSTALL_DIR/$file"

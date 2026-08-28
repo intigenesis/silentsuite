@@ -44,6 +44,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # First gate in the whole lane, before the tag is admitted and before any
+      # job that could push a GHCR child or move an alias. Immutable publication
+      # is what makes a released asset authenticate itself, so a disabled or
+      # unreadable setting stops the release here rather than after bytes have
+      # reached the registry. Uses only this job's contents:read token; the
+      # attachment job and the publish helper check again before they write.
+      - name: Require immutable published releases
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/require-immutable-releases.sh
+
       - name: Require an immutable tag reachable from protected main
         id: source
         shell: bash
@@ -415,6 +427,14 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+    # One tag-scoped domain shared with the Android and Bridge attachment jobs.
+    # Those live in other workflows, so the workflow-level group above cannot
+    # serialize them; this one can, because concurrency groups are repository
+    # scoped by name. Never cancel: a cancelled attachment leaves the umbrella
+    # draft missing a component rather than merely late.
+    concurrency:
+      group: umbrella-release-${{ github.ref_name }}
+      cancel-in-progress: false
     env:
       RELEASE_TAG: ${{ needs.admit.outputs.tag }}
       RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
@@ -447,6 +467,14 @@ jobs:
             --index-digest "$INDEX_DIGEST" \
             --amd64-digest "$AMD64_DIGEST" \
             --arm64-digest "$ARM64_DIGEST"
+
+      # Before any draft is created or any byte is uploaded. A published asset
+      # only authenticates itself if the release cannot be rewritten afterwards.
+      - name: Require immutable published releases
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/require-immutable-releases.sh
 
       - name: Attach the verified assets to the shared draft release
         shell: bash

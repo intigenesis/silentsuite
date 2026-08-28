@@ -17,6 +17,7 @@ on:
       - 'scripts/self-host-compose-effective-check.sh'
       - 'scripts/verify-server-image-release.sh'
       - 'scripts/publish-self-host-release-assets.sh'
+      - 'scripts/require-immutable-releases.sh'
       - 'tests/test_self_host_*.py'
       - 'tests/test_server_image_verifier.py'
       - '.github/workflows/ci-server.yml'
@@ -37,6 +38,7 @@ on:
       - 'scripts/self-host-compose-effective-check.sh'
       - 'scripts/verify-server-image-release.sh'
       - 'scripts/publish-self-host-release-assets.sh'
+      - 'scripts/require-immutable-releases.sh'
       - 'tests/test_self_host_*.py'
       - 'tests/test_server_image_verifier.py'
       - '.github/workflows/ci-server.yml'
@@ -148,7 +150,8 @@ jobs:
             scripts/self-host-image-smoke.sh \
             scripts/self-host-compose-effective-check.sh \
             scripts/verify-server-image-release.sh \
-            scripts/publish-self-host-release-assets.sh; do
+            scripts/publish-self-host-release-assets.sh \
+            scripts/require-immutable-releases.sh; do
             bash -n "$script"
           done
 

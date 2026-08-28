@@ -790,6 +790,12 @@ jobs:
     environment: android-release
     permissions:
       contents: write
+    # Shared tag-scoped domain with the Bridge and self-host attachment jobs, so
+    # the three components never append to the same umbrella draft at once.
+    # Never cancel: a cancelled attachment silently drops a component.
+    concurrency:
+      group: umbrella-release-${{ github.ref_name }}
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: android
@@ -982,6 +988,16 @@ jobs:
           cd ../../native-debug-symbols/release
           sha256sum "silentsuite-android-${{ github.ref_name }}-native-debug-symbols.zip" \
             > "silentsuite-android-${{ github.ref_name }}-native-debug-symbols.sha256"
+
+      # Runs before the release action, which creates the draft on first use.
+      # Assets that can be replaced after publication cannot authenticate
+      # themselves, so the lane refuses to attach anything until immutable
+      # releases are enabled.
+      - name: Require immutable published releases
+        working-directory: ${{ github.workspace }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/require-immutable-releases.sh
 
       - name: Attach Android artifacts to umbrella GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

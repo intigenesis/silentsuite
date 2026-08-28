@@ -281,6 +281,14 @@ jobs:
       (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'yes')
     permissions:
       contents: write
+    # Shared tag-scoped domain with the Android and self-host attachment jobs.
+    # The build matrix above keeps its own cancel-on-superseded group; this one
+    # only serializes umbrella-draft writes and never cancels. A manual dispatch
+    # groups on its dispatch ref and attaches to a synthetic
+    # v0.0.0-bridge-manual-* release, so it never writes a real umbrella draft.
+    concurrency:
+      group: umbrella-release-${{ github.ref_name }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout
@@ -318,6 +326,14 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
+
+      # Runs before the release action below, which creates the draft on first
+      # use. Assets that can be replaced after publication cannot authenticate
+      # themselves, so nothing is attached until immutable releases are enabled.
+      - name: Require immutable published releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/require-immutable-releases.sh
 
       # Create / append to the umbrella GitHub Release.
       # We deliberately do NOT set body/body_path here — the release notes

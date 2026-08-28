@@ -61,6 +61,11 @@ Every SilentSuite release publishes three self-host assets:
 | `silentsuite-self-host-<tag>.tar.gz.sha256` | the bundle's checksum, as a single strict record |
 | `server-image.json` | the immutable image identity: release tag, source commit, OCI index digest, per-architecture digests, supported platforms, and the expected image revision label |
 
+Releases are published as immutable GitHub releases, so these assets cannot be
+replaced after publication. The installer requires that of the release it
+selects: a checksum published beside the bundle it authenticates only proves
+something if neither can be rewritten afterwards.
+
 `docker-compose.yml` contains no image digest. It reads
 `SILENTSUITE_SERVER_IMAGE` from `.env`, which the installer writes as
 `ghcr.io/silent-suite/silentsuite-server@sha256:<index digest>` only after every
@@ -75,20 +80,30 @@ curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-
 
 The installer will:
 1. Check that Docker, Docker Compose, and the download-verification tools are installed
-2. Refuse to continue if `silentsuite-server/` already contains an installation — re-running the installer is not the upgrade path
+2. Refuse to continue if `silentsuite-server/` exists at all — as a directory, an empty directory, a file, or a symlink — and require its parent to be a directory you own that other local users cannot write
 3. Detect your architecture and resolve the newest published release that ships verified self-host assets
-4. Download the release bundle, its checksum, and `server-image.json` into a private temporary directory
-5. Verify the checksum record's exact grammar and the bundle's exact bytes before anything is extracted
-6. Verify the manifest: schema, release tag, source commit, canonical image repository, index and per-architecture digests, supported platforms, and expected image revision
-7. Confirm with GitHub that the release tag really points at the commit the manifest names
-8. Reject the archive unless every entry is a regular file or directory inside the bundle root and the file set is exactly the published inventory — nothing missing, nothing extra — then extract to a temporary staging directory
-9. Confirm the manifest inside the bundle is byte-identical to the separately published one
-10. Pull the image by digest and confirm the registry serves the promised digest, revision, and architecture
-11. Create `silentsuite-server/`, install the verified files, ask for your domain, generate secure random passwords, and write `.env` including the verified image digest
-12. Start the containers and wait for health checks to pass
+4. Require that release to be published as an immutable GitHub release, so its assets cannot be rewritten after you verify them
+5. Download the release bundle, its checksum, and `server-image.json` into a private temporary directory
+6. Verify the checksum record's exact grammar and the bundle's exact bytes before anything is extracted
+7. Verify the manifest: schema, release tag, source commit, canonical image repository, index and per-architecture digests, supported platforms, and expected image revision
+8. Confirm with GitHub that the release tag really points at the commit the manifest names
+9. Reject the archive unless every entry is a regular file or directory inside the bundle root and the file set is exactly the published inventory — nothing missing, nothing extra — then extract to a temporary staging directory
+10. Confirm the manifest inside the bundle is byte-identical to the separately published one
+11. Pull the image by digest and confirm the registry serves the promised digest, revision, and architecture
+12. Create `silentsuite-server/` with a single atomic `mkdir` — the first write outside its temporary workspace — then install the verified files, ask for your domain, generate secure random passwords, and write `.env` including the verified image digest
+13. Start the containers and wait for health checks to pass
 
-If any check fails, the installer stops before creating or changing anything,
-removes its temporary files, and leaves any existing installation untouched.
+Every check above runs before that `mkdir`. If any of them fails, the target is
+never created, nothing outside the installer's temporary workspace is written,
+and those temporary files are removed. If the directory has already been claimed
+and a later step fails — an empty domain answer, a container that will not start
+— the new directory is left in place with whatever it contains at that point;
+remove it yourself before retrying. It is always a directory the installer just
+created, never a pre-existing one.
+
+If the path you give runs through a symlink, the installer resolves it once
+while checking the parent and then uses only the resolved location, so
+re-pointing that symlink later cannot redirect the install.
 
 The first user to sign up in the SilentSuite app becomes the server admin.
 
@@ -122,6 +137,10 @@ its strict checksum sidecar, and the published manifest. It does not create an
 installation, pull an image, or start a container. The stage directory has a
 closed top-level inventory: the archive, sidecar, manifest, and the archive's
 verified managed files.
+
+The stage directory must not exist yet, and its parent must be a directory you
+own that other local users cannot write. Like an install, it is created by a
+single atomic `mkdir` only after every verification has passed.
 
 ## Manual Setup
 
@@ -379,7 +398,8 @@ bash ./install.sh --version vX.Y.Z --stage-only "./silentsuite-vX.Y.Z"
 
 Stage-only verifies the release tag, manifest, checksum sidecar, and archive
 contents. It does not verify the live registry image, install anything, or
-start a container.
+start a container, and it writes only into a directory that did not exist
+before you ran it.
 
 ## Health Checks
 
@@ -461,9 +481,9 @@ docker compose down -v   # WARNING: Deletes all data!
 rm -rf silentsuite-server
 curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
 ```
-The installer will not overwrite an existing installation, so the old directory
-must be removed first. Everything in it, including your credentials, is gone at
-that point.
+The installer refuses to use a path that already exists — even an empty
+directory — so the old one must be removed first. Everything in it, including
+your credentials, is gone at that point.
 
 ## Security Notes
 

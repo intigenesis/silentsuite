@@ -154,6 +154,41 @@ def test_release_admission_runs_before_anything_is_built():
         assert "admit" in ([needs] if isinstance(needs, str) else needs)
 
 
+def test_immutability_is_proven_during_admission_before_any_registry_write():
+    """The gate belongs in admit, not only at attachment time.
+
+    Every other job needs admit, and the two jobs that can push a GHCR child or
+    move an alias are downstream of it, so a disabled or unreadable setting
+    stops the release before any byte reaches the registry.
+    """
+
+    admit = RELEASE["jobs"]["admit"]
+    names = step_names(admit)
+    checkout = names.index("Checkout exact tag commit")
+    guard = names.index("Require immutable published releases")
+    assert guard == checkout + 1, "the gate runs immediately after checkout"
+    assert guard < names.index("Require an immutable tag reachable from protected main")
+
+    step = step_named(admit, "Require immutable published releases")
+    assert "scripts/require-immutable-releases.sh" in step["run"]
+    assert step["env"]["GITHUB_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    # Read-only token: the gate never needs, and must never acquire, write scope.
+    assert admit["permissions"] == {"contents": "read"}
+
+    for registry_writer in ("build", "publish-index"):
+        needs = RELEASE["jobs"][registry_writer]["needs"]
+        assert "admit" in ([needs] if isinstance(needs, str) else needs)
+
+
+def test_the_admission_gate_does_not_replace_the_downstream_checks():
+    """Defense in depth: admit gates the lane, the writers gate themselves."""
+
+    assert "Require immutable published releases" in step_names(RELEASE["jobs"]["admit"])
+    assert "Require immutable published releases" in step_names(RELEASE["jobs"]["attach-release-assets"])
+    helper = (ROOT / "scripts" / "publish-self-host-release-assets.sh").read_text(encoding="utf-8")
+    assert '"$HELPER_DIR/require-immutable-releases.sh"' in helper
+
+
 # ── Release lane: per-platform build and smoke ────────────────────────
 
 
@@ -434,6 +469,105 @@ def test_every_workflow_action_is_pinned_to_an_immutable_commit():
                 if not SHA_PINNED.match(uses):
                     violations.append(f"{path.name}:{job_name}: {uses} is not pinned to a 40-hex commit")
     assert violations == []
+
+
+# ── Umbrella draft: serialization and immutable publication ───────────
+
+
+ANDROID_WORKFLOW = WORKFLOW_DIR / "build-android.yml"
+BRIDGE_WORKFLOW = WORKFLOW_DIR / "build-bridge.yml"
+UMBRELLA_GROUP = "umbrella-release-${{ github.ref_name }}"
+GUARD_SCRIPT = "scripts/require-immutable-releases.sh"
+PUBLISH_HELPER = ROOT / "scripts" / "publish-self-host-release-assets.sh"
+GUARD_STEP = "Require immutable published releases"
+
+# Every job that appends assets to the shared umbrella draft, and the step in it
+# that actually creates or uploads.
+ATTACHMENT_JOBS = [
+    (RELEASE_WORKFLOW, "attach-release-assets", "Attach the verified assets to the shared draft release"),
+    (ANDROID_WORKFLOW, "build-release", "Attach Android artifacts to umbrella GitHub Release"),
+    (BRIDGE_WORKFLOW, "release", "Attach bridge binaries to umbrella GitHub Release"),
+]
+ATTACHMENT_IDS = [f"{path.stem}:{job}" for path, job, _ in ATTACHMENT_JOBS]
+
+
+@pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
+def test_every_umbrella_attachment_job_shares_one_tag_scoped_domain(path, job_name, attach_step):
+    """Three workflows write one draft, so the lock has to live outside them.
+
+    Concurrency groups are repository scoped by name, which is the only thing
+    that can serialize jobs in separate workflow files.
+    """
+
+    job = load(path)["jobs"][job_name]
+    assert job["concurrency"]["group"] == UMBRELLA_GROUP
+    # Cancelling an attachment does not undo it; it just leaves the draft
+    # missing a component with no failure to notice.
+    assert job["concurrency"]["cancel-in-progress"] == "false"
+
+
+def test_the_umbrella_domain_is_scoped_to_the_tag_not_the_commit_or_workflow():
+    for path, job_name, _ in ATTACHMENT_JOBS:
+        group = load(path)["jobs"][job_name]["concurrency"]["group"]
+        assert "github.ref_name" in group
+        for wrong in ("github.sha", "github.workflow", "github.run_id"):
+            assert wrong not in group, f"{path.name}:{job_name} is scoped by {wrong}"
+
+
+def test_a_manual_bridge_release_cannot_share_a_domain_with_a_real_umbrella_tag():
+    """Dispatch runs group on their dispatch ref and mint a synthetic tag."""
+
+    source = BRIDGE_WORKFLOW.read_text(encoding="utf-8")
+    assert 'TAG="v0.0.0-bridge-manual-' in source
+    bridge = load(BRIDGE_WORKFLOW)
+    assert bridge["jobs"]["release"]["concurrency"]["group"] == UMBRELLA_GROUP
+
+
+def test_the_bridge_build_matrix_keeps_its_own_unrelated_concurrency():
+    bridge = load(BRIDGE_WORKFLOW)
+    assert bridge["concurrency"]["group"] == "${{ github.workflow }}-${{ github.ref }}"
+    assert bridge["concurrency"]["cancel-in-progress"] == "true"
+
+
+@pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
+def test_no_asset_is_attached_before_immutability_is_proven(path, job_name, attach_step):
+    job = load(path)["jobs"][job_name]
+    names = step_names(job)
+    assert GUARD_STEP in names, f"{path.name}:{job_name} has no immutability gate"
+    guard_index = names.index(GUARD_STEP)
+    assert guard_index < names.index(attach_step)
+    assert GUARD_SCRIPT in step_named(job, GUARD_STEP)["run"]
+    assert step_named(job, GUARD_STEP)["env"]["GITHUB_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+
+    # Nothing that can create a draft or upload an asset may precede the gate.
+    for step in steps(job)[:guard_index]:
+        assert "softprops/action-gh-release" not in str(step.get("uses", ""))
+        assert "publish-self-host-release-assets.sh" not in str(step.get("run", ""))
+
+
+def test_the_publish_helper_gates_on_immutability_before_it_can_write():
+    """Defense in depth: the helper is what actually creates and uploads."""
+
+    source = PUBLISH_HELPER.read_text(encoding="utf-8")
+    guard = source.index('"$HELPER_DIR/require-immutable-releases.sh"')
+    for write in ('api POST "/repos/${GITHUB_REPOSITORY}/releases"', "${UPLOADS}/repos/"):
+        assert guard < source.index(write), f"the gate must precede {write!r}"
+
+
+def test_the_immutability_gate_never_changes_the_setting():
+    """Enabling immutability is an owner action; code only reads the value."""
+
+    guard = (ROOT / GUARD_SCRIPT).read_text(encoding="utf-8")
+    assert "immutable-releases" in guard
+    for mutation in ("-X POST", "-X PUT", "-X PATCH", "-X DELETE"):
+        assert mutation not in guard
+
+
+def test_ci_covers_the_immutability_gate():
+    for event in ("push", "pull_request"):
+        assert GUARD_SCRIPT in CI["on"][event]["paths"]
+    syntax = step_named(CI["jobs"]["self-host-contracts"], "Check release and self-host shell syntax")["run"]
+    assert GUARD_SCRIPT in syntax
 
 
 # ── Production deploy isolation ───────────────────────────────────────

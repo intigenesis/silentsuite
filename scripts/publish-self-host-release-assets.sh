@@ -6,6 +6,7 @@ set -euo pipefail
 #
 # The Android and Bridge tag workflows append to the same draft concurrently, so
 # this script is deliberately defensive:
+#   * refuses to run at all unless published releases are immutable;
 #   * bounded idempotent lookup-or-create of the draft for this exact tag;
 #   * fails closed if more than one release claims the tag, if the release is not
 #     a draft, or if a same-named asset already exists with different bytes;
@@ -18,6 +19,8 @@ set -euo pipefail
 #     --asset NAME [--asset NAME ...]
 #
 # Requires GITHUB_TOKEN with contents:write, GITHUB_REPOSITORY, and curl + jq.
+
+HELPER_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 
 TAG=""
 DIRECTORY=""
@@ -55,6 +58,12 @@ for asset in "${ASSETS[@]}"; do
     exit 1
   fi
 done
+
+# Defense in depth: the calling workflow gates on this too, but the helper is
+# the thing that actually creates drafts and uploads bytes, so it refuses to do
+# either unless published releases are immutable. Checked before the first
+# create/upload, never after.
+"$HELPER_DIR/require-immutable-releases.sh"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT

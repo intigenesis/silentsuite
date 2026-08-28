@@ -1,44 +1,46 @@
 # Updating
 
-How to keep your self-hosted SilentSuite instance up to date.
+How SilentSuite versions are selected on a self-hosted instance, and what is and is not supported today.
 
 ## How Versions Are Pinned
 
-The `docker-compose.yml` shipped with each SilentSuite release pins the server image to a specific manifest digest, e.g.:
+`docker-compose.yml` contains no image reference of its own. It requires `SILENTSUITE_SERVER_IMAGE` from `.env`, which the installer writes as the immutable OCI index digest of the release it verified:
 
-```yaml
-image: ghcr.io/silent-suite/silentsuite-server@sha256:6689b5d8...
+```
+SILENTSUITE_SERVER_IMAGE=ghcr.io/silent-suite/silentsuite-server@sha256:<index digest>
 ```
 
-This means a plain `docker compose pull` **will not** fetch a newer SilentSuite version — it only re-pulls the same digest. To upgrade across SilentSuite releases you must fetch a newer compose file.
+There is deliberately no default, so Compose refuses to start rather than run an unverified image. A mutable `:version` tag is only ever used to *find* a release; `latest` is never the authority for what runs, and moving a tag cannot change your running server.
 
-## Upgrade to a New SilentSuite Release
+## Restarting the Version You Have
 
-Re-running the installer pulls the latest umbrella release's `docker-compose.yml` (and helper scripts) and recreates the containers:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
-```
-
-To pin to a specific release instead:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | SILENTSUITE_VERSION=v0.1.0-beta bash
-```
-
-The whole self-host config (compose, `update.sh`, `verify.sh`, `success.html`, `close-signups.sh`) is fetched from the requested tag's archive, so the entire matrix moves together as one release.
-
-## Within a Pinned Release
-
-`./update.sh` re-pulls the pinned images and recreates the containers. This is useful after host-level changes (Docker upgrade, kernel reboot, etc.) but does **not** change SilentSuite versions:
+`./update.sh` re-pulls the image already pinned in `.env` and recreates the containers. It is useful after host-level changes (Docker upgrade, kernel reboot). It does **not** change SilentSuite versions — the digest in `.env` is immutable by design, so `docker compose pull` is a no-op across versions:
 
 ```bash
 ./update.sh
 ```
 
+## Upgrading to a New Version
+
+**There is no supported cross-version update procedure yet.** A version-aware updater that moves an existing installation from one release to the next is deliberately deferred to a later change.
+
+Until it ships:
+
+- **Re-running the installer is not the upgrade path.** It refuses to run against an existing target directory, because regenerating credentials and restarting a stack without migrating or backing up its data is not a safe upgrade.
+- **Do not edit the digest in `.env` by hand.** A newer server image may expect a database schema your current volume does not have.
+- **Do not switch the image to a mutable tag.** That gives up the verification the installer performed and can silently change what runs.
+
+You can inspect a newer release without touching your installation. Staging only writes into a directory that does not exist yet, and never pulls an image or starts a container:
+
+```bash
+bash ./install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
+```
+
+This verifies the release tag, the manifest, the checksum sidecar, and the archive contents.
+
 ## Verify
 
-After any update:
+After any restart:
 
 ```bash
 ./verify.sh
@@ -46,3 +48,7 @@ docker compose ps
 ```
 
 All services should report `healthy`.
+
+## Data Safety
+
+Restarting with `./update.sh` preserves your data: the named volumes (`pgdata`, `server_data`) survive container recreation. Back up before any maintenance you are unsure about — see [Backup and Restore](./backup-and-restore.md). Losing the server data volume means losing the server secret key, and encrypted data becomes unrecoverable without it.

@@ -55,6 +55,10 @@ BUNDLE_NAME = bundle_basename(TAG)
 CHECKSUM_NAME = f"{BUNDLE_NAME}.sha256"
 PREFIX = bundle_prefix(TAG)
 
+# GitHub pretty-prints release objects, so a top-level field sits at exactly two
+# spaces. The installer anchors on that; the variants below prove it.
+IMMUTABLE_TRUE = '  "immutable": true,\n'
+
 BUNDLE_FILES = (
     ".env.example",
     "SELF-HOSTING.md",
@@ -83,6 +87,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 printf '%s\\n' "$url" >> "$SILENTSUITE_FIXTURES/requests.log"
+# Race hook: plant something at the installer's target part-way through the
+# download, the way another local principal could.
+if [ -n "${SILENTSUITE_PLANT_ON:-}" ]; then
+  case "$url" in
+    *"$SILENTSUITE_PLANT_ON"*)
+      case "${SILENTSUITE_PLANT_KIND:-dir}" in
+        symlink) ln -sfn "$SILENTSUITE_PLANT_LINK" "$SILENTSUITE_PLANT_TARGET" ;;
+        file) printf 'planted\\n' > "$SILENTSUITE_PLANT_TARGET" ;;
+        *) mkdir -p "$SILENTSUITE_PLANT_TARGET"; printf 'planted\\n' > "$SILENTSUITE_PLANT_TARGET/planted.txt" ;;
+      esac
+      ;;
+  esac
+fi
 key=$(printf '%s' "$url" | sed 's#[^A-Za-z0-9._-]#_#g')
 src="$SILENTSUITE_FIXTURES/$key"
 if [ ! -f "$src" ]; then
@@ -116,6 +133,15 @@ case "$1" in
     ;;
   pull)
     if [ "${SILENTSUITE_FAKE_PULL_FAILS:-0}" = "1" ]; then exit 1; fi
+    # Race hook: the image pull is the longest window between the target check
+    # and the target claim, so this is where a planted path would appear.
+    if [ "${SILENTSUITE_PLANT_ON_PULL:-0}" = "1" ]; then
+      case "${SILENTSUITE_PLANT_KIND:-dir}" in
+        symlink) ln -sfn "$SILENTSUITE_PLANT_LINK" "$SILENTSUITE_PLANT_TARGET" ;;
+        file) printf 'planted\\n' > "$SILENTSUITE_PLANT_TARGET" ;;
+        *) mkdir -p "$SILENTSUITE_PLANT_TARGET"; printf 'planted\\n' > "$SILENTSUITE_PLANT_TARGET/planted.txt" ;;
+      esac
+    fi
     exit 0
     ;;
   image)
@@ -220,6 +246,7 @@ class Release:
         extra: str | None = None,
         omit: str | None = None,
         compare: str | None = IDENTICAL_COMPARE,
+        immutable: str | None = IMMUTABLE_TRUE,
     ) -> None:
         archive = self.fixtures / BUNDLE_NAME
         build_bundle(archive, self.manifest_text, unsafe=unsafe, extra=extra, omit=omit)
@@ -232,7 +259,9 @@ class Release:
         asset_json = "".join(f'      "name": "{name}",\n' for name in self.assets)
         self.put(
             f"{API}/releases/tags/{TAG}",
-            '{\n  "tag_name": "' + TAG + '",\n  "draft": false,\n  "assets": [\n' + asset_json + "  ]\n}\n",
+            '{\n  "tag_name": "' + TAG + '",\n  "draft": false,\n'
+            + (immutable or "")
+            + '  "assets": [\n' + asset_json + "  ]\n}\n",
         )
         self.put(f"{DOWNLOAD}/{BUNDLE_NAME}", archive.read_bytes())
         self.put(f"{DOWNLOAD}/{CHECKSUM_NAME}", checksum_text if checksum_text is not None else f"{digest}  {BUNDLE_NAME}\n")
@@ -247,6 +276,10 @@ def workspace(tmp_path):
     home = tmp_path / "home"
     for directory in (fixtures, binaries, tempdir, home):
         directory.mkdir(parents=True, exist_ok=True)
+        # The installer requires the target's parent to be a directory this user
+        # owns that nobody else can write. A default umask of 0002 would make
+        # these group-writable, which the installer correctly refuses.
+        directory.chmod(0o755)
 
     write_stub(binaries, "curl", CURL_STUB)
     write_stub(binaries, "uname", UNAME_STUB)
@@ -705,21 +738,33 @@ def test_a_non_empty_staging_directory_is_refused(workspace):
     result = run_installer(workspace, "--stage-only", str(staged))
 
     assert result.returncode != 0
-    assert "is not empty" in result.stderr
+    assert "already exists" in result.stderr
     assert (staged / "keep.txt").read_text() == "existing\n"
     assert not (workspace["fixtures"] / "requests.log").exists()
     assert leftover_temporaries(workspace) == []
 
 
-def test_an_explicitly_empty_staging_directory_is_allowed(workspace):
+@pytest.mark.parametrize("stage_only", [False, True], ids=["install", "stage-only"])
+def test_a_pre_existing_empty_target_is_refused(workspace, stage_only):
+    """An empty directory is not proof it will still be empty, or a directory."""
+
     workspace["release"].publish()
-    staged = workspace["root"] / "staged"
-    staged.mkdir()
+    if stage_only:
+        target = workspace["root"] / "staged"
+        target.mkdir()
+        arguments = ("--stage-only", str(target))
+    else:
+        target = install_dir(workspace)
+        target.mkdir(parents=True)
+        arguments = ()
 
-    result = run_installer(workspace, "--stage-only", str(staged))
+    result = run_installer(workspace, *arguments)
 
-    assert result.returncode == 0, result.stderr
-    assert (staged / MANIFEST_NAME).exists()
+    assert result.returncode != 0
+    assert "already exists" in result.stderr
+    assert sorted(entry.name for entry in target.iterdir()) == []
+    assert not (workspace["fixtures"] / "requests.log").exists()
+    assert leftover_temporaries(workspace) == []
 
 
 def test_a_foreign_non_empty_install_directory_is_refused_before_any_download(workspace):
@@ -751,6 +796,250 @@ def test_a_foreign_non_empty_install_directory_is_refused_before_any_download(wo
     assert "compose up" not in docker_log
     assert leftover_temporaries(workspace) == []
 
+
+# ── Immutable release admission ───────────────────────────────────────
+
+
+def _downloaded_assets(workspace) -> list[str]:
+    log = workspace["fixtures"] / "requests.log"
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if "/releases/download/" in line]
+
+
+@pytest.mark.parametrize(
+    ("immutable", "reason"),
+    [
+        ('  "immutable": false,\n', "explicitly mutable"),
+        (None, "no immutability recorded at all (a pre-setting legacy release)"),
+        ('  "immutable": true,\n  "immutable": false,\n', "duplicated declaration"),
+        ('  "immutable": "true",\n', "quoted, not a boolean"),
+        ('  "immutable": null,\n', "null"),
+        ('  "immutable":true,\n', "malformed spacing"),
+        ('      "immutable": true,\n', "nested at asset depth, not top level"),
+    ],
+)
+def test_a_release_that_is_not_immutable_is_never_downloaded(workspace, immutable, reason):
+    """The bundle checksum lives on the release it authenticates.
+
+    That only proves something if the release cannot be rewritten afterwards, so
+    a release without an unambiguous top-level immutable:true is refused before
+    a single asset byte is fetched.
+    """
+
+    workspace["release"].publish(immutable=immutable)
+
+    result = run_installer(workspace)
+
+    assert result.returncode != 0, reason
+    assert "not published as an immutable GitHub release" in result.stderr
+    assert _downloaded_assets(workspace) == []
+    assert not install_dir(workspace).exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_an_immutable_release_is_admitted_and_reported(workspace):
+    workspace["release"].publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode == 0, result.stderr
+    assert "(immutable release)" in result.stdout
+    assert _downloaded_assets(workspace) != []
+
+
+# ── Target claim: parent trust and the download-window race ───────────
+
+
+def test_a_group_or_world_writable_parent_is_refused_before_any_download(workspace):
+    parent = workspace["root"] / "shared"
+    parent.mkdir()
+    parent.chmod(0o777)
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env={"SILENTSUITE_DIR": str(parent / "silentsuite-server")})
+
+    assert result.returncode != 0
+    assert "group- or world-writable" in result.stderr
+    assert not (parent / "silentsuite-server").exists()
+    assert not (workspace["fixtures"] / "requests.log").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_missing_parent_is_refused_before_any_download(workspace):
+    workspace["release"].publish()
+    target = workspace["root"] / "absent" / "silentsuite-server"
+
+    result = run_installer(workspace, env={"SILENTSUITE_DIR": str(target)})
+
+    assert result.returncode != 0
+    assert "does not exist" in result.stderr
+    assert not target.parent.exists()
+    assert not (workspace["fixtures"] / "requests.log").exists()
+
+
+def test_a_private_parent_directory_is_accepted(workspace):
+    parent = workspace["root"] / "private"
+    parent.mkdir()
+    parent.chmod(0o700)
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env={"SILENTSUITE_DIR": str(parent / "silentsuite-server")})
+
+    assert result.returncode == 0, result.stderr
+    installed = parent / "silentsuite-server"
+    assert (installed / ".env").exists()
+    assert oct(installed.stat().st_mode & 0o777) == "0o750"
+
+
+@pytest.mark.parametrize("kind", ["dir", "file"])
+def test_a_target_planted_during_the_image_pull_is_never_written_through(workspace, kind):
+    """The window Sol identified: absent at check time, occupied at write time."""
+
+    workspace["release"].publish()
+    target = install_dir(workspace)
+
+    result = run_installer(
+        workspace,
+        env={
+            "SILENTSUITE_PLANT_ON_PULL": "1",
+            "SILENTSUITE_PLANT_TARGET": str(target),
+            "SILENTSUITE_PLANT_KIND": kind,
+        },
+    )
+
+    assert result.returncode != 0
+    assert "appeared while the release was being verified" in result.stderr
+    if kind == "dir":
+        assert sorted(entry.name for entry in target.iterdir()) == ["planted.txt"]
+    else:
+        assert target.is_file() and target.read_text() == "planted\n"
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert "compose up" not in docker_log
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_target_symlink_planted_during_the_image_pull_is_never_followed(workspace):
+    workspace["release"].publish()
+    target = install_dir(workspace)
+    elsewhere = workspace["root"] / "attacker-controlled"
+    elsewhere.mkdir()
+
+    result = run_installer(
+        workspace,
+        env={
+            "SILENTSUITE_PLANT_ON_PULL": "1",
+            "SILENTSUITE_PLANT_TARGET": str(target),
+            "SILENTSUITE_PLANT_KIND": "symlink",
+            "SILENTSUITE_PLANT_LINK": str(elsewhere),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "appeared while the release was being verified" in result.stderr
+    assert target.is_symlink()
+    # Nothing was written through the link, and its mode was never changed.
+    assert sorted(entry.name for entry in elsewhere.iterdir()) == []
+    assert oct(elsewhere.stat().st_mode & 0o777) != "0o750"
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert "compose up" not in docker_log
+
+
+@pytest.mark.parametrize("kind", ["dir", "symlink"])
+def test_a_stage_target_planted_during_the_download_is_never_written_through(workspace, kind):
+    workspace["release"].publish()
+    staged = workspace["root"] / "staged"
+    elsewhere = workspace["root"] / "attacker-controlled"
+    elsewhere.mkdir()
+
+    result = run_installer(
+        workspace,
+        "--stage-only",
+        str(staged),
+        env={
+            "SILENTSUITE_PLANT_ON": "server-image.json",
+            "SILENTSUITE_PLANT_TARGET": str(staged),
+            "SILENTSUITE_PLANT_KIND": kind,
+            "SILENTSUITE_PLANT_LINK": str(elsewhere),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "appeared while the release was being verified" in result.stderr
+    if kind == "dir":
+        assert sorted(entry.name for entry in staged.iterdir()) == ["planted.txt"]
+    else:
+        assert staged.is_symlink()
+        assert sorted(entry.name for entry in elsewhere.iterdir()) == []
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_symlinked_parent_resolving_to_a_private_directory_is_accepted(workspace):
+    """A symlinked path is fine; the installer just stops addressing it that way."""
+
+    real_parent = workspace["root"] / "real-home"
+    real_parent.mkdir()
+    real_parent.chmod(0o700)
+    link = workspace["root"] / "link-home"
+    link.symlink_to(real_parent)
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env={"SILENTSUITE_DIR": str(link / "silentsuite-server")})
+
+    assert result.returncode == 0, result.stderr
+    installed = real_parent / "silentsuite-server"
+    assert (installed / ".env").exists()
+    assert not installed.is_symlink()
+    # The claim is announced against the canonical path, not the lexical one.
+    assert f"Creating install directory: {installed}" in result.stdout
+
+
+def test_a_symlinked_parent_repointed_during_the_pull_cannot_redirect_the_claim(workspace):
+    """Canonicalisation is what makes the claim un-redirectable.
+
+    The lexical parent is a symlink that gets re-pointed at an attacker-owned
+    directory during the image pull. Because the target was canonicalised right
+    after the parent was vetted, the mkdir never traverses that symlink again.
+    """
+
+    real_parent = workspace["root"] / "real-home"
+    real_parent.mkdir()
+    real_parent.chmod(0o700)
+    decoy = workspace["root"] / "decoy-home"
+    decoy.mkdir()
+    decoy.chmod(0o700)
+    link = workspace["root"] / "link-home"
+    link.symlink_to(real_parent)
+    workspace["release"].publish()
+
+    result = run_installer(
+        workspace,
+        env={
+            "SILENTSUITE_DIR": str(link / "silentsuite-server"),
+            "SILENTSUITE_PLANT_ON_PULL": "1",
+            "SILENTSUITE_PLANT_TARGET": str(link),
+            "SILENTSUITE_PLANT_KIND": "symlink",
+            "SILENTSUITE_PLANT_LINK": str(decoy),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    # The re-point really happened...
+    assert link.readlink() == decoy
+    # ...and changed nothing: the install is in the directory that was vetted.
+    assert (real_parent / "silentsuite-server" / ".env").exists()
+    assert sorted(entry.name for entry in decoy.iterdir()) == []
+
+
+def test_the_target_is_claimed_only_after_the_registry_image_is_verified(workspace):
+    """A pull that fails must leave the target absent, not partially created."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace, env={"SILENTSUITE_FAKE_PULL_FAILS": "1"})
+
+    assert result.returncode != 0
+    assert not install_dir(workspace).exists()
 
 # ── Static guarantees ─────────────────────────────────────────────────
 
