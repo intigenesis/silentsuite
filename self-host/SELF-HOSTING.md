@@ -57,7 +57,7 @@ Every SilentSuite release publishes three self-host assets:
 
 | Asset | Purpose |
 |-------|---------|
-| `silentsuite-self-host-<tag>.tar.gz` | the version-matched `docker-compose.yml`, helper scripts, and landing page |
+| `silentsuite-self-host-<tag>.tar.gz` | the version-matched `docker-compose.yml`, helper scripts, and landing page; stage-only retains this archive for upgrade-time re-verification |
 | `silentsuite-self-host-<tag>.tar.gz.sha256` | the bundle's checksum, as a single strict record |
 | `server-image.json` | the immutable image identity: release tag, source commit, OCI index digest, per-architecture digests, supported platforms, and the expected image revision label |
 
@@ -117,8 +117,11 @@ bash install.sh --version v0.1.0-beta --stage-only ./silentsuite-release
 ```
 
 This performs every download and verification step and writes the verified
-bundle contents into `./silentsuite-release`, without creating an installation,
-pulling an image, or starting a container.
+bundle contents into `./silentsuite-release`, along with the original archive,
+its strict checksum sidecar, and the published manifest. It does not create an
+installation, pull an image, or start a container. The stage directory has a
+closed top-level inventory: the archive, sidecar, manifest, and the archive's
+verified managed files.
 
 ## Manual Setup
 
@@ -355,41 +358,48 @@ Re-running `install.sh` is **not** the upgrade path. It refuses to touch an
 existing installation, because regenerating credentials and restarting a stack
 without backing up your database is not a safe upgrade.
 
-A version-aware updater — one that backs up your configuration, dumps the
-database before migrations, verifies the target release identity before stopping
-the running server, and restores the previous image if startup fails — is
-separate, later work. It is not part of this release.
+An unattended version-aware updater — one that schedules this work, backs up and
+restores state automatically, and recovers a failed migration — is separate,
+later work. It is not part of this release.
 
 Until it ships, upgrade deliberately:
 
 1. **Back up first** (see [Backup and Restore](#backup-and-restore)). Take both the
    database dump and the `server_data` volume, and copy `.env` somewhere safe.
-2. **Get the new release's verified bundle** without installing it:
+2. **Get the new release's verified bundle** without installing it. Run this
+   from the existing installation directory; the stage directory must be
+   nonexistent or empty:
    ```bash
-   bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
+   cd silentsuite-server
+   bash ./install.sh --version vX.Y.Z --stage-only "./silentsuite-vX.Y.Z"
    ```
-3. **Replace the tracked Compose definition with the verified release copy.**
-   Keep your generated `docker-compose.override.yml` unchanged, but do not keep
-   an older base Compose file: earlier releases hard-coded an image and would
-   ignore the new digest in `.env`.
+   Stage-only verifies the separately published manifest against the manifest
+   embedded in the checksummed bundle and verifies the registry image identity.
+   It retains the checksummed archive beside its extracted files so the upgrade
+   helper can repeat the archive checks after staging.
+3. **Run the checked manual upgrade helper**:
    ```bash
-   cp docker-compose.yml "docker-compose.yml.before-vX.Y.Z"
-   cp ./silentsuite-vX.Y.Z/docker-compose.yml ./docker-compose.yml
+   bash "./silentsuite-vX.Y.Z/upgrade.sh" \
+     --staged "$PWD/silentsuite-vX.Y.Z" \
+     --install-dir "$PWD"
    ```
-4. **Pin the new image**: copy `indexDigest` from the staged `server-image.json`
-   into `SILENTSUITE_SERVER_IMAGE` in your existing `.env`. Keep every other
-   value in `.env` as it is — those are your credentials.
-5. **Confirm the effective image, apply migrations, then restart**:
-   ```bash
-   set -euo pipefail
-   target_image="$(sed -n 's/^SILENTSUITE_SERVER_IMAGE=//p' .env)"
-   test -n "$target_image"
-   docker compose config --images | grep -Fx "$target_image"
-   docker compose pull
-   docker compose run --rm --no-deps server python manage.py migrate --noinput
-   docker compose up -d
-   ./verify.sh
-   ```
+
+   The helper derives the canonical `imageRepository@indexDigest` from the
+   verified manifest, then re-verifies the staged archive's strict checksum, closed
+   tar inventory, safe paths and file types, and embedded manifest. It compares
+   every retained extracted managed file with that freshly verified archive and
+   stops if staging changed any bytes. The archive is then the only source for
+   release-managed files: `.env.example`, `SELF-HOSTING.md`, `close-signups.sh`,
+   `docker-compose.yml`, `install.sh`, `success.html`, `upgrade.sh`,
+   `update.sh`, `verify.sh`, and `server-image.json`. The existing `.env`
+   values other than the image entry, `etebase-server.ini`,
+   `docker-compose.override.yml`, named volumes, and operator data are not
+   copied or recreated. The installed manifest and checksum must match the
+   verified release identity or the helper stops.
+
+   The helper applies migrations only after that admission, then recreates the
+   stack and runs `verify.sh`. It is a deliberate, operator-invoked upgrade;
+   there is no unattended upgrade path.
 
 If the new version does not come up, put the previous digest back in
 `SILENTSUITE_SERVER_IMAGE` and run `docker compose up -d`. Note that rolling the

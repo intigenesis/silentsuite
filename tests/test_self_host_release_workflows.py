@@ -201,12 +201,35 @@ def test_release_child_digest_is_only_exposed_after_its_smoke_passes():
 
 def test_release_merges_only_verified_children_into_immutable_references():
     run = step_named(RELEASE["jobs"]["publish-index"], "Merge verified children into the release index")["run"]
-    assert '--tag "${IMAGE_NAME}:${RELEASE_TAG}"' in run
+    assert '--tag "${IMAGE_NAME}:${reference}"' in run
     assert 'COMMIT_REF="selfhost-${RELEASE_COMMIT}"' in run
-    assert '--tag "${IMAGE_NAME}:${COMMIT_REF}"' in run
+    assert 'publish_alias "$COMMIT_REF"' in run
     assert 'existing="$(scripts/verify-server-image-release.sh' in run
-    assert '"$existing" != "absent"' in run
+    assert '"$existing" = "absent"' in run
     assert "latest" not in run
+
+
+def test_release_alias_publication_is_idempotent_but_conflict_safe():
+    run = step_named(RELEASE["jobs"]["publish-index"], "Merge verified children into the release index")["run"]
+    assert RELEASE["concurrency"]["group"] == "release-server-image-${{ github.sha }}"
+    assert "--verify-reference" in run
+    assert "--expected-index-digest" in run
+    assert "ALIAS_DIR" in run
+    assert "expected_index" in run
+    assert "aliases resolve to different verified indexes" in run
+    assert run.count("docker buildx imagetools create") == 1
+    assert "one alias at a" in run
+    assert "not a registry-level atomicity claim" in run
+    assert "Both aliases are checked again" in run
+
+
+def test_release_verifier_can_validate_an_existing_alias_identity():
+    verifier = (ROOT / "scripts" / "verify-server-image-release.sh").read_text(encoding="utf-8")
+    assert "--verify-reference" in verifier
+    assert "--expected-index-digest" in verifier
+    assert "verify_index_reference" in verifier
+    assert "index children do not match the verified per-platform digests" in verifier
+    assert "revision label is" in verifier
 
 
 def test_release_never_pushes_or_moves_latest():

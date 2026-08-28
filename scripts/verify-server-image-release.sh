@@ -24,6 +24,10 @@ set -euo pipefail
 #   scripts/verify-server-image-release.sh --repository ... --resolve REFERENCE
 #     prints the manifest digest for REFERENCE, or "absent" if it does not exist.
 #
+#   scripts/verify-server-image-release.sh --repository ... --verify-reference REFERENCE \
+#     --commit <40-hex> --amd64-digest sha256:... --arm64-digest sha256:... \
+#     [--expected-index-digest sha256:...] [--index-digest-file PATH]
+#
 # Credentials: REGISTRY_USERNAME / REGISTRY_PASSWORD (a workflow GITHUB_TOKEN
 # with packages:read is enough). Never a production or VPS credential.
 
@@ -34,6 +38,8 @@ AMD64_DIGEST=""
 ARM64_DIGEST=""
 INDEX_DIGEST_FILE=""
 RESOLVE_REFERENCE=""
+VERIFY_REFERENCE=""
+EXPECTED_INDEX_DIGEST=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,6 +50,8 @@ while [ $# -gt 0 ]; do
     --arm64-digest) ARM64_DIGEST="${2:-}"; shift 2 ;;
     --index-digest-file) INDEX_DIGEST_FILE="${2:-}"; shift 2 ;;
     --resolve) RESOLVE_REFERENCE="${2:-}"; shift 2 ;;
+    --verify-reference) VERIFY_REFERENCE="${2:-}"; shift 2 ;;
+    --expected-index-digest) EXPECTED_INDEX_DIGEST="${2:-}"; shift 2 ;;
     *) echo "ERROR: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -113,6 +121,10 @@ if [ -n "$RESOLVE_REFERENCE" ]; then
   exit 0
 fi
 
+if [ -n "$VERIFY_REFERENCE" ]; then
+  TAG="$VERIFY_REFERENCE"
+fi
+
 for required in "--tag:$TAG" "--commit:$COMMIT" "--amd64-digest:$AMD64_DIGEST" "--arm64-digest:$ARM64_DIGEST"; do
   if [ -z "${required#*:}" ]; then
     echo "ERROR: ${required%%:*} is required" >&2
@@ -128,75 +140,6 @@ if [ "$AMD64_DIGEST" = "$ARM64_DIGEST" ]; then
   exit 2
 fi
 
-echo "== Resolving ${REPOSITORY}:${TAG} =="
-if ! fetch_manifest "$TAG" "$WORKDIR/index.json"; then
-  echo "ERROR: release tag ${TAG} is not published in the registry" >&2
-  exit 1
-fi
-INDEX_DIGEST="$MANIFEST_DIGEST"
-if ! printf '%s' "$INDEX_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
-  echo "ERROR: registry did not report an immutable index digest for ${TAG}" >&2
-  exit 1
-fi
-
-MEDIA_TYPE="$(jq -r '.mediaType // ""' "$WORKDIR/index.json")"
-if [ "$MEDIA_TYPE" != "application/vnd.oci.image.index.v1+json" ]; then
-  echo "ERROR: ${TAG} is a ${MEDIA_TYPE:-<unset>}, expected an OCI image index" >&2
-  exit 1
-fi
-
-# Runnable children are image manifests with a concrete linux platform.
-# Attestation manifests (unknown/unknown, or carrying the attestation reference
-# annotation) are classified separately and must never satisfy a platform.
-jq -r '
-  [ .manifests[]
-    | select((.platform.os // "unknown") != "unknown")
-    | select((.platform.architecture // "unknown") != "unknown")
-    | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
-    | "\(.platform.os)/\(.platform.architecture) \(.digest)"
-  ] | sort | .[]
-' "$WORKDIR/index.json" > "$WORKDIR/runnable.txt"
-
-# A surprise CPU variant would silently change what an operator runs, so only
-# the canonical arm64 variant spelling is tolerated.
-UNEXPECTED_VARIANTS="$(jq -r '
-  [ .manifests[]
-    | select((.platform.variant // "") != "")
-    | select((.platform.variant // "") != "v8")
-    | "\(.digest) variant=\(.platform.variant)"
-  ] | .[]
-' "$WORKDIR/index.json")"
-if [ -n "$UNEXPECTED_VARIANTS" ]; then
-  echo "ERROR: index contains children with unexpected CPU variants:" >&2
-  printf '%s\n' "$UNEXPECTED_VARIANTS" | sed 's/^/  /' >&2
-  exit 1
-fi
-
-jq -r '
-  [ .manifests[]
-    | select(((.platform.os // "unknown") == "unknown")
-             or ((.platform.architecture // "unknown") == "unknown")
-             or ((.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest"))
-    | "\(.digest) \(.annotations["vnd.docker.reference.type"] // "unclassified")"
-  ] | .[]
-' "$WORKDIR/index.json" > "$WORKDIR/attestations.txt"
-
-echo "runnable children:"
-sed 's/^/  /' "$WORKDIR/runnable.txt"
-if [ -s "$WORKDIR/attestations.txt" ]; then
-  echo "non-runnable (attestation) manifests:"
-  sed 's/^/  /' "$WORKDIR/attestations.txt"
-fi
-
-EXPECTED_RUNNABLE="$(printf 'linux/amd64 %s\nlinux/arm64 %s\n' "$AMD64_DIGEST" "$ARM64_DIGEST" | LC_ALL=C sort)"
-if [ "$(cat "$WORKDIR/runnable.txt")" != "$EXPECTED_RUNNABLE" ]; then
-  echo "ERROR: index children do not match the verified per-platform digests" >&2
-  echo "expected:" >&2
-  printf '%s\n' "$EXPECTED_RUNNABLE" | sed 's/^/  /' >&2
-  exit 1
-fi
-
-echo "== Verifying child identity =="
 verify_child() {
   local expected_arch="$1" digest="$2"
   local body="$WORKDIR/child-${expected_arch}.json"
@@ -236,29 +179,112 @@ verify_child() {
   echo "  linux/${expected_arch} ${digest} revision=${revision}"
 }
 
-verify_child amd64 "$AMD64_DIGEST"
-verify_child arm64 "$ARM64_DIGEST"
+verify_index_reference() {
+  local reference="$1"
+  echo "== Resolving ${REPOSITORY}:${reference} =="
+  if ! fetch_manifest "$reference" "$WORKDIR/index.json"; then
+    echo "ERROR: ${reference} is not published in the registry" >&2
+    exit 1
+  fi
+  INDEX_DIGEST="$MANIFEST_DIGEST"
+  if ! printf '%s' "$INDEX_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+    echo "ERROR: registry did not report an immutable index digest for ${reference}" >&2
+    exit 1
+  fi
+  if [ -n "$EXPECTED_INDEX_DIGEST" ] && [ "$INDEX_DIGEST" != "$EXPECTED_INDEX_DIGEST" ]; then
+    echo "ERROR: ${REPOSITORY}:${reference} resolves to ${INDEX_DIGEST}, expected ${EXPECTED_INDEX_DIGEST}" >&2
+    exit 1
+  fi
+
+  local media_type
+  media_type="$(jq -r '.mediaType // ""' "$WORKDIR/index.json")"
+  if [ "$media_type" != "application/vnd.oci.image.index.v1+json" ]; then
+    echo "ERROR: ${reference} is a ${media_type:-<unset>}, expected an OCI image index" >&2
+    exit 1
+  fi
+
+  # Runnable children are image manifests with a concrete linux platform.
+  # Attestation manifests are classified separately and never satisfy a platform.
+  jq -r '
+    [ .manifests[]
+      | select((.platform.os // "unknown") != "unknown")
+      | select((.platform.architecture // "unknown") != "unknown")
+      | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+      | "\(.platform.os)/\(.platform.architecture) \(.digest)"
+    ] | sort | .[]
+  ' "$WORKDIR/index.json" > "$WORKDIR/runnable.txt"
+
+  # A surprise CPU variant would silently change what an operator runs, so only
+  # the canonical arm64 variant spelling is tolerated.
+  local unexpected_variants
+  unexpected_variants="$(jq -r '
+    [ .manifests[]
+      | select((.platform.variant // "") != "")
+      | select((.platform.variant // "") != "v8")
+      | "\(.digest) variant=\(.platform.variant)"
+    ] | .[]
+  ' "$WORKDIR/index.json")"
+  if [ -n "$unexpected_variants" ]; then
+    echo "ERROR: index contains children with unexpected CPU variants:" >&2
+    printf '%s\n' "$unexpected_variants" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  jq -r '
+    [ .manifests[]
+      | select(((.platform.os // "unknown") == "unknown")
+               or ((.platform.architecture // "unknown") == "unknown")
+               or ((.annotations["vnd.docker.reference.type"] // "") == "attestation-manifest"))
+      | "\(.digest) \(.annotations["vnd.docker.reference.type"] // "unclassified")"
+    ] | .[]
+  ' "$WORKDIR/index.json" > "$WORKDIR/attestations.txt"
+
+  echo "runnable children:"
+  sed 's/^/  /' "$WORKDIR/runnable.txt"
+  if [ -s "$WORKDIR/attestations.txt" ]; then
+    echo "non-runnable (attestation) manifests:"
+    sed 's/^/  /' "$WORKDIR/attestations.txt"
+  fi
+
+  local expected_runnable
+  expected_runnable="$(printf 'linux/amd64 %s\nlinux/arm64 %s\n' "$AMD64_DIGEST" "$ARM64_DIGEST" | LC_ALL=C sort)"
+  if [ "$(cat "$WORKDIR/runnable.txt")" != "$expected_runnable" ]; then
+    echo "ERROR: index children do not match the verified per-platform digests" >&2
+    echo "expected:" >&2
+    printf '%s\n' "$expected_runnable" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  echo "== Verifying child identity =="
+  verify_child amd64 "$AMD64_DIGEST"
+  verify_child arm64 "$ARM64_DIGEST"
+  if ! fetch_manifest "$INDEX_DIGEST" "$WORKDIR/by-digest.json"; then
+    echo "ERROR: index digest ${INDEX_DIGEST} is not retrievable" >&2
+    exit 1
+  fi
+  if [ "$MANIFEST_DIGEST" != "$INDEX_DIGEST" ]; then
+    echo "ERROR: digest reference is not self-consistent" >&2
+    exit 1
+  fi
+}
+
+if [ -n "$VERIFY_REFERENCE" ]; then
+  verify_index_reference "$VERIFY_REFERENCE"
+  if [ -n "$INDEX_DIGEST_FILE" ]; then
+    printf '%s\n' "$INDEX_DIGEST" > "$INDEX_DIGEST_FILE"
+  fi
+  echo "Reference verified: ${REPOSITORY}:${VERIFY_REFERENCE} -> ${INDEX_DIGEST}"
+  exit 0
+fi
+
+EXPECTED_INDEX_DIGEST=""
+verify_index_reference "$TAG"
 
 echo "== Verifying immutable references =="
 COMMIT_REFERENCE="selfhost-${COMMIT}"
-if ! fetch_manifest "$COMMIT_REFERENCE" "$WORKDIR/commit.json"; then
-  echo "ERROR: exact self-host commit reference ${COMMIT_REFERENCE} is not published" >&2
-  exit 1
-fi
-COMMIT_REF_DIGEST="$MANIFEST_DIGEST"
-if [ "$COMMIT_REF_DIGEST" != "$INDEX_DIGEST" ]; then
-  echo "ERROR: ${REPOSITORY}:${COMMIT} resolves to ${COMMIT_REF_DIGEST}, expected ${INDEX_DIGEST}" >&2
-  exit 1
-fi
-if ! fetch_manifest "$INDEX_DIGEST" "$WORKDIR/by-digest.json"; then
-  echo "ERROR: index digest ${INDEX_DIGEST} is not retrievable" >&2
-  exit 1
-fi
-DIGEST_REF_DIGEST="$MANIFEST_DIGEST"
-if [ "$DIGEST_REF_DIGEST" != "$INDEX_DIGEST" ]; then
-  echo "ERROR: digest reference is not self-consistent" >&2
-  exit 1
-fi
+EXPECTED_INDEX_DIGEST="$INDEX_DIGEST"
+verify_index_reference "$COMMIT_REFERENCE"
+COMMIT_REF_DIGEST="$INDEX_DIGEST"
 
 echo "  ${REPOSITORY}:${TAG}    -> ${INDEX_DIGEST}"
 echo "  ${REPOSITORY}:${COMMIT_REFERENCE} -> ${COMMIT_REF_DIGEST}"

@@ -142,22 +142,34 @@ else
 fi
 echo ""
 
-# ── Refuse to touch an existing installation ──────────────────────────
+# ── Refuse to touch an occupied target ────────────────────────────────
 #
 # Re-running the installer is not an upgrade path: it would regenerate
-# credentials and restart a stack whose data it does not back up. This check
-# runs before anything is downloaded, so an existing install is never modified.
+# credentials and restart a stack whose data it does not back up. Stage-only
+# output is also an explicit new-directory operation. Check either target
+# before release resolution so a foreign or partial directory is never
+# inspected, chmodded, or overwritten.
 
-if [ "$STAGE_ONLY" -eq 0 ] && [ -e "$INSTALL_DIR/.env" ]; then
-  echo "An existing SilentSuite installation was found in '$INSTALL_DIR'." >&2
-  echo "" >&2
-  echo "Re-running the installer is NOT the upgrade path and it will not modify" >&2
-  echo "your installation. Nothing has been changed." >&2
-  echo "" >&2
-  echo "  * to restart the current version:  cd $INSTALL_DIR && ./update.sh" >&2
-  echo "" >&2
-  echo "A version-aware updater that backs up configuration and the database" >&2
-  echo "before migrating is tracked separately; see SELF-HOSTING.md." >&2
+TARGET_DIR="$INSTALL_DIR"
+if [ "$STAGE_ONLY" -eq 1 ]; then
+  TARGET_DIR="$STAGE_DIR"
+fi
+
+if [ -L "$TARGET_DIR" ]; then
+  echo "ERROR: target '$TARGET_DIR' is a symbolic link; refusing to use it." >&2
+  exit 1
+fi
+if [ -e "$TARGET_DIR" ] && [ ! -d "$TARGET_DIR" ]; then
+  echo "ERROR: target '$TARGET_DIR' exists and is not a directory; refusing to use it." >&2
+  exit 1
+fi
+if [ -d "$TARGET_DIR" ] && [ -n "$(find "$TARGET_DIR" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+  echo "ERROR: target directory '$TARGET_DIR' is not empty; refusing to use it." >&2
+  if [ "$STAGE_ONLY" -eq 0 ]; then
+    echo "       Re-running the installer is NOT the upgrade path and nothing was changed." >&2
+  else
+    echo "       Stage-only output requires a nonexistent or explicitly empty directory." >&2
+  fi
   exit 1
 fi
 
@@ -466,6 +478,7 @@ EXPECTED_MEMBERS="$(printf '%s\n' \
   install.sh \
   server-image.json \
   success.html \
+  upgrade.sh \
   update.sh \
   verify.sh | LC_ALL=C sort)"
 ACTUAL_MEMBERS="$(sed 's#/$##' "$ENTRY_LIST" | LC_ALL=C sort)"
@@ -512,6 +525,7 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
   fi
   mkdir -p "$STAGE_DIR"
   cp -R "$BUNDLE_ROOT/." "$STAGE_DIR/"
+  cp "$BUNDLE_FILE" "$STAGE_DIR/$BUNDLE_NAME"
   cp "$CHECKSUM_FILE" "$STAGE_DIR/$CHECKSUM_NAME"
   echo "Verified release $VERSION staged in: $STAGE_DIR"
   echo "Server image: $SERVER_IMAGE"
@@ -562,11 +576,11 @@ fi
 # local users on shared hosts — the install dir is a single-operator surface.
 chmod 750 "$INSTALL_DIR"
 
-for file in docker-compose.yml install.sh SELF-HOSTING.md update.sh verify.sh close-signups.sh success.html "$MANIFEST_NAME"; do
+for file in docker-compose.yml install.sh SELF-HOSTING.md update.sh upgrade.sh verify.sh close-signups.sh success.html .env.example "$MANIFEST_NAME"; do
   cp "$BUNDLE_ROOT/$file" "$INSTALL_DIR/$file"
 done
 cp "$CHECKSUM_FILE" "$INSTALL_DIR/$CHECKSUM_NAME"
-chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
+chmod +x "$INSTALL_DIR/install.sh" "$INSTALL_DIR/update.sh" "$INSTALL_DIR/upgrade.sh" "$INSTALL_DIR/verify.sh" "$INSTALL_DIR/close-signups.sh"
 
 cd "$INSTALL_DIR"
 

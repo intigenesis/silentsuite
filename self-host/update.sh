@@ -22,11 +22,9 @@ fi
 # across versions by design.
 #
 # Re-running install.sh is NOT the upgrade path — it refuses to touch an
-# existing installation. A version-aware updater that backs up configuration,
-# dumps the database before migrations, verifies the target release identity,
-# and can restore the previous image is a separate, later piece of work. Until
-# it ships, upgrades are a deliberate manual operation described in
-# SELF-HOSTING.md.
+# existing installation. Use upgrade.sh with a verified stage for a deliberate
+# version change. Automated backup/recovery around migrations remains separate
+# work; this script only restarts the pinned version.
 echo "Pulling pinned images..."
 $COMPOSE pull
 

@@ -15,7 +15,10 @@ on:
       - 'v*'
 
 concurrency:
-  group: release-server-image-${{ github.ref }}
+  # Serialize every publication for a commit, including two release tags that
+  # might point at it. GHCR has no general compare-and-swap for tag writes, so
+  # the publication step also rechecks every alias before and after each write.
+  group: release-server-image-${{ github.sha }}
   cancel-in-progress: false
 
 permissions: {}
@@ -252,18 +255,78 @@ jobs:
         run: |
           set -euo pipefail
           COMMIT_REF="selfhost-${RELEASE_COMMIT}"
+          ALIAS_DIR="$(mktemp -d)"
+          trap 'rm -rf "$ALIAS_DIR"' EXIT
+
+          # Resolve and fully verify any existing alias before a write. An
+          # existing alias is recoverable only when it is the exact verified
+          # index made from these children, platforms, and revisions.
+          verify_alias() {
+            local reference="$1" expected_digest="${2:-}" digest_file="$ALIAS_DIR/${1//\//_}.digest"
+            local args=(
+              --repository "$IMAGE_NAME"
+              --verify-reference "$reference"
+              --commit "$RELEASE_COMMIT"
+              --amd64-digest "$AMD64_DIGEST"
+              --arm64-digest "$ARM64_DIGEST"
+              --index-digest-file "$digest_file"
+            )
+            if [ -n "$expected_digest" ]; then
+              args+=(--expected-index-digest "$expected_digest")
+            fi
+            scripts/verify-server-image-release.sh "${args[@]}" >&2
+            cat "$digest_file"
+          }
+
+          expected_index=""
           for reference in "$RELEASE_TAG" "$COMMIT_REF"; do
             existing="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve "$reference")"
-            if [ "$existing" != "absent" ]; then
-              echo "Refusing release: ${IMAGE_NAME}:${reference} already resolves to ${existing}"
+            if [ "$existing" = "absent" ]; then
+              printf 'absent\n' > "$ALIAS_DIR/${reference//\//_}.state"
+              continue
+            fi
+            verified="$(verify_alias "$reference")"
+            if [ -z "$expected_index" ]; then
+              expected_index="$verified"
+            elif [ "$verified" != "$expected_index" ]; then
+              echo "Refusing release: aliases resolve to different verified indexes" >&2
+              exit 1
+            fi
+            printf 'present\n' > "$ALIAS_DIR/${reference//\//_}.state"
+          done
+
+          publish_alias() {
+            local reference="$1"
+            if [ "$(cat "$ALIAS_DIR/${reference//\//_}.state")" = "present" ]; then
+              return 0
+            fi
+            # imagetools may publish tags sequentially. Publish one alias at a
+            # time and verify it before touching the next; this is recovery
+            # logic, not a registry-level atomicity claim.
+            docker buildx imagetools create \
+              --tag "${IMAGE_NAME}:${reference}" \
+              "${IMAGE_NAME}@${AMD64_DIGEST}" \
+              "${IMAGE_NAME}@${ARM64_DIGEST}"
+            if [ -z "$expected_index" ]; then
+              expected_index="$(verify_alias "$reference")"
+            else
+              verify_alias "$reference" "$expected_index" >/dev/null
+            fi
+            printf 'present\n' > "$ALIAS_DIR/${reference//\//_}.state"
+          }
+
+          publish_alias "$RELEASE_TAG"
+          publish_alias "$COMMIT_REF"
+
+          # Both aliases are checked again after publication/recovery. Any
+          # conflict is detected before a later alias write is attempted.
+          for reference in "$RELEASE_TAG" "$COMMIT_REF"; do
+            verified="$(verify_alias "$reference" "$expected_index")"
+            if [ "$verified" != "$expected_index" ]; then
+              echo "Refusing release: ${reference} changed during publication" >&2
               exit 1
             fi
           done
-          docker buildx imagetools create \
-            --tag "${IMAGE_NAME}:${RELEASE_TAG}" \
-            --tag "${IMAGE_NAME}:${COMMIT_REF}" \
-            "${IMAGE_NAME}@${AMD64_DIGEST}" \
-            "${IMAGE_NAME}@${ARM64_DIGEST}"
 
       - name: Verify the published release image
         id: verify

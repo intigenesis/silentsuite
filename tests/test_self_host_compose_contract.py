@@ -22,6 +22,7 @@ INSTALLER = SELF_HOST / "install.sh"
 ENV_EXAMPLE = SELF_HOST / ".env.example"
 EFFECTIVE_CHECK = ROOT / "scripts" / "self-host-compose-effective-check.sh"
 SELF_HOSTING = SELF_HOST / "SELF-HOSTING.md"
+UPGRADE = SELF_HOST / "upgrade.sh"
 
 MANAGED_IMAGE = "${SILENTSUITE_SERVER_IMAGE:?Set by the verified SilentSuite installer or updater}"
 IMAGE_REPOSITORY = "ghcr.io/silent-suite/silentsuite-server"
@@ -240,9 +241,37 @@ def test_effective_config_check_uses_only_placeholder_values():
     assert "sha256:" + "0" * 64 in source
 
 
-def test_manual_upgrade_stops_before_mutation_when_image_admission_fails():
+def test_manual_upgrade_uses_the_staged_manifest_before_migrations_or_restart():
     guide = SELF_HOSTING.read_text(encoding="utf-8")
-    block = guide.split("5. **Confirm the effective image", 1)[1].split("```", 2)[1]
-    assert "set -euo pipefail" in block
-    assert block.index("set -euo pipefail") < block.index("docker compose config --images")
-    assert block.index("docker compose config --images") < block.index("docker compose pull")
+    helper = UPGRADE.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in helper
+    assert "server-image.json" in guide
+    assert "imageRepository@indexDigest" in guide
+    assert "--staged" in guide and "--install-dir" in guide
+    assert helper.index("TARGET_IMAGE=") < helper.index("docker pull")
+    assert helper.index("confirm_compose_image") < helper.index("docker pull")
+    assert helper.index("docker pull") < helper.index("migrate")
+    assert helper.index("migrate") < helper.index(" up -d")
+
+
+def test_manual_upgrade_has_a_closed_managed_allowlist_and_preserves_operator_state():
+    source = UPGRADE.read_text(encoding="utf-8")
+    for name in (
+        ".env.example",
+        "SELF-HOSTING.md",
+        "close-signups.sh",
+        "docker-compose.yml",
+        "install.sh",
+        "success.html",
+        "upgrade.sh",
+        "update.sh",
+        "verify.sh",
+        "server-image.json",
+        "CHECKSUM_NAME",
+    ):
+        assert name in source
+    for operator_file in ("etebase-server.ini", "docker-compose.override.yml"):
+        assert f'cp "$STAGED_DIR/{operator_file}"' not in source
+    assert 'cp "$STAGED_DIR/.env"' not in source
+    assert "server_data" not in source
+    assert "pgdata" not in source

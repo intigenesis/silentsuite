@@ -62,6 +62,7 @@ BUNDLE_FILES = (
     "docker-compose.yml",
     "install.sh",
     "success.html",
+    "upgrade.sh",
     "update.sh",
     "verify.sh",
 )
@@ -342,7 +343,11 @@ def test_a_valid_release_stages_the_exact_published_bytes(workspace):
     assert result.returncode == 0, result.stderr
     assert (staged / "docker-compose.yml").read_bytes() == (ROOT / "self-host" / "docker-compose.yml").read_bytes()
     assert (staged / MANIFEST_NAME).read_text() == workspace["release"].manifest_text
+    assert (staged / BUNDLE_NAME).read_bytes() == (workspace["fixtures"] / BUNDLE_NAME).read_bytes()
     assert (staged / CHECKSUM_NAME).exists()
+    assert sorted(entry.name for entry in staged.iterdir()) == sorted(
+        [*BUNDLE_FILES, MANIFEST_NAME, BUNDLE_NAME, CHECKSUM_NAME]
+    )
     assert SERVER_IMAGE in result.stdout
     assert leftover_temporaries(workspace) == []
 
@@ -363,6 +368,7 @@ def test_a_valid_release_installs_and_pins_the_immutable_index_digest(workspace)
         "SELF-HOSTING.md",
         "update.sh",
         "verify.sh",
+        "upgrade.sh",
         "close-signups.sh",
         "success.html",
         MANIFEST_NAME,
@@ -671,7 +677,7 @@ def test_an_existing_installation_is_never_modified(workspace):
     result = run_installer(workspace)
 
     assert result.returncode != 0
-    assert "Re-running the installer is NOT the upgrade path" in result.stderr
+    assert "target directory" in result.stderr
     after = {path.name: path.read_bytes() for path in target.iterdir()}
     assert after == before
     assert not (workspace["fixtures"] / "requests.log").exists()
@@ -703,6 +709,49 @@ def test_a_non_empty_staging_directory_is_refused(workspace):
     assert result.returncode != 0
     assert "is not empty" in result.stderr
     assert (staged / "keep.txt").read_text() == "existing\n"
+    assert not (workspace["fixtures"] / "requests.log").exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_an_explicitly_empty_staging_directory_is_allowed(workspace):
+    workspace["release"].publish()
+    staged = workspace["root"] / "staged"
+    staged.mkdir()
+
+    result = run_installer(workspace, "--stage-only", str(staged))
+
+    assert result.returncode == 0, result.stderr
+    assert (staged / MANIFEST_NAME).exists()
+
+
+def test_a_foreign_non_empty_install_directory_is_refused_before_any_download(workspace):
+    target = install_dir(workspace)
+    target.mkdir(parents=True)
+    (target / "operator-file").write_bytes(b"not a SilentSuite install\n")
+    (target / "nested").mkdir()
+    (target / "nested" / "data").write_bytes(b"operator data\x00\xff")
+    before = {
+        path.relative_to(target): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+
+    result = run_installer(workspace)
+
+    assert result.returncode != 0
+    assert "target directory" in result.stderr
+    after = {
+        path.relative_to(target): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not (workspace["fixtures"] / "requests.log").exists()
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert "container inspect" not in docker_log
+    assert "pull" not in docker_log
+    assert "compose up" not in docker_log
+    assert leftover_temporaries(workspace) == []
 
 
 # ── Static guarantees ─────────────────────────────────────────────────

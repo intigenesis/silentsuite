@@ -34,6 +34,7 @@ BUNDLE_SOURCE_FILES = (
     "docker-compose.yml",
     "install.sh",
     "success.html",
+    "upgrade.sh",
     "update.sh",
     "verify.sh",
 )
