@@ -381,7 +381,9 @@ Until it ships, upgrade deliberately:
    value in `.env` as it is — those are your credentials.
 5. **Confirm the effective image, apply migrations, then restart**:
    ```bash
-   docker compose config | grep -F "$SILENTSUITE_SERVER_IMAGE"
+   target_image="$(sed -n 's/^SILENTSUITE_SERVER_IMAGE=//p' .env)"
+   test -n "$target_image"
+   docker compose config --images | grep -Fx "$target_image"
    docker compose pull
    docker compose run --rm --no-deps server python manage.py migrate --noinput
    docker compose up -d

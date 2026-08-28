@@ -129,13 +129,13 @@ case "$1" in
     esac
     exit 0
     ;;
+  container)
+    if [ "$2" = "inspect" ] && [ "${SILENTSUITE_FAKE_EXISTING_CONTAINER:-0}" = "1" ]; then exit 0; fi
+    exit 1
+    ;;
   inspect)
     case "$*" in
       *State.Health.Status*) printf 'healthy\\n'; exit 0 ;;
-      *silentsuite-postgres*|*silentsuite-server*)
-        if [ "${SILENTSUITE_FAKE_EXISTING_CONTAINER:-0}" = "1" ]; then exit 0; fi
-        exit 1
-        ;;
       *) exit 1 ;;
     esac
     ;;

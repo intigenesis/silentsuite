@@ -166,7 +166,7 @@ fi
 # anything rather than stopping an existing stack later.
 if [ "$STAGE_ONLY" -eq 0 ]; then
   for container in silentsuite-postgres silentsuite-server; do
-    if docker inspect "$container" >/dev/null 2>&1; then
+    if docker container inspect "$container" >/dev/null 2>&1; then
       echo "ERROR: container '$container' already exists." >&2
       echo "       This installer will not stop or replace an existing SilentSuite stack." >&2
       echo "       Use that installation's documented upgrade procedure instead." >&2
