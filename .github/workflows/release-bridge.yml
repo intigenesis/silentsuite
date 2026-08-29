@@ -71,9 +71,21 @@ jobs:
           clean: true
           persist-credentials: false
 
-      - name: Download all artifacts
+      # Only this lane's own producer artifacts. Without a filter this step
+      # downloads every artifact in the controller run — the server's two child
+      # digests, the Conscrypt AAR, and Buildx's `.dockerbuild` records — and the
+      # staging helper correctly refuses the first unexpected name, so no bridge
+      # asset is ever attached.
+      #
+      # `merge-multiple: false` is the other half: each artifact keeps its own
+      # directory under `release-assets/`, which is the one-source-directory
+      # layout the staging helper flattens and closes over. Merging them would
+      # collapse that structure and hide a duplicate name from it.
+      - name: Download the bridge producer artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: silentsuite-bridge-*
+          merge-multiple: false
           path: release-assets/
 
       - name: Flatten artifacts and build the checksum manifest
