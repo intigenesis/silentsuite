@@ -10,7 +10,7 @@ Run the SilentSuite sync server on your own infrastructure. Your data stays on y
 | [Quick Start](./quick-start.md) | Fastest path from zero to running |
 | [Manual Setup](./manual-setup.md) | Why setup goes through the installer, and how to audit a release first |
 | [Configuration](./configuration.md) | Environment variables and configuration reference |
-| [Updating](./updating.md) | How to update to new versions |
+| [Updating](./updating.md) | How versions are pinned, and why cross-version updates are not supported yet |
 | [Backup & Restore](./backup-and-restore.md) | Protect your data with backups |
 | [Admin Dashboard](./admin-dashboard.md) | Manage your instance from the browser |
 | [Architecture](./architecture.md) | How the services fit together |

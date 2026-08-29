@@ -22,13 +22,30 @@ The installer will:
 
 The first user to sign up in the SilentSuite app becomes the server admin.
 
-To inspect a release before installing it, stage it first — this runs every
-verification step and writes the files out without installing, pulling an image,
-or starting a container:
+To inspect a release before installing it, stage it first. Staging verifies the
+release tag, the bundle checksum, the manifest, and the archive contents, then
+writes the files out without installing, pulling an image, or starting a
+container:
 
 ```bash
 bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
 ```
+
+Staging deliberately stops before the registry image-identity check, because
+that check pulls the image. A real install performs it; staging reports the
+digest the manifest names, not one it confirmed.
+
+Three different scopes of verification are involved, and it is worth keeping
+them apart:
+
+- **CI**, before any release exists, verifies the complete two-platform image
+  index — both architecture digests, their config, labels, and platforms.
+- **A host install** verifies the one image *this host* pulls: its repository
+  digest against the manifest, its platform against this machine, and its build
+  revision against the release commit. It does the same for the digest-pinned
+  PostgreSQL image.
+- **`--stage-only`** verifies only the metadata: tag, checksum, manifest, and
+  archive contents.
 
 ## 2. Set Up Your Reverse Proxy
 

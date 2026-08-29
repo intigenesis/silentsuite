@@ -1,0 +1,180 @@
+name: Release Controller
+
+# The one privileged release control plane.
+#
+# `repository_dispatch` always loads its workflow definition from the
+# repository's default branch, so nothing in this file — and nothing in the
+# component workflows it calls with `uses: ./…`, which resolve at this same
+# protected revision — can be defined by the tag being released. That is the
+# whole point: the candidate commit is the build input, never the authority
+# that admits it.
+#
+# Trigger it with an authenticated dispatch naming the immutable tag and the
+# exact commit it must resolve to:
+#
+#   gh api repos/silent-suite/silentsuite/dispatches -f event_type=silentsuite_release \
+#     -F 'client_payload[release_tag]=v0.5.4-beta' \
+#     -F 'client_payload[source_sha]=<40-hex>'
+#
+# Boundaries this workflow keeps: it never publishes the release, never moves a
+# mutable tag or `latest`, declares no deployment environment of its own, holds
+# no hosted-deployment credential, and neither calls nor changes the manual
+# hosted-production pipeline, which remains the only route to the hosted service.
+
+on:
+  repository_dispatch:
+    types: [silentsuite_release]
+
+# Scoped to the requested tag, so two dispatches for one release queue instead of
+# racing, while two different releases stay independent. Never cancels: a
+# cancelled run leaves the umbrella draft a component short.
+concurrency:
+  group: silentsuite-release-${{ github.event.client_payload.release_tag }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # Trusted admission. Runs before any candidate code exists on the
+  # runner: it checks out this protected revision only, and every claim
+  # it makes is derived from the live repository, never from the tag.
+  # ───────────────────────────────────────────────────────────────────
+  admit:
+    name: Admit the release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      commit: ${{ steps.identity.outputs.commit }}
+      bypass-actors: ${{ steps.identity.outputs.bypass-actors }}
+
+    steps:
+      - name: Check out the protected controller revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The payload is attacker-shaped data until proven otherwise, so it is
+      # read through the environment and never interpolated into this script.
+      # Exactly two keys, exactly two grammars; anything else stops here.
+      - name: Validate the dispatch payload
+        id: payload
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          KEYS="$(printf '%s' "$PAYLOAD" | jq -r 'keys | join(",")')"
+          if [ "$KEYS" != "release_tag,source_sha" ]; then
+            echo "Refusing release: payload keys are '${KEYS}', expected 'release_tag,source_sha'" >&2
+            exit 1
+          fi
+          RELEASE_TAG="$(printf '%s' "$PAYLOAD" | jq -er '.release_tag | select(type == "string")')"
+          SOURCE_SHA="$(printf '%s' "$PAYLOAD" | jq -er '.source_sha | select(type == "string")')"
+          if ! printf '%s' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "Refusing release: release_tag is not a SilentSuite release tag" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Refusing release: source_sha is not a 40-hex commit id" >&2
+            exit 1
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      # Live tag identity, protected-branch ancestry (proved twice: through the
+      # compare API and again against the fetched object graph), and both tag
+      # rulesets. The workflow token is read-only and is used only to raise the
+      # API rate limit; every read falls back to an anonymous public one.
+      - name: Verify the live release identity and tag rulesets
+        id: identity
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.payload.outputs.tag }}
+          SOURCE_SHA: ${{ steps.payload.outputs.commit }}
+        run: |
+          set -euo pipefail
+          scripts/verify-release-identity.sh \
+            --tag "$RELEASE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --stage controller-admission \
+            --git-ancestry . \
+            --emit-outputs
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the release-boundary checker dependency
+        run: |
+          printf '%s\n' 'PyYAML==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > "$RUNNER_TEMP/release-boundary-requirements.txt"
+          python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r "$RUNNER_TEMP/release-boundary-requirements.txt"
+
+      # The structural half of the same gate: no tag-triggered or dispatchable
+      # workflow may reach signing material, a package/contents write, a
+      # protected environment or the release API, and every privileged lane must
+      # execute admission and attachment code from this protected revision. All
+      # three component lanes wait on it, so a control plane that has drifted
+      # stops the release before anything is built.
+      - name: Enforce the release control-plane boundary
+        run: python "$GITHUB_WORKSPACE/scripts/check-android-signing-boundary.py"
+
+  # ───────────────────────────────────────────────────────────────────
+  # Component lanes. Each `uses: ./…` reference resolves at this same
+  # protected commit, so the called definitions are as trusted as this
+  # file. Each caller job declares the ceiling its lane may reach; the
+  # called jobs narrow it further.
+  # ───────────────────────────────────────────────────────────────────
+  android:
+    name: Android
+    needs: admit
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-android.yml
+    with:
+      release_tag: ${{ needs.admit.outputs.tag }}
+      source_sha: ${{ needs.admit.outputs.commit }}
+
+  bridge:
+    name: Bridge
+    needs: admit
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-bridge.yml
+    with:
+      release_tag: ${{ needs.admit.outputs.tag }}
+      source_sha: ${{ needs.admit.outputs.commit }}
+
+  server:
+    name: Self-host server image
+    needs: admit
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release-server-image.yml
+    with:
+      release_tag: ${{ needs.admit.outputs.tag }}
+      source_sha: ${{ needs.admit.outputs.commit }}
+
+  # ───────────────────────────────────────────────────────────────────
+  # Read-only completeness proof. It reports whether the draft is ready
+  # for a human to publish; it cannot publish anything itself.
+  # ───────────────────────────────────────────────────────────────────
+  readiness:
+    name: Umbrella draft readiness
+    needs: [admit, android, bridge, server]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-readiness.yml
+    with:
+      release_tag: ${{ needs.admit.outputs.tag }}
+      source_sha: ${{ needs.admit.outputs.commit }}

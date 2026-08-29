@@ -1,25 +1,33 @@
 name: Release Self-Host Server Image
 
-# Publishes the multi-architecture self-host server image for an immutable v*
-# tag and attaches the verified self-host bundle to the shared draft umbrella
-# release.
+# Self-host server component of the protected-main release control plane.
+#
+# Reachable only through `workflow_call`, and only ever called by
+# release-controller.yml with `uses: ./…`, which resolves this file at the
+# controller's protected default-branch commit. The tag-push trigger this
+# workflow used to carry is gone: a tag can no longer define the workflow that
+# grants itself `packages: write`.
+#
+# Every job checks the candidate out at `candidate/` and the protected
+# controller revision at `trusted/`. Candidate bytes are the build input;
+# trusted bytes are everything that verifies, mutates or attaches.
 #
 # Boundaries this workflow keeps: it never publishes the release, never moves a
 # mutable tag, declares no deployment environment, holds no hosted-deployment
-# credentials, and neither calls nor changes the manual hosted-production
+# credential, and neither calls nor changes the manual hosted-production
 # pipeline, which remains the only route to the hosted service.
 
 on:
-  push:
-    tags:
-      - 'v*'
-
-concurrency:
-  # Serialize every publication for a commit, including two release tags that
-  # might point at it. GHCR has no general compare-and-swap for tag writes, so
-  # the publication step also rechecks every alias before and after each write.
-  group: release-server-image-${{ github.sha }}
-  cancel-in-progress: false
+  workflow_call:
+    inputs:
+      release_tag:
+        description: The admitted immutable release tag.
+        required: true
+        type: string
+      source_sha:
+        description: The admitted 40-hex source commit.
+        required: true
+        type: string
 
 permissions: {}
 
@@ -27,34 +35,8 @@ env:
   IMAGE_NAME: ghcr.io/silent-suite/silentsuite-server
 
 jobs:
-  admit:
-    name: Admit release source
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    outputs:
-      tag: ${{ steps.source.outputs.tag }}
-      commit: ${{ steps.source.outputs.commit }}
-    steps:
-      - name: Checkout exact tag commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      # One admission definition for all three component lanes. Android and
-      # Bridge run the same helper from their own read-only admission jobs, so
-      # the three cannot drift into different ideas of what a release commit is.
-      - name: Admit the release source
-        id: source
-        shell: bash
-        run: scripts/admit-release-source.sh
-
   build:
     name: Build and smoke (${{ matrix.platform }})
-    needs: admit
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -72,10 +54,20 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout the admitted commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: candidate
+          persist-credentials: false
+
+      # The smoke contract is trusted code so the candidate cannot weaken the
+      # assertions made about the image it just produced.
+      - name: Check out the trusted controller revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          path: trusted
           persist-credentials: false
 
       - name: Set up Docker Buildx
@@ -90,18 +82,20 @@ jobs:
 
       # Pushed by digest only: no version or commit alias exists until both
       # architectures have passed their native smoke, so a half-built release can
-      # never be selected by an operator. Attestations are disabled here on
+      # never be selected by an operator. Buildx attestations are disabled here on
       # purpose — with push-by-digest they would make the recorded child digest an
       # intermediate index rather than the platform manifest, and the published
-      # manifest identity is what the installer verifies.
+      # manifest identity is what the installer verifies. Provenance is instead
+      # attested per child and for the index in `publish-index`, where it is
+      # bound to the exact digests without adding a manifest to the index.
       - name: Build and push ${{ matrix.platform }} by digest
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
-          context: .
-          file: Dockerfile.server
+          context: candidate
+          file: candidate/Dockerfile.server
           platforms: ${{ matrix.platform }}
-          build-args: VCS_REF=${{ github.sha }}
+          build-args: VCS_REF=${{ inputs.source_sha }}
           provenance: false
           sbom: false
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -114,6 +108,7 @@ jobs:
           CHILD_DIGEST: ${{ steps.build.outputs.digest }}
           PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
           if ! printf '%s' "$CHILD_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
@@ -129,10 +124,10 @@ jobs:
             echo "Local image is not the registry content for ${CHILD_DIGEST}"
             exit 1
           fi
-          scripts/self-host-image-smoke.sh \
+          trusted/scripts/self-host-image-smoke.sh \
             --image "$LOCAL_TAG" \
             --platform "$PLATFORM" \
-            --expect-revision "$GITHUB_SHA"
+            --expect-revision "$SOURCE_SHA"
 
       - name: Record the smoked child digest
         shell: bash
@@ -154,7 +149,7 @@ jobs:
 
   publish-index:
     name: Merge, verify and bundle
-    needs: [admit, build]
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -162,21 +157,37 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+    # Every alias and index write for one release tag is serialized here, by the
+    # admitted tag rather than by a commit: two dispatches naming the same tag
+    # must never write the same alias concurrently, and GHCR has no
+    # compare-and-swap for tag writes. Never cancels, and never discards a
+    # pending run — an evicted publication would leave the release without an
+    # index while nothing failed.
+    concurrency:
+      group: silentsuite-server-registry-${{ github.event.client_payload.release_tag }}
+      cancel-in-progress: false
+      queue: max
     outputs:
       index-digest: ${{ steps.verify.outputs.index-digest }}
       amd64-digest: ${{ steps.digests.outputs.amd64 }}
       arm64-digest: ${{ steps.digests.outputs.arm64 }}
     env:
-      RELEASE_TAG: ${{ needs.admit.outputs.tag }}
-      RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
-      REGISTRY_USERNAME: ${{ github.actor }}
-      REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_COMMIT: ${{ inputs.source_sha }}
 
     steps:
-      - name: Checkout exact tag commit
+      - name: Checkout the admitted commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out the trusted controller revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          path: trusted
           persist-credentials: false
 
       - name: Download verified child digests
@@ -211,7 +222,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BEFORE="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
+          BEFORE="$(trusted/scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
           echo "digest=$BEFORE" >> "$GITHUB_OUTPUT"
           echo "latest before merge: $BEFORE"
 
@@ -221,6 +232,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The last thing that happens before the first alias write: the live tag
+      # must still resolve to the admitted commit and both tag rulesets must
+      # still be active. A tag that moved during the two native builds stops the
+      # release here, before any operator-selectable reference exists.
+      - name: Revalidate the live release identity before publishing aliases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash trusted/scripts/verify-release-identity.sh \
+            --tag "$RELEASE_TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --stage server-registry-publication
 
       - name: Merge verified children into the release index
         shell: bash
@@ -249,13 +274,13 @@ jobs:
             if [ -n "$expected_digest" ]; then
               args+=(--expected-index-digest "$expected_digest")
             fi
-            scripts/verify-server-image-release.sh "${args[@]}" >&2
+            trusted/scripts/verify-server-image-release.sh "${args[@]}" >&2
             cat "$digest_file"
           }
 
           expected_index=""
           for reference in "$RELEASE_TAG" "$COMMIT_REF"; do
-            existing="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve "$reference")"
+            existing="$(trusted/scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve "$reference")"
             if [ "$existing" = "absent" ]; then
               printf 'absent\n' > "$ALIAS_DIR/${reference//\//_}.state"
               continue
@@ -311,7 +336,7 @@ jobs:
           ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
         run: |
           set -euo pipefail
-          scripts/verify-server-image-release.sh \
+          trusted/scripts/verify-server-image-release.sh \
             --repository "$IMAGE_NAME" \
             --tag "$RELEASE_TAG" \
             --commit "$RELEASE_COMMIT" \
@@ -326,16 +351,18 @@ jobs:
           LATEST_BEFORE: ${{ steps.latest-before.outputs.digest }}
         run: |
           set -euo pipefail
-          AFTER="$(scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
+          AFTER="$(trusted/scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
           if [ "$AFTER" != "$LATEST_BEFORE" ]; then
             echo "Refusing release: latest moved from ${LATEST_BEFORE} to ${AFTER}"
             exit 1
           fi
           echo "latest unchanged: $AFTER"
 
-      # Repository build provenance for the verified index. push-to-registry is
-      # left off so the attestation is stored by GitHub and the OCI index keeps
-      # exactly the two runnable children the manifest promises.
+      # Repository build provenance for the verified index and for each runnable
+      # child. push-to-registry is left off so the evidence is stored by GitHub
+      # and the OCI index keeps exactly the two runnable children the manifest
+      # promises — attestations stay classified as evidence about a digest, not
+      # as extra manifests inside the index an installer resolves.
       - name: Attest build provenance for the release index
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
@@ -343,6 +370,22 @@ jobs:
           subject-digest: ${{ steps.verify.outputs.index-digest }}
           push-to-registry: false
 
+      - name: Attest build provenance for the linux/amd64 child
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.digests.outputs.amd64 }}
+          push-to-registry: false
+
+      - name: Attest build provenance for the linux/arm64 child
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.digests.outputs.arm64 }}
+          push-to-registry: false
+
+      # The bundle carries the candidate's operator-facing self-host files, but
+      # the packer, the manifest schema and the verifier are all trusted code.
       - name: Build the self-host release bundle
         shell: bash
         env:
@@ -351,12 +394,13 @@ jobs:
           INDEX_DIGEST: ${{ steps.verify.outputs.index-digest }}
         run: |
           set -euo pipefail
-          python3 scripts/build-self-host-bundle.py \
+          python3 trusted/scripts/build-self-host-bundle.py \
             --tag "$RELEASE_TAG" \
             --source-commit "$RELEASE_COMMIT" \
             --index-digest "$INDEX_DIGEST" \
             --amd64-digest "$AMD64_DIGEST" \
             --arm64-digest "$ARM64_DIGEST" \
+            --self-host-dir candidate/self-host \
             --output-dir release-assets
 
       - name: Verify the self-host release bundle
@@ -367,7 +411,7 @@ jobs:
           INDEX_DIGEST: ${{ steps.verify.outputs.index-digest }}
         run: |
           set -euo pipefail
-          python3 scripts/verify-self-host-bundle.py \
+          python3 trusted/scripts/verify-self-host-bundle.py \
             --directory release-assets \
             --tag "$RELEASE_TAG" \
             --source-commit "$RELEASE_COMMIT" \
@@ -385,13 +429,13 @@ jobs:
 
   attach-release-assets:
     name: Attach self-host assets to the draft release
-    needs: [admit, publish-index]
+    needs: publish-index
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: write
     # One tag-scoped domain shared with the Android and Bridge attachment jobs.
-    # Those live in other workflows, so the workflow-level group above cannot
+    # Those live in other workflow files, so a workflow-level group cannot
     # serialize them; this one can, because concurrency groups are repository
     # scoped by name. Never cancel: a cancelled attachment leaves the umbrella
     # draft missing a component rather than merely late.
@@ -401,18 +445,19 @@ jobs:
     # component to arrive would evict the second while it was still waiting.
     # max queues them FIFO; it cannot be combined with cancel-in-progress: true.
     concurrency:
-      group: umbrella-release-${{ github.ref_name }}
+      group: umbrella-release-${{ github.event.client_payload.release_tag }}
       cancel-in-progress: false
       queue: max
     env:
-      RELEASE_TAG: ${{ needs.admit.outputs.tag }}
-      RELEASE_COMMIT: ${{ needs.admit.outputs.commit }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_COMMIT: ${{ inputs.source_sha }}
 
     steps:
-      - name: Checkout exact tag commit
+      - name: Check out the trusted controller revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          clean: true
           persist-credentials: false
 
       - name: Download the verified self-host assets
@@ -439,8 +484,10 @@ jobs:
 
       # One credential, for exactly one purpose: the workflow token, used only
       # for the draft-release reads and writes the helper performs. The helper
-      # creates nothing but a draft, refuses to touch a published release, and
-      # never publishes one — the operator does that by hand.
+      # revalidates the live tag and both rulesets on either side of the upload,
+      # creates nothing but a draft bound to the admitted commit, refuses to
+      # touch a published release, and never publishes one — the operator does
+      # that by hand.
       - name: Attach the verified assets to the shared draft release
         shell: bash
         env:
@@ -449,6 +496,7 @@ jobs:
           set -euo pipefail
           scripts/attach-umbrella-release-assets.sh \
             --tag "$RELEASE_TAG" \
+            --expected-commit "$RELEASE_COMMIT" \
             --directory release-assets \
             --asset "silentsuite-self-host-${RELEASE_TAG}.tar.gz" \
             --asset "silentsuite-self-host-${RELEASE_TAG}.tar.gz.sha256" \

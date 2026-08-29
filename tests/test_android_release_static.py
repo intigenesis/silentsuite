@@ -11,7 +11,8 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ANDROID_BUILD_WORKFLOW = ROOT / ".github/workflows/build-android.yml"
+ANDROID_CI_WORKFLOW = ROOT / ".github/workflows/build-android.yml"
+ANDROID_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-android.yml"
 APP_BUILD_GRADLE = ROOT / "android/app/build.gradle"
 SYMBOLS_VERIFIER = ROOT / "android/scripts/verify-native-debug-symbols.py"
 SYMBOLS_PACKAGER = ROOT / "android/scripts/package-native-debug-symbols.py"
@@ -32,12 +33,18 @@ SYMBOLS_ZIP_BUILD_PATH = (
 
 
 def job_steps(job: str) -> dict[str, dict[str, object]]:
-    workflow = yaml.load(
-        ANDROID_BUILD_WORKFLOW.read_text(encoding="utf-8"),
-        Loader=yaml.BaseLoader,
-    )
-    steps = workflow["jobs"][job]["steps"]
-    return {step["name"]: step for step in steps}
+    """Look the job up in whichever Android lane defines it.
+
+    Unsigned CI and the signed release lane are separate workflows now: the
+    release jobs are only reachable through the protected-main controller, so
+    they no longer live beside the pull-request build.
+    """
+
+    for path in (ANDROID_RELEASE_WORKFLOW, ANDROID_CI_WORKFLOW):
+        workflow = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        if job in workflow["jobs"]:
+            return {step["name"]: step for step in workflow["jobs"][job]["steps"]}
+    raise AssertionError(f"no Android workflow defines the job {job!r}")
 
 
 def release_steps() -> dict[str, dict[str, object]]:
@@ -86,7 +93,9 @@ def test_checksum_output_parser_rejects_non_redirect_lookalikes(run: str):
 
 def test_android_release_checksum_generation_matches_uploads():
     steps = release_steps()
-    tag = "${{ github.ref_name }}"
+    # The admitted tag reaches the signed job as a workflow_call input and is
+    # read through the step environment, never interpolated into the script.
+    tag = "${RELEASE_TAG}"
     apk = f"silentsuite-android-{tag}.apk"
     aab = f"silentsuite-android-{tag}.aab"
     symbols = f"silentsuite-android-{tag}-native-debug-symbols.zip"
@@ -285,7 +294,7 @@ def test_release_job_hash_constant_matches_workflow():
     )
     checker = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(checker)
-    workflow = checker.load_workflow(ANDROID_BUILD_WORKFLOW)
+    workflow = checker.load_workflow(ANDROID_RELEASE_WORKFLOW)
     assert (
         checker.semantic_sha256(workflow["jobs"]["build-release"])
         == checker.EXPECTED_RELEASE_JOB_SHA256

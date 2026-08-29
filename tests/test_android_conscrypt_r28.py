@@ -8,7 +8,8 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = ROOT / ".github/workflows/build-android.yml"
+CI_WORKFLOW = ROOT / ".github/workflows/build-android.yml"
+RELEASE_WORKFLOW = ROOT / ".github/workflows/release-android.yml"
 CERT4ANDROID_GRADLE = ROOT / "android/cert4android/build.gradle"
 ROOT_GRADLE = ROOT / "android/build.gradle"
 BUILD_SCRIPT = ROOT / "android/scripts/build-conscrypt-android-r28.sh"
@@ -35,8 +36,8 @@ def load_verifier():
     return module
 
 
-def workflow_jobs() -> dict:
-    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+def workflow_jobs(path: Path = CI_WORKFLOW) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
 
 
 def test_conscrypt_builder_pins_source_boringssl_and_ndk_r28():
@@ -65,8 +66,29 @@ def test_release_builds_fail_closed_without_rebuilt_conscrypt_aar():
     assert 'includeModule("org.conscrypt", "conscrypt-android")' in root_source
 
 
-def test_workflow_builds_conscrypt_once_without_secrets_and_reuses_exact_run_artifact():
-    jobs = workflow_jobs()
+# CI keys its Conscrypt artifact on the triggering commit; the release lane
+# keys it on the admitted commit, because a repository_dispatch run's
+# `github.sha` is the controller revision, not the tag being released.
+@pytest.mark.parametrize(
+    ("path", "artifact", "consumers"),
+    [
+        (
+            CI_WORKFLOW,
+            "conscrypt-r28-${{ github.sha }}",
+            ("build-pr", "account-recreation-runtime", "color-parity-evidence"),
+        ),
+        (
+            RELEASE_WORKFLOW,
+            "conscrypt-r28-${{ inputs.source_sha }}",
+            ("build-release",),
+        ),
+    ],
+    ids=("ci", "release"),
+)
+def test_workflow_builds_conscrypt_once_without_secrets_and_reuses_exact_run_artifact(
+    path, artifact, consumers
+):
+    jobs = workflow_jobs(path)
     producer = jobs["conscrypt-r28"]
     assert producer["permissions"] == {"contents": "read"}
     assert producer["timeout-minutes"] == 30
@@ -78,31 +100,26 @@ def test_workflow_builds_conscrypt_once_without_secrets_and_reuses_exact_run_art
     assert "--require-lib libconscrypt_jni.so" in verify
     assert "--require-android-ndk-major libconscrypt_jni.so=28" in verify
     upload = producer_steps["Upload rebuilt Conscrypt AAR"]["with"]
-    assert upload["name"] == "conscrypt-r28-${{ github.sha }}"
+    assert upload["name"] == artifact
     assert upload["path"] == f"android/{LOCAL_MAVEN_REPO}"
     assert upload["if-no-files-found"] == "error"
 
-    for job_name in (
-        "build-pr",
-        "account-recreation-runtime",
-        "color-parity-evidence",
-        "build-release",
-    ):
+    for job_name in consumers:
         job = jobs[job_name]
         needs = job["needs"] if isinstance(job["needs"], list) else [job["needs"]]
         assert "conscrypt-r28" in needs
         steps = {step["name"]: step for step in job["steps"]}
         download = steps["Download rebuilt Conscrypt AAR"]["with"]
-        assert download["name"] == "conscrypt-r28-${{ github.sha }}"
+        assert download["name"] == artifact
         assert download["path"] == f"android/{LOCAL_MAVEN_REPO}"
 
 
 def test_final_apk_and_aab_gates_require_conscrypt_ndk_r28_identity():
-    jobs = workflow_jobs()
-    for job_name, step_name in (
-        ("build-pr", "Verify unsigned release native libraries"),
-        ("build-release", "Verify release native libraries"),
+    for path, job_name, step_name in (
+        (CI_WORKFLOW, "build-pr", "Verify unsigned release native libraries"),
+        (RELEASE_WORKFLOW, "build-release", "Verify release native libraries"),
     ):
+        jobs = workflow_jobs(path)
         run = {step["name"]: step for step in jobs[job_name]["steps"]}[step_name]["run"]
         assert "--require-lib libconscrypt_jni.so" in run
         assert "--require-android-ndk-major libconscrypt_jni.so=28" in run

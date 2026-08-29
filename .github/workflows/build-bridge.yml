@@ -1,42 +1,55 @@
 name: Build Bridge Binaries
 
+# The one definition of how a bridge binary is built.
+#
+# Two ways in, one of them privileged and one not:
+#   * release-bridge.yml calls it with the admitted (tag, commit) pair, and that
+#     call resolves this file at the protected controller revision;
+#   * an owner may dispatch it to check the five-platform matrix still builds
+#     without tagging anything.
+#
+# It cannot release. There is no tag trigger, no repository write, no
+# environment, and no credential of any kind — the umbrella attachment lives in
+# release-bridge.yml, which is reachable only through the controller.
+
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      release_tag:
+        description: The admitted immutable release tag, stamped into the binary.
+        required: true
+        type: string
+      source_sha:
+        description: The admitted 40-hex source commit.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
-      create_release:
-        description: "Create a GitHub Release (yes/no)"
+      release_tag:
+        description: Version to stamp into the binaries. Blank uses pyproject.
         required: false
-        default: "no"
-
-# Same-ref runs are serialized, never cancelled. An enclosing cancellation group
-# outranks the job-level umbrella lock below: cancelling the workflow cancels the
-# release job with it, so a second same-ref run (including a dispatch selecting a
-# tag) could interrupt an attachment that was mid-upload or merely pending. Queue
-# them in FIFO instead — supersession is not worth an incomplete umbrella draft.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-  queue: max
+        default: ''
+        type: string
+      source_sha:
+        description: Commit to build. Blank uses the selected ref.
+        required: false
+        default: ''
+        type: string
 
 permissions: {}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build matrix
-  # ---------------------------------------------------------------------------
   build:
     name: Build (${{ matrix.os-label }})
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    # On a tag push, stamp the release version into the binary from the tag.
-    # The spec file (silentsuite-bridge.spec) reads this and freezes it into
-    # _version.py. Empty on non-tag builds, which fall back to pyproject.
+    # The release version is stamped into the binary from the admitted tag. The
+    # spec file (silentsuite-bridge.spec) reads this and freezes it into
+    # _version.py. A bare dispatch leaves it empty, which is what makes the
+    # binary fall back to the pyproject version instead of claiming a release.
     env:
-      SILENTSUITE_BRIDGE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+      SILENTSUITE_BRIDGE_VERSION: ${{ inputs.release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -87,10 +100,16 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout
+      # 1. Checkout the admitted commit
       # -----------------------------------------------------------------------
-      - name: Checkout
+      # An empty `ref` is how actions/checkout is told "the ref that triggered
+      # this run", so a dispatch builds what the operator selected while a
+      # controller call builds exactly the admitted commit.
+      - name: Checkout the admitted commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
 
       # -----------------------------------------------------------------------
       # 2. Set up QEMU (arm64 Linux only)
@@ -266,7 +285,7 @@ jobs:
           cat "${ASSET}.sha256"
 
       # -----------------------------------------------------------------------
-      # 11. Upload artifact (always — for manual inspect even without release)
+      # 11. Upload artifact
       # -----------------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -277,159 +296,3 @@ jobs:
             bridge/dist/${{ matrix.asset-name }}.sha256
           if-no-files-found: error
           retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # Release source admission — read-only, no secrets, no write scope.
-  #
-  # Only ever runs for a real tag push. The shared helper proves strict tag
-  # grammar, the tag object resolving to exactly this commit, the checkout being
-  # exactly this commit, and reachability from protected main. The umbrella
-  # attachment below refuses to start until it passes.
-  # ---------------------------------------------------------------------------
-  admit:
-    name: Admit Bridge release source
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-    outputs:
-      tag: ${{ steps.source.outputs.tag }}
-      commit: ${{ steps.source.outputs.commit }}
-
-    steps:
-      - name: Checkout exact tag commit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Admit the release source
-        id: source
-        run: bash "$GITHUB_WORKSPACE/scripts/admit-release-source.sh"
-
-  # ---------------------------------------------------------------------------
-  # Umbrella release attachment — real tag pushes only.
-  #
-  # `github.event_name == 'push'` is the load-bearing half of this guard. A
-  # manual dispatch can select a `refs/tags/v*` ref, so testing the ref alone
-  # would let a dispatch write a real umbrella draft. Dispatches go to
-  # `manual-release` below instead, which always mints a synthetic tag.
-  # ---------------------------------------------------------------------------
-  release:
-    name: Attach bridge binaries to the umbrella draft
-    needs: [build, admit]
-    runs-on: ubuntu-22.04
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    permissions:
-      contents: write
-    # Shared tag-scoped domain with the Android and self-host attachment jobs.
-    # This one only serializes umbrella-draft writes and never cancels.
-    #
-    # queue: max keeps every waiting attachment. The default (single) retains one
-    # pending job per group and replaces it, which with three components would
-    # silently drop one from the draft. It cannot combine with
-    # cancel-in-progress: true, which is exactly the behaviour being avoided.
-    concurrency:
-      group: umbrella-release-${{ github.ref_name }}
-      cancel-in-progress: false
-      queue: max
-    env:
-      RELEASE_TAG: ${{ needs.admit.outputs.tag }}
-
-    steps:
-      - name: Checkout attachment helper source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: release-assets/
-
-      - name: Flatten artifacts and build the checksum manifest
-        run: bash "$GITHUB_WORKSPACE/scripts/stage-bridge-release-assets.sh" release-assets flat
-
-      # The hardened helper is the only thing that writes a release asset here.
-      # It refuses a published release, never deletes or replaces an asset,
-      # preserves siblings, and reads every upload back — so a rerun after the
-      # operator has published the umbrella release fails closed instead of
-      # damaging it. The release body and name are never written.
-      - name: Attach the bridge binaries to the shared draft release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          ASSET_ARGS=()
-          while IFS= read -r asset; do
-            ASSET_ARGS+=(--asset "$asset")
-          done < <(find flat -mindepth 1 -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort)
-          bash "$GITHUB_WORKSPACE/scripts/attach-umbrella-release-assets.sh" \
-            --tag "$RELEASE_TAG" \
-            --directory flat \
-            "${ASSET_ARGS[@]}"
-
-  # ---------------------------------------------------------------------------
-  # Manual dispatch release — always synthetic, never a real umbrella tag.
-  #
-  # A dispatch may be launched from any ref, including an existing `v*` tag.
-  # The tag minted here is unconditionally `v0.0.0-bridge-manual-<timestamp>`,
-  # so a dispatch cannot reach a real umbrella draft no matter what ref was
-  # selected, and it takes no part in the umbrella concurrency domain.
-  # ---------------------------------------------------------------------------
-  manual-release:
-    name: Create a synthetic manual bridge release
-    needs: build
-    runs-on: ubuntu-22.04
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'yes'
-    permissions:
-      contents: write
-    concurrency:
-      group: bridge-manual-release-${{ github.ref }}
-      cancel-in-progress: false
-      queue: max
-
-    steps:
-      - name: Checkout attachment helper source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # A dispatch may select any ref for the binaries. The release-writing
-          # helper itself always comes from protected main, never that selected
-          # ref, so unreviewed branch code cannot run with contents:write.
-          ref: refs/heads/main
-          persist-credentials: false
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: release-assets/
-
-      - name: Flatten artifacts and build the checksum manifest
-        run: bash "$GITHUB_WORKSPACE/scripts/stage-bridge-release-assets.sh" release-assets flat
-
-      # Unconditional: the selected ref is never consulted, so a dispatch from a
-      # real `v*` tag still lands on its own synthetic release.
-      - name: Mint the synthetic manual tag
-        id: tag
-        run: |
-          set -euo pipefail
-          TAG="v0.0.0-bridge-manual-$(date -u +%Y%m%d%H%M%S)"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Synthetic manual release tag: $TAG"
-
-      - name: Attach the bridge binaries to the synthetic draft release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          set -euo pipefail
-          ASSET_ARGS=()
-          while IFS= read -r asset; do
-            ASSET_ARGS+=(--asset "$asset")
-          done < <(find flat -mindepth 1 -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort)
-          bash "$GITHUB_WORKSPACE/scripts/attach-umbrella-release-assets.sh" \
-            --tag "$RELEASE_TAG" \
-            --directory flat \
-            "${ASSET_ARGS[@]}"

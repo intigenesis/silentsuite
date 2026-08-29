@@ -1,18 +1,27 @@
-FROM python:3.12-alpine AS builder
+# Both stages resolve one approved multi-platform OCI index by digest, so the
+# amd64 and arm64 release jobs cannot pick up two different base generations.
+#
+#   python:3.12-alpine  index sha256:d09d15e6…de7dc31
+#     linux/amd64       child sha256:285a7132…dae76e5
+#     linux/arm64/v8    child sha256:c95cd472…d24fbe1
+#
+# tests/test_self_host_server_image_materials.py re-derives that index and both
+# child descriptors from the registry, so a silent retag is a test failure.
+FROM python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PIP_NO_CACHE_DIR=1
 
-# Install build dependencies
-RUN apk add --no-cache \
-    gcc musl-dev libffi-dev make \
-    postgresql-dev
-
+# No apk layer: every runtime dependency resolves to a pure-Python or
+# musllinux wheel, so nothing is compiled here and no Alpine repository is
+# consulted. --require-hashes pins the exact bytes of every distribution and
+# --only-binary=:all: forbids the sdist fallback that would reintroduce a
+# toolchain and mutable source resolution.
 COPY server/requirements.txt /requirements.txt
-RUN pip install --no-cache-dir -r /requirements.txt
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /requirements.txt
 
 # --- Production stage ---
-FROM python:3.12-alpine
+FROM python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
 
 ARG VCS_REF
 LABEL org.opencontainers.image.revision=$VCS_REF
@@ -20,10 +29,9 @@ LABEL org.opencontainers.image.revision=$VCS_REF
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PYTHONUNBUFFERED=1
 
-# Runtime dependencies only
-RUN apk add --no-cache libpq libffi
-
-# Copy installed packages from builder
+# Copy installed packages from builder. The musllinux wheels vendor their own
+# shared libraries (libpq, libffi, libsodium), so the runtime stage needs no
+# Alpine packages either.
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 

@@ -8,13 +8,18 @@ This is the fastest path from zero to running. Make sure you've met the [require
 curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
 ```
 
-To inspect a release before installing it, stage it first — this verifies
-everything and writes the files out without installing, pulling an image, or
-starting a container:
+To inspect a release before installing it, stage it first. Staging verifies the
+release tag, the bundle checksum, the manifest, and the archive contents, then
+writes the files out without installing, pulling an image, or starting a
+container:
 
 ```bash
 bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
 ```
+
+Staging deliberately stops before the registry image-identity check, because
+that check pulls the image. A real install performs it; staging reports the
+digest the manifest names, not one it confirmed.
 
 The `install.sh` script will:
 

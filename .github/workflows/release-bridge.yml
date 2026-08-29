@@ -1,0 +1,128 @@
+name: Release Bridge
+
+# Bridge component of the protected-main release control plane.
+#
+# Reachable only through `workflow_call`, and only ever called by
+# release-controller.yml with `uses: ./…`, which resolves this file — and the
+# build workflow it in turn calls — at the controller's protected default-branch
+# commit.
+#
+# This replaces the previous tag-push and `workflow_dispatch` bridge release
+# lanes outright. The dispatch lane granted `contents: write` while executing the
+# workflow definition of whatever ref the dispatcher selected, so checking the
+# helper out from `main` protected the helper but not the steps around it. A
+# synthetic tag prevented collisions with a real umbrella draft; it did not
+# establish a trusted workflow source. There is no manual bridge release now,
+# and none is needed: the umbrella draft is the only bridge release.
+#
+# The binaries themselves are built by build-bridge.yml, which has no write
+# permission, no environment and no credential, and which an owner may also
+# dispatch on its own to check the matrix without releasing anything.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: The admitted immutable release tag.
+        required: true
+        type: string
+      source_sha:
+        description: The admitted 40-hex source commit.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build bridge binaries
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-bridge.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}
+      source_sha: ${{ inputs.source_sha }}
+
+  # ---------------------------------------------------------------------------
+  # Umbrella attachment — the only bridge job that can write a release.
+  #
+  # Every step runs code checked out from the protected controller revision, not
+  # from the candidate tree: the staging script, the closed-inventory assertion
+  # and the attachment helper are all trusted bytes.
+  # ---------------------------------------------------------------------------
+  attach-release-assets:
+    name: Attach bridge binaries to the umbrella draft
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    # Shared tag-scoped domain with the Android and self-host attachment jobs;
+    # see release-android.yml for why `queue: max` is load-bearing.
+    concurrency:
+      group: umbrella-release-${{ github.event.client_payload.release_tag }}
+      cancel-in-progress: false
+      queue: max
+
+    steps:
+      - name: Check out the trusted controller revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          persist-credentials: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets/
+
+      - name: Flatten artifacts and build the checksum manifest
+        run: bash "$GITHUB_WORKSPACE/scripts/stage-bridge-release-assets.sh" release-assets flat
+
+      # The build matrix promised exactly five platforms. Anything else here
+      # means an artifact is missing or unexpected, and nothing is uploaded.
+      - name: Re-assert the closed asset inventory
+        run: |
+          set -euo pipefail
+          EXPECTED="$(printf '%s\n' \
+            SHA256SUMS.txt \
+            silentsuite-bridge-linux-arm64 \
+            silentsuite-bridge-linux-arm64.sha256 \
+            silentsuite-bridge-linux-x86_64 \
+            silentsuite-bridge-linux-x86_64.sha256 \
+            silentsuite-bridge-macos-arm64 \
+            silentsuite-bridge-macos-arm64.sha256 \
+            silentsuite-bridge-macos-x86_64 \
+            silentsuite-bridge-macos-x86_64.sha256 \
+            silentsuite-bridge-windows-x86_64.exe \
+            silentsuite-bridge-windows-x86_64.exe.sha256 | LC_ALL=C sort)"
+          ACTUAL="$(find flat -mindepth 1 -printf '%P\n' | LC_ALL=C sort)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Refusing attachment: the bridge asset set is not the closed inventory" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "$EXPECTED" "$ACTUAL" >&2
+            exit 1
+          fi
+          echo "Closed bridge inventory confirmed"
+
+      # The hardened helper is the only thing that writes a release asset here.
+      # It revalidates the live tag and both rulesets on either side of the
+      # upload, refuses a published release, never deletes or replaces an asset,
+      # preserves siblings, and reads every upload back — so a rerun after the
+      # operator has published the umbrella release fails closed instead of
+      # damaging it. The release body and name are never written.
+      - name: Attach the bridge binaries to the shared draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          ASSET_ARGS=()
+          while IFS= read -r asset; do
+            ASSET_ARGS+=(--asset "$asset")
+          done < <(find flat -mindepth 1 -maxdepth 1 -type f -printf '%P\n' | LC_ALL=C sort)
+          bash "$GITHUB_WORKSPACE/scripts/attach-umbrella-release-assets.sh" \
+            --tag "$RELEASE_TAG" \
+            --expected-commit "$SOURCE_SHA" \
+            --directory flat \
+            "${ASSET_ARGS[@]}"

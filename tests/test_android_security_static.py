@@ -6,7 +6,9 @@ LOGIN_ACTIVITY = ROOT / "android/app/src/main/java/io/silentsuite/sync/ui/setup/
 MANIFEST = ROOT / "android/app/src/main/AndroidManifest.xml"
 APP_GRADLE = ROOT / "android/app/build.gradle"
 APP_RESOURCES = ROOT / "android/app/src/main/res"
-ANDROID_BUILD_WORKFLOW = ROOT / ".github/workflows/build-android.yml"
+ANDROID_CI_WORKFLOW = ROOT / ".github/workflows/build-android.yml"
+# The signed build lives in the controller-called release lane.
+ANDROID_RELEASE_WORKFLOW = ROOT / ".github/workflows/release-android.yml"
 
 
 def test_login_activity_rejects_credential_prefill_extras_and_is_not_exported():
@@ -38,7 +40,7 @@ def test_android_resources_do_not_reference_tourguide_owned_white():
 
 
 def test_bundletool_uses_a_private_temporary_password_file():
-    workflow = ANDROID_BUILD_WORKFLOW.read_text(encoding="utf-8")
+    workflow = ANDROID_RELEASE_WORKFLOW.read_text(encoding="utf-8")
     release_step = workflow.split(
         "      - name: Capture release dependency graph and generate signed-release splits\n",
         1,
@@ -60,7 +62,7 @@ def test_bundletool_uses_a_private_temporary_password_file():
 
 
 def test_android_build_runs_for_main_pull_requests_only():
-    workflow = ANDROID_BUILD_WORKFLOW.read_text(encoding="utf-8")
+    workflow = ANDROID_CI_WORKFLOW.read_text(encoding="utf-8")
     pull_request = workflow.split("  pull_request:\n", 1)[1].split(
         "  workflow_dispatch:\n", 1
     )[0]

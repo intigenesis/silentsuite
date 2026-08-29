@@ -2,14 +2,21 @@
 set -euo pipefail
 
 # Attach one component's verified artefacts to the shared draft umbrella release
-# for a release tag.
+# for an admitted (tag, commit) pair.
 #
 # This is the *only* sanctioned way any lane writes a release asset. The Android,
 # Bridge and self-host server lanes all call it, all append to the same draft,
-# and can run concurrently, so it is deliberately defensive:
-#   * bounded idempotent lookup-or-create of the draft for this exact tag;
+# and all execute this copy of it from the protected default-branch checkout —
+# never from the candidate tree. It is deliberately defensive:
+#   * revalidates the live tag, its commit, and both tag rulesets immediately
+#     before the first write and again after the last one;
+#   * pages the releases list to exhaustion rather than assuming the newest few
+#     hundred releases contain every draft;
+#   * bounded idempotent lookup-or-create of the draft for this exact tag,
+#     created with target_commitish set to the admitted commit;
 #   * fails closed if more than one release claims the tag, if the release is not
-#     a draft, or if a same-named asset already exists with different bytes;
+#     a draft, if it targets a different commit, or if a same-named asset already
+#     exists with different bytes;
 #   * never deletes or replaces an asset: a byte-identical re-run is a no-op and
 #     anything else is refused, so a rerun can never damage an existing release;
 #   * never writes the release body, name of an existing release, or publishes it;
@@ -28,26 +35,40 @@ set -euo pipefail
 # built; it is not a guarantee about the release's future.
 #
 # Usage:
-#   scripts/attach-umbrella-release-assets.sh --tag vX.Y.Z --directory DIR \
-#     --asset NAME [--asset NAME ...]
+#   scripts/attach-umbrella-release-assets.sh --tag vX.Y.Z --expected-commit SHA \
+#     --directory DIR --asset NAME [--asset NAME ...]
 #
 # Credential, exactly one:
 #   GITHUB_TOKEN   contents:write — every release read/write here
 # Also requires GITHUB_REPOSITORY, curl and jq. The token is never printed.
 
 TAG=""
+EXPECTED_COMMIT=""
 DIRECTORY=""
 ASSETS=()
 ATTEMPTS=6
 RETRY_DELAY=5
+# 200 pages of 100 is two orders of magnitude beyond this repository's release
+# count. Reaching it means the listing is not converging, which is refused
+# rather than silently truncated — a missed duplicate draft is exactly the
+# failure this bound exists to prevent.
+MAX_PAGES=200
+# The one branch a draft may legitimately name when GitHub ignores the
+# target_commitish this helper sends; see assert_release_identity.
+PROTECTED_BRANCH="main"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+IDENTITY_SCRIPT="${IDENTITY_SCRIPT:-$SCRIPT_DIR/verify-release-identity.sh}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) TAG="${2:-}"; shift 2 ;;
+    --expected-commit) EXPECTED_COMMIT="${2:-}"; shift 2 ;;
     --directory) DIRECTORY="${2:-}"; shift 2 ;;
     --asset) ASSETS+=("${2:-}"); shift 2 ;;
     --attempts) ATTEMPTS="${2:-}"; shift 2 ;;
     --retry-delay) RETRY_DELAY="${2:-}"; shift 2 ;;
+    --max-pages) MAX_PAGES="${2:-}"; shift 2 ;;
     *) echo "ERROR: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -56,8 +77,16 @@ for tool in curl jq sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: '$tool' is required" >&2; exit 2; }
 done
 
-if [ -z "$TAG" ] || [ -z "$DIRECTORY" ] || [ "${#ASSETS[@]}" -eq 0 ]; then
-  echo "ERROR: --tag, --directory and at least one --asset are required" >&2
+if [ -z "$TAG" ] || [ -z "$EXPECTED_COMMIT" ] || [ -z "$DIRECTORY" ] || [ "${#ASSETS[@]}" -eq 0 ]; then
+  echo "ERROR: --tag, --expected-commit, --directory and at least one --asset are required" >&2
+  exit 2
+fi
+if ! printf '%s' "$EXPECTED_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "ERROR: --expected-commit '${EXPECTED_COMMIT}' is not a 40-hex commit id" >&2
+  exit 2
+fi
+if [ ! -x "$IDENTITY_SCRIPT" ] && [ ! -f "$IDENTITY_SCRIPT" ]; then
+  echo "ERROR: the trusted identity verifier ${IDENTITY_SCRIPT} is missing" >&2
   exit 2
 fi
 : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
@@ -75,6 +104,17 @@ done
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
+# The live tag, its commit and both tag rulesets, checked against the pair this
+# workflow was admitted for. Runs before the first write and again after the
+# last one, so a tag that moves mid-attachment cannot leave assets behind under
+# a release identity nobody admitted.
+revalidate() {
+  bash "$IDENTITY_SCRIPT" \
+    --tag "$TAG" \
+    --commit "$EXPECTED_COMMIT" \
+    --stage "attachment:$1"
+}
+
 api() {
   local method="$1" path="$2"
   shift 2
@@ -89,22 +129,38 @@ local_digest() {
   sha256sum "$1" | cut -d' ' -f1
 }
 
-# Draft releases have no git tag yet, so /releases/tags/<tag> cannot find them.
-# Listing releases is the only reliable lookup for a draft.
-find_release() {
-  local page found
-  : > "$WORKDIR/matches.json"
-  for page in 1 2 3; do
-    api GET "/repos/${GITHUB_REPOSITORY}/releases?per_page=100&page=${page}" > "$WORKDIR/page.json"
+# Page a list endpoint to exhaustion into one JSON array. Stopping at a fixed
+# page count would let a second release claiming this tag hide beyond the
+# horizon, which is the one thing the sole-draft check must never miss.
+collect_pages() {
+  local path="$1" destination="$2" page items
+  : > "$WORKDIR/pages.ndjson"
+  page=1
+  while [ "$page" -le "$MAX_PAGES" ]; do
+    api GET "${path}?per_page=100&page=${page}" > "$WORKDIR/page.json"
     if ! jq -e 'type == "array"' "$WORKDIR/page.json" >/dev/null 2>&1; then
-      echo "ERROR: unexpected releases response: $(head -c 300 "$WORKDIR/page.json")" >&2
+      echo "ERROR: unexpected response for ${path}: $(head -c 300 "$WORKDIR/page.json")" >&2
       exit 1
     fi
-    jq -c --arg tag "$TAG" '.[] | select(.tag_name == $tag)' "$WORKDIR/page.json" >> "$WORKDIR/matches.json"
-    if [ "$(jq 'length' "$WORKDIR/page.json")" -lt 100 ]; then
-      break
+    jq -c '.[]' "$WORKDIR/page.json" >> "$WORKDIR/pages.ndjson"
+    items="$(jq 'length' "$WORKDIR/page.json")"
+    if [ "$items" -lt 100 ]; then
+      jq -s '.' "$WORKDIR/pages.ndjson" > "$destination"
+      return 0
     fi
+    page=$((page + 1))
   done
+  echo "ERROR: ${path} did not terminate within ${MAX_PAGES} pages; refusing to guess" >&2
+  exit 1
+}
+
+# Draft releases have no git tag yet, so /releases/tags/<tag> cannot find them.
+# Listing every release is the only reliable lookup for a draft.
+find_release() {
+  local found
+  collect_pages "/repos/${GITHUB_REPOSITORY}/releases" "$WORKDIR/releases.json"
+  jq -c --arg tag "$TAG" '.[] | select(.tag_name == $tag)' "$WORKDIR/releases.json" \
+    > "$WORKDIR/matches.json"
   found="$(wc -l < "$WORKDIR/matches.json" | tr -d ' ')"
   if [ "$found" -gt 1 ]; then
     echo "ERROR: ${found} releases claim tag ${TAG}; refusing to guess which draft to append to" >&2
@@ -113,16 +169,51 @@ find_release() {
   [ "$found" -eq 1 ]
 }
 
+# GitHub documents target_commitish as unused when the git tag already exists,
+# which is always the case here: the owner creates the immutable tag first and
+# only then dispatches the release. So the field can come back either as the
+# commit this helper asked for or as the repository default branch, and both are
+# accepted. Any *other* value — a different commit, a different branch — means
+# the draft was created against something nobody admitted, and is refused. The
+# authoritative binding is not this field but the live tag identity `revalidate`
+# proves on both sides of every write, backed by ruleset 20051355.
+assert_release_identity() {
+  local stage="$1" tag draft target
+  api GET "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$WORKDIR/release.json"
+  tag="$(jq -r '.tag_name // ""' "$WORKDIR/release.json")"
+  draft="$(jq -r '.draft // false' "$WORKDIR/release.json")"
+  target="$(jq -r '.target_commitish // ""' "$WORKDIR/release.json")"
+  if [ "$tag" != "$TAG" ]; then
+    echo "ERROR (${stage}): release ${RELEASE_ID} targets '${tag}', not '${TAG}'" >&2
+    exit 1
+  fi
+  if [ "$draft" != "true" ]; then
+    echo "ERROR (${stage}): release ${RELEASE_ID} for ${TAG} is already published; refusing to alter a published release" >&2
+    exit 1
+  fi
+  case "$target" in
+    "$EXPECTED_COMMIT"|"$PROTECTED_BRANCH") ;;
+    *)
+      echo "ERROR (${stage}): release ${RELEASE_ID} targets '${target}', not the admitted ${EXPECTED_COMMIT}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+revalidate "pre"
+
 RELEASE_ID=""
 for attempt in $(seq 1 "$ATTEMPTS"); do
   if find_release; then
     RELEASE_ID="$(jq -r '.id' "$WORKDIR/matches.json")"
     break
   fi
-  # No release yet. Create the draft; a sibling workflow may win this race, in
-  # which case the next lookup finds theirs and we append to it instead.
+  # No release yet. Create the draft bound to the admitted commit; a sibling
+  # workflow may win this race, in which case the next lookup finds theirs and
+  # we append to it instead.
   api POST "/repos/${GITHUB_REPOSITORY}/releases" \
-    -d "$(jq -n --arg tag "$TAG" '{tag_name: $tag, name: ("SilentSuite " + $tag), draft: true}')" \
+    -d "$(jq -n --arg tag "$TAG" --arg target "$EXPECTED_COMMIT" \
+      '{tag_name: $tag, target_commitish: $target, name: ("SilentSuite " + $tag), draft: true}')" \
     > "$WORKDIR/created.json" || true
   if jq -e '.id? // empty' "$WORKDIR/created.json" >/dev/null 2>&1; then
     RELEASE_ID="$(jq -r '.id' "$WORKDIR/created.json")"
@@ -151,25 +242,11 @@ if [ "$CANONICAL_RELEASE_ID" != "$RELEASE_ID" ]; then
   exit 1
 fi
 
-api GET "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$WORKDIR/release.json"
-RELEASE_TAG="$(jq -r '.tag_name // ""' "$WORKDIR/release.json")"
-RELEASE_DRAFT="$(jq -r '.draft // false' "$WORKDIR/release.json")"
-if [ "$RELEASE_TAG" != "$TAG" ]; then
-  echo "ERROR: release ${RELEASE_ID} targets '${RELEASE_TAG}', not '${TAG}'" >&2
-  exit 1
-fi
-if [ "$RELEASE_DRAFT" != "true" ]; then
-  echo "ERROR: release ${RELEASE_ID} for ${TAG} is already published; refusing to alter a published release" >&2
-  exit 1
-fi
-echo "Appending to draft release ${RELEASE_ID} for ${TAG}"
+assert_release_identity "before upload"
+echo "Appending to draft release ${RELEASE_ID} for ${TAG} at ${EXPECTED_COMMIT}"
 
 list_assets() {
-  api GET "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" > "$WORKDIR/assets.json"
-  if ! jq -e 'type == "array"' "$WORKDIR/assets.json" >/dev/null 2>&1; then
-    echo "ERROR: unexpected assets response: $(head -c 300 "$WORKDIR/assets.json")" >&2
-    exit 1
-  fi
+  collect_pages "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" "$WORKDIR/assets.json"
 }
 
 # Two-step download: the asset endpoint answers 302 to a signed URL that must be
@@ -262,12 +339,7 @@ if [ -n "$MISSING_SIBLINGS" ]; then
   exit 1
 fi
 
-api GET "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$WORKDIR/release-after.json"
-if [ "$(jq -r '.draft' "$WORKDIR/release-after.json")" != "true" ] \
-   || [ "$(jq -r '.tag_name' "$WORKDIR/release-after.json")" != "$TAG" ]; then
-  echo "ERROR: release identity or draft state changed while assets were being attached" >&2
-  exit 1
-fi
+assert_release_identity "after upload"
 
 # Recheck tag ownership after uploads as well. This catches a slower sibling
 # create/create race before this workflow reports a usable shared draft.
@@ -279,6 +351,8 @@ if [ "$(jq -r '.id' "$WORKDIR/matches.json")" != "$RELEASE_ID" ]; then
   echo "ERROR: release ownership for ${TAG} changed during asset upload" >&2
   exit 1
 fi
+
+revalidate "post"
 
 echo ""
 echo "Assets attached to the draft release for ${TAG}; publication remains manual."
