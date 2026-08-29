@@ -45,6 +45,8 @@ import argparse
 import json
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -63,6 +65,8 @@ TARGET_LIBC = {
     "manylinux": ("x86_64",),
 }
 PURE = "pure"
+PYPI_ATTEMPTS = 5
+PYPI_RETRY_DELAY = 2
 
 HEADER = """#
 # Hash-locked runtime dependency set for the self-host server.
@@ -95,6 +99,30 @@ HEADER = """#
 
 class LockError(RuntimeError):
     """A pin cannot be locked to immutable bytes."""
+
+
+def pypi_json(name: str, version: str) -> dict:
+    """Read immutable release metadata, retrying only transient transport faults."""
+
+    url = f"{PYPI}/{name}/{version}/json"
+    request = urllib.request.Request(url, headers={"User-Agent": "SilentSuite-wheel-lock/1"})
+    for attempt in range(1, PYPI_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code != 429 and error.code < 500:
+                raise
+            transient: Exception = error
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError) as error:
+            transient = error
+        if attempt == PYPI_ATTEMPTS:
+            raise LockError(
+                f"PyPI metadata for {name}=={version} remained unavailable after "
+                f"{PYPI_ATTEMPTS} attempts: {transient}"
+            ) from transient
+        time.sleep(PYPI_RETRY_DELAY * attempt)
+    raise AssertionError("unreachable")
 
 
 def classify(filename: str) -> str | None:
@@ -165,8 +193,7 @@ def wheel_hashes(requirement: str) -> list[tuple[str, str, str]]:
     name = name.split("[")[0]
     if not version:
         raise LockError(f"{requirement!r} is not an exact == pin")
-    with urllib.request.urlopen(f"{PYPI}/{name}/{version}/json", timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    payload = pypi_json(name, version)
 
     picked: list[tuple[str, str, str]] = []
     for item in payload["urls"]:

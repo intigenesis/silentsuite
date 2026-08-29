@@ -244,6 +244,37 @@ def test_the_lock_generator_admits_exactly_the_three_environments(filename, cate
     assert lock.classify(filename) == category
 
 
+def test_the_lock_generator_retries_transient_pypi_resets(monkeypatch):
+    import importlib.util
+    import urllib.error
+
+    spec = importlib.util.spec_from_file_location("lock_server_requirements_retry", LOCK_SCRIPT)
+    lock = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(lock)
+    attempts = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return b'{"urls": []}'
+
+    def reset_then_succeed(_request, timeout):
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            raise urllib.error.URLError(ConnectionResetError(104, "reset by peer"))
+        return Response()
+
+    monkeypatch.setattr(lock.urllib.request, "urlopen", reset_then_succeed)
+    monkeypatch.setattr(lock.time, "sleep", lambda _seconds: None)
+    assert lock.pypi_json("example", "1.0") == {"urls": []}
+    assert attempts == [60, 60, 60]
+
+
 def test_the_native_import_check_covers_every_native_distribution():
     checker = (ROOT / "scripts" / "check-server-image-dependencies.py").read_text(encoding="utf-8")
     for name in sorted(NATIVE_DISTRIBUTIONS):
