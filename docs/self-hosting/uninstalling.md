@@ -15,7 +15,7 @@ docker compose down
 docker volume rm self-host_pgdata self-host_server_data
 
 # Remove the Docker images (the silentsuite-server tag/digest may differ — list yours with `docker image ls`)
-docker image rm postgres:16.9-alpine
+docker image rm postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7
 docker image ls --filter 'reference=ghcr.io/silent-suite/silentsuite-server' --format '{{.ID}}' | xargs -r docker image rm
 
 # Remove the install directory

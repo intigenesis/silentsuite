@@ -1,33 +1,55 @@
 name: Build Bridge Binaries
 
+# The one definition of how a bridge binary is built.
+#
+# Two ways in, one of them privileged and one not:
+#   * release-bridge.yml calls it with the admitted (tag, commit) pair, and that
+#     call resolves this file at the protected controller revision;
+#   * an owner may dispatch it to check the five-platform matrix still builds
+#     without tagging anything.
+#
+# It cannot release. There is no tag trigger, no repository write, no
+# environment, and no credential of any kind — the umbrella attachment lives in
+# release-bridge.yml, which is reachable only through the controller.
+
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      release_tag:
+        description: The admitted immutable release tag, stamped into the binary.
+        required: true
+        type: string
+      source_sha:
+        description: The admitted 40-hex source commit.
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
-      create_release:
-        description: "Create a GitHub Release (yes/no)"
+      release_tag:
+        description: Version to stamp into the binaries. Blank uses pyproject.
         required: false
-        default: "no"
+        default: ''
+        type: string
+      source_sha:
+        description: Commit to build. Blank uses the selected ref.
+        required: false
+        default: ''
+        type: string
 
-# Cancel in-progress runs on the same ref
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions: {}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build matrix
-  # ---------------------------------------------------------------------------
   build:
     name: Build (${{ matrix.os-label }})
     runs-on: ${{ matrix.runner }}
-    # On a tag push, stamp the release version into the binary from the tag.
-    # The spec file (silentsuite-bridge.spec) reads this and freezes it into
-    # _version.py. Empty on non-tag builds, which fall back to pyproject.
+    permissions:
+      contents: read
+    # The release version is stamped into the binary from the admitted tag. The
+    # spec file (silentsuite-bridge.spec) reads this and freezes it into
+    # _version.py. A bare dispatch leaves it empty, which is what makes the
+    # binary fall back to the pyproject version instead of claiming a release.
     env:
-      SILENTSUITE_BRIDGE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+      SILENTSUITE_BRIDGE_VERSION: ${{ inputs.release_tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -78,10 +100,16 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout
+      # 1. Checkout the admitted commit
       # -----------------------------------------------------------------------
-      - name: Checkout
+      # An empty `ref` is how actions/checkout is told "the ref that triggered
+      # this run", so a dispatch builds what the operator selected while a
+      # controller call builds exactly the admitted commit.
+      - name: Checkout the admitted commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
 
       # -----------------------------------------------------------------------
       # 2. Set up QEMU (arm64 Linux only)
@@ -257,7 +285,7 @@ jobs:
           cat "${ASSET}.sha256"
 
       # -----------------------------------------------------------------------
-      # 11. Upload artifact (always — for manual inspect even without release)
+      # 11. Upload artifact
       # -----------------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -268,68 +296,3 @@ jobs:
             bridge/dist/${{ matrix.asset-name }}.sha256
           if-no-files-found: error
           retention-days: 14
-
-  # ---------------------------------------------------------------------------
-  # Release job — only on tag push OR when manually requested
-  # ---------------------------------------------------------------------------
-  release:
-    name: Create GitHub Release
-    needs: build
-    runs-on: ubuntu-22.04
-    if: >
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'yes')
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Download all build artifacts
-      - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: release-assets/
-
-      # Flatten the nested artifact directories
-      - name: Flatten artifact directories
-        run: |
-          mkdir -p flat/
-          find release-assets/ -type f -exec mv {} flat/ \;
-          ls -lh flat/
-
-      # Concatenate all SHA256 files into one checksum manifest
-      - name: Build checksum manifest
-        working-directory: flat
-        run: |
-          cat *.sha256 > SHA256SUMS.txt
-          echo "=== SHA256SUMS.txt ==="
-          cat SHA256SUMS.txt
-
-      # Determine tag name (real tag or synthetic for manual dispatch)
-      - name: Determine release tag
-        id: tag
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            TAG="v0.0.0-bridge-manual-$(date +%Y%m%d%H%M%S)"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
-
-      # Create / append to the umbrella GitHub Release.
-      # We deliberately do NOT set body/body_path here — the release notes
-      # live in the umbrella release notes the operator pastes at publish
-      # time. softprops/action-gh-release is idempotent: first workflow to
-      # run creates the draft release, subsequent runs append assets without
-      # clobbering an existing body.
-      - name: Attach bridge binaries to umbrella GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: SilentSuite ${{ steps.tag.outputs.tag }}
-          draft: true
-          fail_on_unmatched_files: true
-          files: flat/*

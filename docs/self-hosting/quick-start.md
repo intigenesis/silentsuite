@@ -8,25 +8,29 @@ This is the fastest path from zero to running. Make sure you've met the [require
 curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
 ```
 
-If you'd rather clone first:
+To inspect a release before installing it, stage it first. Staging verifies the
+release tag, the bundle checksum, the manifest, and the archive contents, then
+writes the files out without installing, pulling an image, or starting a
+container:
 
 ```bash
-git clone https://github.com/silent-suite/silentsuite.git
-cd silentsuite/self-host
-chmod +x install.sh update.sh verify.sh close-signups.sh
-./install.sh
+bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
 ```
+
+Staging deliberately stops before the registry image-identity check, because
+that check pulls the image. A real install performs it; staging reports the
+digest the manifest names, not one it confirmed.
 
 The `install.sh` script will:
 
-1. Check that Docker and Docker Compose are installed.
-2. Resolve the SilentSuite version to install (latest umbrella release, or `main` if none has been cut).
-3. Download the release-pinned `docker-compose.yml`, `update.sh`, `verify.sh`, `close-signups.sh`, and `success.html` into `silentsuite-server/`.
-4. Prompt you for your domain name.
-5. Generate strong random passwords for PostgreSQL and the admin panel.
-6. Write the completed `.env` file.
-7. Pull Docker images and start the two containers (PostgreSQL and the SilentSuite server).
-8. Wait for health checks to pass.
+1. Check that Docker, Docker Compose, and the download-verification tools are installed.
+2. Resolve the newest published release that ships verified self-host assets, or the one you named with `--version`. There is no branch fallback — a branch has no verified server image, so it is not an installable source.
+3. Download the release bundle, its checksum, and `server-image.json`, then verify the checksum, the manifest, and the archive contents before extracting anything.
+4. Confirm with GitHub that the release tag points at the commit the manifest names, and confirm the registry serves the promised image digest, revision, and architecture.
+5. Prompt you for your domain name.
+6. Generate strong random passwords for PostgreSQL and the admin panel.
+7. Write the completed `.env`, including the verified server image digest.
+8. Pull the pinned images, start the two containers (PostgreSQL and the SilentSuite server), and wait for health checks to pass.
 
 Docker publishes the server on host loopback at `127.0.0.1:3735`. It is **not** reachable from the network until you put a reverse proxy in front of it.
 

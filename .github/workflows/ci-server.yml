@@ -7,14 +7,66 @@ on:
       - 'server/**'
       - 'Dockerfile.server'
       - '.dockerignore'
+      - 'self-host/**'
+      - 'contracts/self-host-server-image.schema.json'
+      - 'docs/self-hosting/**'
+      - 'apps/docs/self-hosting/**'
+      - 'scripts/build-self-host-bundle.py'
+      - 'scripts/verify-self-host-bundle.py'
+      - 'scripts/selfhost_release_contract.py'
+      - 'scripts/self-host-image-smoke.sh'
+      - 'scripts/self-host-image-smoke-probe.py'
+      - 'scripts/self-host-compose-effective-check.sh'
+      - 'scripts/verify-server-image-release.sh'
+      - 'scripts/attach-umbrella-release-assets.sh'
+      - 'scripts/verify-release-identity.sh'
+      - 'scripts/verify-umbrella-release-readiness.py'
+      - 'scripts/umbrella_release_contract.py'
+      - 'scripts/check-server-image-dependencies.py'
+      - 'scripts/lock-server-requirements.py'
+      - 'scripts/stage-bridge-release-assets.sh'
+      - 'tests/test_self_host_*.py'
+      - 'tests/test_umbrella_release_*.py'
+      - 'tests/test_server_image_verifier.py'
       - '.github/workflows/ci-server.yml'
+      - '.github/workflows/release-controller.yml'
+      - '.github/workflows/release-android.yml'
+      - '.github/workflows/release-bridge.yml'
+      - '.github/workflows/release-server-image.yml'
+      - '.github/workflows/release-readiness.yml'
   pull_request:
     branches: [main]
     paths:
       - 'server/**'
       - 'Dockerfile.server'
       - '.dockerignore'
+      - 'self-host/**'
+      - 'contracts/self-host-server-image.schema.json'
+      - 'docs/self-hosting/**'
+      - 'apps/docs/self-hosting/**'
+      - 'scripts/build-self-host-bundle.py'
+      - 'scripts/verify-self-host-bundle.py'
+      - 'scripts/selfhost_release_contract.py'
+      - 'scripts/self-host-image-smoke.sh'
+      - 'scripts/self-host-image-smoke-probe.py'
+      - 'scripts/self-host-compose-effective-check.sh'
+      - 'scripts/verify-server-image-release.sh'
+      - 'scripts/attach-umbrella-release-assets.sh'
+      - 'scripts/verify-release-identity.sh'
+      - 'scripts/verify-umbrella-release-readiness.py'
+      - 'scripts/umbrella_release_contract.py'
+      - 'scripts/check-server-image-dependencies.py'
+      - 'scripts/lock-server-requirements.py'
+      - 'scripts/stage-bridge-release-assets.sh'
+      - 'tests/test_self_host_*.py'
+      - 'tests/test_umbrella_release_*.py'
+      - 'tests/test_server_image_verifier.py'
       - '.github/workflows/ci-server.yml'
+      - '.github/workflows/release-controller.yml'
+      - '.github/workflows/release-android.yml'
+      - '.github/workflows/release-bridge.yml'
+      - '.github/workflows/release-server-image.yml'
+      - '.github/workflows/release-readiness.yml'
 
 concurrency:
   group: ci-server-${{ github.ref }}
@@ -25,6 +77,8 @@ jobs:
     name: Server Tests & Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
 
     env:
       DJANGO_SETTINGS_MODULE: etebase_server.settings
@@ -33,16 +87,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.10
+      # 3.12, the same interpreter the release image runs and the same one both
+      # requirement files were compiled for. On 3.10 this job asked PyPI for a
+      # cp310 wheel, which the hash lock does not record and must not: the lock
+      # names the exact bytes of three environments, and a fourth would be an
+      # unreviewed one.
+      - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
+      # This runner is glibc, so pip selects the reviewed manylinux x86_64 wheels
+      # from the same lock the Alpine image installs its musllinux ones from.
+      # The flags are explicit rather than implied: --require-hashes is what pip
+      # infers anyway once any hash is present, and stating it means a lock that
+      # lost its hashes fails here instead of silently resolving live.
       - name: Install dependencies
         working-directory: server
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --require-hashes --only-binary=:all: -r requirements.txt
           pip install -r requirements-dev.txt
 
       - name: Compile Python modules
@@ -82,3 +146,140 @@ jobs:
       - name: Run tests
         working-directory: server
         run: python -m pytest etebase_server/ -v --tb=short
+
+  self-host-contracts:
+    name: Self-Host Release Contracts
+    runs-on: ubuntu-latest
+    # The materials contract resolves the hash lock three times against PyPI —
+    # once per install environment — on a cold runner cache.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install contract test dependencies
+        run: python -m pip install --disable-pip-version-check pytest PyYAML==6.0.3
+
+      # The materials contract is excluded here and run once below instead: it
+      # resolves the hash lock against PyPI three times, and the dedicated step
+      # runs it under the stricter contract that turns a network skip into a
+      # failure. Running it twice would only pay for those downloads twice.
+      - name: Run self-host release contract tests
+        run: |
+          python -m pytest -q \
+            --ignore=tests/test_self_host_server_image_materials.py \
+            tests/test_self_host_*.py \
+            tests/test_umbrella_release_*.py \
+            tests/test_server_image_verifier.py
+
+      - name: Verify the effective self-host Compose configuration
+        run: scripts/self-host-compose-effective-check.sh
+
+      - name: Check release and self-host shell syntax
+        run: |
+          for script in \
+            self-host/install.sh \
+            self-host/update.sh \
+            self-host/verify.sh \
+            self-host/close-signups.sh \
+            scripts/self-host-image-smoke.sh \
+            scripts/self-host-compose-effective-check.sh \
+            scripts/verify-server-image-release.sh \
+            scripts/attach-umbrella-release-assets.sh \
+            scripts/verify-release-identity.sh \
+            scripts/stage-bridge-release-assets.sh; do
+            bash -n "$script"
+          done
+
+      - name: Compile the release control-plane Python helpers
+        run: |
+          python -m py_compile \
+            scripts/check-android-signing-boundary.py \
+            scripts/check-server-image-dependencies.py \
+            scripts/lock-server-requirements.py \
+            scripts/selfhost_release_contract.py \
+            scripts/umbrella_release_contract.py \
+            scripts/verify-umbrella-release-readiness.py
+
+      - name: Enforce the release control-plane boundary
+        run: python scripts/check-android-signing-boundary.py
+
+      # Base image identity, and the three-environment hash lock resolved the
+      # way each environment's pip would. The env var turns "network was
+      # unavailable, so we skipped" into a failure.
+      - name: Verify the pinned base image and the hash lock against live indexes
+        env:
+          SILENTSUITE_REQUIRE_REGISTRY_CONTRACT: '1'
+        run: python -m pytest tests/test_self_host_server_image_materials.py -q
+
+  self-host-image:
+    name: Self-Host Image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Native build only: no registry credentials, no push, no environment.
+      # This is the same image content the release workflow publishes, built and
+      # smoked here before any tag exists.
+      - name: Build the server image for ${{ matrix.platform }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.server
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          provenance: false
+          sbom: false
+          tags: silentsuite-server:ci-${{ matrix.arch }}
+          build-args: VCS_REF=${{ github.sha }}
+          cache-from: type=gha,scope=ci-server-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ci-server-${{ matrix.arch }}
+
+      # The native half of the hash-locked materials proof: the wheels the
+      # Dockerfile installed have to be importable on this architecture, with no
+      # Alpine package providing libpq, libffi or libsodium behind them.
+      - name: Prove the hash-locked dependency set imports natively
+        run: |
+          docker run --rm --entrypoint python3 \
+            -v "$PWD/scripts/check-server-image-dependencies.py:/check.py:ro" \
+            -v "$PWD/server/requirements.txt:/requirements.txt:ro" \
+            "silentsuite-server:ci-${{ matrix.arch }}" \
+            /check.py --requirements /requirements.txt
+
+      - name: Run the self-host image smoke contract
+        run: |
+          scripts/self-host-image-smoke.sh \
+            --image "silentsuite-server:ci-${{ matrix.arch }}" \
+            --platform "${{ matrix.platform }}" \
+            --expect-revision "${{ github.sha }}"

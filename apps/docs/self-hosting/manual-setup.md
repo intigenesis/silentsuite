@@ -1,86 +1,65 @@
 # Manual Setup
 
-If you prefer full control over the configuration, follow these steps instead of the one-liner installer. Make sure you've met the [requirements](./requirements.md) first.
+There is no supported setup path that skips the release bundle.
 
-> **Prefer the quick way?** Run the installer:
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
-> ```
+`docker-compose.yml` deliberately has no server image of its own. It requires
+`SILENTSUITE_SERVER_IMAGE`, and the only place that value comes from is
+`server-image.json` inside a verified release bundle. Downloading
+`docker-compose.yml` and `.env.example` from `main` cannot supply it, so those
+instructions have been removed rather than left as a path that stops at the
+first `docker compose up`.
 
-## 1. Create a Directory
+## Use the installer
 
 ```bash
-mkdir silentsuite-server && cd silentsuite-server
+curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
 ```
 
-## 2. Download the Docker Compose File
+The installer resolves a published release, verifies the bundle checksum, the
+manifest, the archive contents, and the registry image identity, then writes the
+verified digest into `.env`. See [Quick Start](./quick-start.md) for the full
+walkthrough, including the reverse-proxy step that follows it.
+
+## Audit a release before installing it
+
+If what you wanted from manual setup was to see exactly what will be installed,
+stage it instead. This runs the release-metadata, tag-to-commit, checksum,
+manifest and archive checks and writes the verified files out. It does not pull
+an image or contact the registry — the live image-identity check happens only
+during a real install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/docker-compose.yml -o docker-compose.yml
+bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
 ```
 
-## 3. Create the Environment File
+The staged directory holds the archive, its checksum sidecar, the published
+manifest, and the verified bundle contents. Read them, then run the installer
+when you are satisfied.
+
+## Configure it yourself afterwards
+
+Every environment variable remains yours to set. Edit `.env` in the installed
+directory and recreate the containers:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/.env.example -o .env
-```
-
-## 4. Generate Secrets
-
-```bash
-# Database password
-openssl rand -base64 32 | tr -d '/+='
-
-# Django admin password (optional, for advanced use)
-openssl rand -base64 16 | tr -d '/+='
-```
-
-## 5. Edit .env
-
-Open `.env` and set these values:
-
-| Variable | What to set |
-|---|---|
-| `DATABASE_PASSWORD` | The first generated password |
-| `SUPER_PASS` | The second generated password (optional -- Django admin only) |
-| `ALLOWED_HOSTS` | Your domain, e.g., `sync.example.com,localhost` |
-
-See the [Configuration Reference](./configuration.md) for all available options.
-
-## 6. Start the Stack
-
-```bash
+cd silentsuite-server
+$EDITOR .env
 docker compose up -d
 ```
 
-## 7. Wait for Initialization
+| Variable | What to set |
+|---|---|
+| `ALLOWED_HOSTS` | Your domain, e.g., `sync.example.com,localhost` |
+| `TRUSTED_PROXY_IPS` | Your reverse proxy's exact IP, if it runs in Docker |
+| `SILENTSUITE_SERVER_IMAGE` | **Leave alone** -- the verified image digest the installer wrote |
 
-The server needs 20-30 seconds on first start to run database migrations. Check progress:
+See the [Configuration Reference](./configuration.md) for all available options.
 
-```bash
-docker compose logs -f server
-```
+## A note on scope
 
-Wait until you see the server accepting connections, then press `Ctrl+C`.
-
-## 8. Verify
-
-```bash
-docker compose ps
-```
-
-Both `silentsuite-postgres` and `silentsuite-server` should show `Up (healthy)`.
-
-## 9. Set Up Your Reverse Proxy
-
-Configure your reverse proxy to forward HTTPS traffic to `localhost:3735`. See the [Quick Start](./quick-start.md#2-set-up-your-reverse-proxy) for Caddy, nginx, Cloudflare Tunnel, and Docker-based proxy examples.
-
-## 10. Connect Your Apps
-
-1. Open [app.silentsuite.io](https://app.silentsuite.io) or the SilentSuite mobile app.
-2. On the signup page, expand **Advanced Settings**.
-3. Enter your server's HTTPS URL (e.g., `https://sync.example.com`).
-4. Create your account and start syncing -- the first user becomes the admin!
+This installs a fresh instance. There is no supported cross-version update
+procedure yet; see [Updating](./updating.md) for what is and is not supported
+today.
 
 ## Next Steps
 

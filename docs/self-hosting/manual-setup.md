@@ -1,54 +1,60 @@
 # Manual Setup
 
-If you prefer full control over the configuration, follow these steps instead of running `install.sh`. Make sure you've met the [requirements](./requirements.md) first.
+There is no supported setup path that skips the release bundle.
 
-## 1. Clone the Repository
+`docker-compose.yml` deliberately has no server image of its own. It requires
+`SILENTSUITE_SERVER_IMAGE`, and the only place that value comes from is
+`server-image.json` inside a verified release bundle. Cloning the repository or
+downloading files from `main` cannot supply it, so those instructions have been
+removed rather than left as a path that stops at the first `docker compose up`.
+
+## Use the installer
 
 ```bash
-git clone https://github.com/silent-suite/silentsuite.git
-cd silentsuite/self-host
+curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
 ```
 
-## 2. Create the Environment File
+The installer resolves a published release, verifies the bundle checksum, the
+manifest, the archive contents, and the registry image identity, then writes the
+verified digest into `.env`. See [Quick Start](./quick-start.md) for the full
+walkthrough and the reverse-proxy step that follows it.
+
+## Audit a release before installing it
+
+If what you wanted from manual setup was to see exactly what will be installed,
+stage it instead. This runs the release-metadata, tag-to-commit, checksum,
+manifest and archive checks and writes the verified files out. It does not pull
+an image or contact the registry — the live image-identity check happens only
+during a real install:
 
 ```bash
-cp .env.example .env
+bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
 ```
 
-## 3. Generate Secrets
+The staged directory holds the archive, its checksum sidecar, the published
+manifest, and the verified bundle contents. Read them, then run the installer
+when you are satisfied.
 
-Generate the passwords that `.env` requires:
+## Configure it yourself afterwards
 
-```bash
-openssl rand -base64 32 | tr -d '/+='   # use for DATABASE_PASSWORD
-openssl rand -base64 16 | tr -d '/+='   # use for SUPER_PASS
-```
-
-## 4. Edit .env
-
-Open `.env` in your editor and fill in all required values. See the [Configuration Reference](./configuration.md) for details on each variable.
-
-At minimum, set:
-
-- `DOMAIN` -- your domain name (e.g., `sync.example.com`)
-- `DATABASE_PASSWORD` -- the generated database password
-- `SUPER_PASS` -- the generated admin password
-
-## 5. Start the Stack
+Every environment variable remains yours to set. Edit `.env` in the installed
+directory and recreate the containers:
 
 ```bash
+cd silentsuite-server
+$EDITOR .env
 docker compose up -d
 ```
 
-## 6. Verify
+See the [Configuration Reference](./configuration.md) for what each variable
+does. Do not edit `SILENTSUITE_SERVER_IMAGE` by hand — it is the verified image
+digest the installer wrote.
 
-Check that all containers are running and healthy:
+## A note on scope
 
-```bash
-docker compose ps
-```
-
-All services should show `Up` with a health status of `healthy`.
+This installs a fresh instance. There is no supported cross-version update
+procedure yet; see [Updating](./updating.md) for what is and is not supported
+today.
 
 ## Next Steps
 

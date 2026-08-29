@@ -23,7 +23,7 @@ test('Web and Docs preview/deploy workflows enforce the root guard and preview f
   }
 })
 
-test('public CI workflows trigger only from main while release and manual paths remain available', () => {
+test('public CI workflows trigger only from main while protected release and manual paths remain available', () => {
   const root = new URL('../', import.meta.url)
   const workflows = new Map(
     ['ci.yml', 'ci-server.yml', 'build-android.yml', 'test-bridge-linux.yml', 'test-bridge-windows.yml']
@@ -36,7 +36,12 @@ test('public CI workflows trigger only from main while release and manual paths 
     assert.doesNotMatch(workflow, /branches: \[[^\]]*\bdev\b/, `${name} must not retain dev branch triggers`)
   }
   const android = workflows.get('build-android.yml')
-  assert.match(android, /tags:\n\s+- 'v\*'/, 'Android release tags must remain enabled')
+  const controller = readFileSync(new URL('.github/workflows/release-controller.yml', root), 'utf8')
+  const androidRelease = readFileSync(new URL('.github/workflows/release-android.yml', root), 'utf8')
+  assert.doesNotMatch(android, /tags:\n\s+- 'v\*'/, 'untrusted Android CI must not load from a release tag')
+  assert.match(controller, /repository_dispatch:\n\s+types: \[silentsuite_release\]/, 'the protected-main release controller must remain enabled')
+  assert.match(controller, /android:\n[\s\S]*?uses: \.\/\.github\/workflows\/release-android\.yml/, 'the controller must invoke the Android release lane')
+  assert.match(androidRelease, /workflow_call:/, 'the Android release lane must remain callable only through the controller')
   assert.match(android, /\n  workflow_dispatch:\n/, 'Android manual dispatch must remain enabled')
   for (const name of ['test-bridge-linux.yml', 'test-bridge-windows.yml']) {
     assert.match(workflows.get(name), /\n  workflow_dispatch:\n/, `${name} manual dispatch must remain enabled`)

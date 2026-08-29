@@ -29,8 +29,8 @@ You provide your own reverse proxy (Caddy, nginx, Traefik, Cloudflare Tunnel) to
 
 | Service | Image | Role |
 |---------|-------|------|
-| **SilentSuite Server** | `ghcr.io/silent-suite/silentsuite-server` (pinned per release) | Sync server (Etebase protocol). All data is E2E encrypted. |
-| **PostgreSQL** | `postgres:16.9-alpine` | Database for encrypted sync data and user accounts. |
+| **SilentSuite Server** | `ghcr.io/silent-suite/silentsuite-server`, pinned to the immutable OCI index digest of the release you installed | Sync server (Etebase protocol). All data is E2E encrypted. |
+| **PostgreSQL** | `postgres`, pinned to the immutable OCI index digest of 16.9-alpine | Database for encrypted sync data and user accounts. |
 
 ## Prerequisites
 
@@ -38,6 +38,67 @@ You provide your own reverse proxy (Caddy, nginx, Traefik, Cloudflare Tunnel) to
 - Docker Engine 24+ with Compose v2
 - A reverse proxy for TLS termination
 - A domain name (e.g., `sync.example.com`) with DNS pointing to your server
+- `curl`, `tar`, and `sha256sum` (or `shasum`) for the installer's download verification
+
+### Supported architectures
+
+Server images are published for `linux/amd64` and `linux/arm64`. The installer
+detects your architecture and refuses to continue on anything else rather than
+installing an image that cannot run.
+
+`linux/arm64` support is verified in the release pipeline on native ARM64
+runners. Acceptance on specific ARM64 single-board hardware, such as a Raspberry
+Pi, has not been completed yet — treat it as untested until that evidence is
+published.
+
+## How Releases Are Pinned
+
+Every SilentSuite release publishes three self-host assets:
+
+| Asset | Purpose |
+|-------|---------|
+| `silentsuite-self-host-<tag>.tar.gz` | the version-matched `docker-compose.yml`, helper scripts, and landing page; `--stage-only` keeps this archive and its sidecar beside the files it extracted |
+| `silentsuite-self-host-<tag>.tar.gz.sha256` | the bundle's checksum, as a single strict record |
+| `server-image.json` | the immutable image identity: release tag, source commit, OCI index digest, per-architecture digests, supported platforms, and the expected image revision label |
+
+The installer requires the release it selects to be published (never a draft),
+tagged exactly what you asked for, and in possession of all three assets.
+
+**What the checksum proves, and what it does not.** It detects corruption in
+transit and any inconsistency between the bundle, its sidecar, and the manifest
+*as they are published right now*. It is not evidence that an asset was never
+replaced: the checksum lives on the same release as the bundle, so a repository
+administrator can replace both together. GitHub's immutable-releases feature,
+which would close that gap, is not in use yet — see
+[issue #682](https://github.com/silent-suite/silentsuite/issues/682).
+
+**Who verifies what about the image.** The two checks are different, and neither
+is the other:
+
+| Stage | What it verifies |
+|-------|------------------|
+| Release workflow (CI) | the complete published OCI index: both platform children by digest, their sizes and media types, the closed two-platform set, and the build revision on each — before the bundle is ever built |
+| `install.sh` (your machine) | the image it actually pulls: that its repo digest is the index digest the manifest names, that its platform is your host's, and that its build revision matches; then the same digest and platform check for the pinned PostgreSQL image |
+| `install.sh --stage-only` | release metadata, tag-to-commit binding, checksum, manifest and archive only. It pulls nothing and contacts no registry. |
+
+So the installer confirms that what will run on *your* host is the reviewed
+image, for your architecture, built from the named commit. It does not re-derive
+the whole index — a single host can only pull one platform, and reproducing the
+full index check would need registry credentials the installer has no business
+holding. The closed two-platform verification is CI's job, and its result is
+what the manifest records.
+
+`docker-compose.yml` contains no *server* image digest. It reads
+`SILENTSUITE_SERVER_IMAGE` from `.env`, which the installer writes as
+`ghcr.io/silent-suite/silentsuite-server@sha256:<index digest>` only after every
+check above has passed. A mutable `:version` tag is used to *find* a release,
+never to decide what runs.
+
+PostgreSQL is different: it is fixed source data rather than release data, so its
+immutable index digest is written directly in the bundled `docker-compose.yml`
+and travels inside the checksummed bundle. Neither container is ever started
+from a mutable tag, and the installer refuses a bundle whose Compose file
+unpins the database.
 
 ## Quick Start
 
@@ -46,15 +107,31 @@ curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-
 ```
 
 The installer will:
-1. Check that Docker and Docker Compose are installed
-2. Resolve which SilentSuite version to install (latest umbrella release, or `main` if none has been cut yet)
-3. Create a `silentsuite-server/` directory
-4. Download the Docker Compose configuration *from the release tag*, so the compose, helper scripts, and pinned image digest all come from one known-good matrix
-5. Ask for your domain name
-6. Generate secure random passwords
-7. Write the `.env` file
-8. Pull Docker images and start the containers
-9. Wait for health checks to pass
+1. Check that Docker, Docker Compose, and the download-verification tools are installed
+2. Refuse to continue if `silentsuite-server/` exists at all — as a directory, an empty directory, a file, or a symlink — and require its parent to be a directory you own that other local users cannot write
+3. Detect your architecture and resolve the newest published release that ships verified self-host assets
+4. Require that release to be published rather than a draft, and to carry exactly the tag that was requested
+5. Download the release bundle, its checksum, and `server-image.json` into a private temporary directory
+6. Verify the checksum record's exact grammar and the bundle's exact bytes before anything is extracted
+7. Verify the manifest: schema, release tag, source commit, canonical image repository, index and per-architecture digests, supported platforms, and expected image revision
+8. Confirm with GitHub that the release tag really points at the commit the manifest names
+9. Reject the archive unless every entry is a regular file or directory inside the bundle root and the file set is exactly the published inventory — nothing missing, nothing extra — then extract to a temporary staging directory
+10. Confirm the manifest inside the bundle is byte-identical to the separately published one
+11. Pull the image by digest and confirm the pulled image's repo digest, build revision, and architecture are the ones the manifest names — then do the same for the pinned PostgreSQL digest and platform
+12. Create `silentsuite-server/` with a single atomic `mkdir` — the first write outside its temporary workspace — then install the verified files, ask for your domain, generate secure random passwords, and write `.env` including the verified image digest
+13. Start the containers and wait for health checks to pass
+
+Every check above runs before that `mkdir`. If any of them fails, the target is
+never created, nothing outside the installer's temporary workspace is written,
+and those temporary files are removed. If the directory has already been claimed
+and a later step fails — an empty domain answer, a container that will not start
+— the new directory is left in place with whatever it contains at that point;
+remove it yourself before retrying. It is always a directory the installer just
+created, never a pre-existing one.
+
+If the path you give runs through a symlink, the installer resolves it once
+while checking the parent and then uses only the resolved location, so
+re-pointing that symlink later cannot redirect the install.
 
 The first user to sign up in the SilentSuite app becomes the server admin.
 
@@ -72,31 +149,108 @@ curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-
 bash install.sh --version v0.1.0-beta
 ```
 
-When pinned, the installer fetches all of `docker-compose.yml`, `update.sh`, `verify.sh`, `close-signups.sh`, and `success.html` from the requested tag's archive — the entire self-host config moves together as one release.
+The requested release must be published and must ship the self-host assets;
+otherwise the installer stops. There is no branch fallback: a branch has no
+verified server image, so it is not an installable source.
+
+### Inspecting a release before installing it
+
+```bash
+bash install.sh --version v0.1.0-beta --stage-only ./silentsuite-release
+```
+
+This performs the release-metadata, tag-to-commit, checksum, manifest and
+archive checks — steps 3 through 10 above — and writes the verified bundle
+contents into `./silentsuite-release`, along with the original archive, its
+strict checksum sidecar, and the published manifest. It stops there: it does
+**not** pull an image, does not contact the registry, does not create an
+installation, and does not start a container. The live image-identity check in
+step 11 is part of installing, not of staging. The stage directory has a closed
+top-level inventory: the archive, sidecar, manifest, and the archive's verified
+managed files.
+
+The stage directory must not exist yet, and its parent must be a directory you
+own that other local users cannot write. Like an install, it is created by a
+single atomic `mkdir` only after every check it performs has passed.
 
 ## Manual Setup
 
-1. **Create a directory and download the config:**
+> `install.sh --version vX.Y.Z --stage-only ./staged` performs the release-tag,
+> manifest, bundle, checksum, and archive checks, but not the live registry
+> image-identity check — that happens only during a real install. It writes the
+> verified files out without installing or starting anything.
+> Prefer it unless you specifically want to do this by hand; step 4 below is the
+> image check you would otherwise be skipping.
+
+1. **Download and verify the release bundle** (replace `vX.Y.Z` with the release
+   you want, from [the releases page](https://github.com/silent-suite/silentsuite/releases)):
    ```bash
-   mkdir silentsuite-server && cd silentsuite-server
-   chmod 750 .
-   curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/docker-compose.yml -o docker-compose.yml
-   curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/.env.example -o .env
-   curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/success.html -o success.html
+   BASE=https://github.com/silent-suite/silentsuite/releases/download/vX.Y.Z
+   curl -fLO "$BASE/silentsuite-self-host-vX.Y.Z.tar.gz"
+   curl -fLO "$BASE/silentsuite-self-host-vX.Y.Z.tar.gz.sha256"
+   curl -fLO "$BASE/server-image.json"
+
+   # The sidecar must be exactly one record naming exactly this archive.
+   cat silentsuite-self-host-vX.Y.Z.tar.gz.sha256
+   sha256sum -c silentsuite-self-host-vX.Y.Z.tar.gz.sha256
+
+   tar -tzf silentsuite-self-host-vX.Y.Z.tar.gz      # review before extracting
+   tar -xzf silentsuite-self-host-vX.Y.Z.tar.gz
    ```
 
-2. **Generate passwords:**
+   Do not skip the checksum step: it is what catches a bundle altered in
+   transit, or one that does not match the sidecar published beside it. It
+   cannot tell you the release was never rewritten — both files live on the same
+   release. The registry check in step 4 is the part that binds what you install
+   to an image identity nobody can substitute.
+
+2. **Bind the manifest to the bundle you verified.** The checksum covers the
+   archive only, so the separately downloaded `server-image.json` proves nothing
+   until you show it is the same file that is *inside* the verified archive:
+   ```bash
+   cmp server-image.json silentsuite-self-host-vX.Y.Z/server-image.json
+   ```
+   Any difference means the manifest is not the one this bundle was built with —
+   stop there. From this point on, use the copy inside the extracted bundle.
+
+3. **Install the verified files:**
+   ```bash
+   mkdir silentsuite-server && chmod 750 silentsuite-server
+   cp -R silentsuite-self-host-vX.Y.Z/. silentsuite-server/
+   cd silentsuite-server
+   cp .env.example .env
+   ```
+
+4. **Pin the server image.** Read `indexDigest` out of the bundled
+   `server-image.json` and put it in `.env`:
+   ```bash
+   SILENTSUITE_SERVER_IMAGE=ghcr.io/silent-suite/silentsuite-server@sha256:<indexDigest>
+   ```
+   Compose has no default for this value and will refuse to start without it.
+   Then confirm the registry really serves that image, for your architecture,
+   built from the commit the manifest claims:
+   ```bash
+   docker pull "$SILENTSUITE_SERVER_IMAGE"
+   docker image inspect "$SILENTSUITE_SERVER_IMAGE" \
+     --format '{{.Os}}/{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+   ```
+   The architecture must match your host and the revision must equal the
+   manifest's `expectedRevision`. The installer additionally asks GitHub to
+   confirm the release tag points at `sourceCommit`; by hand, check the tag on
+   the releases page.
+
+5. **Generate passwords:**
    ```bash
    openssl rand -base64 32 | tr -d '/+='   # use for DATABASE_PASSWORD
    openssl rand -base64 16 | tr -d '/+='   # use for SUPER_PASS
    ```
 
-3. **Edit `.env`:**
+6. **Edit `.env`:**
    - `DATABASE_PASSWORD` -- the generated database password
    - `SUPER_PASS` -- the generated admin password
    - Save with `chmod 600 .env` so only the host operator can read it.
 
-4. **Create `etebase-server.ini`** (server-side configuration; mounted into the container). Replace `YOUR_DATABASE_PASSWORD` with the value you set in `.env`, and `sync.example.com` with your domain:
+7. **Create `etebase-server.ini`** (server-side configuration; mounted into the container). Replace `YOUR_DATABASE_PASSWORD` with the value you set in `.env`, and `sync.example.com` with your domain:
    ```ini
    [global]
    secret_file = /data/secret.txt
@@ -118,12 +272,12 @@ When pinned, the installer fetches all of `docker-compose.yml`, `update.sh`, `ve
    ```
    Save with `chmod 644` so the container's `etebase` user can read it via the bind mount. Keep the install directory itself at `0750`; `etebase-server.ini` contains the database password and should not live in a shared directory. Users outside the directory owner/group cannot traverse a `0750` directory, but members of that group can still read the file.
 
-5. **Start the stack:**
+8. **Start the stack:**
    ```bash
    docker compose up -d
    ```
 
-6. **Set up your reverse proxy** (see examples below).
+9. **Set up your reverse proxy** (see examples below).
 
 ## Reverse Proxy Examples
 
@@ -244,19 +398,43 @@ cd silentsuite-server
 
 The script flips `ETEBASE_DISABLE_SIGNUP=true` in `.env` and recreates the server container. New registrations are blocked at the API layer thereafter. To re-open (e.g. to add another user), edit `.env`, set `ETEBASE_DISABLE_SIGNUP=false`, and run `docker compose up -d --force-recreate server`.
 
-## Updating
+## Restarting the version you have
 
-The server image is pinned to a specific manifest digest per SilentSuite release, so a `docker compose pull` won't fetch a newer SilentSuite version on its own. To upgrade across versions, re-run the installer — it'll download the release-pinned `docker-compose.yml`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
-```
-
-Within a single pinned release, `./update.sh` re-pulls the pinned images and recreates the containers (useful after host-level changes):
+`./update.sh` re-pulls the images already pinned in `.env` and recreates the
+containers. It is useful after host-level changes. It does **not** move between
+SilentSuite versions — the digest in `.env` is immutable by design.
 
 ```bash
 ./update.sh
 ```
+
+## Upgrading to a new version
+
+**Cross-version upgrading is not supplied yet.** This release ships the
+installer, the immutable release image identity, and the version-matched
+bundle; a version-aware updater that moves an existing installation from one
+release to the next is deliberately deferred to a follow-up change.
+
+Re-running `install.sh` is **not** the upgrade path. It refuses to touch an
+existing installation, because regenerating credentials and restarting a stack
+without backing up its data is not a safe upgrade — and nothing in this release
+migrates an installed version for you.
+
+`./update.sh` restarts the version you already have (above); it does not change
+versions. Until a supported updater ships, do not attempt a cross-version move
+by hand on an installation whose data you care about.
+
+You can still inspect a newer release safely without touching your
+installation, because staging only writes into a new directory:
+
+```bash
+bash ./install.sh --version vX.Y.Z --stage-only "./silentsuite-vX.Y.Z"
+```
+
+Stage-only verifies the release tag, manifest, checksum sidecar, and archive
+contents. It does not verify the live registry image, install anything, or
+start a container, and it writes only into a directory that did not exist
+before you ran it.
 
 ## Health Checks
 
@@ -326,17 +504,28 @@ docker compose up -d --force-recreate server
 - Verify PostgreSQL is healthy: `docker compose ps`
 - Check that `DATABASE_PASSWORD` in `.env` matches the original value (changing it after first run requires a volume reset or manual password change in PostgreSQL)
 
+### Server won't start: SILENTSUITE_SERVER_IMAGE is not set
+Compose refuses to start without a verified image digest. Copy `indexDigest`
+from `server-image.json` in your install directory into `.env` as
+`SILENTSUITE_SERVER_IMAGE=ghcr.io/silent-suite/silentsuite-server@sha256:...`,
+or re-install into a fresh directory from a published release.
+
 ### Reset everything
 ```bash
 docker compose down -v   # WARNING: Deletes all data!
+rm -rf silentsuite-server
 curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-host/install.sh | bash
 ```
+The installer refuses to use a path that already exists — even an empty
+directory — so the old one must be removed first. Everything in it, including
+your credentials, is gone at that point.
 
 ## Security Notes
 
 - PostgreSQL is only accessible within the Docker network (not exposed to the host)
 - Docker publishes the server port on host loopback only: `127.0.0.1:${SERVER_PORT:-3735}:3735`. Do not change this to `0.0.0.0` unless you put the server behind your own network firewall or proxy controls.
 - All sync traffic is end-to-end encrypted. The server never sees your plaintext data.
+- The server image is selected by an immutable digest, never by a mutable tag, so the bytes you verified at install time are the bytes that keep running.
 - Built on the [Etebase protocol](https://docs.etebase.com), an open standard for E2E encrypted data sync.
 
 ## Full Documentation

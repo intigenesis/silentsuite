@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Fail closed when Android signing escapes the protected release job."""
+"""Fail closed when the release control plane or Android signing escapes it.
+
+Two boundaries, one checker, because they are the same boundary seen from two
+sides:
+
+  * release authority is defined only by workflow code loaded from the protected
+    default branch — a repository_dispatch controller and the local reusable
+    workflows it calls — and never by the tag being released;
+  * Android signing material lives in exactly one job of that control plane,
+    which holds no repository write, no release API and no workflow token.
+
+Everything here is structural. It parses the workflows rather than grepping
+them, reviews the load-bearing jobs against exact literals, and pins the whole
+of each one with a semantic digest so that any edit which is not re-reviewed
+fails the check.
+"""
 
 from __future__ import annotations
 
@@ -23,13 +38,76 @@ SIGNING_SECRETS = {
     "ANDROID_KEYSTORE_PASSWORD",
     "ANDROID_KEY_ALIAS",
 }
-ROOT_WORKFLOW = Path(".github/workflows/build-android.yml")
+WORKFLOW_DIR = Path(".github/workflows")
+# The signing lane. Reachable only through workflow_call from the controller.
+ROOT_WORKFLOW = WORKFLOW_DIR / "release-android.yml"
+# Unprivileged Android CI. It keeps the same structural policy job and Conscrypt
+# producer, and must never regain a release-producing job.
+ANDROID_CI_WORKFLOW = WORKFLOW_DIR / "build-android.yml"
 ANDROID_SIBLING_WORKFLOW = Path("android/.github/workflows/build.yml")
 CONSCRYPT_BUILD_SCRIPT = Path("android/scripts/build-conscrypt-android-r28.sh")
+
+CONTROLLER_WORKFLOW = WORKFLOW_DIR / "release-controller.yml"
+BRIDGE_WORKFLOW = WORKFLOW_DIR / "release-bridge.yml"
+SERVER_WORKFLOW = WORKFLOW_DIR / "release-server-image.yml"
+READINESS_WORKFLOW = WORKFLOW_DIR / "release-readiness.yml"
+COMPONENT_WORKFLOWS = (ROOT_WORKFLOW, BRIDGE_WORKFLOW, SERVER_WORKFLOW, READINESS_WORKFLOW)
+CONTROL_PLANE = (CONTROLLER_WORKFLOW, *COMPONENT_WORKFLOWS)
+# The hosted-production lane. It predates and is independent of the release
+# control plane, is dispatch-only, and binds its own protected environment on
+# every job. Named here so the "no other privileged manual lane" rule below has
+# exactly one reviewed exemption rather than a silent hole.
+PRODUCTION_WORKFLOW = WORKFLOW_DIR / "deploy-server.yml"
+PRODUCTION_ENVIRONMENT = "server-production"
+
+DISPATCH_EVENT_TYPE = "silentsuite_release"
 ALLOWED_JOB = "build-release"
 POLICY_JOB = "signing-policy"
-TAG_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+REVALIDATION_JOB = "revalidate-signing"
+CONSCRYPT_JOB = "conscrypt-r28"
+ATTACHMENT_JOB = "attach-release-assets"
+ADMISSION_JOB = "admit"
 ENVIRONMENT_NAME = "android-release"
+
+IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
+ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
+READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
+RELEASE_ASSET_ARTIFACT = "silentsuite-android-release-assets-${{ inputs.source_sha }}"
+
+# The server lane's irreversible act and the check that must immediately precede
+# it. `publish_alias` returns early when the alias already exists, so verifying
+# an existing alias — which mutates nothing — is deliberately not gated.
+ALIAS_MERGE_STEP = "Merge verified children into the release index"
+ALIAS_WRITE = "docker buildx imagetools create"
+ALIAS_REVALIDATION = 'revalidate_identity "$reference"'
+ALIAS_REVALIDATION_HELPER = "trusted/scripts/verify-release-identity.sh"
+
+# Every repository script whose bytes decide whether a release is admitted,
+# verified, published or attached. Inside the control plane each one may be
+# executed only through a checkout of the protected controller revision.
+TRUSTED_HELPERS = (
+    "verify-release-identity.sh",
+    "attach-umbrella-release-assets.sh",
+    "verify-umbrella-release-readiness.py",
+    "check-android-signing-boundary.py",
+    "verify-server-image-release.sh",
+    "stage-bridge-release-assets.sh",
+    "build-self-host-bundle.py",
+    "verify-self-host-bundle.py",
+    "self-host-image-smoke.sh",
+)
+TRUSTED_REF = "${{ github.sha }}"
+
+# Anything that can reach the release API or a repository write. None of these
+# may appear in a job that also holds signing material.
+RELEASE_WRITE_MARKERS = (
+    "attach-umbrella-release-assets.sh",
+    "softprops/action-gh-release",
+    "gh release",
+    "api.github.com",
+    "uploads.github.com",
+    "${{ secrets.GITHUB_TOKEN }}",
+)
 SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
 UNSAFE_SECRET_EXPRESSION = re.compile(
     r"\bsecrets\s*\[|\bsecrets\s*\.\s*\*|\btojson\s*\(\s*secrets\s*\)",
@@ -37,6 +115,15 @@ UNSAFE_SECRET_EXPRESSION = re.compile(
 )
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_PYTHON_ACTION = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+PIP_INSTALL_POLICY_DEPENDENCY = (
+    "printf '%s\\n' 'PyYAML==6.0.3 "
+    "--hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' "
+    '> "$RUNNER_TEMP/android-signing-policy-requirements.txt"\n'
+    "python -m pip install --disable-pip-version-check --only-binary=:all: "
+    '--require-hashes -r "$RUNNER_TEMP/android-signing-policy-requirements.txt"\n'
+)
+# The release lane's copy pins the policy source to the protected controller
+# revision; the CI copy has no admitted commit to distinguish itself from.
 EXPECTED_POLICY_JOB: dict[str, Any] = {
     "name": "Enforce Android signing boundary",
     "runs-on": "ubuntu-latest",
@@ -49,13 +136,36 @@ EXPECTED_POLICY_JOB: dict[str, Any] = {
         },
         {
             "name": "Install signing policy dependency",
-            "run": (
-                "printf '%s\\n' 'PyYAML==6.0.3 "
-                "--hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' "
-                '> "$RUNNER_TEMP/android-signing-policy-requirements.txt"\n'
-                "python -m pip install --disable-pip-version-check --only-binary=:all: "
-                '--require-hashes -r "$RUNNER_TEMP/android-signing-policy-requirements.txt"\n'
-            ),
+            "run": PIP_INSTALL_POLICY_DEPENDENCY,
+        },
+        {
+            "name": "Checkout policy source",
+            "uses": CHECKOUT_ACTION,
+            "with": {
+                "ref": TRUSTED_REF,
+                "clean": "true",
+                "persist-credentials": "false",
+            },
+        },
+        {
+            "name": "Enforce Android signing boundary",
+            "run": 'python "$GITHUB_WORKSPACE/scripts/check-android-signing-boundary.py"',
+        },
+    ],
+}
+EXPECTED_CI_POLICY_JOB: dict[str, Any] = {
+    "name": "Enforce Android signing boundary",
+    "runs-on": "ubuntu-latest",
+    "permissions": {"contents": "read"},
+    "steps": [
+        {
+            "name": "Set up Python",
+            "uses": SETUP_PYTHON_ACTION,
+            "with": {"python-version": "3.12"},
+        },
+        {
+            "name": "Install signing policy dependency",
+            "run": PIP_INSTALL_POLICY_DEPENDENCY,
         },
         {
             "name": "Checkout policy source",
@@ -83,6 +193,234 @@ EXPECTED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     },
 }
+# Steps in the signed job that carry a non-secret environment. Naming them keeps
+# the "a step environment is reviewed or absent" rule intact now that the
+# admitted tag reaches the job as an input rather than as github.ref_name.
+EXPECTED_RELEASE_PLAIN_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
+    "Rename Android artifacts for release": {"RELEASE_TAG": "${{ inputs.release_tag }}"},
+    "Stage the closed release-asset set": {"RELEASE_TAG": "${{ inputs.release_tag }}"},
+}
+# The umbrella-draft attachment lock, shared by all three component lanes.
+# Reviewed as an exact literal so a release cannot be quietly re-scoped: a
+# different group would stop serializing against the sibling component lanes,
+# cancel-in-progress would drop an attachment mid-upload, and anything other
+# than queue: max lets the scheduler discard a pending attachment without
+# failing anything.
+UMBRELLA_GROUP = "umbrella-release-${{ github.event.client_payload.release_tag }}"
+EXPECTED_RELEASE_CONCURRENCY: dict[str, Any] = {
+    "group": UMBRELLA_GROUP,
+    "cancel-in-progress": "false",
+    "queue": "max",
+}
+
+# Every `secrets.NAME` the signed release job is allowed to name. The reviewed
+# step environments below are the only place any of them may appear, so a new
+# credential — a repository-settings reader, a release token, anything — cannot
+# be introduced into the job that holds the decoded keystore.
+#
+# GITHUB_TOKEN is on this list only because the job revalidates the release
+# identity immediately before each irreversible act, and that read needs an
+# authenticated rate limit. It is admissible only inside the four reviewed
+# revalidation steps below, which are compared as exact literals; `check`
+# separately proves it appears nowhere else in the job, so candidate Gradle and
+# candidate scripts cannot receive it. The job holds `contents: read`, so the
+# token cannot write a release even if it escaped.
+ALLOWED_RELEASE_SECRETS = set(SIGNING_SECRETS) | {"GITHUB_TOKEN"}
+WORKFLOW_TOKEN = "${{ secrets.GITHUB_TOKEN }}"
+SECRET_REFERENCE = re.compile(r"secrets\.\s*([A-Za-z_][A-Za-z0-9_-]*)")
+
+# The signed job checks out the admitted commit and keeps no credential from it,
+# then checks the protected controller revision out into a separate path so the
+# verifier it runs is never candidate code. Reviewed as exact literals, in this
+# order: dropping `persist-credentials: false` would hand a repository write
+# token to Gradle and every build script it runs, beside the decoded keystore,
+# and checking the trusted copy out first would let the candidate checkout's
+# clean sweep remove it.
+EXPECTED_RELEASE_CHECKOUTS: list[dict[str, Any]] = [
+    {
+        "name": "Checkout",
+        "uses": CHECKOUT_ACTION,
+        "with": {"ref": "${{ inputs.source_sha }}", "persist-credentials": "false"},
+    },
+    {
+        "name": "Check out the trusted controller revision",
+        "uses": CHECKOUT_ACTION,
+        "with": {
+            "ref": TRUSTED_REF,
+            "path": ".release-trusted",
+            "persist-credentials": "false",
+        },
+    },
+]
+
+# One reviewed literal per irreversible boundary inside the signed job. Each runs
+# the verifier out of the trusted checkout, carries the workflow token, and
+# nothing else. `check` asserts they appear in this order and that each one
+# immediately precedes the step it guards.
+def _revalidation_step(name: str, stage: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "env": {
+            "GITHUB_TOKEN": WORKFLOW_TOKEN,
+            "RELEASE_TAG": "${{ inputs.release_tag }}",
+            "SOURCE_SHA": "${{ inputs.source_sha }}",
+        },
+        "run": (
+            "set -euo pipefail\n"
+            'bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \\\n'
+            '  --tag "$RELEASE_TAG" \\\n'
+            '  --commit "$SOURCE_SHA" \\\n'
+            f"  --stage {stage}\n"
+        ),
+    }
+
+
+# revalidation step name -> the step name it must immediately precede.
+RELEASE_MUTATION_BOUNDARIES: dict[str, str] = {
+    "Revalidate the release identity before decoding signing material": "Decode release keystore",
+    "Revalidate the release identity before publishing signed artifacts": (
+        "Upload signed tracker verification evidence"
+    ),
+    "Revalidate the release identity before publishing signed release outputs": (
+        "Upload signed release APK, AAB, and native debug symbols"
+    ),
+    "Revalidate the release identity before the attachment handoff": (
+        "Publish the closed release-asset set to the attachment job"
+    ),
+}
+EXPECTED_RELEASE_REVALIDATION_STEPS: dict[str, dict[str, Any]] = {
+    "Revalidate the release identity before decoding signing material": _revalidation_step(
+        "Revalidate the release identity before decoding signing material",
+        "android-signing-material",
+    ),
+    "Revalidate the release identity before publishing signed artifacts": _revalidation_step(
+        "Revalidate the release identity before publishing signed artifacts",
+        "android-signed-artifact-egress",
+    ),
+    "Revalidate the release identity before publishing signed release outputs": _revalidation_step(
+        "Revalidate the release identity before publishing signed release outputs",
+        "android-release-output-egress",
+    ),
+    "Revalidate the release identity before the attachment handoff": _revalidation_step(
+        "Revalidate the release identity before the attachment handoff",
+        "android-attachment-handoff",
+    ),
+}
+
+# The read-only job that revalidates the live tag, its commit and both tag
+# rulesets in the last moment before signing material exists on any runner. It
+# is a separate job so this entry check never shares a runner with candidate
+# code. The signed job performs its own later trusted checks with the workflow
+# token scoped only to those exact steps.
+EXPECTED_REVALIDATION_JOB: dict[str, Any] = {
+    "name": "Revalidate the release identity before signing",
+    "needs": CONSCRYPT_JOB,
+    "runs-on": "ubuntu-latest",
+    "timeout-minutes": "10",
+    "permissions": {"contents": "read"},
+    "steps": [
+        {
+            "name": "Check out the trusted controller revision",
+            "uses": CHECKOUT_ACTION,
+            "with": {
+                "ref": TRUSTED_REF,
+                "clean": "true",
+                "persist-credentials": "false",
+            },
+        },
+        {
+            "name": "Verify the live release identity and tag rulesets",
+            "env": {
+                "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+                "RELEASE_TAG": "${{ inputs.release_tag }}",
+                "SOURCE_SHA": "${{ inputs.source_sha }}",
+            },
+            "run": (
+                "set -euo pipefail\n"
+                'bash "$GITHUB_WORKSPACE/scripts/verify-release-identity.sh" \\\n'
+                '  --tag "$RELEASE_TAG" \\\n'
+                '  --commit "$SOURCE_SHA" \\\n'
+                "  --stage android-signing\n"
+            ),
+        },
+    ],
+}
+
+# The controller's admission job: the only place a dispatch payload becomes an
+# admitted (tag, commit) pair, and the only privileged job that runs before any
+# candidate code exists on a runner.
+EXPECTED_CONTROLLER_ADMIT_PERMISSIONS = {"contents": "read"}
+# The repository owner's numeric account id. `repository_dispatch` is available
+# to any token with repository write access, so this comparison — not a ruleset
+# field the lane cannot read — is what makes release initiation owner-only.
+# Numeric because a login can be renamed and the name reused.
+RELEASE_OWNER_ID = "265568982"
+EXPECTED_OWNER_GATE_STEP: dict[str, Any] = {
+    "name": "Require the release owner as dispatch sender",
+    "shell": "bash",
+    "env": {
+        "SENDER_ID": "${{ github.event.sender.id }}",
+        "OWNER_ID": RELEASE_OWNER_ID,
+    },
+    "run": (
+        "set -euo pipefail\n"
+        "if ! printf '%s' \"$SENDER_ID\" | grep -Eq '^[0-9]+$'; then\n"
+        '  echo "Refusing release: the dispatch carried no numeric sender id" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [ "$SENDER_ID" != "$OWNER_ID" ]; then\n'
+        '  echo "Refusing release: sender id ${SENDER_ID} is not the release owner" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        'echo "Dispatch sender is the release owner (${OWNER_ID})"\n'
+    ),
+}
+# Authorisation must never be derived from a mutable display name.
+LOGIN_AUTHORISATION_MARKERS = (
+    "github.actor",
+    "github.triggering_actor",
+    "github.event.sender.login",
+)
+EXPECTED_CONTROLLER_CALLERS: dict[str, dict[str, Any]] = {
+    "android": {
+        "uses": "./.github/workflows/release-android.yml",
+        "permissions": {"contents": "write"},
+    },
+    "bridge": {
+        "uses": "./.github/workflows/release-bridge.yml",
+        "permissions": {"contents": "write"},
+    },
+    "server": {
+        "uses": "./.github/workflows/release-server-image.yml",
+        "permissions": {
+            "contents": "write",
+            "packages": "write",
+            "id-token": "write",
+            "attestations": "write",
+        },
+    },
+    "readiness": {
+        "uses": "./.github/workflows/release-readiness.yml",
+        "permissions": {"contents": "read"},
+    },
+}
+EXPECTED_CALLER_INPUTS = {
+    "release_tag": "${{ needs.admit.outputs.tag }}",
+    "source_sha": "${{ needs.admit.outputs.commit }}",
+}
+EXPECTED_COMPONENT_INPUTS = {
+    "release_tag": {
+        "description": "The admitted immutable release tag.",
+        "required": "true",
+        "type": "string",
+    },
+    "source_sha": {
+        "description": "The admitted 40-hex source commit.",
+        "required": "true",
+        "type": "string",
+    },
+}
+
 EXPECTED_SECRET_STEP_SHA256 = {
     "Decode release keystore": "44c1231395b5f7347980a05fa641b0e7d866451e10ddb88958e61459f649ffba",
     "Build signed release APK and AAB": "e9e02db295ff745dfe2ead024747b996b246ddb2fc2cc0f195ed2244b1a86776",
@@ -90,8 +428,31 @@ EXPECTED_SECRET_STEP_SHA256 = {
         "69ded7eab4c4ff48deff2da950aacf8e627da05373ffa507f358fbcc986a7a6a"
     ),
 }
-EXPECTED_RELEASE_JOB_SHA256 = "e93b5f55523ad24dc208392f575a84b46e54576e5f2ab0921b61d68f13ff9a60"
-EXPECTED_CONSCRYPT_JOB_SHA256 = "ed27963320252615ff159bbc388c858fdc872516fc0ea2aa5f50d905f4a5063b"
+# Signing steps and the two reviewed plain-environment steps are the only steps
+# in the release job permitted to carry an environment at all.
+REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
+    **EXPECTED_RELEASE_STEP_ENVIRONMENTS,
+    **EXPECTED_RELEASE_PLAIN_STEP_ENVIRONMENTS,
+    **{name: step["env"] for name, step in EXPECTED_RELEASE_REVALIDATION_STEPS.items()},
+}
+# Covers the whole reviewed signing job: the explicit literal checks state the
+# intent, this digest makes any other edit to the job fail closed as well.
+EXPECTED_RELEASE_JOB_SHA256 = "2789fa4a1277514497c625a87e3c091894c47b797101b1d08fb320eaabf1a01c"
+# Same treatment for the one job that can write a release. It carries the write
+# credential, the attachment helper and the umbrella lock, so every byte of it
+# is reviewed.
+EXPECTED_ATTACHMENT_JOB_SHA256 = "1d58283e8697f63a21627dc6ea037e5d2d0e1de50d5c72d6c9eb8781599a2cca"
+EXPECTED_CONTROLLER_ADMIT_SHA256 = "6423d79810b64d292382c9bccab15a7b0ed342a6ff6e7272972502a868a3d958"
+# The helpers those jobs execute. Hashing the step is not enough: the step text
+# is stable while the file it runs is what reaches the network and the API.
+EXPECTED_IDENTITY_HELPER_SHA256 = "5782b71552a0e08c3d011cab58112bd5998d92e561cbf4c78875ca147248c9e9"
+EXPECTED_ATTACHMENT_HELPER_SHA256 = "4ca8ca30a843abbb8305bdd63a8e04541c8791cb4bc04e0c6006e7474e463ebf"
+EXPECTED_READINESS_HELPER_SHA256 = "c75ebfba772c4f7bd6559161f64df3127c9c390bf1e5a81e39236ba47cc6e26f"
+# The Conscrypt producer exists twice: unprivileged CI builds it from the
+# triggering ref, the release lane builds it from the admitted commit. Both are
+# pinned so neither can drift into an unreviewed native toolchain.
+EXPECTED_CI_CONSCRYPT_JOB_SHA256 = "ed27963320252615ff159bbc388c858fdc872516fc0ea2aa5f50d905f4a5063b"
+EXPECTED_RELEASE_CONSCRYPT_JOB_SHA256 = "e7d36401f4d350a09355af11917f22f1e66b7a466c87723b77aad77f978a455c"
 EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256 = (
     "0ee234f2ced343c4167bd1efad134a77853f288eb9c5210c1e1173594a014b8b"
 )
@@ -103,6 +464,16 @@ ALLOWED_RELEASE_JOB_KEYS = {
     "environment",
     "permissions",
     "defaults",
+    "steps",
+}
+ALLOWED_ATTACHMENT_JOB_KEYS = {
+    "name",
+    "needs",
+    "if",
+    "runs-on",
+    "permissions",
+    "concurrency",
+    "env",
     "steps",
 }
 ALLOWED_RELEASE_STEP_KEYS = {"name", "uses", "with", "run", "env", "if"}
@@ -255,11 +626,13 @@ def as_mapping(value: Any, label: str, violations: list[str]) -> dict[str, Any]:
     return value
 
 
-def trigger_paths(workflow: Mapping[str, Any], event: str) -> list[str]:
+def triggers(workflow: Mapping[str, Any]) -> dict[str, Any]:
     events = workflow.get("on")
-    if not isinstance(events, Mapping):
-        return []
-    config = events.get(event)
+    return events if isinstance(events, Mapping) else {}
+
+
+def trigger_paths(workflow: Mapping[str, Any], event: str) -> list[str]:
+    config = triggers(workflow).get(event)
     if not isinstance(config, Mapping):
         return []
     paths = config.get("paths")
@@ -268,8 +641,409 @@ def trigger_paths(workflow: Mapping[str, Any], event: str) -> list[str]:
     return [item for item in paths if isinstance(item, str)]
 
 
+def job_steps(job: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return []
+    return [step for step in steps if isinstance(step, Mapping)]
+
+
+def checkout_refs(job: Mapping[str, Any]) -> list[tuple[str | None, str]]:
+    """Every checkout in a job as (ref, path). `None` ref means the default."""
+
+    found: list[tuple[str | None, str]] = []
+    for step in job_steps(job):
+        uses = step.get("uses")
+        if not isinstance(uses, str) or not uses.startswith("actions/checkout@"):
+            continue
+        options = step.get("with") if isinstance(step.get("with"), Mapping) else {}
+        ref = options.get("ref")
+        path = options.get("path")
+        found.append((ref if isinstance(ref, str) else None, path if isinstance(path, str) else "."))
+    return found
+
+
+def trusted_helper_references(job: Mapping[str, Any]) -> list[str]:
+    """Every token in a job's run scripts that invokes a trusted helper."""
+
+    pattern = re.compile(r"[^\s'\"]*scripts/(?:" + "|".join(re.escape(h) for h in TRUSTED_HELPERS) + r")")
+    found: list[str] = []
+    for step in job_steps(job):
+        run = step.get("run")
+        if not isinstance(run, str):
+            continue
+        for token in pattern.findall(run):
+            # A command substitution keeps its `$(` in the matched token; the
+            # path being invoked is what matters, so strip it before checking.
+            found.append(token[2:] if token.startswith("$(") else token)
+    return found
+
+
+def check_trusted_helper_sources(
+    relative: Path, job_name: str, job: Mapping[str, Any], violations: list[str]
+) -> None:
+    """No control-plane job may run a helper out of the candidate checkout."""
+
+    references = trusted_helper_references(job)
+    if not references:
+        return
+    checkouts = checkout_refs(job)
+    trusted_paths = {path for ref, path in checkouts if ref == TRUSTED_REF}
+    candidate_paths = {path for ref, path in checkouts if ref is not None and ref != TRUSTED_REF}
+    if not trusted_paths:
+        violations.append(
+            f"{relative} job {job_name} runs {sorted(set(references))} without checking out the "
+            f"protected controller revision (ref: {TRUSTED_REF})"
+        )
+        return
+    if candidate_paths & trusted_paths:
+        violations.append(
+            f"{relative} job {job_name} checks the candidate and the controller out at the same "
+            "path, so a helper's source is ambiguous"
+        )
+        return
+
+    allowed: set[str] = set()
+    for helper in TRUSTED_HELPERS:
+        for path in trusted_paths:
+            if path in {".", ""}:
+                prefixes = ("", "./", "$GITHUB_WORKSPACE/", "${GITHUB_WORKSPACE}/")
+            else:
+                prefixes = (f"{path}/", f"./{path}/", f"$GITHUB_WORKSPACE/{path}/")
+            allowed |= {f"{prefix}scripts/{helper}" for prefix in prefixes}
+
+    for reference in references:
+        if reference not in allowed:
+            violations.append(
+                f"{relative} job {job_name} runs '{reference}', which is not inside a checkout of "
+                f"the protected controller revision ({sorted(trusted_paths)})"
+            )
+
+
+def check_control_plane(
+    loaded: Mapping[Path, dict[str, Any]], violations: list[str]
+) -> None:
+    """The release authority: where it is loaded from, and what it may reach."""
+
+    # 1. Nothing anywhere is triggered by a tag push. This is what makes "no
+    #    tag-sourced workflow code can obtain a privilege" a structural fact
+    #    rather than a per-job argument.
+    for relative, workflow in loaded.items():
+        push = triggers(workflow).get("push")
+        if isinstance(push, Mapping) and "tags" in push:
+            violations.append(
+                f"{relative} declares a tag-push trigger; release authority must come from the "
+                "protected default branch, never from a tag"
+            )
+        if "repository_dispatch" in triggers(workflow) and relative != CONTROLLER_WORKFLOW:
+            violations.append(f"{relative} must not define a second release control plane")
+
+    # 2. The controller is loaded from the default branch by construction, and
+    #    it is the only workflow that may be.
+    controller = loaded.get(CONTROLLER_WORKFLOW)
+    if controller is None:
+        violations.append(f"missing release controller: {CONTROLLER_WORKFLOW}")
+        return
+    controller_triggers = triggers(controller)
+    if set(controller_triggers) != {"repository_dispatch"}:
+        violations.append(
+            f"{CONTROLLER_WORKFLOW} must declare exactly one trigger, repository_dispatch"
+        )
+    dispatch = controller_triggers.get("repository_dispatch")
+    if not isinstance(dispatch, Mapping) or dispatch.get("types") != [DISPATCH_EVENT_TYPE]:
+        violations.append(
+            f"{CONTROLLER_WORKFLOW} must accept exactly the {DISPATCH_EVENT_TYPE} event type"
+        )
+    if controller.get("permissions") != {}:
+        violations.append(f"{CONTROLLER_WORKFLOW} must grant no default permissions")
+    outer = controller.get("concurrency")
+    if not isinstance(outer, Mapping) or outer.get("cancel-in-progress") != "false":
+        violations.append(
+            f"{CONTROLLER_WORKFLOW} must serialize releases without cancelling one in flight"
+        )
+
+    controller_jobs = as_mapping(controller.get("jobs"), f"{CONTROLLER_WORKFLOW} jobs", violations)
+    expected_jobs = {ADMISSION_JOB, *EXPECTED_CONTROLLER_CALLERS}
+    if set(controller_jobs) != expected_jobs:
+        violations.append(
+            f"{CONTROLLER_WORKFLOW} jobs must be exactly {sorted(expected_jobs)}"
+        )
+
+    admit = controller_jobs.get(ADMISSION_JOB)
+    if not isinstance(admit, Mapping):
+        violations.append(f"{CONTROLLER_WORKFLOW} must define the {ADMISSION_JOB} job")
+    else:
+        # Owner-only initiation, decided before a payload is parsed, before a
+        # candidate commit is named and before anything is checked out. It is a
+        # failing step rather than a job-level `if:` on purpose: a skipped job
+        # reports success, and a release that was refused must look refused.
+        admit_steps = job_steps(admit)
+        if not admit_steps or admit_steps[0] != EXPECTED_OWNER_GATE_STEP:
+            violations.append(
+                f"{ADMISSION_JOB} must begin with the exact reviewed owner-sender gate, "
+                f"comparing github.event.sender.id against {RELEASE_OWNER_ID}"
+            )
+        if "if" in admit:
+            violations.append(
+                f"{ADMISSION_JOB} must not gate itself with a job-level condition; a skipped "
+                "admission reports success"
+            )
+        for marker in LOGIN_AUTHORISATION_MARKERS:
+            if marker in "\n".join(strings(admit)):
+                violations.append(
+                    f"{ADMISSION_JOB} must not authorise by {marker}; a login can be renamed "
+                    "and reused, an account id cannot"
+                )
+        if admit.get("permissions") != EXPECTED_CONTROLLER_ADMIT_PERMISSIONS:
+            violations.append(f"{ADMISSION_JOB} must declare exactly contents: read")
+        if environment_name(admit) is not None:
+            violations.append(f"{ADMISSION_JOB} must not bind any deployment environment")
+        if signing_references(admit):
+            violations.append(f"{ADMISSION_JOB} must never reference Android signing secrets")
+        refs = checkout_refs(admit)
+        if refs != [(TRUSTED_REF, ".")]:
+            violations.append(
+                f"{ADMISSION_JOB} must check out exactly the protected controller revision"
+            )
+        if semantic_sha256(admit) != EXPECTED_CONTROLLER_ADMIT_SHA256:
+            violations.append(f"{ADMISSION_JOB} must match its exact reviewed digest")
+
+    # 3. The payload is data, never code: it may only ever reach a script
+    #    through the environment.
+    for job_name, job in controller_jobs.items():
+        if not isinstance(job, Mapping):
+            continue
+        for step in job_steps(job):
+            run = step.get("run")
+            if isinstance(run, str) and "client_payload" in run:
+                violations.append(
+                    f"{CONTROLLER_WORKFLOW} job {job_name} interpolates the dispatch payload into "
+                    "a script; it must be passed through the environment"
+                )
+
+    # 4. Each component lane is called from this protected revision, with the
+    #    admitted pair, under a declared permission ceiling, and with no secret
+    #    handed across the call boundary.
+    for job_name, expected in EXPECTED_CONTROLLER_CALLERS.items():
+        job = controller_jobs.get(job_name)
+        if not isinstance(job, Mapping):
+            violations.append(f"{CONTROLLER_WORKFLOW} must define the {job_name} lane")
+            continue
+        if job.get("uses") != expected["uses"]:
+            violations.append(
+                f"{CONTROLLER_WORKFLOW} job {job_name} must call {expected['uses']} from this "
+                "protected revision"
+            )
+        if job.get("permissions") != expected["permissions"]:
+            violations.append(
+                f"{CONTROLLER_WORKFLOW} job {job_name} must declare exactly "
+                f"{expected['permissions']}"
+            )
+        if job.get("with") != EXPECTED_CALLER_INPUTS:
+            violations.append(
+                f"{CONTROLLER_WORKFLOW} job {job_name} must pass exactly the admitted tag and commit"
+            )
+        if "secrets" in job:
+            violations.append(
+                f"{CONTROLLER_WORKFLOW} job {job_name} must not pass secrets across the call "
+                "boundary; environment secrets belong to the called job that binds the environment"
+            )
+        needs = job.get("needs")
+        needs = [needs] if isinstance(needs, str) else (needs or [])
+        if ADMISSION_JOB not in needs:
+            violations.append(f"{CONTROLLER_WORKFLOW} job {job_name} can run unadmitted")
+
+    readiness = controller_jobs.get("readiness")
+    if isinstance(readiness, Mapping):
+        needs = readiness.get("needs")
+        needs = [needs] if isinstance(needs, str) else (needs or [])
+        if set(needs) != {ADMISSION_JOB, "android", "bridge", "server"}:
+            violations.append(
+                f"{CONTROLLER_WORKFLOW} readiness must wait for every component lane"
+            )
+
+    # 5. Component workflows are reachable only by that call.
+    for relative in COMPONENT_WORKFLOWS:
+        workflow = loaded.get(relative)
+        if workflow is None:
+            violations.append(f"missing release component workflow: {relative}")
+            continue
+        component_triggers = triggers(workflow)
+        if set(component_triggers) != {"workflow_call"}:
+            violations.append(
+                f"{relative} must declare exactly one trigger, workflow_call; any other trigger "
+                "lets a selected ref supply its own definition of a privileged lane"
+            )
+        call = component_triggers.get("workflow_call")
+        declared = call.get("inputs") if isinstance(call, Mapping) else None
+        if declared != EXPECTED_COMPONENT_INPUTS:
+            violations.append(f"{relative} must accept exactly the admitted tag and commit")
+        if isinstance(call, Mapping) and "secrets" in call:
+            violations.append(f"{relative} must not declare callable secrets")
+        if workflow.get("permissions") != {}:
+            violations.append(f"{relative} must grant no default permissions")
+
+    # 5b. Anything a component lane calls in turn is on the release path too.
+    #     It may build the candidate, but it may not hold a write permission or
+    #     bind an environment, and it must be a local workflow so that it
+    #     resolves at this same protected revision.
+    for relative in COMPONENT_WORKFLOWS:
+        workflow = loaded.get(relative)
+        if workflow is None:
+            continue
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            if not isinstance(job, Mapping):
+                continue
+            called_ref = job.get("uses")
+            if not isinstance(called_ref, str):
+                continue
+            if not called_ref.startswith("./"):
+                violations.append(
+                    f"{relative} job {job_name} calls {called_ref}, which is not resolved at this "
+                    "protected revision"
+                )
+                continue
+            if not permissions_read_only(job.get("permissions")):
+                violations.append(
+                    f"{relative} job {job_name} delegates a build and must declare read-only "
+                    "permissions"
+                )
+            called = loaded.get(Path(called_ref[2:]))
+            if called is None:
+                violations.append(f"{relative} job {job_name} calls a missing workflow {called_ref}")
+                continue
+            if called.get("permissions") != {}:
+                violations.append(f"{called_ref} must grant no default permissions")
+            for sub_name, sub_job in (called.get("jobs") or {}).items():
+                if not isinstance(sub_job, Mapping):
+                    continue
+                if not permissions_read_only(sub_job.get("permissions")):
+                    violations.append(
+                        f"{called_ref} job {sub_name} is on the release path and must declare "
+                        "read-only permissions"
+                    )
+                if environment_name(sub_job) is not None:
+                    violations.append(
+                        f"{called_ref} job {sub_name} is on the release path and must not bind a "
+                        "deployment environment"
+                    )
+
+    # 5c. The registry alias write is the server lane's irreversible act, and
+    #     there are two of them. The identity check has to sit immediately
+    #     before the write itself — inside the helper that performs it — not
+    #     once at the top of the step, or the second alias is written on an
+    #     identity that was only confirmed before the first.
+    server = loaded.get(SERVER_WORKFLOW)
+    if server is not None:
+        publish = (server.get("jobs") or {}).get("publish-index")
+        merge = None
+        if isinstance(publish, Mapping):
+            for step in job_steps(publish):
+                if step.get("name") == ALIAS_MERGE_STEP:
+                    merge = step
+        if merge is None:
+            violations.append(f"{SERVER_WORKFLOW} must define the {ALIAS_MERGE_STEP!r} step")
+        else:
+            script = [line.strip() for line in str(merge.get("run", "")).splitlines()]
+            writes = [index for index, line in enumerate(script) if line.startswith(ALIAS_WRITE)]
+            if len(writes) != 1:
+                violations.append(
+                    f"{SERVER_WORKFLOW} must perform exactly one alias write, found {len(writes)}"
+                )
+            for index in writes:
+                if script[index - 1 : index] != [ALIAS_REVALIDATION]:
+                    violations.append(
+                        f"{SERVER_WORKFLOW} must run {ALIAS_REVALIDATION} immediately before "
+                        f"{ALIAS_WRITE}; found {script[index - 1: index]}"
+                    )
+            if ALIAS_REVALIDATION_HELPER not in str(merge.get("run", "")):
+                violations.append(
+                    f"{SERVER_WORKFLOW} must revalidate with the trusted verifier "
+                    f"({ALIAS_REVALIDATION_HELPER})"
+                )
+            if merge.get("env", {}).get("GITHUB_TOKEN") != WORKFLOW_TOKEN:
+                violations.append(
+                    f"{SERVER_WORKFLOW} {ALIAS_MERGE_STEP!r} needs the workflow token for its "
+                    "revalidation reads"
+                )
+
+    # 6. Trusted helpers execute from a checkout of this protected revision.
+    for relative in CONTROL_PLANE:
+        workflow = loaded.get(relative)
+        if workflow is None:
+            continue
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            if isinstance(job, Mapping):
+                check_trusted_helper_sources(relative, job_name, job, violations)
+
+    # 7. Outside the control plane, the release helpers may only be named by a
+    #    read-only job — a syntax check or a contract test, never a writer.
+    for relative, workflow in loaded.items():
+        if relative in CONTROL_PLANE:
+            continue
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            if not isinstance(job, Mapping):
+                continue
+            body = "\n".join(strings(job))
+            named = [
+                helper
+                for helper in (ATTACHMENT_HELPER.name, IDENTITY_HELPER.name, READINESS_HELPER.name)
+                if helper in body
+            ]
+            if named and not permissions_read_only(job.get("permissions")):
+                violations.append(
+                    f"{relative} job {job_name} names {sorted(named)} outside the release control "
+                    "plane while holding a write permission"
+                )
+
+    # 8. The umbrella lock is one repository-wide domain, declared identically by
+    #    all three attachment jobs.
+    attachment_owners = []
+    for relative in (ROOT_WORKFLOW, BRIDGE_WORKFLOW, SERVER_WORKFLOW):
+        workflow = loaded.get(relative)
+        if workflow is None:
+            continue
+        job = (workflow.get("jobs") or {}).get(ATTACHMENT_JOB)
+        if not isinstance(job, Mapping):
+            violations.append(f"{relative} must define the {ATTACHMENT_JOB} job")
+            continue
+        attachment_owners.append(relative)
+        if job.get("concurrency") != EXPECTED_RELEASE_CONCURRENCY:
+            violations.append(
+                f"{relative} {ATTACHMENT_JOB} must declare exactly the reviewed umbrella-release "
+                f"concurrency {EXPECTED_RELEASE_CONCURRENCY}"
+            )
+        if job.get("permissions") != {"contents": "write"}:
+            violations.append(f"{relative} {ATTACHMENT_JOB} permissions must be exactly contents: write")
+        if environment_name(job) is not None:
+            violations.append(f"{relative} {ATTACHMENT_JOB} must not bind a deployment environment")
+        if signing_references(job):
+            violations.append(
+                f"{relative} {ATTACHMENT_JOB} must never reference Android signing secrets; it "
+                "holds the release write credential"
+            )
+        if ATTACHMENT_HELPER.name not in "\n".join(strings(job)):
+            violations.append(f"{relative} {ATTACHMENT_JOB} must attach through {ATTACHMENT_HELPER}")
+    if len(attachment_owners) != 3:
+        violations.append("all three component lanes must own an umbrella attachment job")
+
+    # 9. Only the reviewed production lane may combine a manual trigger with a
+    #    protected environment; nothing else may bind server-production.
+    for relative, workflow in loaded.items():
+        for job_name, job in (workflow.get("jobs") or {}).items():
+            if not isinstance(job, Mapping):
+                continue
+            if environment_name(job) == PRODUCTION_ENVIRONMENT and relative != PRODUCTION_WORKFLOW:
+                violations.append(
+                    f"{relative} job {job_name} binds {PRODUCTION_ENVIRONMENT}, which belongs "
+                    f"exclusively to {PRODUCTION_WORKFLOW}"
+                )
+        if relative in CONTROL_PLANE and PRODUCTION_WORKFLOW.name in json.dumps(workflow):
+            violations.append(f"{relative} must not reference the hosted-production workflow")
+
+
 def check(root: Path) -> list[str]:
-    workflow_dir = root / ".github" / "workflows"
+    workflow_dir = root / WORKFLOW_DIR
     violations: list[str] = []
     root_path = root / ROOT_WORKFLOW
     sibling_path = root / ANDROID_SIBLING_WORKFLOW
@@ -321,6 +1095,8 @@ def check(root: Path) -> list[str]:
             if env and "${{" in env and not is_allowed:
                 violations.append(f"{relative} job {job_name} uses a dynamic environment outside {ALLOWED_JOB}")
 
+    check_control_plane(loaded, violations)
+
     root_workflow = loaded.get(ROOT_WORKFLOW)
     if root_workflow is None:
         return violations
@@ -333,11 +1109,20 @@ def check(root: Path) -> list[str]:
     if not isinstance(release, Mapping):
         violations.append(f"{ROOT_WORKFLOW} is missing mapping job {ALLOWED_JOB}")
         return violations
-    conscrypt_job = jobs.get("conscrypt-r28")
-    if not isinstance(conscrypt_job, Mapping):
-        violations.append(f"{ROOT_WORKFLOW} is missing mapping job conscrypt-r28")
-    elif semantic_sha256(conscrypt_job) != EXPECTED_CONSCRYPT_JOB_SHA256:
-        violations.append("conscrypt-r28 must match the exact reviewed producer specification")
+
+    # The Conscrypt producer, reviewed in both the release lane and CI.
+    for relative, job_digest in (
+        (ROOT_WORKFLOW, EXPECTED_RELEASE_CONSCRYPT_JOB_SHA256),
+        (ANDROID_CI_WORKFLOW, EXPECTED_CI_CONSCRYPT_JOB_SHA256),
+    ):
+        workflow = loaded.get(relative)
+        conscrypt_job = (workflow or {}).get("jobs", {}).get(CONSCRYPT_JOB)
+        if not isinstance(conscrypt_job, Mapping):
+            violations.append(f"{relative} is missing mapping job {CONSCRYPT_JOB}")
+        elif semantic_sha256(conscrypt_job) != job_digest:
+            violations.append(
+                f"{relative} {CONSCRYPT_JOB} must match the exact reviewed producer specification"
+            )
 
     conscrypt_script = root / CONSCRYPT_BUILD_SCRIPT
     if not conscrypt_script.is_file():
@@ -345,28 +1130,158 @@ def check(root: Path) -> list[str]:
     elif hashlib.sha256(conscrypt_script.read_bytes()).hexdigest() != EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256:
         violations.append(f"{CONSCRYPT_BUILD_SCRIPT} must match its exact reviewed digest")
 
-    top_permissions = root_workflow.get("permissions")
-    if top_permissions is not None and not permissions_read_only(top_permissions):
-        violations.append(f"{ROOT_WORKFLOW} must not grant dynamic or write permissions at workflow scope")
-    for inherited_key in ("defaults", "env"):
-        if inherited_key in root_workflow:
+    # The helpers this control plane executes. Their bytes are what actually
+    # admit a source commit, what writes a release asset, and what decides that
+    # a draft is complete.
+    for helper, expected_digest in (
+        (IDENTITY_HELPER, EXPECTED_IDENTITY_HELPER_SHA256),
+        (ATTACHMENT_HELPER, EXPECTED_ATTACHMENT_HELPER_SHA256),
+        (READINESS_HELPER, EXPECTED_READINESS_HELPER_SHA256),
+    ):
+        path = root / helper
+        if not path.is_file():
+            violations.append(f"{helper} is missing")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
+            violations.append(f"{helper} must match its exact reviewed digest")
+
+    revalidation = jobs.get(REVALIDATION_JOB)
+    if not isinstance(revalidation, Mapping):
+        violations.append(f"{ROOT_WORKFLOW} must define the {REVALIDATION_JOB} job")
+    elif revalidation != EXPECTED_REVALIDATION_JOB:
+        violations.append(
+            f"{REVALIDATION_JOB} must match the exact reviewed pre-signing revalidation job"
+        )
+
+    attachment = jobs.get(ATTACHMENT_JOB)
+    if not isinstance(attachment, Mapping):
+        violations.append(f"{ROOT_WORKFLOW} must define the {ATTACHMENT_JOB} job")
+    else:
+        unexpected_keys = set(attachment) - ALLOWED_ATTACHMENT_JOB_KEYS
+        if unexpected_keys:
             violations.append(
-                f"{ROOT_WORKFLOW} must not define workflow-level {inherited_key} that can alter {POLICY_JOB}"
+                f"{ATTACHMENT_JOB} has unreviewed job keys: {', '.join(sorted(unexpected_keys))}"
             )
+        if attachment.get("needs") != ALLOWED_JOB:
+            violations.append(f"{ATTACHMENT_JOB} must require a successful {ALLOWED_JOB}")
+        attachment_body = "\n".join(strings(attachment))
+        if "softprops/action-gh-release" in attachment_body:
+            violations.append(
+                f"{ATTACHMENT_JOB} must not use a marketplace release action; it can overwrite "
+                "assets on an already-published release"
+            )
+        if RELEASE_ASSET_ARTIFACT not in attachment_body:
+            violations.append(
+                f"{ATTACHMENT_JOB} must consume the closed release-asset artifact "
+                f"{RELEASE_ASSET_ARTIFACT}"
+            )
+        if "--expected-commit" not in attachment_body:
+            violations.append(
+                f"{ATTACHMENT_JOB} must bind the attachment to the admitted commit"
+            )
+        for target in action_uses(attachment):
+            if target.startswith("./"):
+                violations.append(f"{ATTACHMENT_JOB} must not invoke local actions")
+            elif unpinned_action(target):
+                violations.append(f"{ATTACHMENT_JOB} action {target} must be SHA-pinned")
+        if semantic_sha256(attachment) != EXPECTED_ATTACHMENT_JOB_SHA256:
+            violations.append(
+                f"{ATTACHMENT_JOB} must match the exact reviewed attachment-job specification"
+            )
+
+    # The load-bearing separation: nothing that can write a release may sit in a
+    # job that also holds signing material, in this workflow or any other.
+    for relative, workflow in loaded.items():
+        for job_name, raw_job in (workflow.get("jobs") or {}).items():
+            if not isinstance(raw_job, Mapping) or not signing_references(raw_job):
+                continue
+            scanned = dict(raw_job)
+            if relative == ROOT_WORKFLOW and job_name == ALLOWED_JOB:
+                # The reviewed revalidation steps legitimately carry the
+                # read-only workflow token. They are dropped from this sweep
+                # only when they are byte-identical to their reviewed literal;
+                # a step that merely borrows the name stays in it.
+                scanned["steps"] = [
+                    step
+                    for step in job_steps(raw_job)
+                    if EXPECTED_RELEASE_REVALIDATION_STEPS.get(str(step.get("name"))) != step
+                ]
+            body = "\n".join(strings(scanned))
+            reachable = [marker for marker in RELEASE_WRITE_MARKERS if marker in body]
+            if reachable:
+                violations.append(
+                    f"{relative} job {job_name} holds signing material and can also write a "
+                    f"release: {', '.join(sorted(reachable))}"
+                )
+            if not permissions_read_only(raw_job.get("permissions")):
+                violations.append(
+                    f"{relative} job {job_name} holds signing material and must declare "
+                    "read-only permissions"
+                )
+
+    for relative in (ROOT_WORKFLOW, ANDROID_CI_WORKFLOW):
+        workflow = loaded.get(relative)
+        if workflow is None:
+            continue
+        top_permissions = workflow.get("permissions")
+        if top_permissions is not None and not permissions_read_only(top_permissions):
+            if not (relative == ROOT_WORKFLOW and top_permissions == {}):
+                violations.append(
+                    f"{relative} must not grant dynamic or write permissions at workflow scope"
+                )
+        for inherited_key in ("defaults", "env"):
+            if inherited_key in workflow:
+                violations.append(
+                    f"{relative} must not define workflow-level {inherited_key} that can alter "
+                    f"{POLICY_JOB}"
+                )
 
     for job_name, raw_job in jobs.items():
         if not isinstance(raw_job, Mapping):
             continue
         permissions = raw_job.get("permissions")
-        if job_name == ALLOWED_JOB:
+        if job_name == ATTACHMENT_JOB:
             if permissions != {"contents": "write"}:
-                violations.append(f"{ALLOWED_JOB} permissions must be exactly contents: write")
+                violations.append(f"{ATTACHMENT_JOB} permissions must be exactly contents: write")
         elif permissions is None:
             violations.append(f"{ROOT_WORKFLOW} job {job_name} must declare explicit read-only permissions")
         elif not permissions_read_only(permissions):
             violations.append(
-                f"{ROOT_WORKFLOW} job {job_name} has dynamic or write permissions outside {ALLOWED_JOB}"
+                f"{ROOT_WORKFLOW} job {job_name} has dynamic or write permissions outside "
+                f"{ATTACHMENT_JOB}"
             )
+
+    # Unprivileged Android CI keeps the same policy gate and may hold nothing else.
+    ci_workflow = loaded.get(ANDROID_CI_WORKFLOW)
+    if ci_workflow is None:
+        violations.append(f"missing Android CI workflow: {ANDROID_CI_WORKFLOW}")
+    else:
+        ci_jobs = as_mapping(ci_workflow.get("jobs"), f"{ANDROID_CI_WORKFLOW} jobs", violations)
+        if ci_jobs.get(POLICY_JOB) != EXPECTED_CI_POLICY_JOB:
+            violations.append(
+                f"{ANDROID_CI_WORKFLOW} {POLICY_JOB} must match the exact fail-closed job specification"
+            )
+        for job_name, raw_job in ci_jobs.items():
+            if not isinstance(raw_job, Mapping):
+                continue
+            if not permissions_read_only(raw_job.get("permissions")):
+                violations.append(
+                    f"{ANDROID_CI_WORKFLOW} job {job_name} must declare read-only permissions"
+                )
+            if environment_name(raw_job) is not None:
+                violations.append(
+                    f"{ANDROID_CI_WORKFLOW} job {job_name} must not bind a deployment environment"
+                )
+        for event in ("push", "pull_request"):
+            paths = trigger_paths(ci_workflow, event)
+            missing_paths = REQUIRED_TRIGGER_PATHS - set(paths)
+            if missing_paths:
+                violations.append(
+                    f"{ANDROID_CI_WORKFLOW} {event}.paths is missing: {', '.join(sorted(missing_paths))}"
+                )
+            if any(path.startswith("!") for path in paths):
+                violations.append(
+                    f"{ANDROID_CI_WORKFLOW} {event}.paths must not contain negative patterns"
+                )
 
     if policy != EXPECTED_POLICY_JOB:
         violations.append(f"{POLICY_JOB} must match the exact fail-closed job specification")
@@ -374,11 +1289,83 @@ def check(root: Path) -> list[str]:
     missing_refs = SIGNING_SECRETS - signing_references(release)
     if missing_refs:
         violations.append(f"{ALLOWED_JOB} is missing signing references: {', '.join(sorted(missing_refs))}")
-    if release.get("if") != TAG_GUARD:
-        violations.append(f"{ALLOWED_JOB} must use the exact push-triggered version-tag guard")
-    if release.get("needs") != [POLICY_JOB, "conscrypt-r28"]:
+    if "if" in release:
         violations.append(
-            f"{ALLOWED_JOB} must require successful {POLICY_JOB} and conscrypt-r28"
+            f"{ALLOWED_JOB} must not carry an event guard; this lane is reachable only through "
+            "the protected controller"
+        )
+    if release.get("needs") != [POLICY_JOB, CONSCRYPT_JOB, REVALIDATION_JOB]:
+        violations.append(
+            f"{ALLOWED_JOB} must require successful {POLICY_JOB}, {CONSCRYPT_JOB} and "
+            f"{REVALIDATION_JOB}"
+        )
+    if release.get("permissions") != {"contents": "read"}:
+        violations.append(
+            f"{ALLOWED_JOB} permissions must be exactly contents: read; the release write "
+            f"belongs to {ATTACHMENT_JOB}"
+        )
+    release_steps_raw = release.get("steps")
+    checkout_steps = [
+        step
+        for step in (release_steps_raw if isinstance(release_steps_raw, list) else [])
+        if isinstance(step, Mapping) and str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    if checkout_steps != EXPECTED_RELEASE_CHECKOUTS:
+        violations.append(
+            f"{ALLOWED_JOB} must check out the admitted commit and then the trusted controller "
+            "revision, in that order, both with persist-credentials: false"
+        )
+
+    # Each irreversible boundary is guarded by the reviewed revalidation step
+    # that immediately precedes it. Immediately: an inserted step between the
+    # check and the act would reopen exactly the window this closes.
+    release_step_list = job_steps(release)
+    release_step_names = [str(step.get("name")) for step in release_step_list]
+    for guard_name, guarded_name in RELEASE_MUTATION_BOUNDARIES.items():
+        expected_step = EXPECTED_RELEASE_REVALIDATION_STEPS[guard_name]
+        matching = [step for step in release_step_list if step.get("name") == guard_name]
+        if len(matching) != 1 or matching[0] != expected_step:
+            violations.append(
+                f"{ALLOWED_JOB} must contain exactly one {guard_name!r} step matching its "
+                "reviewed trusted-revalidation literal"
+            )
+            continue
+        if guarded_name not in release_step_names:
+            violations.append(f"{ALLOWED_JOB} is missing the guarded step {guarded_name!r}")
+            continue
+        guard_index = release_step_names.index(guard_name)
+        if release_step_names[guard_index + 1 : guard_index + 2] != [guarded_name]:
+            violations.append(
+                f"{ALLOWED_JOB} must revalidate the release identity immediately before "
+                f"{guarded_name!r}; {guard_name!r} is followed by "
+                f"{release_step_names[guard_index + 1 : guard_index + 2]}"
+            )
+
+    # The workflow token is admissible only inside those reviewed steps. Any
+    # other appearance would put it in reach of candidate Gradle or a candidate
+    # script running beside the decoded keystore.
+    token_carriers = sorted(
+        str(step.get("name"))
+        for step in release_step_list
+        if WORKFLOW_TOKEN in "\n".join(strings(step))
+    )
+    if token_carriers != sorted(EXPECTED_RELEASE_REVALIDATION_STEPS):
+        violations.append(
+            f"{ALLOWED_JOB} may name the workflow token only in its reviewed revalidation "
+            f"steps; found it in {token_carriers}"
+        )
+    release_without_steps = {key: value for key, value in release.items() if key != "steps"}
+    if WORKFLOW_TOKEN in "\n".join(strings(release_without_steps)):
+        violations.append(f"{ALLOWED_JOB} must not carry the workflow token at job scope")
+
+    named_secrets = {
+        name for item in strings(release) for name in SECRET_REFERENCE.findall(item)
+    }
+    unreviewed_secrets = named_secrets - ALLOWED_RELEASE_SECRETS
+    if unreviewed_secrets:
+        violations.append(
+            f"{ALLOWED_JOB} must not carry any credential beyond the reviewed signing "
+            f"secrets: {', '.join(sorted(unreviewed_secrets))}"
         )
     if release.get("environment") != ENVIRONMENT_NAME:
         violations.append(f"{ALLOWED_JOB} must bind the {ENVIRONMENT_NAME} environment")
@@ -386,6 +1373,13 @@ def check(root: Path) -> list[str]:
         violations.append(f"{ALLOWED_JOB} must run exactly on GitHub-hosted ubuntu-latest")
     if release.get("defaults") != {"run": {"working-directory": "android"}}:
         violations.append(f"{ALLOWED_JOB} must use the exact Android working-directory defaults")
+    # The umbrella lock belongs on the attachment job. Leaving it here would put
+    # the signing job back in the shared write domain it no longer belongs to.
+    if "concurrency" in release:
+        violations.append(
+            f"{ALLOWED_JOB} must not declare concurrency; the umbrella lock belongs to "
+            f"{ATTACHMENT_JOB}"
+        )
     if semantic_sha256(release) != EXPECTED_RELEASE_JOB_SHA256:
         violations.append(f"{ALLOWED_JOB} must match the exact reviewed release-job specification")
     for forbidden_key in ("container", "services", "strategy", "env", "continue-on-error"):
@@ -426,11 +1420,12 @@ def check(root: Path) -> list[str]:
                         f"{ALLOWED_JOB} step {step_name!r} must not define {forbidden_key}"
                     )
             if "env" in step:
-                expected_env = EXPECTED_RELEASE_STEP_ENVIRONMENTS.get(str(step_name))
+                expected_env = REVIEWED_RELEASE_STEP_ENVIRONMENTS.get(str(step_name))
                 if step.get("env") != expected_env:
                     violations.append(
                         f"{ALLOWED_JOB} step {step_name!r} must use its exact reviewed environment"
                     )
+
         for step_name, expected_env in EXPECTED_RELEASE_STEP_ENVIRONMENTS.items():
             matching_steps = [
                 step
@@ -459,17 +1454,7 @@ def check(root: Path) -> list[str]:
                 f"{', '.join(sorted(refs_outside_reviewed_env))}"
             )
 
-    for event in ("push", "pull_request"):
-        paths = trigger_paths(root_workflow, event)
-        missing_paths = REQUIRED_TRIGGER_PATHS - set(paths)
-        if missing_paths:
-            violations.append(
-                f"{ROOT_WORKFLOW} {event}.paths is missing: {', '.join(sorted(missing_paths))}"
-            )
-        if any(path.startswith("!") for path in paths):
-            violations.append(f"{ROOT_WORKFLOW} {event}.paths must not contain negative patterns")
-
-    for relative in (ROOT_WORKFLOW, ANDROID_SIBLING_WORKFLOW):
+    for relative in (ROOT_WORKFLOW, ANDROID_CI_WORKFLOW, ANDROID_SIBLING_WORKFLOW):
         path = root / relative
         try:
             workflow = load_workflow(path)
@@ -489,12 +1474,12 @@ def main() -> int:
 
     violations = check(args.root.resolve())
     if violations:
-        print("Android signing boundary check failed:")
+        print("Release control-plane / Android signing boundary check failed:")
         for violation in sorted(set(violations)):
             print(f"- {violation}")
         return 1
 
-    print("Android signing boundary check passed")
+    print("Release control-plane and Android signing boundary check passed")
     return 0
 
 
