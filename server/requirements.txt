@@ -1,17 +1,28 @@
 #
-# Hash-locked runtime dependency set for the self-host server image.
+# Hash-locked runtime dependency set for the self-host server.
 #
 # Regenerate the pin list with:
 #     pip-compile --output-file=requirements.txt requirements.in/base.txt
 # then re-run scripts/lock-server-requirements.py to refresh the hashes.
 #
-# Every entry carries the sha256 of each distribution that CPython 3.12 on
-# linux/amd64 and linux/arm64 musl may select: the pure-Python wheel where one
-# exists, and the cp312/abi3 musllinux wheels for x86_64 and aarch64 otherwise.
-# No sdist hash is listed, so a build-from-source fallback cannot be selected
-# even if --only-binary were dropped. Dockerfile.server installs this file with
+# Three environments install this file and each may select a different wheel for
+# the same pin, so each one's exact bytes are recorded here:
+#
+#   musllinux x86_64   the linux/amd64 release image  (Alpine, CPython 3.12)
+#   musllinux aarch64  the linux/arm64 release image  (Alpine, CPython 3.12)
+#   manylinux x86_64   the glibc CI runner that lints and tests the server
+#
+# A pure-Python wheel serves all three and is recorded once. Listing the CI
+# wheel here does not widen the release image: pip's supported tags on musl
+# never include manylinux, so the Alpine build is structurally incapable of
+# selecting it, and the reverse holds on glibc. Nothing else is listed: no
+# sdist, no architecture beyond those three, no unportable `linux_*` wheel, and
+# no wheel CPython 3.12 could not select — a `cp3X-abi3` wheel carries an older
+# interpreter tag but is stable-ABI, so 3.12 selects it and it is recorded.
+# A build-from-source fallback therefore cannot be selected even if
+# --only-binary were dropped. Dockerfile.server installs this file with
 # --require-hashes --only-binary=:all:, so a byte that is not named here cannot
-# enter the release image.
+# enter the image.
 #
 aiofiles==25.1.0 \
     --hash=sha256:abe311e527c862958650f9438e859c1fa7568a141b22abcd015e120e86a85695
@@ -31,6 +42,7 @@ asgiref==3.11.1 \
     --hash=sha256:e8667a091e69529631969fd45dc268fa79b99c92c5fcdda727757e52146ec133
     # via django
 cffi==2.0.0 \
+    --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba \
     --hash=sha256:3925dd22fa2b7699ed2617149842d2e6adde22b262fcbfada50e3d195e4b3a94 \
     --hash=sha256:2c8f814d84194c9ea681642fd164267891702542f028a15fc97d4674b6206187
     # via pynacl
@@ -47,6 +59,7 @@ h11==0.16.0 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
     # via uvicorn
 httptools==0.8.0 \
+    --hash=sha256:b15fc622b0f869d19207c4089a501d9bcc63ca5e071ffdd2f03f922df882dcb2 \
     --hash=sha256:ef7c3c97f4311c7be57e2986629df89d49cb434dbff78eafcd48c2bff986b15a \
     --hash=sha256:a1afd7c9fbff0d9f5d489c4ce2768bd09c84a46ddefc7161e6aa82ae35c85745
     # via uvicorn
@@ -54,10 +67,12 @@ idna==3.18 \
     --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2
     # via anyio
 msgpack==1.2.1 \
+    --hash=sha256:020e881a764b20d8d7ca1a54fc01b8175519d108e3c3f194fddc200bda95951a \
     --hash=sha256:8b267ce94efb76fbd1b3373511420074ee3187f0f7811bf394531de13294735a \
     --hash=sha256:f02cf17a6ca1abe29b5f980644f7551f94d71f2011509b26d8625ce038f0df64
     # via -r requirements.in/base.txt
 psycopg2-binary==2.9.12 \
+    --hash=sha256:9fe06d93e72f1c048e731a2e3e7854a5bfaa58fc736068df90b352cefe66f03f \
     --hash=sha256:612b965daee295ae2da8f8218ce1d274645dc76ef3f1abf6a0a94fd57eff876d \
     --hash=sha256:7af18183109e23502c8b2ae7f6926c0882766f35b5175a4cd737ad825e4d7a1b
     # via -r requirements.in/base.txt
@@ -70,10 +85,14 @@ pydantic==2.13.4 \
     #   -r requirements.in/base.txt
     #   fastapi
 pydantic-core==2.46.4 \
+    --hash=sha256:926c9541b14b12b1681dca8a0b75feb510b06c6341b70a8e500c2fdcff837cce \
     --hash=sha256:b2f69dec1725e79a012d920df1707de5caf7ed5e08f3be4435e25803efc47458 \
     --hash=sha256:fbdb89b3e1c94a30cc5edfce477c6e6a5dc4d8f84665b455c27582f211a1c72c
     # via pydantic
 pynacl==1.6.2 \
+    --hash=sha256:22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4 \
+    --hash=sha256:8a66d6fb6ae7661c58995f9c6435bda2b1e68b54b598a6a10247bfcdadac996c \
+    --hash=sha256:c8a231e36ec2cab018c4ad4358c386e36eede0319a0c41fed24f840b1dac59f6 \
     --hash=sha256:68be3a09455743ff9505491220b64440ced8973fe930f270c8e07ccfa25b1f9e \
     --hash=sha256:8b097553b380236d51ed11356c953bf8ce36a29a3e596e934ecabe76c985a577
     # via -r requirements.in/base.txt
@@ -81,6 +100,7 @@ python-dotenv==1.2.2 \
     --hash=sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a
     # via uvicorn
 pyyaml==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
     --hash=sha256:8dc52c23056b9ddd46818a57b78404882310fb473d63f17b07d5c40421e47f8e \
     --hash=sha256:41715c910c881bc081f1e8872880d3c650acf13dfa8214bad49ed4cede7c34ea
     # via uvicorn
@@ -112,14 +132,17 @@ uvicorn[standard]==0.49.0 \
     --hash=sha256:ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f
     # via -r requirements.in/base.txt
 uvloop==0.22.1 \
+    --hash=sha256:7b5b1ac819a3f946d3b2ee07f09149578ae76066d70b44df3fa990add49a82e4 \
     --hash=sha256:e047cc068570bac9866237739607d1313b9253c3051ad84738cbb095be0537b2 \
     --hash=sha256:512fec6815e2dd45161054592441ef76c830eddaad55c8aa30952e6fe1ed07c0
     # via uvicorn
 watchfiles==1.2.0 \
+    --hash=sha256:e53a384f76b631c3ae5334ce6a52f0baa3a911eb94a4eac7f160079868b716d5 \
     --hash=sha256:2cb93af48550faf1cea04c303107c8b75833de7013e57ce27d3b8d21d8d0f58c \
     --hash=sha256:2995c176de7692b86a2e4c58d9ec718f753150a979cb4a754e2b4ffa38e70906
     # via uvicorn
 websockets==16.0 \
+    --hash=sha256:9b5aca38b67492ef518a8ab76851862488a478602229112c4b0d58d63a7a4d5c \
     --hash=sha256:a0b31e0b424cc6b5a04b8838bbaec1688834b2383256688cf47eb97412531da1 \
     --hash=sha256:485c49116d0af10ac698623c513c1cc01c9446c058a4e61e3bf6c19dff7335a2 \
     --hash=sha256:1637db62fad1dc833276dded54215f2c7fa46912301a24bd94d45d46a011ceec

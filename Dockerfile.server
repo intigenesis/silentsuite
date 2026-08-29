@@ -17,6 +17,12 @@ ENV PIP_NO_CACHE_DIR=1
 # consulted. --require-hashes pins the exact bytes of every distribution and
 # --only-binary=:all: forbids the sdist fallback that would reintroduce a
 # toolchain and mutable source resolution.
+#
+# server/requirements.txt also records the manylinux x86_64 hashes the glibc CI
+# runner needs. That cannot widen this build: pip's supported tags under musl
+# never include manylinux, so the only hashes reachable from here are the
+# musllinux and pure ones. tests/test_self_host_server_image_materials.py
+# resolves all three environments and asserts exactly that separation.
 COPY server/requirements.txt /requirements.txt
 RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r /requirements.txt
 

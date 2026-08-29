@@ -755,8 +755,13 @@ def test_ci_server_runs_the_contract_suite_and_shell_syntax_checks():
         assert script in syntax
     boundary = step_named(job, "Enforce the release control-plane boundary")["run"]
     assert "check-android-signing-boundary.py" in boundary
-    registry = step_named(job, "Verify the pinned base image against the live registry")
+    # The materials contract is deselected from the glob above and run once
+    # under the stricter env var instead; assert both halves so the exclusion
+    # can never silently drop its coverage.
+    assert "--ignore=tests/test_self_host_server_image_materials.py" in contract_tests
+    registry = step_named(job, "Verify the pinned base image and the hash lock against live indexes")
     assert registry["env"]["SILENTSUITE_REQUIRE_REGISTRY_CONTRACT"] == "1"
+    assert "tests/test_self_host_server_image_materials.py" in registry["run"]
 
 
 def test_ci_server_checks_the_effective_compose_configuration():

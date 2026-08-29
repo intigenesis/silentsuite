@@ -87,16 +87,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Set up Python 3.10
+      # 3.12, the same interpreter the release image runs and the same one both
+      # requirement files were compiled for. On 3.10 this job asked PyPI for a
+      # cp310 wheel, which the hash lock does not record and must not: the lock
+      # names the exact bytes of three environments, and a fourth would be an
+      # unreviewed one.
+      - name: Set up Python 3.12
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.10"
+          python-version: "3.12"
 
+      # This runner is glibc, so pip selects the reviewed manylinux x86_64 wheels
+      # from the same lock the Alpine image installs its musllinux ones from.
+      # The flags are explicit rather than implied: --require-hashes is what pip
+      # infers anyway once any hash is present, and stating it means a lock that
+      # lost its hashes fails here instead of silently resolving live.
       - name: Install dependencies
         working-directory: server
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --require-hashes --only-binary=:all: -r requirements.txt
           pip install -r requirements-dev.txt
 
       - name: Compile Python modules
@@ -140,7 +150,9 @@ jobs:
   self-host-contracts:
     name: Self-Host Release Contracts
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The materials contract resolves the hash lock three times against PyPI —
+    # once per install environment — on a cold runner cache.
+    timeout-minutes: 15
     permissions:
       contents: read
 
@@ -158,8 +170,17 @@ jobs:
       - name: Install contract test dependencies
         run: python -m pip install --disable-pip-version-check pytest PyYAML==6.0.3
 
+      # The materials contract is excluded here and run once below instead: it
+      # resolves the hash lock against PyPI three times, and the dedicated step
+      # runs it under the stricter contract that turns a network skip into a
+      # failure. Running it twice would only pay for those downloads twice.
       - name: Run self-host release contract tests
-        run: python -m pytest tests/test_self_host_*.py tests/test_umbrella_release_*.py tests/test_server_image_verifier.py -q
+        run: |
+          python -m pytest -q \
+            --ignore=tests/test_self_host_server_image_materials.py \
+            tests/test_self_host_*.py \
+            tests/test_umbrella_release_*.py \
+            tests/test_server_image_verifier.py
 
       - name: Verify the effective self-host Compose configuration
         run: scripts/self-host-compose-effective-check.sh
@@ -193,7 +214,10 @@ jobs:
       - name: Enforce the release control-plane boundary
         run: python scripts/check-android-signing-boundary.py
 
-      - name: Verify the pinned base image against the live registry
+      # Base image identity, and the three-environment hash lock resolved the
+      # way each environment's pip would. The env var turns "network was
+      # unavailable, so we skipped" into a failure.
+      - name: Verify the pinned base image and the hash lock against live indexes
         env:
           SILENTSUITE_REQUIRE_REGISTRY_CONTRACT: '1'
         run: python -m pytest tests/test_self_host_server_image_materials.py -q
