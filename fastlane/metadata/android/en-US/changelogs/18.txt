@@ -1,0 +1,1 @@
+Keeps SilentSuite release downloads and version information aligned across platforms.
