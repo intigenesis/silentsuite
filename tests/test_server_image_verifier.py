@@ -25,11 +25,26 @@ COMMIT = "b" * 40
 COMMIT_REFERENCE = f"selfhost-{COMMIT}"
 OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 
+# Distinctive enough that finding any of them in a recorded argv is unambiguous,
+# and shaped like the real thing: a login, a ghs_ workflow token, and a
+# base64url bearer with the dots a ghcr.io JWT carries.
+FIXTURE_USER = "fixture-actor"
+FIXTURE_PASSWORD = "ghs_fixturepassword0123456789"
+FIXTURE_BEARER = "eyJmaXh0dXJl.YmVhcmVy.dG9rZW4-value_0123"
+
 CURL_STUB = r'''#!/usr/bin/env python3
-"""Minimal ghcr.io stand-in: exact fixture bytes plus an honest digest header."""
+"""Minimal ghcr.io stand-in.
+
+Serves exact fixture bytes with an honest digest header, and — because a
+credential that reaches curl by argv is the defect under test — records the
+exact argv of every call plus, for any `--config` file, its mode, its parent's
+mode and its contents. The verifier's secrets must appear in the second set and
+never in the first.
+"""
 import hashlib
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,9 +54,96 @@ routes = json.loads((fixture / "routes.json").read_text())
 args = sys.argv[1:]
 parsed = urlparse(args[-1])
 
+
+def unescape(value):
+    """Reverse the escaping curl applies inside a double-quoted config value."""
+    out, index = [], 0
+    while index < len(value):
+        character = value[index]
+        if character == "\\" and index + 1 < len(value):
+            index += 1
+            out.append({"n": "\n", "r": "\r", "t": "\t", "v": "\v"}.get(value[index], value[index]))
+        else:
+            out.append(character)
+        index += 1
+    return "".join(out)
+
+
+def read_config(path):
+    """Return {option: value} from a curl config file."""
+    options = {}
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        option, _, raw = line.partition("=")
+        option, raw = option.strip(), raw.strip()
+        if raw.startswith('"') and raw.endswith('"'):
+            raw = unescape(raw[1:-1])
+        options.setdefault(option, []).append(raw)
+    return options
+
+
+configs = {}
+options = {}
+for index, argument in enumerate(args):
+    if argument in ("--config", "-K") and index + 1 < len(args):
+        path = Path(args[index + 1])
+        entry = {
+            "path": str(path),
+            "exists": path.exists(),
+            "mode": None,
+            "parent_mode": None,
+            "content": None,
+        }
+        if path.exists():
+            entry["mode"] = stat.S_IMODE(path.stat().st_mode)
+            entry["parent_mode"] = stat.S_IMODE(path.parent.stat().st_mode)
+            entry["content"] = path.read_text()
+            for option, values in read_config(path).items():
+                options.setdefault(option, []).extend(values)
+        configs[str(path)] = entry
+
+log = os.environ.get("VERIFIER_ARGV_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "argv": args,
+                    "url": args[-1],
+                    "path": parsed.path,
+                    "configs": configs,
+                    "config_options": options,
+                    "environ": {
+                        name: os.environ[name]
+                        for name in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD")
+                        if name in os.environ
+                    },
+                }
+            )
+            + "\n"
+        )
+
 if parsed.path == "/token":
-    print(json.dumps({"token": "fixture-token"}))
+    # ghcr.io issues an anonymous pull token only for a publicly readable
+    # package. For anything else it answers 403, and `curl -f` exits 22.
+    credentials = options.get("user", [":"])[0]
+    user, _, password = credentials.partition(":")
+    if not user or not password:
+        sys.stderr.write("curl: (22) The requested URL returned error: 403\n")
+        raise SystemExit(22)
+    print(json.dumps({"token": FIXTURE_BEARER}))
     raise SystemExit(0)
+
+# Every other route is authenticated by the minted bearer, which must arrive in
+# a config file rather than on the command line.
+if not any(
+    value.strip().lower() == "authorization: bearer " + FIXTURE_BEARER.lower()
+    for value in options.get("header", [])
+):
+    sys.stderr.write("curl: (22) The requested URL returned error: 401\n")
+    raise SystemExit(22)
 
 if "/blobs/" in parsed.path:
     digest = parsed.path.rsplit("/blobs/", 1)[1]
@@ -222,34 +324,44 @@ def _registry_fixture(
     registry.publish()
 
     curl = tmp_path / "curl"
-    curl.write_text(CURL_STUB, encoding="utf-8")
+    shebang, _, body = CURL_STUB.partition("\n")
+    curl.write_text(
+        f"{shebang}\nFIXTURE_BEARER = {FIXTURE_BEARER!r}\n{body}", encoding="utf-8"
+    )
     curl.chmod(0o755)
 
     return {
         "path": directory,
         "curl": curl,
+        "argv_log": tmp_path / "curl-argv.jsonl",
         "amd64_digest": children["amd64"]["digest"],
         "arm64_digest": children["arm64"]["digest"],
         "index_digest": index_digest,
     }
 
 
-def _run_verifier(fixture: dict) -> subprocess.CompletedProcess[str]:
+def _verifier_environment(fixture: dict, *, credentials: bool = True) -> dict:
     environment = dict(os.environ)
+    environment.pop("REGISTRY_USERNAME", None)
+    environment.pop("REGISTRY_PASSWORD", None)
     environment.update(
         {
             "PATH": f"{fixture['curl'].parent}:{environment['PATH']}",
             "VERIFIER_FIXTURE": str(fixture["path"]),
-            "REGISTRY_USERNAME": "fixture-user",
-            "REGISTRY_PASSWORD": "fixture-password",
         }
     )
-    return subprocess.run(
-        [
-            "bash",
-            str(VERIFIER),
-            "--repository",
-            REPOSITORY,
+    if credentials:
+        environment["REGISTRY_USERNAME"] = FIXTURE_USER
+        environment["REGISTRY_PASSWORD"] = FIXTURE_PASSWORD
+    environment["VERIFIER_ARGV_LOG"] = str(fixture["argv_log"])
+    return environment
+
+
+def _run_verifier(
+    fixture: dict, *, credentials: bool = True, arguments: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    if arguments is None:
+        arguments = [
             "--tag",
             TAG,
             "--commit",
@@ -258,9 +370,11 @@ def _run_verifier(fixture: dict) -> subprocess.CompletedProcess[str]:
             fixture["amd64_digest"],
             "--arm64-digest",
             fixture["arm64_digest"],
-        ],
+        ]
+    return subprocess.run(
+        ["bash", str(VERIFIER), "--repository", REPOSITORY, *arguments],
         cwd=ROOT,
-        env=environment,
+        env=_verifier_environment(fixture, credentials=credentials),
         capture_output=True,
         text=True,
     )
@@ -360,3 +474,319 @@ def test_the_verified_index_digest_is_the_hash_of_the_bytes_the_registry_served(
     assert result.returncode == 0, result.stderr
     assert _digest(served) == fixture["index_digest"]
     assert f"{REPOSITORY}@{fixture['index_digest']}" in result.stdout
+
+
+# ── Registry authentication ───────────────────────────────────────────
+#
+# The first real v0.5.4-beta release stopped here: `--resolve latest` ran with
+# no REGISTRY_USERNAME / REGISTRY_PASSWORD, asked ghcr.io/token anonymously and
+# was answered 403. These reproduce that against the stand-in registry, in both
+# the mode that failed and every other mode the release workflow uses.
+
+
+@pytest.mark.parametrize(
+    ("mode", "arguments"),
+    [
+        ("resolve", ["--resolve", "latest"]),
+        ("resolve-alias", ["--resolve", TAG]),
+        ("verify-tag", None),
+        (
+            "verify-reference",
+            ["--verify-reference", TAG, "--commit", COMMIT],
+        ),
+    ],
+)
+def test_every_verifier_mode_fails_closed_without_registry_credentials(
+    tmp_path: Path, mode: str, arguments
+):
+    """No credentials means no pull token, and no pull token means no release."""
+
+    fixture = _registry_fixture(tmp_path)
+    if arguments is not None and mode == "verify-reference":
+        arguments = arguments + [
+            "--amd64-digest",
+            fixture["amd64_digest"],
+            "--arm64-digest",
+            fixture["arm64_digest"],
+        ]
+
+    result = _run_verifier(fixture, credentials=False, arguments=arguments)
+
+    assert result.returncode != 0, f"{mode} continued without a registry token"
+    assert "could not obtain a registry pull token" in result.stderr
+    # Nothing is reported as verified, and no digest is emitted for a caller to
+    # mistake for a resolved reference.
+    assert "absent" not in result.stdout
+    assert "sha256:" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mode", "arguments"),
+    [
+        ("resolve", ["--resolve", "latest"]),
+        ("verify-tag", None),
+    ],
+)
+def test_the_same_modes_succeed_once_the_credentials_are_present(
+    tmp_path: Path, mode: str, arguments
+):
+    fixture = _registry_fixture(tmp_path)
+
+    result = _run_verifier(fixture, credentials=True, arguments=arguments)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_partial_credential_pair_is_not_treated_as_anonymous_success(tmp_path: Path):
+    """A username with no password must fail, not silently degrade."""
+
+    fixture = _registry_fixture(tmp_path)
+    environment = _verifier_environment(fixture, credentials=False)
+    environment["REGISTRY_USERNAME"] = "fixture-user"
+
+    result = subprocess.run(
+        ["bash", str(VERIFIER), "--repository", REPOSITORY, "--resolve", "latest"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "could not obtain a registry pull token" in result.stderr
+
+
+def test_the_credentials_never_appear_in_verifier_output(tmp_path: Path):
+    """Redaction is GitHub's job for the secret; the script must not help it leak."""
+
+    fixture = _registry_fixture(tmp_path)
+
+    result = _run_verifier(fixture)
+
+    assert result.returncode == 0, result.stderr
+    for secret in ("fixture-password", "fixture-user"):
+        assert secret not in result.stdout
+        assert secret not in result.stderr
+
+
+# ── Credentials never reach a command line ────────────────────────────
+#
+# `-u user:pass` and `-H "Authorization: Bearer …"` put the secret in the
+# child's argv, which every process on the runner can read out of
+# /proc/<pid>/cmdline. These run the real verifier against the stand-in curl,
+# which records the exact argv of every call, and assert the secrets are absent
+# from all of it — while proving they did reach curl, through a 0600 config
+# file inside a 0700 directory that no longer exists once the run ends.
+
+SECRETS = (FIXTURE_USER, FIXTURE_PASSWORD, FIXTURE_BEARER, f"{FIXTURE_USER}:{FIXTURE_PASSWORD}")
+
+
+def _calls(fixture: dict) -> list[dict]:
+    log = fixture["argv_log"]
+    assert log.exists(), "the stand-in curl recorded no call at all"
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+def _token_call(calls: list[dict]) -> dict:
+    matches = [call for call in calls if call["path"] == "/token"]
+    assert len(matches) == 1, f"expected one token call, got {len(matches)}"
+    return matches[0]
+
+
+def _registry_calls(calls: list[dict]) -> list[dict]:
+    return [call for call in calls if call["path"] != "/token"]
+
+
+def test_no_credential_value_appears_in_any_curl_argv(tmp_path: Path):
+    """The finding, stated as a property of every recorded invocation."""
+
+    fixture = _registry_fixture(tmp_path)
+    result = _run_verifier(fixture)
+    assert result.returncode == 0, result.stderr
+
+    calls = _calls(fixture)
+    assert len(calls) >= 4, "the fixture should cover token, index, children and configs"
+    for call in calls:
+        flat = "\x00".join(call["argv"])
+        for secret in SECRETS:
+            assert secret not in flat, f"{secret!r} reached argv of {call['url']}"
+        # Not even the option that would carry one.
+        assert "-u" not in call["argv"], call["argv"]
+        assert "--user" not in call["argv"], call["argv"]
+        assert not [
+            argument for argument in call["argv"] if argument.lower().startswith("authorization:")
+        ], call["argv"]
+        # The config path travels in argv too, so it must not encode a secret
+        # in its own name.
+        for path in call["configs"]:
+            assert Path(path).name in ("token.conf", "bearer.conf"), path
+
+
+def test_the_basic_pair_reaches_curl_through_a_protected_config_file(tmp_path: Path):
+    fixture = _registry_fixture(tmp_path)
+    assert _run_verifier(fixture).returncode == 0
+
+    call = _token_call(_calls(fixture))
+    assert "--config" in call["argv"]
+    (entry,) = list(call["configs"].values())
+    assert entry["exists"], "curl was pointed at a config file that was not there"
+    # 0600 for the file, 0700 for the directory holding it: never group- or
+    # world-readable at any point curl could read it.
+    assert entry["mode"] == 0o600, oct(entry["mode"])
+    assert entry["parent_mode"] == 0o700, oct(entry["parent_mode"])
+    # And it really is how the credentials travelled.
+    assert call["config_options"]["user"] == [f"{FIXTURE_USER}:{FIXTURE_PASSWORD}"]
+    assert FIXTURE_PASSWORD in entry["content"]
+
+
+def test_the_minted_bearer_reaches_curl_through_a_protected_config_file(tmp_path: Path):
+    fixture = _registry_fixture(tmp_path)
+    assert _run_verifier(fixture).returncode == 0
+
+    registry_calls = _registry_calls(_calls(fixture))
+    assert registry_calls, "no manifest or blob call was recorded"
+    for call in registry_calls:
+        assert "--config" in call["argv"], call["argv"]
+        (entry,) = list(call["configs"].values())
+        assert entry["mode"] == 0o600, oct(entry["mode"])
+        assert entry["parent_mode"] == 0o700, oct(entry["parent_mode"])
+        assert call["config_options"]["header"] == [f"Authorization: Bearer {FIXTURE_BEARER}"]
+
+
+def test_both_manifest_and_blob_calls_are_covered(tmp_path: Path):
+    """The blob fetch reads the image config; it authenticates the same way."""
+
+    fixture = _registry_fixture(tmp_path)
+    assert _run_verifier(fixture).returncode == 0
+
+    calls = _calls(fixture)
+    assert any("/manifests/" in call["path"] for call in calls)
+    assert any("/blobs/" in call["path"] for call in calls)
+
+
+def test_the_config_material_is_removed_when_the_run_finishes(tmp_path: Path):
+    fixture = _registry_fixture(tmp_path)
+    assert _run_verifier(fixture).returncode == 0
+
+    referenced = {
+        path for call in _calls(fixture) for path in call["configs"]
+    }
+    assert referenced, "no config file was ever referenced"
+    for path in referenced:
+        assert not Path(path).exists(), f"{path} outlived the run"
+        assert not Path(path).parent.exists(), f"{Path(path).parent} outlived the run"
+
+
+def test_the_config_material_is_removed_when_the_run_fails(tmp_path: Path):
+    """Failure is the path a leak would survive on, so it gets its own case."""
+
+    fixture = _registry_fixture(tmp_path, swap_child_bodies=True)
+    result = _run_verifier(fixture)
+    assert result.returncode != 0, "this fixture is supposed to be rejected"
+
+    referenced = {path for call in _calls(fixture) for path in call["configs"]}
+    assert referenced
+    for path in referenced:
+        assert not Path(path).exists(), f"{path} outlived a failed run"
+
+
+def test_the_token_config_is_dropped_once_the_bearer_exists(tmp_path: Path):
+    """The basic pair has one job; it does not linger for the whole run."""
+
+    fixture = _registry_fixture(tmp_path)
+    assert _run_verifier(fixture).returncode == 0
+
+    calls = _calls(fixture)
+    token_config = next(iter(_token_call(calls)["configs"]))
+    for call in _registry_calls(calls):
+        assert token_config not in call["configs"]
+        assert not any(
+            token_config == argument for argument in call["argv"]
+        ), "the registry calls still point at the basic-auth config"
+
+
+def test_the_registry_credentials_are_not_inherited_by_curl(tmp_path: Path):
+    """Unset after use, so no child process carries them in its environment."""
+
+    fixture = _registry_fixture(tmp_path)
+    assert _run_verifier(fixture).returncode == 0
+
+    for call in _calls(fixture):
+        assert call["environ"] == {}, f"{call['url']} inherited {sorted(call['environ'])}"
+
+
+def test_no_credential_value_appears_in_output_or_artifacts(tmp_path: Path):
+    fixture = _registry_fixture(tmp_path)
+    digest_file = tmp_path / "index.digest"
+    result = _run_verifier(
+        fixture,
+        arguments=[
+            "--tag",
+            TAG,
+            "--commit",
+            COMMIT,
+            "--amd64-digest",
+            fixture["amd64_digest"],
+            "--arm64-digest",
+            fixture["arm64_digest"],
+            "--index-digest-file",
+            str(digest_file),
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+
+    for secret in SECRETS:
+        assert secret not in result.stdout
+        assert secret not in result.stderr
+        assert secret not in digest_file.read_text(encoding="utf-8")
+
+
+def test_shell_tracing_does_not_publish_a_credential(tmp_path: Path):
+    """`bash -x` prints every expansion, including the ones that matter."""
+
+    fixture = _registry_fixture(tmp_path)
+    result = subprocess.run(
+        ["bash", "-x", str(VERIFIER), "--repository", REPOSITORY, "--resolve", TAG],
+        cwd=ROOT,
+        env=_verifier_environment(fixture),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    combined = result.stdout + result.stderr
+    assert "+ " in result.stderr, "the run was not actually traced"
+    for secret in SECRETS:
+        assert secret not in combined, f"{secret!r} appeared in a shell trace"
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "why"),
+    [
+        ("REGISTRY_PASSWORD", "good\nheader = \"X: y\"", "a newline could add a config line"),
+        ("REGISTRY_PASSWORD", 'quo"te', "a bare quote could end the value early"),
+        ("REGISTRY_PASSWORD", "back\\slash", "a backslash could escape the closing quote"),
+        ("REGISTRY_USERNAME", "space actor", "a login never contains a space"),
+        ("REGISTRY_USERNAME", "semi;colon", "a login never contains a semicolon"),
+    ],
+)
+def test_a_credential_that_could_break_out_of_the_config_is_refused(
+    tmp_path: Path, variable: str, value: str, why: str
+):
+    fixture = _registry_fixture(tmp_path)
+    environment = _verifier_environment(fixture)
+    environment[variable] = value
+
+    result = subprocess.run(
+        ["bash", str(VERIFIER), "--repository", REPOSITORY, "--resolve", TAG],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2, why
+    assert "will not hand to curl" in result.stderr
+    # The refusal never quotes the value back.
+    assert value not in result.stdout + result.stderr
+    assert not fixture["argv_log"].exists(), "curl was called before the value was checked"

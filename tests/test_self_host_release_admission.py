@@ -546,3 +546,196 @@ def test_staging_refuses_to_reuse_an_existing_directory(tmp_path: Path):
 
     assert result.returncode != 0
     assert "already exists" in result.stderr
+
+
+# ── Bridge artifact acquisition: the real mixed run ───────────────────
+#
+# Controller run 33269466888 held ten artifacts at once. The Bridge attachment
+# job's `actions/download-artifact` named none of them and matched no pattern,
+# so it took all ten; the staging helper refused a foreign file and the lane
+# attached nothing. These cases reproduce that run's artifact set and prove the
+# acquisition filter — not a change to the helper — is what fixes it.
+
+import fnmatch  # noqa: E402
+import re as _re  # noqa: E402
+
+import yaml as _yaml  # noqa: E402
+
+BRIDGE_WORKFLOW = ROOT / ".github" / "workflows" / "release-bridge.yml"
+BRIDGE_PATTERN = "silentsuite-bridge-*"
+
+# Artifact name -> the files that artifact contains, as the run produced them.
+# `merge-multiple: false` gives each artifact its own directory, so this is the
+# tree the staging helper is handed.
+REAL_RUN_ARTIFACTS: dict[str, dict[str, str]] = {
+    "silentsuite-bridge-linux-x86_64": {
+        "silentsuite-bridge-linux-x86_64": "linux-x86_64-binary\n",
+        "silentsuite-bridge-linux-x86_64.sha256": "aaa  silentsuite-bridge-linux-x86_64\n",
+    },
+    "silentsuite-bridge-linux-arm64": {
+        "silentsuite-bridge-linux-arm64": "linux-arm64-binary\n",
+        "silentsuite-bridge-linux-arm64.sha256": "bbb  silentsuite-bridge-linux-arm64\n",
+    },
+    "silentsuite-bridge-macos-x86_64": {
+        "silentsuite-bridge-macos-x86_64": "macos-x86_64-binary\n",
+        "silentsuite-bridge-macos-x86_64.sha256": "ccc  silentsuite-bridge-macos-x86_64\n",
+    },
+    "silentsuite-bridge-macos-arm64": {
+        "silentsuite-bridge-macos-arm64": "macos-arm64-binary\n",
+        "silentsuite-bridge-macos-arm64.sha256": "ddd  silentsuite-bridge-macos-arm64\n",
+    },
+    "silentsuite-bridge-windows-x86_64.exe": {
+        "silentsuite-bridge-windows-x86_64.exe": "windows-binary\n",
+        "silentsuite-bridge-windows-x86_64.exe.sha256": "eee  silentsuite-bridge-windows-x86_64.exe\n",
+    },
+    # Sibling lanes' artifacts, present in the same run.
+    "server-image-digest-amd64": {"amd64.digest": "sha256:" + "1" * 64 + "\n"},
+    "server-image-digest-arm64": {"arm64.digest": "sha256:" + "2" * 64 + "\n"},
+    # Buildx build records. The upstream file name is not asserted anywhere here;
+    # what matters is that a foreign artifact's contents reach staging at all.
+    "build-amd64-dockerbuild": {"Build and push linux (amd64).dockerbuild": "record\n"},
+    "build-arm64-dockerbuild": {"Build and push linux (arm64).dockerbuild": "record\n"},
+    "conscrypt-r28-abc123": {
+        "org/conscrypt/conscrypt-android/2.6.3-r28/conscrypt-android-2.6.3-r28.aar": "aar\n",
+    },
+}
+
+
+def workflow_expected_inventory() -> list[str]:
+    """The closed name set the attachment job asserts, read from the workflow."""
+
+    workflow = _yaml.safe_load(BRIDGE_WORKFLOW.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["attach-release-assets"]["steps"]
+    run = next(s for s in steps if s.get("name") == "Re-assert the closed asset inventory")["run"]
+    block = run.split("printf '%s\\n' \\", 1)[1].split("| LC_ALL=C sort)", 1)[0]
+    return sorted(_re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", block))
+
+
+def materialise(root: Path, artifacts: dict[str, dict[str, str]]) -> Path:
+    """Lay artifacts out the way download-artifact does with merge-multiple: false."""
+
+    source = root / "release-assets"
+    for artifact, files in artifacts.items():
+        for relative, content in files.items():
+            target = source / artifact / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+    return source
+
+
+def run_staging(source: Path, staging: Path):
+    return subprocess.run(
+        ["bash", str(STAGE), str(source), str(staging)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def filtered(artifacts: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+    return {
+        name: files
+        for name, files in artifacts.items()
+        if fnmatch.fnmatch(name, BRIDGE_PATTERN)
+    }
+
+
+def test_the_real_run_held_ten_artifacts_and_the_filter_admits_exactly_five():
+    assert len(REAL_RUN_ARTIFACTS) == 10
+    admitted = sorted(filtered(REAL_RUN_ARTIFACTS))
+    assert admitted == [
+        "silentsuite-bridge-linux-arm64",
+        "silentsuite-bridge-linux-x86_64",
+        "silentsuite-bridge-macos-arm64",
+        "silentsuite-bridge-macos-x86_64",
+        "silentsuite-bridge-windows-x86_64.exe",
+    ]
+    rejected = sorted(set(REAL_RUN_ARTIFACTS) - set(admitted))
+    assert rejected == [
+        "build-amd64-dockerbuild",
+        "build-arm64-dockerbuild",
+        "conscrypt-r28-abc123",
+        "server-image-digest-amd64",
+        "server-image-digest-arm64",
+    ]
+
+
+def test_the_unfiltered_acquisition_stops_the_lane_before_anything_is_attached(tmp_path: Path):
+    """The observed failure, reproduced: staging is handed foreign artifacts."""
+
+    source = materialise(tmp_path, REAL_RUN_ARTIFACTS)
+    staging = tmp_path / "flat"
+
+    result = run_staging(source, staging)
+
+    assert result.returncode != 0, "the helper accepted a run it should have refused"
+    assert not (staging / "SHA256SUMS.txt").exists(), "a manifest was built from foreign inputs"
+
+
+def test_the_filtered_acquisition_stages_exactly_the_closed_bridge_inventory(tmp_path: Path):
+    """With the pattern applied, only the five producers reach the helper."""
+
+    source = materialise(tmp_path, filtered(REAL_RUN_ARTIFACTS))
+    staging = tmp_path / "flat"
+
+    result = run_staging(source, staging)
+
+    assert result.returncode == 0, result.stderr
+    staged = sorted(entry.name for entry in staging.iterdir())
+    assert staged == workflow_expected_inventory()
+    assert len(staged) == 11, staged
+    # The manifest is the per-asset sidecars concatenated in C-locale order.
+    manifest = (staging / "SHA256SUMS.txt").read_text(encoding="utf-8")
+    sidecars = sorted(name for name in staged if name.endswith(".sha256"))
+    assert manifest == "".join(
+        (staging / name).read_text(encoding="utf-8") for name in sidecars
+    )
+
+
+def test_a_missing_bridge_producer_fails_the_closed_inventory(tmp_path: Path):
+    artifacts = filtered(REAL_RUN_ARTIFACTS)
+    del artifacts["silentsuite-bridge-macos-arm64"]
+    source = materialise(tmp_path, artifacts)
+    staging = tmp_path / "flat"
+
+    assert run_staging(source, staging).returncode == 0
+    staged = sorted(entry.name for entry in staging.iterdir())
+    assert staged != workflow_expected_inventory()
+    assert set(workflow_expected_inventory()) - set(staged) == {
+        "silentsuite-bridge-macos-arm64",
+        "silentsuite-bridge-macos-arm64.sha256",
+    }
+
+
+def test_a_duplicated_bridge_producer_is_refused_by_the_helper(tmp_path: Path):
+    """Two artifacts carrying one name must not silently overwrite each other."""
+
+    artifacts = dict(filtered(REAL_RUN_ARTIFACTS))
+    artifacts["silentsuite-bridge-linux-x86_64-rerun"] = {
+        "silentsuite-bridge-linux-x86_64": "a-different-binary\n",
+    }
+    source = materialise(tmp_path, artifacts)
+
+    result = run_staging(source, tmp_path / "flat")
+
+    assert result.returncode != 0
+    assert "both named" in result.stderr
+
+
+def test_an_unexpected_extra_bridge_asset_fails_the_closed_inventory(tmp_path: Path):
+    artifacts = dict(filtered(REAL_RUN_ARTIFACTS))
+    artifacts["silentsuite-bridge-freebsd-x86_64"] = {
+        "silentsuite-bridge-freebsd-x86_64": "unexpected\n",
+        "silentsuite-bridge-freebsd-x86_64.sha256": "fff  silentsuite-bridge-freebsd-x86_64\n",
+    }
+    source = materialise(tmp_path, artifacts)
+    staging = tmp_path / "flat"
+
+    # It matches the acquisition pattern, so the filter alone does not stop it;
+    # the closed inventory is what does.
+    assert fnmatch.fnmatch("silentsuite-bridge-freebsd-x86_64", BRIDGE_PATTERN)
+    assert run_staging(source, staging).returncode == 0
+    staged = sorted(entry.name for entry in staging.iterdir())
+    assert set(staged) - set(workflow_expected_inventory()) == {
+        "silentsuite-bridge-freebsd-x86_64",
+        "silentsuite-bridge-freebsd-x86_64.sha256",
+    }

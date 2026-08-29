@@ -20,6 +20,7 @@ boundaries fixed:
 from __future__ import annotations
 
 import re
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -508,6 +509,146 @@ def test_release_verifier_can_validate_an_existing_alias_identity():
     assert "verify_index_reference" in verifier
     assert "index children do not match the verified per-platform digests" in verifier
     assert "revision label is" in verifier
+
+
+# ── Registry verifier credentials ─────────────────────────────────────
+#
+# The verifier queries the GHCR API directly instead of going through the Docker
+# client, so `docker/login-action` does nothing for it. It mints its own pull
+# token from REGISTRY_USERNAME / REGISTRY_PASSWORD, and asks anonymously when
+# they are unset — which a package that is not publicly readable answers with
+# 403. Every step that runs it therefore needs exactly those two variables, and
+# no other step may carry them.
+
+REGISTRY_VERIFIER = "verify-server-image-release.sh"
+REGISTRY_CREDENTIALS = {
+    "REGISTRY_USERNAME": "${{ github.actor }}",
+    "REGISTRY_PASSWORD": "${{ secrets.GITHUB_TOKEN }}",
+}
+
+
+def verifier_steps(workflow: dict) -> list[tuple[str, dict]]:
+    """Every step whose script actually executes the registry verifier."""
+
+    found = []
+    for job_name, job in workflow["jobs"].items():
+        for step in steps(job):
+            if REGISTRY_VERIFIER in str(step.get("run", "")):
+                found.append((f"{job_name}/{step.get('name')}", step))
+    return found
+
+
+def test_every_registry_verifier_step_can_obtain_a_pull_token():
+    """The whole point: an uncredentialed call gets 403 and stops the release."""
+
+    found = verifier_steps(RELEASE)
+    # latest-before, alias resolve/verify, published-image verify, latest-after.
+    assert [name for name, _ in found] == [
+        "publish-index/Record the current latest reference",
+        "publish-index/Merge verified children into the release index",
+        "publish-index/Verify the published release image",
+        "publish-index/Assert latest was not moved",
+    ], found
+    for name, step in found:
+        env = step.get("env") or {}
+        for key, value in REGISTRY_CREDENTIALS.items():
+            assert env.get(key) == value, f"{name} is missing {key}={value}"
+
+
+def test_the_registry_credentials_are_scoped_to_those_steps_alone():
+    """Never job scope, never workflow scope, never a candidate step."""
+
+    for path in all_workflows():
+        workflow = load(path)
+        assert not set(REGISTRY_CREDENTIALS) & set(workflow.get("env") or {}), path.name
+        for job_name, job in workflow.get("jobs", {}).items():
+            assert not set(REGISTRY_CREDENTIALS) & set(job.get("env") or {}), (
+                f"{path.name}:{job_name} grants the registry credentials to every step"
+            )
+            for step in steps(job):
+                carried = set(REGISTRY_CREDENTIALS) & set(step.get("env") or {})
+                if not carried:
+                    continue
+                assert path == RELEASE_WORKFLOW, f"{path.name} must not carry {carried}"
+                assert REGISTRY_VERIFIER in str(step.get("run", "")), (
+                    f"{path.name}:{job_name}/{step.get('name')!r} carries {carried} "
+                    "without running the verifier"
+                )
+
+
+def test_the_workflow_never_writes_a_credential_into_a_step_script():
+    """Scope note: this covers the YAML only.
+
+    It proves the workflow hands the verifier its credentials through the step
+    environment rather than composing them into a shell command. It says
+    nothing about what the verifier then does with them — a script can receive
+    a secret by environment and still put it in a child's argv, which is
+    exactly the defect this file used to claim to have ruled out. The argv of
+    the processes the verifier actually spawns is proved in
+    tests/test_server_image_verifier.py, by recording it.
+    """
+
+    for job in RELEASE["jobs"].values():
+        for step in steps(job):
+            body = str(step.get("run", ""))
+            for key in REGISTRY_CREDENTIALS:
+                assert f"--{key.lower()}" not in body
+                assert f"{key}=" not in body, f"{key} must be inherited, not re-assigned"
+            assert "secrets.GITHUB_TOKEN" not in body, "a secret must reach a script by env"
+
+
+def test_the_verifier_hands_curl_its_credentials_through_config_files():
+    """Both credentials, and neither on a command line.
+
+    `-u user:pass` and `-H "Authorization: Bearer …"` publish the secret in the
+    child's argv for the life of the request. Both now travel in curl config
+    files instead. The behavioural proof — recorded argv, file mode, directory
+    mode, cleanup — is in tests/test_server_image_verifier.py; these are the
+    structural invariants that keep it that way.
+    """
+
+    verifier = (ROOT / "scripts" / REGISTRY_VERIFIER).read_text(encoding="utf-8")
+    # Comments name the removed forms in order to explain them, so the argv
+    # assertions below look at executable lines only.
+    code = "\n".join(
+        line for line in verifier.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    # The two argv forms that leaked are gone, including any spelling of them.
+    for leaking in ('-u "', "--user ", '-H "Authorization:', '--header "Authorization:'):
+        assert leaking not in code, f"{leaking!r} would place a secret in argv"
+
+    # Both credentials arrive by --config, from a private directory.
+    assert code.count('--config "$TOKEN_CONFIG"') == 1
+    assert code.count('--config "$BEARER_CONFIG"') == 2, "manifest and blob calls"
+    assert 'mkdir -m 700 "$CREDENTIAL_DIR"' in verifier
+    assert "umask 077" in verifier
+
+    # Removed on success, failure and the signals a cancelled job sends.
+    assert "trap cleanup_credentials EXIT" in verifier
+    assert "trap 'cleanup_credentials; trap - EXIT; exit 130' HUP INT QUIT TERM" in verifier
+
+    # Validated before use, and never inherited by an unrelated child.
+    assert "assert_credential_shape" in verifier
+    assert "unset REGISTRY_USERNAME REGISTRY_PASSWORD" in verifier
+
+    # It fails closed when no token can be minted rather than proceeding.
+    assert "could not obtain a registry pull token" in verifier
+    assert "set -euo pipefail" in verifier
+    # And it never echoes what it was given.
+    assert 'echo "$REGISTRY_PASSWORD' not in verifier
+    assert 'echo "$TOKEN' not in verifier
+
+
+def test_the_docker_login_is_not_what_authenticates_the_verifier():
+    """Documented so the next reader does not delete the env as redundant."""
+
+    names = step_names(RELEASE["jobs"]["publish-index"])
+    assert names.index("Record the current latest reference") < names.index(
+        "Login to GitHub Container Registry"
+    ), "the first verifier call precedes the Docker login, which cannot serve it"
+    source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "does nothing for it" in source
 
 
 def test_release_never_pushes_or_moves_latest():
@@ -1097,3 +1238,104 @@ def test_the_attachment_helper_revalidates_before_each_individual_write():
     assert lines[create - 1] == 'revalidate "before-create"'
     upload = lines.index('echo "  ${asset}: uploading"')
     assert lines[upload - 1] == 'revalidate "before-upload:${asset}"'
+
+
+# ── Artifact acquisition: each lane takes only its own producers ──────
+#
+# A controller run holds every component's artifacts at once. An acquisition
+# with no `name` and no `pattern` takes all of them, so the Bridge attachment
+# job downloaded the server's child digests, the Conscrypt AAR and Buildx's
+# `.dockerbuild` records alongside its five binaries. The staging helper refused
+# the first unexpected name — correctly — and the lane attached nothing.
+
+
+BRIDGE_PRODUCER_ARTIFACTS = (
+    "silentsuite-bridge-linux-x86_64",
+    "silentsuite-bridge-linux-arm64",
+    "silentsuite-bridge-macos-x86_64",
+    "silentsuite-bridge-macos-arm64",
+    "silentsuite-bridge-windows-x86_64.exe",
+)
+# Artifact names the same run really produced, from controller run 33269466888.
+FOREIGN_RUN_ARTIFACTS = (
+    "server-image-digest-amd64",
+    "server-image-digest-arm64",
+    "conscrypt-r28-${{ inputs.source_sha }}",
+    "silentsuite-android-release-assets-${{ inputs.source_sha }}",
+    "build-amd64-dockerbuild",
+    "build-arm64-dockerbuild",
+    "silentsuite-self-host-release-assets",
+    "android-tracker-scan-${{ inputs.source_sha }}",
+)
+BRIDGE_ACQUISITION_STEP = "Download the bridge producer artifacts"
+BRIDGE_ARTIFACT_PATTERN = "silentsuite-bridge-*"
+
+
+def download_steps(job: dict) -> list[dict]:
+    return [
+        step
+        for step in steps(job)
+        if str(step.get("uses", "")).startswith("actions/download-artifact@")
+    ]
+
+
+def test_the_bridge_attachment_downloads_only_its_own_producer_artifacts():
+    job = BRIDGE["jobs"]["attach-release-assets"]
+    acquisitions = download_steps(job)
+    assert len(acquisitions) == 1, "the bridge lane acquires artifacts exactly once"
+    step = step_named(job, BRIDGE_ACQUISITION_STEP)
+    assert step["with"]["pattern"] == BRIDGE_ARTIFACT_PATTERN
+    assert step["with"]["path"] == "release-assets/"
+    # No `name`: a single named artifact would take one platform, not five.
+    assert "name" not in step["with"]
+
+
+def test_the_bridge_acquisition_keeps_one_directory_per_artifact():
+    """`merge-multiple: false` is what preserves the staging helper's input shape.
+
+    The helper flattens one source tree into a closed set of names and refuses a
+    collision. Merging the artifacts before it runs would do that flattening
+    unchecked, outside the helper, and a duplicate would be silently overwritten.
+    """
+
+    step = step_named(BRIDGE["jobs"]["attach-release-assets"], BRIDGE_ACQUISITION_STEP)
+    assert step["with"]["merge-multiple"] == "false"
+
+
+def test_no_release_lane_acquires_artifacts_without_a_filter():
+    """The defect in run 33269466888, stated as a repository-wide rule."""
+
+    unfiltered = []
+    for path in (*CONTROL_PLANE, BRIDGE_BUILD_WORKFLOW):
+        for job_name, job in load(path).get("jobs", {}).items():
+            if not isinstance(job, dict):
+                continue
+            for step in download_steps(job):
+                options = step.get("with") or {}
+                if not options.get("name") and not options.get("pattern"):
+                    unfiltered.append(f"{path.name}:{job_name}: {step.get('name')}")
+    assert unfiltered == [], (
+        "these steps download every artifact in the run, including sibling lanes': "
+        f"{unfiltered}"
+    )
+
+
+@pytest.mark.parametrize("artifact", BRIDGE_PRODUCER_ARTIFACTS)
+def test_every_bridge_producer_artifact_matches_the_acquisition_pattern(artifact):
+    assert fnmatch(artifact, BRIDGE_ARTIFACT_PATTERN), artifact
+
+
+@pytest.mark.parametrize("artifact", FOREIGN_RUN_ARTIFACTS)
+def test_no_sibling_lane_artifact_matches_the_acquisition_pattern(artifact):
+    assert not fnmatch(artifact, BRIDGE_ARTIFACT_PATTERN), artifact
+
+
+def test_the_pattern_covers_exactly_the_five_matrix_producers():
+    """The uploaded names come from the build matrix, so compare against it."""
+
+    matrix = load(BRIDGE_BUILD_WORKFLOW)["jobs"]["build"]["strategy"]["matrix"]["include"]
+    produced = {entry["asset-name"] for entry in matrix}
+    assert produced == set(BRIDGE_PRODUCER_ARTIFACTS)
+    upload = step_named(load(BRIDGE_BUILD_WORKFLOW)["jobs"]["build"], "Upload artifact")
+    assert upload["with"]["name"] == "${{ matrix.asset-name }}"
+    assert {name for name in produced if fnmatch(name, BRIDGE_ARTIFACT_PATTERN)} == produced

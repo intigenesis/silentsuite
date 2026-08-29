@@ -36,6 +36,20 @@ set -euo pipefail
 #
 # Credentials: REGISTRY_USERNAME / REGISTRY_PASSWORD (a workflow GITHUB_TOKEN
 # with packages:read is enough). Never a production or VPS credential.
+#
+# No credential value is ever passed to curl on a command line. `-u user:pass`
+# and `-H "Authorization: Bearer …"` both place the secret in the child's argv,
+# which every process on the runner can read from /proc/<pid>/cmdline for as
+# long as the request lasts. Both are supplied through curl config files
+# instead: a 0600 file inside a 0700 private directory, written with a umask
+# that never lets the bytes exist group- or world-readable, removed on success,
+# failure and signal. `--netrc-file` would cover the basic pair but not the
+# bearer header, so one mechanism covers both rather than two half-measures.
+#
+# What that does and does not buy: argv is world-readable, a 0600 file is not.
+# Anything running as this user — or as root — can still read the file while it
+# exists, which is the same trust boundary the environment variables already sit
+# behind.
 
 REPOSITORY=""
 TAG=""
@@ -80,19 +94,129 @@ fi
 
 ACCEPT_TYPES='application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
 
-registry_token() {
-  curl -fsSL -u "${REGISTRY_USERNAME:-}:${REGISTRY_PASSWORD:-}" \
-    "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull" | jq -r '.token'
+# ── Credential handling ───────────────────────────────────────────────
+
+WORKDIR="$(mktemp -d)"
+CREDENTIAL_DIR="$WORKDIR/credentials"
+mkdir -m 700 "$CREDENTIAL_DIR"
+TOKEN_CONFIG="$CREDENTIAL_DIR/token.conf"
+BEARER_CONFIG="$CREDENTIAL_DIR/bearer.conf"
+
+# Installed before the first credential byte is written, and covering the
+# signals a cancelled workflow job actually sends, so no config file outlives
+# the run that created it.
+cleanup_credentials() {
+  rm -rf "$WORKDIR"
+}
+trap cleanup_credentials EXIT
+trap 'cleanup_credentials; trap - EXIT; exit 130' HUP INT QUIT TERM
+
+# Every character GitHub can put in an actor login, a workflow token or a
+# ghcr.io bearer. Validation is not the only defence — the writer escapes as
+# well — but it is the one that refuses a value carrying a newline, which is
+# the single character that could turn one config line into two.
+#
+# Matching happens with the bash regex operator rather than grep: grep is
+# line-oriented, so `^…$` would happily match each line of an injected value
+# separately, and it would also place the value in a child's argv.
+ACTOR_PATTERN='^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?(\[bot\])?$'
+SECRET_PATTERN='^[A-Za-z0-9._~+/=:-]+$'
+
+assert_credential_shape() {
+  local label="$1" value="$2" pattern="$3"
+  if [[ ! "$value" =~ $pattern ]]; then
+    echo "ERROR: ${label} contains characters this verifier will not hand to curl" >&2
+    echo "       (its value is not printed; expected only the characters GitHub" >&2
+    echo "        issues for an actor login, a workflow token or a pull token)" >&2
+    exit 2
+  fi
 }
 
-TOKEN="$(registry_token)"
-if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+# Write one curl config option whose value is a secret. The value is passed by
+# variable *name* and dereferenced inside, because bash expands a function
+# call's arguments before it traces them: passing the value itself would print
+# it under `set -x` no matter what the body does.
+#
+# The file is created inside the 0700 directory under a 0077 umask, so the bytes
+# are never momentarily group- or world-readable.
+write_curl_config() {
+  local path="$1" option="$2" variable="$3" xtrace="" value
+  case "$-" in
+    *x*) xtrace=1; set +x ;;
+  esac
+  value="${!variable}"
+  # Escape for a double-quoted curl config value: backslash first, then quote.
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  ( umask 077; : > "$path" )
+  printf '%s = "%s"\n' "$option" "$value" > "$path"
+  if [ -n "$xtrace" ]; then
+    set -x
+  fi
+}
+
+# ghcr.io issues an anonymous pull token only for a publicly readable package.
+# For anything else it answers 403, which `curl -f` reports as exit 22 — and
+# under `set -e` that used to abort the script before the diagnostic below could
+# run, leaving a bare "curl: (22)" as the only explanation. The failure is
+# reported here instead, so a caller that forgot the credentials is told so.
+registry_token() {
+  local response
+  if ! response="$(curl -fsSL --config "$TOKEN_CONFIG" \
+      "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull" 2>/dev/null)"; then
+    return 1
+  fi
+  printf '%s' "$response" | jq -r '.token // empty'
+}
+
+# Everything that touches a credential value runs with tracing suspended, and
+# the region is deliberately wider than the writes themselves: `set -x` prints
+# an assignment together with the value assigned, so `TOKEN="$(registry_token)"`
+# would publish the bearer to stderr on its own. Tracing resumes immediately
+# afterwards — the curl calls below carry no secret in argv, so they stay
+# visible to anyone debugging a release.
+CREDENTIAL_XTRACE=""
+case "$-" in
+  *x*) CREDENTIAL_XTRACE=1; set +x ;;
+esac
+
+# An empty pair is still written, so the request shape is exactly what it was
+# when this was `-u ":"`: ghcr.io answers a genuinely anonymous read only for a
+# publicly readable package, and the diagnostic below depends on that 403.
+if [ -n "${REGISTRY_USERNAME:-}" ]; then
+  assert_credential_shape REGISTRY_USERNAME "$REGISTRY_USERNAME" "$ACTOR_PATTERN"
+fi
+if [ -n "${REGISTRY_PASSWORD:-}" ]; then
+  assert_credential_shape REGISTRY_PASSWORD "$REGISTRY_PASSWORD" "$SECRET_PATTERN"
+fi
+CURL_BASIC_PAIR="${REGISTRY_USERNAME:-}:${REGISTRY_PASSWORD:-}"
+write_curl_config "$TOKEN_CONFIG" user CURL_BASIC_PAIR
+unset CURL_BASIC_PAIR
+
+# Past this point nothing in this process needs them, so no child — curl, jq,
+# sha256sum, awk — inherits them either.
+unset REGISTRY_USERNAME REGISTRY_PASSWORD
+
+TOKEN=""
+if ! TOKEN="$(registry_token)" || [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
   echo "ERROR: could not obtain a registry pull token for ${IMAGE_PATH}" >&2
+  echo "       Set REGISTRY_USERNAME and REGISTRY_PASSWORD; a workflow" >&2
+  echo "       GITHUB_TOKEN with packages:read is enough. An anonymous read" >&2
+  echo "       succeeds only for a publicly readable package." >&2
   exit 1
 fi
 
-WORKDIR="$(mktemp -d)"
-trap 'rm -rf "$WORKDIR"' EXIT
+assert_credential_shape "the minted registry pull token" "$TOKEN" "$SECRET_PATTERN"
+CURL_BEARER_HEADER="Authorization: Bearer $TOKEN"
+write_curl_config "$BEARER_CONFIG" header CURL_BEARER_HEADER
+# The basic pair has done its one job; the bearer lives in its file from here.
+unset CURL_BEARER_HEADER
+TOKEN=""
+rm -f "$TOKEN_CONFIG"
+
+if [ -n "$CREDENTIAL_XTRACE" ]; then
+  set -x
+fi
 
 # Fetch a manifest by reference. Writes the body to $2, sets MANIFEST_DIGEST to
 # the SHA-256 of the exact bytes received and MANIFEST_BYTES to their exact
@@ -114,7 +238,7 @@ fetch_manifest() {
   MANIFEST_BYTES=""
   : > "$body"
   status="$(curl -sS -o "$body" -D "$headers" -w '%{http_code}' \
-    -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT_TYPES" \
+    --config "$BEARER_CONFIG" -H "Accept: $ACCEPT_TYPES" \
     "https://ghcr.io/v2/${IMAGE_PATH}/manifests/${reference}")"
   case "$status" in
     200) ;;
@@ -146,7 +270,7 @@ fetch_manifest() {
 }
 
 fetch_blob() {
-  curl -fsSL -H "Authorization: Bearer $TOKEN" \
+  curl -fsSL --config "$BEARER_CONFIG" \
     "https://ghcr.io/v2/${IMAGE_PATH}/blobs/$1"
 }
 
