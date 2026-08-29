@@ -102,7 +102,10 @@ def test_an_immutable_tag_on_protected_main_is_verified(stub, tmp_path: Path):
     # bypass_actors is not served without administration:read, and the verifier
     # says so rather than pretending it checked.
     assert "bypass-actors=unobservable" in recorded
-    assert "not served to this reader" in result.stdout
+    # The run must say it did not prove this, not merely that it could not read it.
+    assert "UNOBSERVABLE — not proven by this run." in result.stdout
+    assert "Owner-only release authority comes" in result.stdout
+    assert "verified exactly" not in result.stdout
 
 
 def test_an_annotated_tag_is_dereferenced_to_its_commit(stub):

@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKER = ROOT / "scripts" / "check-android-signing-boundary.py"
@@ -36,6 +38,17 @@ RELEASE_CHECKOUT = (
     "          ref: ${{ inputs.source_sha }}\n"
     "          persist-credentials: false\n"
 )
+TRUSTED_CHECKOUT = (
+    "      # Second, and into its own directory: the candidate checkout above cleans\n"
+    "      # the workspace root, so the trusted verifier has to land after it and\n"
+    "      # outside it. Nothing in the Android build reads from this path.\n"
+    "      - name: Check out the trusted controller revision\n"
+    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+    "        with:\n"
+    "          ref: ${{ github.sha }}\n"
+    "          path: .release-trusted\n"
+    "          persist-credentials: false\n"
+)
 RELEASE_JOB_HEAD = (
     "    defaults:\n"
     "      run:\n"
@@ -43,6 +56,8 @@ RELEASE_JOB_HEAD = (
     "\n"
     "    steps:\n"
     + RELEASE_CHECKOUT
+    + "\n"
+    + TRUSTED_CHECKOUT
     + "\n"
     "      - name: Set up JDK 17\n"
 )
@@ -1243,7 +1258,8 @@ def test_persisting_the_checkout_credential_in_the_signing_job_is_rejected(tmp_p
     )
     assert_rejected(
         run_checker(root),
-        "build-release must check out the admitted commit exactly once with persist-credentials: false",
+        "build-release must check out the admitted commit and then the trusted controller "
+        "revision, in that order, both with persist-credentials: false",
     )
 
 
@@ -1256,7 +1272,8 @@ def test_checking_out_a_floating_ref_in_the_signing_job_is_rejected(tmp_path: Pa
     )
     assert_rejected(
         run_checker(root),
-        "build-release must check out the admitted commit exactly once with persist-credentials: false",
+        "build-release must check out the admitted commit and then the trusted controller "
+        "revision, in that order, both with persist-credentials: false",
     )
 
 
@@ -1532,3 +1549,311 @@ def test_a_tag_trigger_on_the_delegated_bridge_build_is_rejected(tmp_path: Path)
         "on:\n  push:\n    tags:\n      - 'v*'\n  workflow_call:\n",
     )
     assert_rejected(run_checker(root), "declares a tag-push trigger")
+
+
+# ── Owner-only release initiation ─────────────────────────────────────
+
+
+OWNER_GATE = """      - name: Require the release owner as dispatch sender
+        shell: bash
+        env:
+          SENDER_ID: ${{ github.event.sender.id }}
+          OWNER_ID: '265568982'
+"""
+
+
+def test_removing_the_owner_sender_gate_is_rejected(tmp_path: Path) -> None:
+    """Without it, any write collaborator could start a release."""
+
+    root = fixture_root(tmp_path)
+    workflow = root / CONTROLLER
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index(OWNER_GATE)
+    end = text.index("      - name: Check out the protected controller revision", start)
+    workflow.write_text(text[:start] + text[end:], encoding="utf-8")
+    assert_rejected(run_checker(root), "must begin with the exact reviewed owner-sender gate")
+
+
+def test_changing_the_owner_account_id_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(root / CONTROLLER, "OWNER_ID: '265568982'", "OWNER_ID: '999999999'")
+    assert_rejected(run_checker(root), "must begin with the exact reviewed owner-sender gate")
+
+
+def test_authorising_by_actor_login_instead_of_account_id_is_rejected(tmp_path: Path) -> None:
+    """A login can be renamed and the freed name re-registered."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "          SENDER_ID: ${{ github.event.sender.id }}\n",
+        "          SENDER_ID: ${{ github.actor }}\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must not authorise by github.actor" in result.stdout
+    assert "must begin with the exact reviewed owner-sender gate" in result.stdout
+
+
+def test_moving_the_owner_gate_after_the_payload_is_read_is_rejected(tmp_path: Path) -> None:
+    """A gate that runs after the payload has already consumed attacker input."""
+
+    root = fixture_root(tmp_path)
+    workflow = root / CONTROLLER
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index(OWNER_GATE)
+    end = text.index("      - name: Check out the protected controller revision", start)
+    gate = text[start:end]
+    text = text[:start] + text[end:]
+    anchor = "      - name: Verify the live release identity and tag rulesets\n"
+    workflow.write_text(text.replace(anchor, gate + anchor, 1), encoding="utf-8")
+    assert_rejected(run_checker(root), "must begin with the exact reviewed owner-sender gate")
+
+
+def test_turning_the_owner_gate_into_a_skipping_job_condition_is_rejected(tmp_path: Path) -> None:
+    """A skipped admission job reports success; a refused release must fail."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "  admit:\n    name: Admit the release source\n",
+        "  admit:\n    name: Admit the release source\n"
+        "    if: github.event.sender.id == 265568982\n",
+    )
+    assert_rejected(run_checker(root), "must not gate itself with a job-level condition")
+
+
+# ── Revalidation immediately before each irreversible act ─────────────
+
+
+ANDROID_GUARDS = {
+    "Revalidate the release identity before decoding signing material": "Decode release keystore",
+    "Revalidate the release identity before publishing signed artifacts": (
+        "Upload signed tracker verification evidence"
+    ),
+    "Revalidate the release identity before the attachment handoff": (
+        "Publish the closed release-asset set to the attachment job"
+    ),
+}
+
+
+def guard_block(text: str, guard: str) -> str:
+    start = text.index(f"      - name: {guard}\n")
+    end = text.index("      - name: ", start + 10)
+    return text[start:end]
+
+
+@pytest.mark.parametrize("guard", sorted(ANDROID_GUARDS), ids=lambda value: value[-24:])
+def test_removing_an_android_revalidation_is_rejected(tmp_path: Path, guard: str) -> None:
+    root = fixture_root(tmp_path)
+    workflow = root / ROOT_WORKFLOW
+    text = workflow.read_text(encoding="utf-8")
+    workflow.write_text(text.replace(guard_block(text, guard), "", 1), encoding="utf-8")
+    assert_rejected(
+        run_checker(root),
+        f"must contain exactly one {guard!r} step matching its reviewed "
+        "trusted-revalidation literal",
+    )
+
+
+@pytest.mark.parametrize("guard", sorted(ANDROID_GUARDS), ids=lambda value: value[-24:])
+def test_separating_a_revalidation_from_the_step_it_guards_is_rejected(
+    tmp_path: Path, guard: str
+) -> None:
+    """The check must be immediately before the act, not merely somewhere above."""
+
+    root = fixture_root(tmp_path)
+    workflow = root / ROOT_WORKFLOW
+    text = workflow.read_text(encoding="utf-8")
+    guarded = ANDROID_GUARDS[guard]
+    intruder = "      - name: Slip something in between\n        run: echo drift\n\n"
+    workflow.write_text(
+        text.replace(f"      - name: {guarded}\n", intruder + f"      - name: {guarded}\n", 1),
+        encoding="utf-8",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must revalidate the release identity immediately before" in result.stdout
+    assert guarded in result.stdout
+
+
+def test_pointing_a_revalidation_at_the_candidate_tree_is_rejected(tmp_path: Path) -> None:
+    """The candidate must not supply the code that admits it."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        '          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \\\n'
+        '            --tag "$RELEASE_TAG" \\\n'
+        '            --commit "$SOURCE_SHA" \\\n'
+        "            --stage android-signing-material\n",
+        '          bash "$GITHUB_WORKSPACE/scripts/verify-release-identity.sh" \\\n'
+        '            --tag "$RELEASE_TAG" \\\n'
+        '            --commit "$SOURCE_SHA" \\\n'
+        "            --stage android-signing-material\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "matching its reviewed trusted-revalidation literal" in result.stdout
+
+
+def test_removing_the_trusted_checkout_from_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Check out the trusted controller revision\n"
+        "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+        "        with:\n"
+        "          ref: ${{ github.sha }}\n"
+        "          path: .release-trusted\n"
+        "          persist-credentials: false\n\n",
+        "",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must check out the admitted commit and then the trusted controller revision" in result.stdout
+
+
+def test_checking_the_trusted_copy_out_before_the_candidate_is_rejected(tmp_path: Path) -> None:
+    """The candidate checkout cleans the workspace root; order is load-bearing."""
+
+    root = fixture_root(tmp_path)
+    workflow = root / ROOT_WORKFLOW
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index(RELEASE_CHECKOUT)
+    end = text.index("      - name: Set up JDK 17", start)
+    workflow.write_text(
+        text[:start] + TRUSTED_CHECKOUT + "\n" + RELEASE_CHECKOUT + "\n" + text[end:],
+        encoding="utf-8",
+    )
+    assert_rejected(
+        run_checker(root),
+        "must check out the admitted commit and then the trusted controller revision",
+    )
+
+
+def test_handing_the_workflow_token_to_candidate_gradle_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Build signed release APK and AAB\n        env:\n",
+        "      - name: Build signed release APK and AAB\n        env:\n"
+        "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "may name the workflow token only in its reviewed revalidation steps" in result.stdout
+    assert "holds signing material and can also write a release" in result.stdout
+
+
+def test_a_token_at_signing_job_scope_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "    environment: android-release\n    permissions:\n      contents: read\n",
+        "    environment: android-release\n    permissions:\n      contents: read\n"
+        "    env:\n      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must not define job-level env" in result.stdout
+
+
+def test_a_step_that_only_borrows_a_revalidation_name_is_still_swept(tmp_path: Path) -> None:
+    """The token carve-out applies to byte-identical reviewed steps only."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "            --stage android-signing-material\n",
+        "            --stage android-signing-material\n"
+        '          curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/x\n',
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "holds signing material and can also write a release" in result.stdout
+    assert "matching its reviewed trusted-revalidation literal" in result.stdout
+
+
+# ── Server registry alias writes ──────────────────────────────────────
+
+
+def test_removing_the_per_alias_revalidation_is_rejected(tmp_path: Path) -> None:
+    """One check at the top of the step leaves the second alias write unguarded."""
+
+    root = fixture_root(tmp_path)
+    mutate(root / SERVER_WORKFLOW, '            revalidate_identity "$reference"\n', "")
+    assert_rejected(
+        run_checker(root),
+        'must run revalidate_identity "$reference" immediately before '
+        "docker buildx imagetools create",
+    )
+
+
+def test_separating_the_revalidation_from_the_alias_write_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SERVER_WORKFLOW,
+        '            revalidate_identity "$reference"\n'
+        "            docker buildx imagetools create \\\n",
+        '            revalidate_identity "$reference"\n'
+        '            echo "publishing ${reference}"\n'
+        "            docker buildx imagetools create \\\n",
+    )
+    assert_rejected(run_checker(root), "immediately before docker buildx imagetools create")
+
+
+def test_hoisting_the_alias_revalidation_out_of_the_writing_helper_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Checking once before the loop is exactly the pattern being removed."""
+
+    root = fixture_root(tmp_path)
+    workflow = root / SERVER_WORKFLOW
+    text = workflow.read_text(encoding="utf-8")
+    text = text.replace('            revalidate_identity "$reference"\n', "", 1)
+    text = text.replace(
+        '          publish_alias "$RELEASE_TAG"\n',
+        '          revalidate_identity "$RELEASE_TAG"\n          publish_alias "$RELEASE_TAG"\n',
+        1,
+    )
+    workflow.write_text(text, encoding="utf-8")
+    assert_rejected(run_checker(root), "immediately before docker buildx imagetools create")
+
+
+def test_revalidating_the_alias_write_with_candidate_code_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SERVER_WORKFLOW,
+        "            bash trusted/scripts/verify-release-identity.sh \\\n",
+        "            bash candidate/scripts/verify-release-identity.sh \\\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must revalidate with the trusted verifier" in result.stdout
+    assert "is not inside a checkout of the protected controller revision" in result.stdout
+
+
+def test_dropping_the_token_from_the_alias_step_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SERVER_WORKFLOW,
+        "          ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}\n"
+        "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
+        "          ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}\n",
+    )
+    assert_rejected(run_checker(root), "needs the workflow token for its revalidation reads")
+
+
+def test_adding_a_second_unguarded_alias_write_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SERVER_WORKFLOW,
+        '          publish_alias "$COMMIT_REF"\n',
+        '          publish_alias "$COMMIT_REF"\n'
+        "          docker buildx imagetools create --tag \"${IMAGE_NAME}:extra\" \\\n"
+        "            \"${IMAGE_NAME}@${AMD64_DIGEST}\"\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must perform exactly one alias write, found 2" in result.stdout

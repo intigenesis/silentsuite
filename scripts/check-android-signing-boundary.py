@@ -74,6 +74,14 @@ ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
 RELEASE_ASSET_ARTIFACT = "silentsuite-android-release-assets-${{ inputs.source_sha }}"
 
+# The server lane's irreversible act and the check that must immediately precede
+# it. `publish_alias` returns early when the alias already exists, so verifying
+# an existing alias — which mutates nothing — is deliberately not gated.
+ALIAS_MERGE_STEP = "Merge verified children into the release index"
+ALIAS_WRITE = "docker buildx imagetools create"
+ALIAS_REVALIDATION = 'revalidate_identity "$reference"'
+ALIAS_REVALIDATION_HELPER = "trusted/scripts/verify-release-identity.sh"
+
 # Every repository script whose bytes decide whether a release is admitted,
 # verified, published or attached. Inside the control plane each one may be
 # executed only through a checkout of the protected controller revision.
@@ -209,24 +217,101 @@ EXPECTED_RELEASE_CONCURRENCY: dict[str, Any] = {
 # step environments below are the only place any of them may appear, so a new
 # credential — a repository-settings reader, a release token, anything — cannot
 # be introduced into the job that holds the decoded keystore.
-ALLOWED_RELEASE_SECRETS = set(SIGNING_SECRETS)
+#
+# GITHUB_TOKEN is on this list only because the job revalidates the release
+# identity immediately before each irreversible act, and that read needs an
+# authenticated rate limit. It is admissible only inside the four reviewed
+# revalidation steps below, which are compared as exact literals; `check`
+# separately proves it appears nowhere else in the job, so candidate Gradle and
+# candidate scripts cannot receive it. The job holds `contents: read`, so the
+# token cannot write a release even if it escaped.
+ALLOWED_RELEASE_SECRETS = set(SIGNING_SECRETS) | {"GITHUB_TOKEN"}
+WORKFLOW_TOKEN = "${{ secrets.GITHUB_TOKEN }}"
 SECRET_REFERENCE = re.compile(r"secrets\.\s*([A-Za-z_][A-Za-z0-9_-]*)")
 
-# The signed job checks out the admitted commit and keeps no credential from it.
-# Reviewed as an exact literal: dropping `persist-credentials: false` would hand
-# a repository write token to Gradle and every build script it runs, beside the
-# decoded keystore.
-EXPECTED_RELEASE_CHECKOUT: dict[str, Any] = {
-    "name": "Checkout",
-    "uses": CHECKOUT_ACTION,
-    "with": {"ref": "${{ inputs.source_sha }}", "persist-credentials": "false"},
+# The signed job checks out the admitted commit and keeps no credential from it,
+# then checks the protected controller revision out into a separate path so the
+# verifier it runs is never candidate code. Reviewed as exact literals, in this
+# order: dropping `persist-credentials: false` would hand a repository write
+# token to Gradle and every build script it runs, beside the decoded keystore,
+# and checking the trusted copy out first would let the candidate checkout's
+# clean sweep remove it.
+EXPECTED_RELEASE_CHECKOUTS: list[dict[str, Any]] = [
+    {
+        "name": "Checkout",
+        "uses": CHECKOUT_ACTION,
+        "with": {"ref": "${{ inputs.source_sha }}", "persist-credentials": "false"},
+    },
+    {
+        "name": "Check out the trusted controller revision",
+        "uses": CHECKOUT_ACTION,
+        "with": {
+            "ref": TRUSTED_REF,
+            "path": ".release-trusted",
+            "persist-credentials": "false",
+        },
+    },
+]
+
+# One reviewed literal per irreversible boundary inside the signed job. Each runs
+# the verifier out of the trusted checkout, carries the workflow token, and
+# nothing else. `check` asserts they appear in this order and that each one
+# immediately precedes the step it guards.
+def _revalidation_step(name: str, stage: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "env": {
+            "GITHUB_TOKEN": WORKFLOW_TOKEN,
+            "RELEASE_TAG": "${{ inputs.release_tag }}",
+            "SOURCE_SHA": "${{ inputs.source_sha }}",
+        },
+        "run": (
+            "set -euo pipefail\n"
+            'bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \\\n'
+            '  --tag "$RELEASE_TAG" \\\n'
+            '  --commit "$SOURCE_SHA" \\\n'
+            f"  --stage {stage}\n"
+        ),
+    }
+
+
+# revalidation step name -> the step name it must immediately precede.
+RELEASE_MUTATION_BOUNDARIES: dict[str, str] = {
+    "Revalidate the release identity before decoding signing material": "Decode release keystore",
+    "Revalidate the release identity before publishing signed artifacts": (
+        "Upload signed tracker verification evidence"
+    ),
+    "Revalidate the release identity before publishing signed release outputs": (
+        "Upload signed release APK, AAB, and native debug symbols"
+    ),
+    "Revalidate the release identity before the attachment handoff": (
+        "Publish the closed release-asset set to the attachment job"
+    ),
+}
+EXPECTED_RELEASE_REVALIDATION_STEPS: dict[str, dict[str, Any]] = {
+    "Revalidate the release identity before decoding signing material": _revalidation_step(
+        "Revalidate the release identity before decoding signing material",
+        "android-signing-material",
+    ),
+    "Revalidate the release identity before publishing signed artifacts": _revalidation_step(
+        "Revalidate the release identity before publishing signed artifacts",
+        "android-signed-artifact-egress",
+    ),
+    "Revalidate the release identity before publishing signed release outputs": _revalidation_step(
+        "Revalidate the release identity before publishing signed release outputs",
+        "android-release-output-egress",
+    ),
+    "Revalidate the release identity before the attachment handoff": _revalidation_step(
+        "Revalidate the release identity before the attachment handoff",
+        "android-attachment-handoff",
+    ),
 }
 
 # The read-only job that revalidates the live tag, its commit and both tag
 # rulesets in the last moment before signing material exists on any runner. It
-# is a separate job precisely so the signed job can stay free of the workflow
-# token this check needs, and so the check never shares a runner with candidate
-# code.
+# is a separate job so this entry check never shares a runner with candidate
+# code. The signed job performs its own later trusted checks with the workflow
+# token scoped only to those exact steps.
 EXPECTED_REVALIDATION_JOB: dict[str, Any] = {
     "name": "Revalidate the release identity before signing",
     "needs": CONSCRYPT_JOB,
@@ -265,6 +350,37 @@ EXPECTED_REVALIDATION_JOB: dict[str, Any] = {
 # admitted (tag, commit) pair, and the only privileged job that runs before any
 # candidate code exists on a runner.
 EXPECTED_CONTROLLER_ADMIT_PERMISSIONS = {"contents": "read"}
+# The repository owner's numeric account id. `repository_dispatch` is available
+# to any token with repository write access, so this comparison — not a ruleset
+# field the lane cannot read — is what makes release initiation owner-only.
+# Numeric because a login can be renamed and the name reused.
+RELEASE_OWNER_ID = "265568982"
+EXPECTED_OWNER_GATE_STEP: dict[str, Any] = {
+    "name": "Require the release owner as dispatch sender",
+    "shell": "bash",
+    "env": {
+        "SENDER_ID": "${{ github.event.sender.id }}",
+        "OWNER_ID": RELEASE_OWNER_ID,
+    },
+    "run": (
+        "set -euo pipefail\n"
+        "if ! printf '%s' \"$SENDER_ID\" | grep -Eq '^[0-9]+$'; then\n"
+        '  echo "Refusing release: the dispatch carried no numeric sender id" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        'if [ "$SENDER_ID" != "$OWNER_ID" ]; then\n'
+        '  echo "Refusing release: sender id ${SENDER_ID} is not the release owner" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        'echo "Dispatch sender is the release owner (${OWNER_ID})"\n'
+    ),
+}
+# Authorisation must never be derived from a mutable display name.
+LOGIN_AUTHORISATION_MARKERS = (
+    "github.actor",
+    "github.triggering_actor",
+    "github.event.sender.login",
+)
 EXPECTED_CONTROLLER_CALLERS: dict[str, dict[str, Any]] = {
     "android": {
         "uses": "./.github/workflows/release-android.yml",
@@ -317,19 +433,20 @@ EXPECTED_SECRET_STEP_SHA256 = {
 REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
     **EXPECTED_RELEASE_STEP_ENVIRONMENTS,
     **EXPECTED_RELEASE_PLAIN_STEP_ENVIRONMENTS,
+    **{name: step["env"] for name, step in EXPECTED_RELEASE_REVALIDATION_STEPS.items()},
 }
 # Covers the whole reviewed signing job: the explicit literal checks state the
 # intent, this digest makes any other edit to the job fail closed as well.
-EXPECTED_RELEASE_JOB_SHA256 = "e9a9c7b42e7a698d36993d0697b3959dfe44d8112baaa43b982948d5ef507f12"
+EXPECTED_RELEASE_JOB_SHA256 = "2789fa4a1277514497c625a87e3c091894c47b797101b1d08fb320eaabf1a01c"
 # Same treatment for the one job that can write a release. It carries the write
 # credential, the attachment helper and the umbrella lock, so every byte of it
 # is reviewed.
 EXPECTED_ATTACHMENT_JOB_SHA256 = "1d58283e8697f63a21627dc6ea037e5d2d0e1de50d5c72d6c9eb8781599a2cca"
-EXPECTED_CONTROLLER_ADMIT_SHA256 = "6c1f2a4f0f5368063dbec32c757fe3874f3157905ff7bc26f3c5826eb4930856"
+EXPECTED_CONTROLLER_ADMIT_SHA256 = "6423d79810b64d292382c9bccab15a7b0ed342a6ff6e7272972502a868a3d958"
 # The helpers those jobs execute. Hashing the step is not enough: the step text
 # is stable while the file it runs is what reaches the network and the API.
-EXPECTED_IDENTITY_HELPER_SHA256 = "72f998d7ab3d524cc979e2e9b737cd3dcec1bf1a7aeb3731ef6f49bfddd0cd5c"
-EXPECTED_ATTACHMENT_HELPER_SHA256 = "7a7b346ef8e40b56946b573765ba2797e1b9658de6ea34697b084c8e24581fce"
+EXPECTED_IDENTITY_HELPER_SHA256 = "5782b71552a0e08c3d011cab58112bd5998d92e561cbf4c78875ca147248c9e9"
+EXPECTED_ATTACHMENT_HELPER_SHA256 = "4ca8ca30a843abbb8305bdd63a8e04541c8791cb4bc04e0c6006e7474e463ebf"
 EXPECTED_READINESS_HELPER_SHA256 = "c75ebfba772c4f7bd6559161f64df3127c9c390bf1e5a81e39236ba47cc6e26f"
 # The Conscrypt producer exists twice: unprivileged CI builds it from the
 # triggering ref, the release lane builds it from the admitted commit. Both are
@@ -656,6 +773,27 @@ def check_control_plane(
     if not isinstance(admit, Mapping):
         violations.append(f"{CONTROLLER_WORKFLOW} must define the {ADMISSION_JOB} job")
     else:
+        # Owner-only initiation, decided before a payload is parsed, before a
+        # candidate commit is named and before anything is checked out. It is a
+        # failing step rather than a job-level `if:` on purpose: a skipped job
+        # reports success, and a release that was refused must look refused.
+        admit_steps = job_steps(admit)
+        if not admit_steps or admit_steps[0] != EXPECTED_OWNER_GATE_STEP:
+            violations.append(
+                f"{ADMISSION_JOB} must begin with the exact reviewed owner-sender gate, "
+                f"comparing github.event.sender.id against {RELEASE_OWNER_ID}"
+            )
+        if "if" in admit:
+            violations.append(
+                f"{ADMISSION_JOB} must not gate itself with a job-level condition; a skipped "
+                "admission reports success"
+            )
+        for marker in LOGIN_AUTHORISATION_MARKERS:
+            if marker in "\n".join(strings(admit)):
+                violations.append(
+                    f"{ADMISSION_JOB} must not authorise by {marker}; a login can be renamed "
+                    "and reused, an account id cannot"
+                )
         if admit.get("permissions") != EXPECTED_CONTROLLER_ADMIT_PERMISSIONS:
             violations.append(f"{ADMISSION_JOB} must declare exactly contents: read")
         if environment_name(admit) is not None:
@@ -789,6 +927,45 @@ def check_control_plane(
                         f"{called_ref} job {sub_name} is on the release path and must not bind a "
                         "deployment environment"
                     )
+
+    # 5c. The registry alias write is the server lane's irreversible act, and
+    #     there are two of them. The identity check has to sit immediately
+    #     before the write itself — inside the helper that performs it — not
+    #     once at the top of the step, or the second alias is written on an
+    #     identity that was only confirmed before the first.
+    server = loaded.get(SERVER_WORKFLOW)
+    if server is not None:
+        publish = (server.get("jobs") or {}).get("publish-index")
+        merge = None
+        if isinstance(publish, Mapping):
+            for step in job_steps(publish):
+                if step.get("name") == ALIAS_MERGE_STEP:
+                    merge = step
+        if merge is None:
+            violations.append(f"{SERVER_WORKFLOW} must define the {ALIAS_MERGE_STEP!r} step")
+        else:
+            script = [line.strip() for line in str(merge.get("run", "")).splitlines()]
+            writes = [index for index, line in enumerate(script) if line.startswith(ALIAS_WRITE)]
+            if len(writes) != 1:
+                violations.append(
+                    f"{SERVER_WORKFLOW} must perform exactly one alias write, found {len(writes)}"
+                )
+            for index in writes:
+                if script[index - 1 : index] != [ALIAS_REVALIDATION]:
+                    violations.append(
+                        f"{SERVER_WORKFLOW} must run {ALIAS_REVALIDATION} immediately before "
+                        f"{ALIAS_WRITE}; found {script[index - 1: index]}"
+                    )
+            if ALIAS_REVALIDATION_HELPER not in str(merge.get("run", "")):
+                violations.append(
+                    f"{SERVER_WORKFLOW} must revalidate with the trusted verifier "
+                    f"({ALIAS_REVALIDATION_HELPER})"
+                )
+            if merge.get("env", {}).get("GITHUB_TOKEN") != WORKFLOW_TOKEN:
+                violations.append(
+                    f"{SERVER_WORKFLOW} {ALIAS_MERGE_STEP!r} needs the workflow token for its "
+                    "revalidation reads"
+                )
 
     # 6. Trusted helpers execute from a checkout of this protected revision.
     for relative in CONTROL_PLANE:
@@ -1017,7 +1194,18 @@ def check(root: Path) -> list[str]:
         for job_name, raw_job in (workflow.get("jobs") or {}).items():
             if not isinstance(raw_job, Mapping) or not signing_references(raw_job):
                 continue
-            body = "\n".join(strings(raw_job))
+            scanned = dict(raw_job)
+            if relative == ROOT_WORKFLOW and job_name == ALLOWED_JOB:
+                # The reviewed revalidation steps legitimately carry the
+                # read-only workflow token. They are dropped from this sweep
+                # only when they are byte-identical to their reviewed literal;
+                # a step that merely borrows the name stays in it.
+                scanned["steps"] = [
+                    step
+                    for step in job_steps(raw_job)
+                    if EXPECTED_RELEASE_REVALIDATION_STEPS.get(str(step.get("name"))) != step
+                ]
+            body = "\n".join(strings(scanned))
             reachable = [marker for marker in RELEASE_WRITE_MARKERS if marker in body]
             if reachable:
                 violations.append(
@@ -1122,11 +1310,54 @@ def check(root: Path) -> list[str]:
         for step in (release_steps_raw if isinstance(release_steps_raw, list) else [])
         if isinstance(step, Mapping) and str(step.get("uses", "")).startswith("actions/checkout@")
     ]
-    if len(checkout_steps) != 1 or checkout_steps[0] != EXPECTED_RELEASE_CHECKOUT:
+    if checkout_steps != EXPECTED_RELEASE_CHECKOUTS:
         violations.append(
-            f"{ALLOWED_JOB} must check out the admitted commit exactly once with "
-            "persist-credentials: false"
+            f"{ALLOWED_JOB} must check out the admitted commit and then the trusted controller "
+            "revision, in that order, both with persist-credentials: false"
         )
+
+    # Each irreversible boundary is guarded by the reviewed revalidation step
+    # that immediately precedes it. Immediately: an inserted step between the
+    # check and the act would reopen exactly the window this closes.
+    release_step_list = job_steps(release)
+    release_step_names = [str(step.get("name")) for step in release_step_list]
+    for guard_name, guarded_name in RELEASE_MUTATION_BOUNDARIES.items():
+        expected_step = EXPECTED_RELEASE_REVALIDATION_STEPS[guard_name]
+        matching = [step for step in release_step_list if step.get("name") == guard_name]
+        if len(matching) != 1 or matching[0] != expected_step:
+            violations.append(
+                f"{ALLOWED_JOB} must contain exactly one {guard_name!r} step matching its "
+                "reviewed trusted-revalidation literal"
+            )
+            continue
+        if guarded_name not in release_step_names:
+            violations.append(f"{ALLOWED_JOB} is missing the guarded step {guarded_name!r}")
+            continue
+        guard_index = release_step_names.index(guard_name)
+        if release_step_names[guard_index + 1 : guard_index + 2] != [guarded_name]:
+            violations.append(
+                f"{ALLOWED_JOB} must revalidate the release identity immediately before "
+                f"{guarded_name!r}; {guard_name!r} is followed by "
+                f"{release_step_names[guard_index + 1 : guard_index + 2]}"
+            )
+
+    # The workflow token is admissible only inside those reviewed steps. Any
+    # other appearance would put it in reach of candidate Gradle or a candidate
+    # script running beside the decoded keystore.
+    token_carriers = sorted(
+        str(step.get("name"))
+        for step in release_step_list
+        if WORKFLOW_TOKEN in "\n".join(strings(step))
+    )
+    if token_carriers != sorted(EXPECTED_RELEASE_REVALIDATION_STEPS):
+        violations.append(
+            f"{ALLOWED_JOB} may name the workflow token only in its reviewed revalidation "
+            f"steps; found it in {token_carriers}"
+        )
+    release_without_steps = {key: value for key, value in release.items() if key != "steps"}
+    if WORKFLOW_TOKEN in "\n".join(strings(release_without_steps)):
+        violations.append(f"{ALLOWED_JOB} must not carry the workflow token at job scope")
+
     named_secrets = {
         name for item in strings(release) for name in SECRET_REFERENCE.findall(item)
     }

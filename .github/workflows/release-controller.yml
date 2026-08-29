@@ -16,6 +16,14 @@ name: Release Controller
 #     -F 'client_payload[release_tag]=v0.5.4-beta' \
 #     -F 'client_payload[source_sha]=<40-hex>'
 #
+# Who may do that is the first thing this workflow decides. `repository_dispatch`
+# is available to any token with repository write access, so the owner-only
+# release authority is established here, by comparing the numeric sender account
+# id before a payload is parsed or a commit is named. It is deliberately not
+# derived from reading a repository setting: this lane holds no administration
+# credential, and adding one to a public workflow to read `bypass_actors` would
+# be a worse trade than the check it would enable.
+#
 # Boundaries this workflow keeps: it never publishes the release, never moves a
 # mutable tag or `latest`, declares no deployment environment of its own, holds
 # no hosted-deployment credential, and neither calls nor changes the manual
@@ -52,6 +60,33 @@ jobs:
       bypass-actors: ${{ steps.identity.outputs.bypass-actors }}
 
     steps:
+      # Who may start a release, decided before anything else happens: no
+      # payload has been read, no candidate commit has been named, and nothing
+      # has been checked out. `repository_dispatch` requires a token with write
+      # access, so without this gate every present and future write collaborator
+      # could start a release. The numeric account id is what is compared —
+      # logins can be changed and reused, ids cannot.
+      #
+      # This is the repository's owner-only release authority. It does not
+      # depend on reading a repository setting, which is why this lane needs no
+      # administration credential at all.
+      - name: Require the release owner as dispatch sender
+        shell: bash
+        env:
+          SENDER_ID: ${{ github.event.sender.id }}
+          OWNER_ID: '265568982'
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SENDER_ID" | grep -Eq '^[0-9]+$'; then
+            echo "Refusing release: the dispatch carried no numeric sender id" >&2
+            exit 1
+          fi
+          if [ "$SENDER_ID" != "$OWNER_ID" ]; then
+            echo "Refusing release: sender id ${SENDER_ID} is not the release owner" >&2
+            exit 1
+          fi
+          echo "Dispatch sender is the release owner (${OWNER_ID})"
+
       - name: Check out the protected controller revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

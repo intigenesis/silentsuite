@@ -166,6 +166,70 @@ def test_the_admission_job_only_reads_and_only_from_the_protected_revision():
     ]
 
 
+OWNER_ID = "265568982"
+
+
+def test_owner_only_initiation_is_decided_before_anything_else():
+    """`repository_dispatch` is open to any write collaborator; this is not.
+
+    The gate is the first step of the first job: no payload has been parsed, no
+    candidate commit named, nothing checked out. That ordering is the contract —
+    a gate placed after the payload step would already have consumed attacker
+    input.
+    """
+
+    admit = CONTROLLER["jobs"]["admit"]
+    gate = steps(admit)[0]
+    assert gate["name"] == "Require the release owner as dispatch sender"
+    assert gate["env"] == {
+        "SENDER_ID": "${{ github.event.sender.id }}",
+        "OWNER_ID": OWNER_ID,
+    }
+    # A numeric identity comparison that exits non-zero, not a log line.
+    assert '[ "$SENDER_ID" != "$OWNER_ID" ]' in gate["run"]
+    assert "exit 1" in gate["run"]
+    assert "^[0-9]+$" in gate["run"], "an empty or non-numeric sender must be refused"
+
+    names = step_names(admit)
+    assert names.index("Require the release owner as dispatch sender") == 0
+    assert names.index("Require the release owner as dispatch sender") < names.index(
+        "Check out the protected controller revision"
+    )
+    assert names.index("Require the release owner as dispatch sender") < names.index(
+        "Validate the dispatch payload"
+    )
+
+
+def test_release_authority_is_never_derived_from_a_login():
+    """Logins can be renamed and the freed name re-registered; ids cannot."""
+
+    source = CONTROLLER_WORKFLOW.read_text(encoding="utf-8")
+    for login_marker in ("github.actor", "github.triggering_actor", "github.event.sender.login"):
+        assert login_marker not in source, f"{login_marker} must not decide release authority"
+
+
+def test_a_refused_dispatch_fails_rather_than_skipping():
+    """A job-level `if:` would report success for a refused release."""
+
+    admit = CONTROLLER["jobs"]["admit"]
+    assert "if" not in admit
+    for name, job in CONTROLLER["jobs"].items():
+        assert "sender" not in str(job.get("if", "")), name
+
+
+def test_the_verifier_does_not_claim_an_unobservable_bypass_list():
+    """The authority claim moved to the sender gate; the script must say so."""
+
+    verifier = (ROOT / "scripts" / "verify-release-identity.sh").read_text(encoding="utf-8")
+    prose = " ".join(verifier.replace("#", " ").split())
+    assert "UNOBSERVABLE — not proven by this run." in verifier
+    assert "Owner-only release authority therefore does not come from here" in prose
+    assert "the run reports `unobservable` and claims nothing" in prose
+    # The exact reviewed value is still enforced whenever GitHub does serve it.
+    assert 'jq -e \'has("bypass_actors")\'' in verifier
+    assert "CREATION_BYPASS_ACTOR=265568982" in verifier
+
+
 def test_the_dispatch_payload_is_validated_before_it_is_used():
     payload = step_named(CONTROLLER["jobs"]["admit"], "Validate the dispatch payload")
     assert payload["env"] == {"PAYLOAD": "${{ toJSON(github.event.client_payload) }}"}
@@ -930,3 +994,106 @@ def test_directly_invoked_release_helpers_are_executable():
         "scripts/stage-bridge-release-assets.sh",
     ):
         assert modes.get(helper) == "100755", f"{helper} is not tracked as executable"
+
+
+# ── Revalidation immediately before each irreversible act ─────────────
+
+
+ANDROID_MUTATION_BOUNDARIES = [
+    (
+        "Revalidate the release identity before decoding signing material",
+        "Decode release keystore",
+        "android-signing-material",
+    ),
+    (
+        "Revalidate the release identity before publishing signed artifacts",
+        "Upload signed tracker verification evidence",
+        "android-signed-artifact-egress",
+    ),
+    (
+        "Revalidate the release identity before publishing signed release outputs",
+        "Upload signed release APK, AAB, and native debug symbols",
+        "android-release-output-egress",
+    ),
+    (
+        "Revalidate the release identity before the attachment handoff",
+        "Publish the closed release-asset set to the attachment job",
+        "android-attachment-handoff",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("guard", "guarded", "stage"), ANDROID_MUTATION_BOUNDARIES, ids=lambda v: str(v)[:38]
+)
+def test_each_android_irreversible_step_is_immediately_preceded_by_a_revalidation(
+    guard, guarded, stage
+):
+    """Immediately: an inserted step would reopen the window this closes."""
+
+    names = step_names(ANDROID["jobs"]["build-release"])
+    assert guard in names, guard
+    assert guarded in names, guarded
+    assert names[names.index(guard) + 1] == guarded, (
+        f"{guard!r} must sit directly before {guarded!r}, found "
+        f"{names[names.index(guard) + 1]!r}"
+    )
+    step = step_named(ANDROID["jobs"]["build-release"], guard)
+    assert f"--stage {stage}" in step["run"]
+
+
+def test_the_android_revalidations_run_trusted_code_not_the_candidate_tree():
+    job = ANDROID["jobs"]["build-release"]
+    assert checkouts(job) == [
+        {"ref": "${{ inputs.source_sha }}", "persist-credentials": "false"},
+        {"ref": TRUSTED_REF, "path": ".release-trusted", "persist-credentials": "false"},
+    ]
+    for guard, _, _ in ANDROID_MUTATION_BOUNDARIES:
+        run = step_named(job, guard)["run"]
+        assert '"$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh"' in run
+        assert "android/scripts" not in run
+
+
+def test_only_the_android_revalidation_steps_receive_the_workflow_token():
+    """Candidate Gradle and candidate scripts must never see it."""
+
+    job = ANDROID["jobs"]["build-release"]
+    carriers = [
+        step.get("name")
+        for step in steps(job)
+        if "${{ secrets.GITHUB_TOKEN }}" in str(step.get("env", ""))
+    ]
+    assert sorted(carriers) == sorted(guard for guard, _, _ in ANDROID_MUTATION_BOUNDARIES)
+    # And the job still cannot write a release with it.
+    assert job["permissions"] == {"contents": "read"}
+    assert job["environment"] == "android-release"
+
+
+def test_the_server_revalidates_immediately_before_each_alias_write():
+    """Two aliases, two writes; one check at the top would only cover the first."""
+
+    run = step_named(RELEASE["jobs"]["publish-index"], "Merge verified children into the release index")["run"]
+    lines = [line.strip() for line in run.splitlines()]
+    write = lines.index("docker buildx imagetools create \\")
+    assert lines[write - 1] == 'revalidate_identity "$reference"', lines[write - 3 : write + 1]
+    # Inside publish_alias, which returns early when the alias already exists —
+    # verifying an existing alias mutates nothing and needs no gate.
+    assert 'if [ "$(cat "$ALIAS_DIR/${reference//\\//_}.state")" = "present" ]; then' in run
+    assert run.count("revalidate_identity \"$reference\"") == 1
+    assert run.count("docker buildx imagetools create") == 1
+    assert 'publish_alias "$RELEASE_TAG"' in run
+    assert 'publish_alias "$COMMIT_REF"' in run
+    assert "trusted/scripts/verify-release-identity.sh" in run
+
+
+def test_the_attachment_helper_revalidates_before_each_individual_write():
+    helper = ATTACH_HELPER.read_text(encoding="utf-8")
+    for stage in ('revalidate "pre"', 'revalidate "before-create"', 'revalidate "post"'):
+        assert stage in helper, stage
+    assert 'revalidate "before-upload:${asset}"' in helper
+    lines = [line.strip() for line in helper.splitlines()]
+    # Immediately before the two POST bodies, not merely somewhere above them.
+    create = lines.index('api POST "/repos/${GITHUB_REPOSITORY}/releases" \\')
+    assert lines[create - 1] == 'revalidate "before-create"'
+    upload = lines.index('echo "  ${asset}: uploading"')
+    assert lines[upload - 1] == 'revalidate "before-upload:${asset}"'

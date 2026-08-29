@@ -20,8 +20,18 @@ set -euo pipefail
 #      one — to exactly that commit, right now;
 #   5. that commit is an ancestor of the protected default branch;
 #   6. both public tag rulesets are still present, active, scoped to
-#      refs/tags/v*, and carry exactly the rules that make a v* tag creatable
-#      only by the owner and thereafter immutable.
+#      refs/tags/v*, and carry exactly the rules that gate v* tag creation and
+#      make an existing v* tag immutable.
+#
+# What it does not prove, stated plainly: the creation ruleset's `bypass_actors`
+# list. GitHub serves that field only to a reader with repository administration
+# rights, and this lane deliberately holds none. When the field is served the
+# reviewed value is enforced exactly; when it is hidden the run reports
+# `unobservable` and claims nothing. Owner-only release authority therefore does
+# not come from here — it comes from the protected-main controller, which
+# compares the numeric dispatch sender id against the owner before any payload
+# or candidate input is read. A hidden extra bypass principal on the creation
+# ruleset is a defence-in-depth gap, not a way to start a release.
 #
 # Ruleset reads are deliberately unprivileged. The repository is public, so the
 # rulesets endpoint answers without a credential; issue #682 removed the
@@ -248,10 +258,17 @@ check_ruleset() {
     || refuse "ruleset ${id} publishes no rule list"
   [ "$actual" = "$rules" ] || refuse "ruleset ${id} rules are ${actual}, expected ${rules}"
 
-  # bypass_actors is only served to a reader with repository administration
-  # rights. Issue #682 deliberately leaves this lane without such a credential,
-  # so the field is normally absent: enforce it exactly whenever it is visible,
-  # and report it as unobservable when it is not. Never treat absent as pass.
+  # bypass_actors is only served to a reader holding repository administration
+  # rights, and this lane deliberately holds no such credential. So the field is
+  # normally absent, and this script does not pretend otherwise: when it is
+  # served the reviewed value is enforced exactly, and when it is hidden the
+  # result is recorded as `unobservable` and reported that way in every output.
+  #
+  # Absence is not a proof and is not treated as one. Owner-only release
+  # authority does not rest on it: it rests on the controller's sender-id gate,
+  # which is what decides who may start a release at all. A hidden bypass
+  # principal on the creation ruleset would be defence-in-depth that could not be
+  # confirmed here; it could not by itself start a release.
   if jq -e 'has("bypass_actors")' "$file" >/dev/null 2>&1; then
     BYPASS_OBSERVED="observed"
     actual="$(json "$file" '[.bypass_actors[] | {actor_id, actor_type, bypass_mode}] | sort_by(.actor_id) | @json')" \
@@ -299,5 +316,8 @@ echo "  rulesets ${CREATION_RULESET_ID} and ${IMMUTABILITY_RULESET_ID}: active f
 if [ "$BYPASS_OBSERVED" = "observed" ]; then
   echo "  bypass actors: verified exactly"
 else
-  echo "  bypass actors: not served to this reader (no administration:read credential by design)"
+  echo "  bypass actors: UNOBSERVABLE — not proven by this run."
+  echo "    The field is served only to a reader with administration rights, which"
+  echo "    this lane deliberately does not hold. Owner-only release authority comes"
+  echo "    from the controller's dispatch sender-id gate, not from this field."
 fi

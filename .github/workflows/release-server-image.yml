@@ -252,11 +252,25 @@ jobs:
         env:
           AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
           ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           COMMIT_REF="selfhost-${RELEASE_COMMIT}"
           ALIAS_DIR="$(mktemp -d)"
           trap 'rm -rf "$ALIAS_DIR"' EXIT
+
+          # Called immediately before each alias write, and only when a write is
+          # actually about to happen. Resolving and verifying an alias that
+          # already exists mutates nothing, so it needs no gate; creating one is
+          # irreversible for an operator who may already be pulling it. Trusted
+          # verifier code, from the controller revision, with the read-only
+          # workflow token.
+          revalidate_identity() {
+            bash trusted/scripts/verify-release-identity.sh \
+              --tag "$RELEASE_TAG" \
+              --commit "$RELEASE_COMMIT" \
+              --stage "server-alias-write:$1"
+          }
 
           # Resolve and fully verify any existing alias before a write. An
           # existing alias is recoverable only when it is the exact verified
@@ -303,6 +317,12 @@ jobs:
             # imagetools may publish tags sequentially. Publish one alias at a
             # time and verify it before touching the next; this is recovery
             # logic, not a registry-level atomicity claim.
+            #
+            # The identity check sits here rather than once at the top of the
+            # step so that the second alias write is gated too: the first write
+            # plus its verification can take long enough for the tag to move
+            # underneath the second.
+            revalidate_identity "$reference"
             docker buildx imagetools create \
               --tag "${IMAGE_NAME}:${reference}" \
               "${IMAGE_NAME}@${AMD64_DIGEST}" \

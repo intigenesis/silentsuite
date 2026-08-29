@@ -9,7 +9,8 @@ set -euo pipefail
 # and all execute this copy of it from the protected default-branch checkout —
 # never from the candidate tree. It is deliberately defensive:
 #   * revalidates the live tag, its commit, and both tag rulesets immediately
-#     before the first write and again after the last one;
+#     before every write it makes — the draft-creation POST and each individual
+#     asset-upload POST — and once more after the last one;
 #   * pages the releases list to exhaustion rather than assuming the newest few
 #     hundred releases contain every draft;
 #   * bounded idempotent lookup-or-create of the draft for this exact tag,
@@ -105,9 +106,14 @@ WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 # The live tag, its commit and both tag rulesets, checked against the pair this
-# workflow was admitted for. Runs before the first write and again after the
-# last one, so a tag that moves mid-attachment cannot leave assets behind under
-# a release identity nobody admitted.
+# workflow was admitted for.
+#
+# Called immediately before every irreversible request this script makes — the
+# draft-creation POST and each individual asset-upload POST — and again after
+# the last one. A single check at the top would leave a whole series of uploads,
+# each of them minutes long for a release APK, running on an identity that was
+# only true when the script started. The trailing check stays: it is what
+# catches a tag that moved during the final upload, which no pre-check can.
 revalidate() {
   bash "$IDENTITY_SCRIPT" \
     --tag "$TAG" \
@@ -210,7 +216,10 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   fi
   # No release yet. Create the draft bound to the admitted commit; a sibling
   # workflow may win this race, in which case the next lookup finds theirs and
-  # we append to it instead.
+  # we append to it instead. The listing above can page through thousands of
+  # releases, so the identity is re-proved here rather than inherited from the
+  # check at the top of the script.
+  revalidate "before-create"
   api POST "/repos/${GITHUB_REPOSITORY}/releases" \
     -d "$(jq -n --arg tag "$TAG" --arg target "$EXPECTED_COMMIT" \
       '{tag_name: $tag, target_commitish: $target, name: ("SilentSuite " + $tag), draft: true}')" \
@@ -286,6 +295,10 @@ for asset in "${ASSETS[@]}"; do
     exit 1
   fi
 
+  # Per asset, not per run: an umbrella draft takes eleven bridge binaries, six
+  # Android artefacts and three self-host files, and each upload is its own
+  # irreversible write.
+  revalidate "before-upload:${asset}"
   echo "  ${asset}: uploading"
   curl -sS -X POST \
     -H "Authorization: Bearer $GITHUB_TOKEN" \

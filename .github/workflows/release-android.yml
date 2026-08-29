@@ -14,7 +14,8 @@ name: Release Android
 #   signing-policy       trusted structural gate, contents: read
 #   conscrypt-r28        candidate build, contents: read
 #   build-release        holds the keystore; contents: read, no persisted
-#                        checkout credential, no release API, no token
+#                        checkout credential or release API; the read token is
+#                        scoped only to trusted identity-revalidation steps
 #   attach-release-assets  holds contents: write; no environment, no signing
 #                        secret, no Gradle — only the closed artifact and the
 #                        trusted attachment helper
@@ -113,19 +114,18 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────
-  # The last gate before signing material exists on any runner.
+  # The lane's entry gate: `build-release` cannot start until this passes, so
+  # the environment-gated job is never even scheduled for a tag that has already
+  # moved. It runs trusted controller code on a runner with no candidate tree on
+  # it at all, which is the one thing the in-job checks cannot claim.
   #
-  # It is a job of its own, not a step inside the signed build, for two
-  # reasons: the check must execute trusted controller code with no candidate
-  # tree anywhere near it, and the signed job must stay free of every
-  # credential except the keystore — including the workflow token this check
-  # needs to read the tag and ruleset APIs at an authenticated rate limit.
-  # `build-release` cannot start until this passes.
+  # It is not the last word. A job boundary is not "immediately before" anything
+  # — the signed build still has to check out, install an NDK and build an AAR
+  # before it reaches the keystore — so `build-release` revalidates again at each
+  # of its own irreversible boundaries, from its own trusted checkout.
   #
-  # It waits on conscrypt-r28 deliberately. Running it at the head of the lane
-  # would put a half-hour native build between the check and the keystore;
-  # running it here means the last thing observed before signing is the live
-  # tag, its commit, and both tag rulesets.
+  # It waits on conscrypt-r28 deliberately: running it at the head of the lane
+  # would put a half-hour native build between this gate and the signed job.
   # ─────────────────────────────────────────────────────────────────────
   revalidate-signing:
     name: Revalidate the release identity before signing
@@ -160,11 +160,19 @@ jobs:
   # Uses a protected GitHub Environment so signing secrets are not
   # accessible to PRs, forks, or anything outside this called lane.
   #
-  # This job holds signing material and therefore holds nothing else: no
-  # contents:write, no persisted checkout credential, no release API call, no
-  # attachment helper, no workflow token. It hands its signed output to
-  # `attach-release-assets` through a closed artifact, and that job — which has
-  # none of the signing material — is the only thing that can write a release.
+  # This job holds signing material and therefore holds no repository write: no
+  # contents:write, no persisted checkout credential, no release API write, no
+  # attachment helper. It hands its signed output to `attach-release-assets`
+  # through a closed artifact, and that job — which has none of the signing
+  # material — is the only thing that can write a release.
+  #
+  # It does carry the read-only workflow token, and only in the three reviewed
+  # revalidation steps below. Those run trusted verifier code checked out
+  # separately from `${{ github.sha }}` into `.release-trusted`, and they bracket
+  # every irreversible act in this job: the keystore is not decoded, no signed
+  # byte leaves, and the closed asset set is not handed to the write-capable lane
+  # until the live tag, its commit and both tag rulesets have just been
+  # re-confirmed. Candidate Gradle and candidate scripts never see the token.
   # ─────────────────────────────────────────────────────────────────────
   build-release:
     name: Build (signed, admitted release)
@@ -182,6 +190,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+
+      # Second, and into its own directory: the candidate checkout above cleans
+      # the workspace root, so the trusted verifier has to land after it and
+      # outside it. Nothing in the Android build reads from this path.
+      - name: Check out the trusted controller revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .release-trusted
           persist-credentials: false
 
       - name: Set up JDK 17
@@ -225,6 +243,20 @@ jobs:
         with:
           name: conscrypt-r28-${{ inputs.source_sha }}
           path: android/build/conscrypt-m2
+
+      # Immediately before the release key exists on this runner. Everything
+      # above is reversible; nothing below it is.
+      - name: Revalidate the release identity before decoding signing material
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \
+            --tag "$RELEASE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --stage android-signing-material
 
       - name: Decode release keystore
         env:
@@ -294,6 +326,20 @@ jobs:
             build/privacy-evidence/signed-release.apks \
             build/privacy-evidence/signed-release-splits
 
+      # The privacy evidence carries the signed universal .apks set, so this is
+      # the first byte produced with the release key that leaves the job.
+      - name: Revalidate the release identity before publishing signed artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \
+            --tag "$RELEASE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --stage android-signed-artifact-egress
+
       - name: Upload signed tracker verification evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -339,6 +385,18 @@ jobs:
 
       - name: Verify AAB signature
         run: jarsigner -verify -certs -verbose app/build/outputs/bundle/release/*.aab
+
+      - name: Revalidate the release identity before publishing signed release outputs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \
+            --tag "$RELEASE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --stage android-release-output-egress
 
       - name: Upload signed release APK, AAB, and native debug symbols
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -389,6 +447,20 @@ jobs:
              "app/build/outputs/native-debug-symbols/release/silentsuite-android-${RELEASE_TAG}-native-debug-symbols.sha256" \
              build/release-assets/
           ls -l build/release-assets
+
+      # The last gate in this job: past this point the closed asset set is
+      # available to `attach-release-assets`, which holds contents: write.
+      - name: Revalidate the release identity before the attachment handoff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \
+            --tag "$RELEASE_TAG" \
+            --commit "$SOURCE_SHA" \
+            --stage android-attachment-handoff
 
       - name: Publish the closed release-asset set to the attachment job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

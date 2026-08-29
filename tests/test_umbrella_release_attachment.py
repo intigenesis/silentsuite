@@ -251,12 +251,41 @@ def test_a_moved_tag_stops_the_attachment_before_any_upload(stub, assets: Path):
     assert stub.state["releases"] == [], "a draft was created for an unadmitted tag"
 
 
-def test_a_tag_that_moves_during_the_upload_fails_the_post_check(stub, assets: Path):
-    """The pre-check passed; the post-check is what catches the late move."""
+# One tag read per identity check, so `tag_moves_after` selects which write the
+# tag moves in front of. With two assets the happy path reads the tag five
+# times: pre, before-create, before-upload x2, post.
+#
+# The point of these cases is that every one of them stops *before* the write it
+# guards, not merely afterwards: a post-hoc detection cannot un-upload an asset.
+@pytest.mark.parametrize(
+    ("moves_after", "stage", "expected_uploads"),
+    [
+        (0, "attachment:pre", 0),
+        (1, "attachment:before-create", 0),
+        (2, "attachment:before-upload:server-image.json", 0),
+        (3, f"attachment:before-upload:silentsuite-self-host-{TAG}.tar.gz", 1),
+    ],
+    ids=("pre", "before-create", "before-first-upload", "before-second-upload"),
+)
+def test_a_tag_that_moves_is_caught_before_the_next_write(
+    stub, assets: Path, moves_after, stage, expected_uploads
+):
+    stub.state["tag_moves_after"] = moves_after
 
-    # One tag read per identity check: the pre-upload one still sees the
-    # admitted commit, the post-upload one does not.
-    stub.state["tag_moves_after"] = 1
+    result = attach(stub, assets)
+
+    assert result.returncode != 0
+    assert stage in result.stderr, result.stderr
+    written = sum(len(v) for v in stub.state["assets"].values())
+    assert written == expected_uploads, (
+        f"{written} assets were uploaded after the tag moved; expected {expected_uploads}"
+    )
+
+
+def test_a_tag_that_moves_after_the_last_upload_still_fails_the_post_check(stub, assets: Path):
+    """No pre-check can see a move that happens during the final upload."""
+
+    stub.state["tag_moves_after"] = 4
 
     result = attach(stub, assets)
 
@@ -314,3 +343,66 @@ def test_the_uploaded_bytes_are_read_back_and_compared(stub, assets: Path):
         local = (assets / name).read_bytes()
         assert hashlib.sha256(payload).hexdigest() == hashlib.sha256(local).hexdigest()
     assert "digest verified" in result.stdout
+
+
+# ── Call ordering at every mutation boundary ──────────────────────────
+
+
+def request_log(stub: GitHubStub) -> list[str]:
+    """The stub records every request; identity reads mark a revalidation."""
+
+    log = []
+    for method, path in stub.state["requests"]:
+        if method == "GET" and "/git/ref/tags/" in path:
+            log.append("revalidate")
+        elif method == "POST" and path.endswith("/releases"):
+            log.append("create-draft")
+        elif method == "POST" and "/assets" in path:
+            log.append("upload-asset")
+    return log
+
+
+def test_every_write_is_immediately_preceded_by_a_revalidation(stub, assets: Path):
+    """Ordering, not the presence of a call: each write's predecessor is a check.
+
+    A revalidation that ran only at the start of the script would satisfy any
+    "does it call the verifier" assertion while leaving every write unguarded.
+    """
+
+    assert attach(stub, assets).returncode == 0
+
+    log = request_log(stub)
+    writes = [index for index, event in enumerate(log) if event != "revalidate"]
+    assert writes, "the run performed no write at all"
+    for index in writes:
+        assert index > 0 and log[index - 1] == "revalidate", (
+            f"{log[index]} at position {index} was not immediately preceded by a "
+            f"revalidation; sequence was {log}"
+        )
+
+
+def test_the_run_revalidates_once_per_write_plus_the_bracketing_pair(stub, assets: Path):
+    assert attach(stub, assets).returncode == 0
+
+    log = request_log(stub)
+    writes = [event for event in log if event != "revalidate"]
+    checks = [event for event in log if event == "revalidate"]
+    # one draft creation + two asset uploads
+    assert writes == ["create-draft", "upload-asset", "upload-asset"]
+    # one per write, plus the opening and closing checks
+    assert len(checks) == len(writes) + 2
+    assert log[0] == "revalidate"
+    assert log[-1] == "revalidate"
+
+
+def test_an_identical_rerun_revalidates_but_performs_no_write(stub, assets: Path):
+    """Idempotency must not be mistaken for a mutation that needs guarding."""
+
+    assert attach(stub, assets).returncode == 0
+    stub.state["requests"].clear()
+
+    assert attach(stub, assets).returncode == 0
+
+    log = request_log(stub)
+    assert [event for event in log if event != "revalidate"] == []
+    assert log.count("revalidate") == 2, "an unchanged rerun still brackets its reads"
