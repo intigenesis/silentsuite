@@ -217,9 +217,24 @@ jobs:
           echo "amd64=$AMD64" >> "$GITHUB_OUTPUT"
           echo "arm64=$ARM64" >> "$GITHUB_OUTPUT"
 
+      # The verifier talks to the GHCR API directly rather than through the
+      # Docker client, so `docker/login-action` below does nothing for it: it
+      # needs its own pull token, and it mints one from REGISTRY_USERNAME /
+      # REGISTRY_PASSWORD. Without them it asks ghcr.io/token anonymously, which
+      # a package that is not publicly readable answers with 403 — and the
+      # verifier, being fail-closed, stops the release there.
+      #
+      # These two variables are set on each verifier-running step and nowhere
+      # else: not at job scope, and not on any step that executes candidate
+      # code. The password is the workflow token this job already holds, used
+      # here only for the `:pull` scope it needs; the job's `packages: write`
+      # ceiling is unchanged and no new secret is introduced.
       - name: Record the current latest reference
         id: latest-before
         shell: bash
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           BEFORE="$(trusted/scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"
@@ -253,6 +268,8 @@ jobs:
           AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
           ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           COMMIT_REF="selfhost-${RELEASE_COMMIT}"
@@ -354,6 +371,8 @@ jobs:
         env:
           AMD64_DIGEST: ${{ steps.digests.outputs.amd64 }}
           ARM64_DIGEST: ${{ steps.digests.outputs.arm64 }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           trusted/scripts/verify-server-image-release.sh \
@@ -369,6 +388,8 @@ jobs:
         shell: bash
         env:
           LATEST_BEFORE: ${{ steps.latest-before.outputs.digest }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           AFTER="$(trusted/scripts/verify-server-image-release.sh --repository "$IMAGE_NAME" --resolve latest)"

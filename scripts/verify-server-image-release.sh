@@ -80,14 +80,26 @@ fi
 
 ACCEPT_TYPES='application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json'
 
+# ghcr.io issues an anonymous pull token only for a publicly readable package.
+# For anything else it answers 403, which `curl -f` reports as exit 22 — and
+# under `set -e` that used to abort the script before the diagnostic below could
+# run, leaving a bare "curl: (22)" as the only explanation. The failure is
+# reported here instead, so a caller that forgot the credentials is told so.
 registry_token() {
-  curl -fsSL -u "${REGISTRY_USERNAME:-}:${REGISTRY_PASSWORD:-}" \
-    "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull" | jq -r '.token'
+  local response
+  if ! response="$(curl -fsSL -u "${REGISTRY_USERNAME:-}:${REGISTRY_PASSWORD:-}" \
+      "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_PATH}:pull" 2>/dev/null)"; then
+    return 1
+  fi
+  printf '%s' "$response" | jq -r '.token // empty'
 }
 
-TOKEN="$(registry_token)"
-if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+TOKEN=""
+if ! TOKEN="$(registry_token)" || [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
   echo "ERROR: could not obtain a registry pull token for ${IMAGE_PATH}" >&2
+  echo "       Set REGISTRY_USERNAME and REGISTRY_PASSWORD; a workflow" >&2
+  echo "       GITHUB_TOKEN with packages:read is enough. An anonymous read" >&2
+  echo "       succeeds only for a publicly readable package." >&2
   exit 1
 fi
 

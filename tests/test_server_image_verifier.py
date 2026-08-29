@@ -40,6 +40,13 @@ args = sys.argv[1:]
 parsed = urlparse(args[-1])
 
 if parsed.path == "/token":
+    # ghcr.io issues an anonymous pull token only for a publicly readable
+    # package. For anything else it answers 403, and `curl -f` exits 22.
+    credentials = args[args.index("-u") + 1] if "-u" in args else ":"
+    user, _, password = credentials.partition(":")
+    if not user or not password:
+        sys.stderr.write("curl: (22) The requested URL returned error: 403\n")
+        raise SystemExit(22)
     print(json.dumps({"token": "fixture-token"}))
     raise SystemExit(0)
 
@@ -234,22 +241,27 @@ def _registry_fixture(
     }
 
 
-def _run_verifier(fixture: dict) -> subprocess.CompletedProcess[str]:
+def _verifier_environment(fixture: dict, *, credentials: bool = True) -> dict:
     environment = dict(os.environ)
+    environment.pop("REGISTRY_USERNAME", None)
+    environment.pop("REGISTRY_PASSWORD", None)
     environment.update(
         {
             "PATH": f"{fixture['curl'].parent}:{environment['PATH']}",
             "VERIFIER_FIXTURE": str(fixture["path"]),
-            "REGISTRY_USERNAME": "fixture-user",
-            "REGISTRY_PASSWORD": "fixture-password",
         }
     )
-    return subprocess.run(
-        [
-            "bash",
-            str(VERIFIER),
-            "--repository",
-            REPOSITORY,
+    if credentials:
+        environment["REGISTRY_USERNAME"] = "fixture-user"
+        environment["REGISTRY_PASSWORD"] = "fixture-password"
+    return environment
+
+
+def _run_verifier(
+    fixture: dict, *, credentials: bool = True, arguments: list[str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    if arguments is None:
+        arguments = [
             "--tag",
             TAG,
             "--commit",
@@ -258,9 +270,11 @@ def _run_verifier(fixture: dict) -> subprocess.CompletedProcess[str]:
             fixture["amd64_digest"],
             "--arm64-digest",
             fixture["arm64_digest"],
-        ],
+        ]
+    return subprocess.run(
+        ["bash", str(VERIFIER), "--repository", REPOSITORY, *arguments],
         cwd=ROOT,
-        env=environment,
+        env=_verifier_environment(fixture, credentials=credentials),
         capture_output=True,
         text=True,
     )
@@ -360,3 +374,96 @@ def test_the_verified_index_digest_is_the_hash_of_the_bytes_the_registry_served(
     assert result.returncode == 0, result.stderr
     assert _digest(served) == fixture["index_digest"]
     assert f"{REPOSITORY}@{fixture['index_digest']}" in result.stdout
+
+
+# ── Registry authentication ───────────────────────────────────────────
+#
+# The first real v0.5.4-beta release stopped here: `--resolve latest` ran with
+# no REGISTRY_USERNAME / REGISTRY_PASSWORD, asked ghcr.io/token anonymously and
+# was answered 403. These reproduce that against the stand-in registry, in both
+# the mode that failed and every other mode the release workflow uses.
+
+
+@pytest.mark.parametrize(
+    ("mode", "arguments"),
+    [
+        ("resolve", ["--resolve", "latest"]),
+        ("resolve-alias", ["--resolve", TAG]),
+        ("verify-tag", None),
+        (
+            "verify-reference",
+            ["--verify-reference", TAG, "--commit", COMMIT],
+        ),
+    ],
+)
+def test_every_verifier_mode_fails_closed_without_registry_credentials(
+    tmp_path: Path, mode: str, arguments
+):
+    """No credentials means no pull token, and no pull token means no release."""
+
+    fixture = _registry_fixture(tmp_path)
+    if arguments is not None and mode == "verify-reference":
+        arguments = arguments + [
+            "--amd64-digest",
+            fixture["amd64_digest"],
+            "--arm64-digest",
+            fixture["arm64_digest"],
+        ]
+
+    result = _run_verifier(fixture, credentials=False, arguments=arguments)
+
+    assert result.returncode != 0, f"{mode} continued without a registry token"
+    assert "could not obtain a registry pull token" in result.stderr
+    # Nothing is reported as verified, and no digest is emitted for a caller to
+    # mistake for a resolved reference.
+    assert "absent" not in result.stdout
+    assert "sha256:" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mode", "arguments"),
+    [
+        ("resolve", ["--resolve", "latest"]),
+        ("verify-tag", None),
+    ],
+)
+def test_the_same_modes_succeed_once_the_credentials_are_present(
+    tmp_path: Path, mode: str, arguments
+):
+    fixture = _registry_fixture(tmp_path)
+
+    result = _run_verifier(fixture, credentials=True, arguments=arguments)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_partial_credential_pair_is_not_treated_as_anonymous_success(tmp_path: Path):
+    """A username with no password must fail, not silently degrade."""
+
+    fixture = _registry_fixture(tmp_path)
+    environment = _verifier_environment(fixture, credentials=False)
+    environment["REGISTRY_USERNAME"] = "fixture-user"
+
+    result = subprocess.run(
+        ["bash", str(VERIFIER), "--repository", REPOSITORY, "--resolve", "latest"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "could not obtain a registry pull token" in result.stderr
+
+
+def test_the_credentials_never_appear_in_verifier_output(tmp_path: Path):
+    """Redaction is GitHub's job for the secret; the script must not help it leak."""
+
+    fixture = _registry_fixture(tmp_path)
+
+    result = _run_verifier(fixture)
+
+    assert result.returncode == 0, result.stderr
+    for secret in ("fixture-password", "fixture-user"):
+        assert secret not in result.stdout
+        assert secret not in result.stderr

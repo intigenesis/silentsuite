@@ -510,6 +510,106 @@ def test_release_verifier_can_validate_an_existing_alias_identity():
     assert "revision label is" in verifier
 
 
+# ── Registry verifier credentials ─────────────────────────────────────
+#
+# The verifier queries the GHCR API directly instead of going through the Docker
+# client, so `docker/login-action` does nothing for it. It mints its own pull
+# token from REGISTRY_USERNAME / REGISTRY_PASSWORD, and asks anonymously when
+# they are unset — which a package that is not publicly readable answers with
+# 403. Every step that runs it therefore needs exactly those two variables, and
+# no other step may carry them.
+
+REGISTRY_VERIFIER = "verify-server-image-release.sh"
+REGISTRY_CREDENTIALS = {
+    "REGISTRY_USERNAME": "${{ github.actor }}",
+    "REGISTRY_PASSWORD": "${{ secrets.GITHUB_TOKEN }}",
+}
+
+
+def verifier_steps(workflow: dict) -> list[tuple[str, dict]]:
+    """Every step whose script actually executes the registry verifier."""
+
+    found = []
+    for job_name, job in workflow["jobs"].items():
+        for step in steps(job):
+            if REGISTRY_VERIFIER in str(step.get("run", "")):
+                found.append((f"{job_name}/{step.get('name')}", step))
+    return found
+
+
+def test_every_registry_verifier_step_can_obtain_a_pull_token():
+    """The whole point: an uncredentialed call gets 403 and stops the release."""
+
+    found = verifier_steps(RELEASE)
+    # latest-before, alias resolve/verify, published-image verify, latest-after.
+    assert [name for name, _ in found] == [
+        "publish-index/Record the current latest reference",
+        "publish-index/Merge verified children into the release index",
+        "publish-index/Verify the published release image",
+        "publish-index/Assert latest was not moved",
+    ], found
+    for name, step in found:
+        env = step.get("env") or {}
+        for key, value in REGISTRY_CREDENTIALS.items():
+            assert env.get(key) == value, f"{name} is missing {key}={value}"
+
+
+def test_the_registry_credentials_are_scoped_to_those_steps_alone():
+    """Never job scope, never workflow scope, never a candidate step."""
+
+    for path in all_workflows():
+        workflow = load(path)
+        assert not set(REGISTRY_CREDENTIALS) & set(workflow.get("env") or {}), path.name
+        for job_name, job in workflow.get("jobs", {}).items():
+            assert not set(REGISTRY_CREDENTIALS) & set(job.get("env") or {}), (
+                f"{path.name}:{job_name} grants the registry credentials to every step"
+            )
+            for step in steps(job):
+                carried = set(REGISTRY_CREDENTIALS) & set(step.get("env") or {})
+                if not carried:
+                    continue
+                assert path == RELEASE_WORKFLOW, f"{path.name} must not carry {carried}"
+                assert REGISTRY_VERIFIER in str(step.get("run", "")), (
+                    f"{path.name}:{job_name}/{step.get('name')!r} carries {carried} "
+                    "without running the verifier"
+                )
+
+
+def test_the_registry_password_is_never_placed_on_a_command_line():
+    """A secret in argv is visible to every process on the runner."""
+
+    for job in RELEASE["jobs"].values():
+        for step in steps(job):
+            body = str(step.get("run", ""))
+            for key in REGISTRY_CREDENTIALS:
+                assert f"--{key.lower()}" not in body
+                assert f"{key}=" not in body, f"{key} must be inherited, not re-assigned"
+            assert "secrets.GITHUB_TOKEN" not in body, "a secret must reach a script by env"
+
+
+def test_the_verifier_reads_its_credentials_only_from_the_environment():
+    verifier = (ROOT / "scripts" / REGISTRY_VERIFIER).read_text(encoding="utf-8")
+    assert '-u "${REGISTRY_USERNAME:-}:${REGISTRY_PASSWORD:-}"' in verifier
+    assert "--registry-username" not in verifier, "credentials must not be CLI arguments"
+    # It fails closed when no token can be minted rather than proceeding.
+    assert "could not obtain a registry pull token" in verifier
+    assert "set -euo pipefail" in verifier
+    # And it never echoes what it was given.
+    assert "echo \"$REGISTRY_PASSWORD" not in verifier
+    assert "REGISTRY_PASSWORD}\"" not in verifier.replace('${REGISTRY_PASSWORD:-}"', "")
+
+
+def test_the_docker_login_is_not_what_authenticates_the_verifier():
+    """Documented so the next reader does not delete the env as redundant."""
+
+    names = step_names(RELEASE["jobs"]["publish-index"])
+    assert names.index("Record the current latest reference") < names.index(
+        "Login to GitHub Container Registry"
+    ), "the first verifier call precedes the Docker login, which cannot serve it"
+    source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+    assert "does nothing for it" in source
+
+
 def test_release_never_pushes_or_moves_latest():
     source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     assert ":latest" not in source
