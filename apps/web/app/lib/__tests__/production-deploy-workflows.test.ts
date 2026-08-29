@@ -104,7 +104,6 @@ const approvedNode24ActionPins: Record<string, string> = {
   'actions/setup-java': 'b6effb05e454b25005698d916606bdc6ffcbf961',
   'actions/cache': '55cc8345863c7cc4c66a329aec7e433d2d1c52a9',
   'ReactiveCircus/android-emulator-runner': 'a421e43855164a8197daf9d8d40fe71c6996bb0d',
-  'softprops/action-gh-release': '3d0d9888cb7fd7b750713d6e236d1fcb99157228',
   'actions/github-script': '3a2844b7e9c422d3c10d287c895573f7108da1b3',
   'cloudflare/wrangler-action': 'ebbaa1584979971c8614a24965b4405ff95890e0',
   'docker/setup-qemu-action': '96fe6ef7f33517b61c61be40b68a1882f3264fb8',
