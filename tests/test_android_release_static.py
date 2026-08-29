@@ -44,6 +44,12 @@ def release_steps() -> dict[str, dict[str, object]]:
     return job_steps("build-release")
 
 
+def attachment_steps() -> dict[str, dict[str, object]]:
+    """Release assets are attached from a separate, signing-free job."""
+
+    return job_steps("attach-release-assets")
+
+
 def checksum_outputs(run: str) -> dict[str, str]:
     lines = run.splitlines()
     outputs: dict[str, str] = {}
@@ -95,18 +101,36 @@ def test_android_release_checksum_generation_matches_uploads():
         symbols: symbols_checksum,
     }
 
-    attach = steps["Attach Android artifacts to umbrella GitHub Release"]
-    uploaded = attach["with"]["files"].splitlines()
-    assert uploaded == [
-        f"android/app/build/outputs/apk/release/{apk}",
-        f"android/app/build/outputs/apk/release/{installer_checksum}",
-        f"android/app/build/outputs/bundle/release/{aab}",
-        f"android/app/build/outputs/bundle/release/{bundle_checksum}",
-        f"android/app/build/outputs/native-debug-symbols/release/{symbols}",
-        f"android/app/build/outputs/native-debug-symbols/release/{symbols_checksum}",
+    # The signed job stages exactly the six renamed assets into one closed
+    # directory; it no longer attaches them itself.
+    stage_run = steps["Stage the closed release-asset set"]["run"]
+    for name in (apk, installer_checksum, aab, bundle_checksum, symbols, symbols_checksum):
+        assert name in stage_run, name
+
+    # The attachment job re-asserts that closed inventory and hands exactly those
+    # six names to the hardened helper, which refuses a published release and
+    # never overwrites an asset.
+    attach_steps = attachment_steps()
+    inventory = attach_steps["Re-assert the closed asset inventory"]["run"]
+    handoff = attach_steps["Attach the Android assets to the shared draft release"]["run"]
+    release_tag = "${RELEASE_TAG}"
+    expected = [
+        f"silentsuite-android-{release_tag}.apk",
+        f"silentsuite-android-{release_tag}-installer.sha256",
+        f"silentsuite-android-{release_tag}.aab",
+        f"silentsuite-android-{release_tag}-bundle.sha256",
+        f"silentsuite-android-{release_tag}-native-debug-symbols.zip",
+        f"silentsuite-android-{release_tag}-native-debug-symbols.sha256",
     ]
-    assert attach["with"]["draft"] == "true"
-    assert attach["with"]["fail_on_unmatched_files"] == "true"
+    handed_off = [
+        line.split("--asset ")[1].strip().rstrip("\\").strip().strip('"')
+        for line in handoff.splitlines()
+        if "--asset " in line
+    ]
+    assert handed_off == expected
+    for name in expected:
+        assert name in inventory, f"{name} is not in the re-asserted inventory"
+    assert "scripts/attach-umbrella-release-assets.sh" in handoff
 
 
 def test_android_release_checksum_sidecars_do_not_match_orion_apk_filter():
@@ -202,8 +226,19 @@ def test_release_symbols_upload_is_gated_by_verifier_and_release_attach():
     assert ordered.index("Verify release native debug symbols") < ordered.index(
         "Upload signed release APK, AAB, and native debug symbols"
     )
-    attach = steps["Attach Android artifacts to umbrella GitHub Release"]
-    assert attach["with"]["fail_on_unmatched_files"] == "true"
+    # Release assets leave this job as a closed artifact instead of being
+    # attached here; the inventory re-assertion downstream is what now fails
+    # closed if the symbols ZIP is missing.
+    stage_run = steps["Stage the closed release-asset set"]["run"]
+    assert "native-debug-symbols.zip" in stage_run
+    artifact = steps["Publish the closed release-asset set to the attachment job"]
+    assert artifact["with"]["if-no-files-found"] == "error"
+    assert ordered.index("Verify release native debug symbols") < ordered.index(
+        "Stage the closed release-asset set"
+    )
+    inventory = attachment_steps()["Re-assert the closed asset inventory"]["run"]
+    assert "native-debug-symbols.zip" in inventory
+    assert "Refusing attachment" in inventory
 
 
 def test_pr_build_uploads_generated_symbols_after_verification():

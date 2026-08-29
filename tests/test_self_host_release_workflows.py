@@ -138,12 +138,23 @@ def test_only_the_asset_attachment_job_can_write_repository_contents():
 
 
 def test_release_admission_requires_a_tag_reachable_from_protected_main():
-    run = step_named(RELEASE["jobs"]["admit"], "Require an immutable tag reachable from protected main")["run"]
-    assert r"^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$" in run
-    assert "git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main" in run
-    assert "+refs/heads/main:refs/remotes/origin/main" in run
-    assert '"$(git rev-parse HEAD)" != "$GITHUB_SHA"' in run
-    assert '"$TAG_COMMIT" != "$GITHUB_SHA"' in run
+    """One admission definition, shared by all three component lanes."""
+
+    step = step_named(RELEASE["jobs"]["admit"], "Admit the release source")
+    assert step["run"].strip() == "scripts/admit-release-source.sh"
+    helper = ADMIT_HELPER.read_text(encoding="utf-8")
+    assert r"^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$" in helper
+    assert 'git merge-base --is-ancestor "$GITHUB_SHA" origin/main' in helper
+    assert "+refs/heads/main:refs/remotes/origin/main" in helper
+    assert '"$(git rev-parse HEAD)" != "$GITHUB_SHA"' in helper
+    assert '"$TAG_COMMIT" != "$GITHUB_SHA"' in helper
+    assert "only admits tag pushes" in helper
+    checkout = step_named(RELEASE["jobs"]["admit"], "Checkout exact tag commit")
+    assert checkout["with"] == {
+        "ref": "${{ github.sha }}",
+        "fetch-depth": "0",
+        "persist-credentials": "false",
+    }
 
 
 def test_release_admission_runs_before_anything_is_built():
@@ -164,7 +175,7 @@ def test_admission_is_the_last_thing_that_happens_before_any_registry_write():
 
     admit = RELEASE["jobs"]["admit"]
     names = step_names(admit)
-    source = names.index("Require an immutable tag reachable from protected main")
+    source = names.index("Admit the release source")
     assert source == len(names) - 1, "admission is the last thing the job does"
     assert admit["permissions"] == {"contents": "read"}
 
@@ -294,7 +305,7 @@ def test_release_attaches_only_self_host_assets_to_the_shared_draft():
         "Attach the verified assets to the shared draft release"
     )
     attach = step_named(job, "Attach the verified assets to the shared draft release")["run"]
-    assert "scripts/publish-self-host-release-assets.sh" in attach
+    assert "scripts/attach-umbrella-release-assets.sh" in attach
     for asset in (
         '--asset "silentsuite-self-host-${RELEASE_TAG}.tar.gz"',
         '--asset "silentsuite-self-host-${RELEASE_TAG}.tar.gz.sha256"',
@@ -310,7 +321,7 @@ def test_release_never_publishes_the_umbrella_release():
 
 
 def test_shared_draft_helper_is_race_safe_and_fails_closed():
-    helper = (ROOT / "scripts" / "publish-self-host-release-assets.sh").read_text(encoding="utf-8")
+    helper = (ROOT / "scripts" / "attach-umbrella-release-assets.sh").read_text(encoding="utf-8")
     assert "refusing to guess which draft to append to" in helper
     assert "refusing to clobber" in helper
     assert "refusing to alter a published release" in helper
@@ -342,7 +353,7 @@ def test_ci_server_covers_every_surface_that_can_change_the_image():
             "scripts/verify-self-host-bundle.py",
             "scripts/selfhost_release_contract.py",
             "scripts/verify-server-image-release.sh",
-            "scripts/publish-self-host-release-assets.sh",
+            "scripts/attach-umbrella-release-assets.sh",
             "contracts/self-host-server-image.schema.json",
             "tests/test_self_host_*.py",
             "tests/test_server_image_verifier.py",
@@ -380,7 +391,7 @@ def test_ci_server_runs_the_contract_suite_and_shell_syntax_checks():
         "scripts/self-host-image-smoke.sh",
         "scripts/self-host-compose-effective-check.sh",
         "scripts/verify-server-image-release.sh",
-        "scripts/publish-self-host-release-assets.sh",
+        "scripts/attach-umbrella-release-assets.sh",
     ):
         assert script in syntax
 
@@ -467,14 +478,15 @@ def test_every_workflow_action_is_pinned_to_an_immutable_commit():
 ANDROID_WORKFLOW = WORKFLOW_DIR / "build-android.yml"
 BRIDGE_WORKFLOW = WORKFLOW_DIR / "build-bridge.yml"
 UMBRELLA_GROUP = "umbrella-release-${{ github.ref_name }}"
-PUBLISH_HELPER = ROOT / "scripts" / "publish-self-host-release-assets.sh"
+ATTACH_HELPER = ROOT / "scripts" / "attach-umbrella-release-assets.sh"
+ADMIT_HELPER = ROOT / "scripts" / "admit-release-source.sh"
 
 # Every job that appends assets to the shared umbrella draft, and the step in it
 # that actually creates or uploads.
 ATTACHMENT_JOBS = [
     (RELEASE_WORKFLOW, "attach-release-assets", "Attach the verified assets to the shared draft release"),
-    (ANDROID_WORKFLOW, "build-release", "Attach Android artifacts to umbrella GitHub Release"),
-    (BRIDGE_WORKFLOW, "release", "Attach bridge binaries to umbrella GitHub Release"),
+    (ANDROID_WORKFLOW, "attach-release-assets", "Attach the Android assets to the shared draft release"),
+    (BRIDGE_WORKFLOW, "release", "Attach the bridge binaries to the shared draft release"),
 ]
 ATTACHMENT_IDS = [f"{path.stem}:{job}" for path, job, _ in ATTACHMENT_JOBS]
 
@@ -510,12 +522,102 @@ def test_the_umbrella_domain_is_scoped_to_the_tag_not_the_commit_or_workflow():
 
 
 def test_a_manual_bridge_release_cannot_share_a_domain_with_a_real_umbrella_tag():
-    """Dispatch runs group on their dispatch ref and mint a synthetic tag."""
+    """A dispatch always mints a synthetic tag, whatever ref it selected.
 
-    source = BRIDGE_WORKFLOW.read_text(encoding="utf-8")
-    assert 'TAG="v0.0.0-bridge-manual-' in source
+    A `workflow_dispatch` can choose a `refs/tags/v*` ref. Deriving the tag from
+    the ref — as this workflow used to — let such a dispatch write a real
+    umbrella draft. The dispatch lane is now a separate job that never consults
+    the ref and never joins the umbrella concurrency domain.
+    """
+
     bridge = load(BRIDGE_WORKFLOW)
+    manual = bridge["jobs"]["manual-release"]
+    assert bridge["permissions"] == {}
+    assert bridge["jobs"]["build"]["permissions"] == {"contents": "read"}
+    assert manual["if"] == (
+        "github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'yes'"
+    )
+    assert manual["concurrency"]["group"] == "bridge-manual-release-${{ github.ref }}"
+    assert manual["concurrency"]["group"] != UMBRELLA_GROUP
+    checkout = step_named(manual, "Checkout attachment helper source")
+    assert checkout["with"] == {
+        "ref": "refs/heads/main",
+        "persist-credentials": "false",
+    }, "manual release-writing helper code must come from protected main"
+
+    mint = step_named(manual, "Mint the synthetic manual tag")["run"]
+    assert 'TAG="v0.0.0-bridge-manual-$(date -u +%Y%m%d%H%M%S)"' in mint
+    # The whole point: no branch on the ref, so a tag ref cannot be adopted.
+    for ref_read in ("GITHUB_REF", "github.ref_name", "refs/tags/"):
+        assert ref_read not in mint, f"the synthetic tag must not consult {ref_read}"
+
+    # And the real umbrella lane is reachable only from a tag push.
+    assert bridge["jobs"]["release"]["if"] == (
+        "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
+    )
     assert bridge["jobs"]["release"]["concurrency"]["group"] == UMBRELLA_GROUP
+
+
+def test_the_bridge_manual_lane_cannot_reach_the_real_umbrella_tag_output():
+    """It has no admission job, so it has no admitted tag to attach to."""
+
+    bridge = load(BRIDGE_WORKFLOW)
+    manual = bridge["jobs"]["manual-release"]
+    assert manual["needs"] == "build"
+    assert "admit" not in str(manual["needs"])
+    assert "needs.admit" not in str(manual)
+
+
+# ── Component admission: every lane admits its own source ─────────────
+
+
+ADMISSION_JOBS = [
+    (RELEASE_WORKFLOW, "admit"),
+    (ANDROID_WORKFLOW, "release-admission"),
+    (BRIDGE_WORKFLOW, "admit"),
+]
+ADMISSION_IDS = [f"{path.stem}:{job}" for path, job in ADMISSION_JOBS]
+
+
+@pytest.mark.parametrize(("path", "job_name"), ADMISSION_JOBS, ids=ADMISSION_IDS)
+def test_every_lane_admits_its_source_with_the_one_shared_helper(path, job_name):
+    """Three lanes, one definition of what a release commit is."""
+
+    job = load(path)["jobs"][job_name]
+    assert job["permissions"] == {"contents": "read"}
+    assert "environment" not in job
+    assert job["outputs"]["tag"] == "${{ steps.source.outputs.tag }}"
+    assert job["outputs"]["commit"] == "${{ steps.source.outputs.commit }}"
+
+    checkout = step_named(job, "Checkout exact tag commit")
+    assert checkout["with"] == {
+        "ref": "${{ github.sha }}",
+        "fetch-depth": "0",
+        "persist-credentials": "false",
+    }
+    run = step_named(job, "Admit the release source")["run"].strip()
+    assert run in (
+        "scripts/admit-release-source.sh",
+        'bash "$GITHUB_WORKSPACE/scripts/admit-release-source.sh"',
+    ), run
+
+
+@pytest.mark.parametrize(
+    ("path", "producer_jobs"),
+    [
+        (RELEASE_WORKFLOW, ["build", "publish-index", "attach-release-assets"]),
+        (ANDROID_WORKFLOW, ["build-release", "attach-release-assets"]),
+        (BRIDGE_WORKFLOW, ["release"]),
+    ],
+    ids=lambda value: value.stem if hasattr(value, "stem") else "jobs",
+)
+def test_no_release_producing_job_runs_without_admission(path, producer_jobs):
+    workflow = load(path)
+    admission = {"admit", "release-admission"}
+    for job_name in producer_jobs:
+        needs = workflow["jobs"][job_name]["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        assert admission & set(needs), f"{path.name}:{job_name} can run unadmitted"
 
 
 def test_no_enclosing_concurrency_rule_can_cancel_a_tag_attachment():
@@ -585,7 +687,7 @@ def test_no_umbrella_lane_holds_a_repository_settings_credential(path):
 def test_no_lane_calls_a_repository_settings_endpoint():
     """Release lanes talk to releases and the registry, never to settings."""
 
-    sources = [PUBLISH_HELPER.read_text(encoding="utf-8")]
+    sources = [ATTACH_HELPER.read_text(encoding="utf-8")]
     sources += [
         path.read_text(encoding="utf-8")
         for path in (RELEASE_WORKFLOW, ANDROID_WORKFLOW, BRIDGE_WORKFLOW, CI_WORKFLOW)
@@ -598,7 +700,7 @@ def test_no_lane_calls_a_repository_settings_endpoint():
 def test_the_publish_helper_only_addresses_release_objects_and_assets():
     """Every API path it builds is a release read/write, nothing wider."""
 
-    source = PUBLISH_HELPER.read_text(encoding="utf-8")
+    source = ATTACH_HELPER.read_text(encoding="utf-8")
     paths = set(re.findall(r'"/repos/\$\{GITHUB_REPOSITORY\}(/[^"$]*)', source))
     assert paths, "the helper should address the releases API"
     for path in paths:
@@ -613,7 +715,7 @@ def test_the_publish_helper_step_carries_only_the_workflow_token():
         "Attach the verified assets to the shared draft release",
     )
     assert step["env"] == {"GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}
-    helper = PUBLISH_HELPER.read_text(encoding="utf-8")
+    helper = ATTACH_HELPER.read_text(encoding="utf-8")
     assert "GITHUB_TOKEN:?" in helper, "the helper requires it up front"
 
 
@@ -624,22 +726,61 @@ def test_every_attachment_writes_a_draft_and_never_publishes_it(path, job_name, 
     job = load(path)["jobs"][job_name]
     assert attach_step in step_names(job)
     step = step_named(job, attach_step)
-    if "uses" in step:
-        assert "softprops/action-gh-release" in step["uses"]
-        assert step["with"]["draft"] == "true"
-        assert "make_latest" not in step["with"]
-    else:
-        assert "publish-self-host-release-assets.sh" in step["run"]
+    # Exactly one publisher across all three lanes. A marketplace release action
+    # would treat `draft: true` as "keep an existing draft a draft" rather than
+    # "refuse a published release", and would delete a colliding asset before
+    # re-uploading it; the helper does neither.
+    assert "uses" not in step, f"{path.name}:{job_name} must not attach with an action"
+    assert str(ATTACH_HELPER.name) in step["run"]
 
     source = path.read_text(encoding="utf-8")
-    for forbidden in ("draft: false", "gh release edit", "gh release create", "make_latest"):
-        assert forbidden not in source, f"{path.name} can publish the umbrella release"
+    for forbidden in (
+        "softprops/action-gh-release",
+        "draft: false",
+        "gh release edit",
+        "gh release create",
+        "gh release upload",
+        "make_latest",
+        "overwrite_files",
+    ):
+        assert forbidden not in source, f"{path.name} can publish or overwrite a release asset"
+
+
+def test_no_workflow_anywhere_writes_a_release_outside_the_hardened_helper():
+    """Repository-wide: the helper is the single sanctioned release publisher."""
+
+    offenders = []
+    for path in all_workflows():
+        source = path.read_text(encoding="utf-8")
+        for marker in ("softprops/action-gh-release", "gh release create", "gh release upload",
+                       "gh release edit", "gh release delete"):
+            if marker in source:
+                offenders.append(f"{path.name}: {marker}")
+    assert offenders == []
+
+
+def test_the_helper_never_deletes_or_replaces_an_existing_asset():
+    """A rerun is a no-op or a refusal, never a destructive rewrite.
+
+    This is the exact behaviour the marketplace action does not have: it deletes
+    a same-named asset before re-uploading, so an interrupted rerun can leave a
+    published release missing an asset.
+    """
+
+    helper = ATTACH_HELPER.read_text(encoding="utf-8")
+    assert "refusing to clobber" in helper
+    assert "already present with identical bytes" in helper
+    for destructive in ("-X DELETE", "-X PATCH", "-X PUT", "releases/assets/${asset_id}\" -X"):
+        assert destructive not in helper, f"the helper must never {destructive}"
+    # The only mutating verb it uses is POST: create a draft, upload an asset.
+    verbs = set(re.findall(r"-X ([A-Z]+)", helper))
+    assert verbs <= {"GET", "POST"}, verbs
 
 
 def test_the_shared_draft_helper_refuses_to_touch_a_published_release():
     """Draft-only is enforced by the helper, not just by its callers."""
 
-    helper = PUBLISH_HELPER.read_text(encoding="utf-8")
+    helper = ATTACH_HELPER.read_text(encoding="utf-8")
     assert "refusing to alter a published release" in helper
     assert '[ "$RELEASE_DRAFT" != "true" ]' in helper
     assert "publication remains manual" in helper

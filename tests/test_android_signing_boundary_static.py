@@ -11,20 +11,24 @@ CHECKER = ROOT / "scripts" / "check-android-signing-boundary.py"
 ROOT_WORKFLOW = Path(".github/workflows/build-android.yml")
 SIBLING_WORKFLOW = Path("android/.github/workflows/build.yml")
 CONSCRYPT_BUILD_SCRIPT = Path("android/scripts/build-conscrypt-android-r28.sh")
-RELEASE_NEEDS = "    needs: [signing-policy, conscrypt-r28]\n"
+ADMISSION_HELPER = Path("scripts/admit-release-source.sh")
+ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
+RELEASE_NEEDS = "    needs: [signing-policy, conscrypt-r28, release-admission]\n"
+RELEASE_CHECKOUT = (
+    "      - name: Checkout\n"
+    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+    "        with:\n"
+    "          ref: ${{ github.sha }}\n"
+    "          persist-credentials: false\n"
+)
 RELEASE_JOB_HEAD = (
-    "    concurrency:\n"
-    "      group: umbrella-release-${{ github.ref_name }}\n"
-    "      cancel-in-progress: false\n"
-    "      queue: max\n"
     "    defaults:\n"
     "      run:\n"
     "        working-directory: android\n"
     "\n"
     "    steps:\n"
-    "      - name: Checkout\n"
-    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
-    "\n"
+    + RELEASE_CHECKOUT
+    + "\n"
     "      - name: Set up JDK 17\n"
 )
 POLICY_STEP = """      - name: Enforce Android signing boundary
@@ -49,6 +53,12 @@ def fixture_root(tmp_path: Path) -> Path:
     shutil.copy2(ROOT / SIBLING_WORKFLOW, root / SIBLING_WORKFLOW)
     (root / CONSCRYPT_BUILD_SCRIPT).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / CONSCRYPT_BUILD_SCRIPT, root / CONSCRYPT_BUILD_SCRIPT)
+    # The admission and attachment jobs execute these with network and API
+    # access, so the policy pins their bytes; the fixture must carry them for
+    # the digest checks to be real.
+    for helper in (ADMISSION_HELPER, ATTACHMENT_HELPER):
+        (root / helper).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / helper, root / helper)
     return root
 
 
@@ -443,7 +453,7 @@ def test_nonrelease_job_write_permission_is_rejected(tmp_path: Path) -> None:
 
     assert_rejected(
         run_checker(root),
-        "job build-pr has dynamic or write permissions outside build-release",
+        "job build-pr has dynamic or write permissions outside attach-release-assets",
     )
 
 
@@ -473,7 +483,7 @@ def test_release_needs_must_be_exact(tmp_path: Path) -> None:
     mutate(
         workflow,
         RELEASE_NEEDS,
-        "    needs: [signing-policy, conscrypt-r28, attacker]\n",
+        "    needs: [signing-policy, conscrypt-r28, release-admission, attacker]\n",
     )
 
     assert_rejected(run_checker(root), "build-release must require successful signing-policy")
@@ -801,10 +811,11 @@ def test_earlier_release_step_cannot_poison_secret_execution_environment(tmp_pat
 def test_release_secret_cannot_move_into_action_input(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     workflow = root / ROOT_WORKFLOW
-    mutate_last(
+    mutate(
         workflow,
-        "      - name: Checkout\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n\n      - name: Set up JDK 17\n",
-        "      - name: Checkout\n        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n        with:\n          token: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n\n      - name: Set up JDK 17\n",
+        RELEASE_CHECKOUT,
+        RELEASE_CHECKOUT.rstrip("\n")
+        + "\n          token: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n",
     )
 
     assert_rejected(run_checker(root), "references signing secrets outside reviewed step environments")
@@ -866,7 +877,7 @@ CONCURRENCY_BLOCK = (
     "      cancel-in-progress: false\n"
     "      queue: max\n"
 )
-CONCURRENCY_NEEDLE = "build-release must declare exactly the reviewed umbrella-release concurrency"
+CONCURRENCY_NEEDLE = "attach-release-assets must declare exactly the reviewed umbrella-release concurrency"
 
 
 def test_removing_queue_max_from_the_attachment_lock_is_rejected(tmp_path: Path) -> None:
@@ -959,4 +970,262 @@ def test_every_attachment_mutation_also_breaks_the_exact_job_digest(tmp_path: Pa
     mutate(root / ROOT_WORKFLOW, "      queue: max\n", "      queue: single\n")
     result = run_checker(root)
     assert result.returncode == 1
-    assert "must match the exact reviewed release-job specification" in result.stdout
+    assert "must match the exact reviewed attachment-job specification" in result.stdout
+
+
+# ── Credential isolation: signing and release-writing are separate jobs ──
+
+
+def test_moving_the_umbrella_lock_onto_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    """The signing job must not rejoin the shared write domain."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "    environment: android-release\n    permissions:\n      contents: read\n"
+        "    defaults:\n",
+        "    environment: android-release\n    permissions:\n      contents: read\n"
+        + CONCURRENCY_BLOCK
+        + "    defaults:\n",
+    )
+    assert_rejected(
+        run_checker(root),
+        "build-release must not declare concurrency; the umbrella lock belongs to",
+    )
+
+
+def test_granting_the_signing_job_write_permission_is_rejected(tmp_path: Path) -> None:
+    """contents:write beside a decoded keystore is the whole thing being removed."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "    environment: android-release\n    permissions:\n      contents: read\n",
+        "    environment: android-release\n    permissions:\n      contents: write\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "build-release permissions must be exactly contents: read" in result.stdout
+    assert "holds signing material and must declare read-only permissions" in result.stdout
+
+
+def test_persisting_the_checkout_credential_in_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    """A persisted token would be readable by Gradle and every build script."""
+
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, RELEASE_CHECKOUT,
+           RELEASE_CHECKOUT.replace("          persist-credentials: false\n", ""))
+    assert_rejected(
+        run_checker(root),
+        "build-release must check out the admitted commit exactly once with persist-credentials: false",
+    )
+
+
+def test_checking_out_a_floating_ref_in_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, "          ref: ${{ github.sha }}\n          persist-credentials: false\n",
+           "          ref: main\n          persist-credentials: false\n")
+    assert_rejected(
+        run_checker(root),
+        "build-release must check out the admitted commit exactly once with persist-credentials: false",
+    )
+
+
+def test_reintroducing_a_release_action_beside_signing_material_is_rejected(tmp_path: Path) -> None:
+    """The exact regression the reviewers found: an overwrite-capable publisher."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Cleanup keystore\n",
+        "      - name: Attach Android artifacts to umbrella GitHub Release\n"
+        "        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2\n"
+        "        with:\n"
+        "          tag_name: ${{ github.ref_name }}\n"
+        "          draft: true\n"
+        "\n      - name: Cleanup keystore\n",
+    )
+    assert_rejected(
+        run_checker(root),
+        "holds signing material and can also write a release: softprops/action-gh-release",
+    )
+
+
+def test_calling_the_attachment_helper_beside_signing_material_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Cleanup keystore\n",
+        "      - name: Attach directly\n"
+        "        run: bash scripts/attach-umbrella-release-assets.sh --tag v1.2.3\n"
+        "\n      - name: Cleanup keystore\n",
+    )
+    assert_rejected(
+        run_checker(root),
+        "holds signing material and can also write a release: attach-umbrella-release-assets.sh",
+    )
+
+
+def test_a_release_api_call_beside_signing_material_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Cleanup keystore\n",
+        "      - name: Poke the API\n"
+        "        run: |\n"
+        '          curl -sS https://api.github.com/repos/o/r/releases\n'
+        "\n      - name: Cleanup keystore\n",
+    )
+    assert_rejected(
+        run_checker(root),
+        "holds signing material and can also write a release: api.github.com",
+    )
+
+
+def test_dropping_the_admission_prerequisite_is_rejected(tmp_path: Path) -> None:
+    """A tag pushed at an unreviewed commit must not reach signing material."""
+
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, RELEASE_NEEDS, "    needs: [signing-policy, conscrypt-r28]\n")
+    assert_rejected(
+        run_checker(root),
+        "build-release must require successful signing-policy, conscrypt-r28 and release-admission",
+    )
+
+
+def test_removing_the_admission_job_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    workflow = root / ROOT_WORKFLOW
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index("  release-admission:\n")
+    end = text.index("  # ─────────────────────────────────────────────────────────────────────\n"
+                     "  # Release builds", start)
+    workflow.write_text(text[:start] + text[end:], encoding="utf-8")
+    assert_rejected(run_checker(root), "must define the release-admission job")
+
+
+def test_neutering_the_admission_command_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        '        run: bash "$GITHUB_WORKSPACE/scripts/admit-release-source.sh"\n',
+        '        run: bash "$GITHUB_WORKSPACE/scripts/admit-release-source.sh" || true\n',
+    )
+    assert_rejected(
+        run_checker(root),
+        "release-admission must match the exact reviewed admission-job specification",
+    )
+
+
+def test_a_shallow_admission_checkout_is_rejected(tmp_path: Path) -> None:
+    """Reachability from protected main needs real history."""
+
+    root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, "          fetch-depth: 0\n", "          fetch-depth: 1\n")
+    assert_rejected(
+        run_checker(root),
+        "release-admission must match the exact reviewed admission-job specification",
+    )
+
+
+def test_granting_the_admission_job_write_permission_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "  release-admission:\n    name: Admit Android release source\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+        "    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n",
+        "  release-admission:\n    name: Admit Android release source\n"
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n"
+        "    runs-on: ubuntu-latest\n    permissions:\n      contents: write\n",
+    )
+    assert_rejected(run_checker(root), "release-admission must declare exactly contents: read")
+
+
+def test_mutating_the_admission_helper_bytes_is_rejected(tmp_path: Path) -> None:
+    """The step text is stable; the file it runs is what admits a commit."""
+
+    root = fixture_root(tmp_path)
+    assert run_checker(root).returncode == 0, "fixture is clean before the mutation"
+    helper = root / ADMISSION_HELPER
+    helper.write_text(helper.read_text(encoding="utf-8") + "\nexit 0\n", encoding="utf-8")
+    assert_rejected(run_checker(root), f"{ADMISSION_HELPER} must match its exact reviewed digest")
+
+
+def test_mutating_the_attachment_helper_bytes_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    helper = root / ATTACHMENT_HELPER
+    helper.write_text(helper.read_text(encoding="utf-8") + "\ncurl -X DELETE https://elsewhere\n",
+                      encoding="utf-8")
+    assert_rejected(run_checker(root), f"{ATTACHMENT_HELPER} must match its exact reviewed digest")
+
+
+def test_a_missing_helper_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    (root / ATTACHMENT_HELPER).unlink()
+    assert_rejected(run_checker(root), f"{ATTACHMENT_HELPER} is missing")
+
+
+def test_binding_the_attachment_job_to_the_signing_environment_is_rejected(tmp_path: Path) -> None:
+    """The write job must not be able to request the signing environment."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "  attach-release-assets:\n    name: Attach Android assets to the draft release\n",
+        "  attach-release-assets:\n    name: Attach Android assets to the draft release\n"
+        "    environment: android-release\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "attach-release-assets must not bind a deployment environment" in result.stdout
+
+
+def test_a_signing_secret_in_the_attachment_job_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "        env:\n          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        "        run: |\n          set -euo pipefail\n"
+        '          bash "$GITHUB_WORKSPACE/scripts/attach-umbrella-release-assets.sh" \\\n',
+        "        env:\n          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n"
+        "          KSTOREPWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}\n"
+        "        run: |\n          set -euo pipefail\n"
+        '          bash "$GITHUB_WORKSPACE/scripts/attach-umbrella-release-assets.sh" \\\n',
+    )
+    assert_rejected(
+        run_checker(root),
+        "attach-release-assets must never reference Android signing secrets",
+    )
+
+
+def test_swapping_the_attachment_helper_for_a_release_action_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Attach the Android assets to the shared draft release\n",
+        "      - name: Attach with a marketplace action\n"
+        "        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2\n"
+        "        with:\n"
+        "          tag_name: ${{ github.ref_name }}\n"
+        "          draft: true\n"
+        "\n      - name: Attach the Android assets to the shared draft release\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "attach-release-assets must not use a marketplace release action" in result.stdout
+
+
+def test_dropping_the_closed_asset_artifact_is_rejected(tmp_path: Path) -> None:
+    """The attachment job must consume exactly what the signed job produced."""
+
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "          name: silentsuite-android-release-assets-${{ github.sha }}\n"
+        "          path: release-assets\n",
+        "          path: release-assets\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "attach-release-assets must consume the closed release-asset artifact" in result.stdout

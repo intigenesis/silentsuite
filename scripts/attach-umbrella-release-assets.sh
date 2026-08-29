@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Attach the verified self-host release artefacts to the shared draft umbrella
-# release for one release tag.
+# Attach one component's verified artefacts to the shared draft umbrella release
+# for a release tag.
 #
-# The Android and Bridge tag workflows append to the same draft concurrently, so
-# this script is deliberately defensive:
+# This is the *only* sanctioned way any lane writes a release asset. The Android,
+# Bridge and self-host server lanes all call it, all append to the same draft,
+# and can run concurrently, so it is deliberately defensive:
 #   * bounded idempotent lookup-or-create of the draft for this exact tag;
 #   * fails closed if more than one release claims the tag, if the release is not
 #     a draft, or if a same-named asset already exists with different bytes;
+#   * never deletes or replaces an asset: a byte-identical re-run is a no-op and
+#     anything else is refused, so a rerun can never damage an existing release;
 #   * never writes the release body, name of an existing release, or publishes it;
 #   * records sibling asset names before uploading and re-asserts them after;
 #   * reads every uploaded asset back and compares its bytes to the local file.
+#
+# Why not a marketplace release action: the widely used ones treat `draft: true`
+# as "keep an existing draft a draft" rather than "refuse a published release",
+# and default to deleting a colliding asset before re-uploading it. Either
+# behaviour can damage a published umbrella release on a delayed or repeated run.
 #
 # What it does not claim: nothing here freezes a published release. GitHub
 # immutable releases are deferred while the repository has a single direct admin
@@ -20,7 +28,7 @@ set -euo pipefail
 # built; it is not a guarantee about the release's future.
 #
 # Usage:
-#   scripts/publish-self-host-release-assets.sh --tag vX.Y.Z --directory DIR \
+#   scripts/attach-umbrella-release-assets.sh --tag vX.Y.Z --directory DIR \
 #     --asset NAME [--asset NAME ...]
 #
 # Credential, exactly one:
@@ -82,8 +90,7 @@ local_digest() {
 }
 
 # Draft releases have no git tag yet, so /releases/tags/<tag> cannot find them.
-# The releases list is the only reliable lookup, exactly as the sibling
-# component workflows' release action does it.
+# Listing releases is the only reliable lookup for a draft.
 find_release() {
   local page found
   : > "$WORKDIR/matches.json"
@@ -274,4 +281,4 @@ if [ "$(jq -r '.id' "$WORKDIR/matches.json")" != "$RELEASE_ID" ]; then
 fi
 
 echo ""
-echo "Self-host assets attached to the draft release for ${TAG}; publication remains manual."
+echo "Assets attached to the draft release for ${TAG}; publication remains manual."

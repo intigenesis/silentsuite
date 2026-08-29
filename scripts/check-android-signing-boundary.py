@@ -28,8 +28,23 @@ ANDROID_SIBLING_WORKFLOW = Path("android/.github/workflows/build.yml")
 CONSCRYPT_BUILD_SCRIPT = Path("android/scripts/build-conscrypt-android-r28.sh")
 ALLOWED_JOB = "build-release"
 POLICY_JOB = "signing-policy"
+ADMISSION_JOB = "release-admission"
+ATTACHMENT_JOB = "attach-release-assets"
 TAG_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
 ENVIRONMENT_NAME = "android-release"
+ADMISSION_HELPER = Path("scripts/admit-release-source.sh")
+ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
+RELEASE_ASSET_ARTIFACT = "silentsuite-android-release-assets-${{ github.sha }}"
+# Anything that can reach the release API or a repository write. None of these
+# may appear in a job that also holds signing material.
+RELEASE_WRITE_MARKERS = (
+    "attach-umbrella-release-assets.sh",
+    "softprops/action-gh-release",
+    "gh release",
+    "api.github.com",
+    "uploads.github.com",
+    "${{ secrets.GITHUB_TOKEN }}",
+)
 SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
 UNSAFE_SECRET_EXPRESSION = re.compile(
     r"\bsecrets\s*\[|\bsecrets\s*\.\s*\*|\btojson\s*\(\s*secrets\s*\)",
@@ -83,11 +98,12 @@ EXPECTED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     },
 }
-# The umbrella-draft attachment lock. Reviewed as an exact literal so a release
-# cannot be quietly re-scoped: a different group would stop serializing against
-# the sibling component lanes, cancel-in-progress would drop an attachment
-# mid-upload, and anything other than queue: max lets the scheduler discard a
-# pending attachment without failing anything.
+# The umbrella-draft attachment lock, which now lives on the attachment job.
+# Reviewed as an exact literal so a release cannot be quietly re-scoped: a
+# different group would stop serializing against the sibling component lanes,
+# cancel-in-progress would drop an attachment mid-upload, and anything other
+# than queue: max lets the scheduler discard a pending attachment without
+# failing anything.
 EXPECTED_RELEASE_CONCURRENCY: dict[str, Any] = {
     "group": "umbrella-release-${{ github.ref_name }}",
     "cancel-in-progress": "false",
@@ -96,10 +112,49 @@ EXPECTED_RELEASE_CONCURRENCY: dict[str, Any] = {
 
 # Every `secrets.NAME` the signed release job is allowed to name. The reviewed
 # step environments below are the only place any of them may appear, so a new
-# credential — a repository-settings reader, a registry token, anything — cannot
+# credential — a repository-settings reader, a release token, anything — cannot
 # be introduced into the job that holds the decoded keystore.
 ALLOWED_RELEASE_SECRETS = set(SIGNING_SECRETS)
 SECRET_REFERENCE = re.compile(r"secrets\.\s*([A-Za-z_][A-Za-z0-9_-]*)")
+
+# The signed job checks out the admitted commit and keeps no credential from it.
+# Reviewed as an exact literal: dropping `persist-credentials: false` would hand
+# a repository write token to Gradle and every build script it runs, beside the
+# decoded keystore.
+EXPECTED_RELEASE_CHECKOUT: dict[str, Any] = {
+    "name": "Checkout",
+    "uses": CHECKOUT_ACTION,
+    "with": {"ref": "${{ github.sha }}", "persist-credentials": "false"},
+}
+
+# The read-only admission job every release-producing Android job depends on.
+EXPECTED_ADMISSION_JOB: dict[str, Any] = {
+    "name": "Admit Android release source",
+    "if": TAG_GUARD,
+    "runs-on": "ubuntu-latest",
+    "permissions": {"contents": "read"},
+    "outputs": {
+        "tag": "${{ steps.source.outputs.tag }}",
+        "commit": "${{ steps.source.outputs.commit }}",
+    },
+    "steps": [
+        {
+            "name": "Checkout exact tag commit",
+            "uses": CHECKOUT_ACTION,
+            "with": {
+                "ref": "${{ github.sha }}",
+                "fetch-depth": "0",
+                "persist-credentials": "false",
+            },
+        },
+        {
+            "name": "Admit the release source",
+            "id": "source",
+            "run": 'bash "$GITHUB_WORKSPACE/scripts/admit-release-source.sh"',
+        },
+    ],
+}
+ALLOWED_ADMISSION_JOB_KEYS = set(EXPECTED_ADMISSION_JOB)
 
 EXPECTED_SECRET_STEP_SHA256 = {
     "Decode release keystore": "44c1231395b5f7347980a05fa641b0e7d866451e10ddb88958e61459f649ffba",
@@ -113,10 +168,18 @@ EXPECTED_SECRET_STEP_SHA256 = {
 REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = dict(
     EXPECTED_RELEASE_STEP_ENVIRONMENTS
 )
-# Covers the whole reviewed job, concurrency included: the explicit literal
-# check above states the intent, this digest makes any other edit to the job
-# fail closed as well.
-EXPECTED_RELEASE_JOB_SHA256 = "16bc9b31381ba8f24fac8a6be6ae3eeb1c33433bab59c00911f94e15e164b57f"
+# Covers the whole reviewed signing job: the explicit literal checks state the
+# intent, this digest makes any other edit to the job fail closed as well.
+EXPECTED_RELEASE_JOB_SHA256 = "9a7d5fe7339446372b8195139b93841b9f6503370937efe4ca9c8dc69e1a7da4"
+# Same treatment for the one job that can write a release. It carries the write
+# credential, the attachment helper and the umbrella lock, so every byte of it
+# is reviewed.
+EXPECTED_ATTACHMENT_JOB_SHA256 = "e3b4f77333a03dd1d46f992243c31dd8c2a57ed10a7fb16118c809925dbfc974"
+EXPECTED_ADMISSION_JOB_SHA256 = "02cf1f903158329993decb728b8ce146f05380f14ac13a8aab4b77385e0d27a2"
+# The helpers those jobs execute. Hashing the step is not enough: the step text
+# is stable while the file it runs is what reaches the network and the API.
+EXPECTED_ADMISSION_HELPER_SHA256 = "1052e5386a8939eb8732ca6188255733e358cedbde9c9f42f685de301edb5e5f"
+EXPECTED_ATTACHMENT_HELPER_SHA256 = "0a10f91147f1786966a3f66b226c58fc9259cc9ced677fe1aea642c224ae6873"
 EXPECTED_CONSCRYPT_JOB_SHA256 = "ed27963320252615ff159bbc388c858fdc872516fc0ea2aa5f50d905f4a5063b"
 EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256 = (
     "0ee234f2ced343c4167bd1efad134a77853f288eb9c5210c1e1173594a014b8b"
@@ -129,7 +192,16 @@ ALLOWED_RELEASE_JOB_KEYS = {
     "environment",
     "permissions",
     "defaults",
+    "steps",
+}
+ALLOWED_ATTACHMENT_JOB_KEYS = {
+    "name",
+    "needs",
+    "if",
+    "runs-on",
+    "permissions",
     "concurrency",
+    "env",
     "steps",
 }
 ALLOWED_RELEASE_STEP_KEYS = {"name", "uses", "with", "run", "env", "if"}
@@ -372,6 +444,112 @@ def check(root: Path) -> list[str]:
     elif hashlib.sha256(conscrypt_script.read_bytes()).hexdigest() != EXPECTED_CONSCRYPT_BUILD_SCRIPT_SHA256:
         violations.append(f"{CONSCRYPT_BUILD_SCRIPT} must match its exact reviewed digest")
 
+    # The two helpers this lane executes. Their bytes are what actually admit a
+    # source commit and what actually writes a release asset.
+    for helper, expected_digest in (
+        (ADMISSION_HELPER, EXPECTED_ADMISSION_HELPER_SHA256),
+        (ATTACHMENT_HELPER, EXPECTED_ATTACHMENT_HELPER_SHA256),
+    ):
+        path = root / helper
+        if not path.is_file():
+            violations.append(f"{helper} is missing")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != expected_digest:
+            violations.append(f"{helper} must match its exact reviewed digest")
+
+    admission = jobs.get(ADMISSION_JOB)
+    if not isinstance(admission, Mapping):
+        violations.append(f"{ROOT_WORKFLOW} must define the {ADMISSION_JOB} job")
+    else:
+        unexpected_keys = set(admission) - ALLOWED_ADMISSION_JOB_KEYS
+        if unexpected_keys:
+            violations.append(
+                f"{ADMISSION_JOB} has unreviewed job keys: {', '.join(sorted(unexpected_keys))}"
+            )
+        if admission.get("permissions") != {"contents": "read"}:
+            violations.append(f"{ADMISSION_JOB} must declare exactly contents: read")
+        if environment_name(admission) is not None:
+            violations.append(f"{ADMISSION_JOB} must not bind any deployment environment")
+        if signing_references(admission):
+            violations.append(f"{ADMISSION_JOB} must never reference Android signing secrets")
+        if admission != EXPECTED_ADMISSION_JOB:
+            violations.append(f"{ADMISSION_JOB} must match the exact reviewed admission-job specification")
+        if semantic_sha256(admission) != EXPECTED_ADMISSION_JOB_SHA256:
+            violations.append(f"{ADMISSION_JOB} must match its exact reviewed digest")
+
+    attachment = jobs.get(ATTACHMENT_JOB)
+    if not isinstance(attachment, Mapping):
+        violations.append(f"{ROOT_WORKFLOW} must define the {ATTACHMENT_JOB} job")
+    else:
+        unexpected_keys = set(attachment) - ALLOWED_ATTACHMENT_JOB_KEYS
+        if unexpected_keys:
+            violations.append(
+                f"{ATTACHMENT_JOB} has unreviewed job keys: {', '.join(sorted(unexpected_keys))}"
+            )
+        if attachment.get("if") != TAG_GUARD:
+            violations.append(f"{ATTACHMENT_JOB} must use the exact push-triggered version-tag guard")
+        if attachment.get("needs") != [ADMISSION_JOB, ALLOWED_JOB]:
+            violations.append(
+                f"{ATTACHMENT_JOB} must require successful {ADMISSION_JOB} and {ALLOWED_JOB}"
+            )
+        if attachment.get("permissions") != {"contents": "write"}:
+            violations.append(f"{ATTACHMENT_JOB} permissions must be exactly contents: write")
+        if environment_name(attachment) is not None:
+            violations.append(
+                f"{ATTACHMENT_JOB} must not bind a deployment environment; it must not be able "
+                "to reach the signing environment's secrets"
+            )
+        if signing_references(attachment):
+            violations.append(
+                f"{ATTACHMENT_JOB} must never reference Android signing secrets; it holds the "
+                "release write credential"
+            )
+        if attachment.get("concurrency") != EXPECTED_RELEASE_CONCURRENCY:
+            violations.append(
+                f"{ATTACHMENT_JOB} must declare exactly the reviewed umbrella-release concurrency "
+                f"{EXPECTED_RELEASE_CONCURRENCY}"
+            )
+        attachment_body = "\n".join(strings(attachment))
+        if str(ATTACHMENT_HELPER) not in attachment_body:
+            violations.append(f"{ATTACHMENT_JOB} must attach through {ATTACHMENT_HELPER}")
+        if "softprops/action-gh-release" in attachment_body:
+            violations.append(
+                f"{ATTACHMENT_JOB} must not use a marketplace release action; it can overwrite "
+                "assets on an already-published release"
+            )
+        if RELEASE_ASSET_ARTIFACT not in attachment_body:
+            violations.append(
+                f"{ATTACHMENT_JOB} must consume the closed release-asset artifact "
+                f"{RELEASE_ASSET_ARTIFACT}"
+            )
+        for target in action_uses(attachment):
+            if target.startswith("./"):
+                violations.append(f"{ATTACHMENT_JOB} must not invoke local actions")
+            elif unpinned_action(target):
+                violations.append(f"{ATTACHMENT_JOB} action {target} must be SHA-pinned")
+        if semantic_sha256(attachment) != EXPECTED_ATTACHMENT_JOB_SHA256:
+            violations.append(
+                f"{ATTACHMENT_JOB} must match the exact reviewed attachment-job specification"
+            )
+
+    # The load-bearing separation: nothing that can write a release may sit in a
+    # job that also holds signing material, in this workflow or any other.
+    for relative, workflow in loaded.items():
+        for job_name, raw_job in (workflow.get("jobs") or {}).items():
+            if not isinstance(raw_job, Mapping) or not signing_references(raw_job):
+                continue
+            body = "\n".join(strings(raw_job))
+            reachable = [marker for marker in RELEASE_WRITE_MARKERS if marker in body]
+            if reachable:
+                violations.append(
+                    f"{relative} job {job_name} holds signing material and can also write a "
+                    f"release: {', '.join(sorted(reachable))}"
+                )
+            if not permissions_read_only(raw_job.get("permissions")):
+                violations.append(
+                    f"{relative} job {job_name} holds signing material and must declare "
+                    "read-only permissions"
+                )
+
     top_permissions = root_workflow.get("permissions")
     if top_permissions is not None and not permissions_read_only(top_permissions):
         violations.append(f"{ROOT_WORKFLOW} must not grant dynamic or write permissions at workflow scope")
@@ -385,14 +563,15 @@ def check(root: Path) -> list[str]:
         if not isinstance(raw_job, Mapping):
             continue
         permissions = raw_job.get("permissions")
-        if job_name == ALLOWED_JOB:
+        if job_name == ATTACHMENT_JOB:
             if permissions != {"contents": "write"}:
-                violations.append(f"{ALLOWED_JOB} permissions must be exactly contents: write")
+                violations.append(f"{ATTACHMENT_JOB} permissions must be exactly contents: write")
         elif permissions is None:
             violations.append(f"{ROOT_WORKFLOW} job {job_name} must declare explicit read-only permissions")
         elif not permissions_read_only(permissions):
             violations.append(
-                f"{ROOT_WORKFLOW} job {job_name} has dynamic or write permissions outside {ALLOWED_JOB}"
+                f"{ROOT_WORKFLOW} job {job_name} has dynamic or write permissions outside "
+                f"{ATTACHMENT_JOB}"
             )
 
     if policy != EXPECTED_POLICY_JOB:
@@ -403,8 +582,26 @@ def check(root: Path) -> list[str]:
         violations.append(f"{ALLOWED_JOB} is missing signing references: {', '.join(sorted(missing_refs))}")
     if release.get("if") != TAG_GUARD:
         violations.append(f"{ALLOWED_JOB} must use the exact push-triggered version-tag guard")
-    if release.get("needs") != [POLICY_JOB, "conscrypt-r28"]:
-        violations.append(f"{ALLOWED_JOB} must require successful {POLICY_JOB} and conscrypt-r28")
+    if release.get("needs") != [POLICY_JOB, "conscrypt-r28", ADMISSION_JOB]:
+        violations.append(
+            f"{ALLOWED_JOB} must require successful {POLICY_JOB}, conscrypt-r28 and {ADMISSION_JOB}"
+        )
+    if release.get("permissions") != {"contents": "read"}:
+        violations.append(
+            f"{ALLOWED_JOB} permissions must be exactly contents: read; the release write "
+            f"belongs to {ATTACHMENT_JOB}"
+        )
+    release_steps_raw = release.get("steps")
+    checkout_steps = [
+        step
+        for step in (release_steps_raw if isinstance(release_steps_raw, list) else [])
+        if isinstance(step, Mapping) and str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    if len(checkout_steps) != 1 or checkout_steps[0] != EXPECTED_RELEASE_CHECKOUT:
+        violations.append(
+            f"{ALLOWED_JOB} must check out the admitted commit exactly once with "
+            "persist-credentials: false"
+        )
     named_secrets = {
         name for item in strings(release) for name in SECRET_REFERENCE.findall(item)
     }
@@ -420,10 +617,12 @@ def check(root: Path) -> list[str]:
         violations.append(f"{ALLOWED_JOB} must run exactly on GitHub-hosted ubuntu-latest")
     if release.get("defaults") != {"run": {"working-directory": "android"}}:
         violations.append(f"{ALLOWED_JOB} must use the exact Android working-directory defaults")
-    if release.get("concurrency") != EXPECTED_RELEASE_CONCURRENCY:
+    # The umbrella lock belongs on the attachment job. Leaving it here would put
+    # the signing job back in the shared write domain it no longer belongs to.
+    if "concurrency" in release:
         violations.append(
-            f"{ALLOWED_JOB} must declare exactly the reviewed umbrella-release concurrency "
-            f"{EXPECTED_RELEASE_CONCURRENCY}"
+            f"{ALLOWED_JOB} must not declare concurrency; the umbrella lock belongs to "
+            f"{ATTACHMENT_JOB}"
         )
     if semantic_sha256(release) != EXPECTED_RELEASE_JOB_SHA256:
         violations.append(f"{ALLOWED_JOB} must match the exact reviewed release-job specification")

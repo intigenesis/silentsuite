@@ -944,6 +944,107 @@ def test_the_installer_never_asks_for_a_repository_setting(workspace):
     assert "cannot be rewritten" not in source
 
 
+# ── Verification scope: what each mode actually proves ────────────────
+#
+# The installer verifies the image *this host pulls*. It does not re-derive the
+# published two-platform index — that is CI's job, and doing it here would need
+# registry credentials an operator installer must not hold. `--stage-only` stops
+# earlier still. Every claim made to an operator has to match that.
+
+
+SELF_HOSTING_DOC = ROOT / "self-host" / "SELF-HOSTING.md"
+MANUAL_SETUP_DOCS = (
+    ROOT / "docs" / "self-hosting" / "manual-setup.md",
+    ROOT / "apps" / "docs" / "self-hosting" / "manual-setup.md",
+)
+
+
+def test_stage_only_never_contacts_the_registry(workspace):
+    """The narrow claim, proven behaviourally: no pull, no registry request."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode == 0, result.stderr
+    docker_log = workspace["fixtures"] / "docker.log"
+    if docker_log.exists():
+        for verb in ("pull", "image inspect", "compose up"):
+            assert verb not in docker_log.read_text(), f"staging must not run docker {verb}"
+    requested = (workspace["fixtures"] / "requests.log").read_text()
+    assert "ghcr.io" not in requested
+
+
+def test_stage_only_says_it_skipped_the_image_identity_check(workspace):
+    """An operator must not read a staged digest as a verified one."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode == 0, result.stderr
+    assert "stopped before the registry image-identity check" in result.stdout
+
+
+def test_a_real_install_does_perform_the_image_identity_check(workspace):
+    """The distinction is only honest if installing really does more."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace)
+
+    assert result.returncode == 0, result.stderr
+    docker_log = (workspace["fixtures"] / "docker.log").read_text()
+    assert "pull" in docker_log
+    assert "Registry identity verified" in result.stdout
+    assert "Database identity verified" in result.stdout
+
+
+def test_the_installer_does_not_claim_to_verify_the_whole_index():
+    """It checks the pulled image, not both children and the closed index."""
+
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert "not re-derive the published index" in source
+    assert "scripts/verify-server-image-release.sh" in source, (
+        "the installer should name where the full index check actually happens"
+    )
+    # Named in a comment, never executed: that verifier needs registry
+    # credentials an operator installer must not hold.
+    executable_lines = [
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert not any("verify-server-image-release.sh" in line for line in executable_lines)
+
+
+def test_the_published_docs_do_not_overclaim_stage_only(workspace=None):
+    """No page may tell an operator staging performs every verification step."""
+
+    for doc in (SELF_HOSTING_DOC, *MANUAL_SETUP_DOCS):
+        text = doc.read_text(encoding="utf-8")
+        for overclaim in (
+            "every download and verification step",
+            "fully verify the release bundle",
+            "every verification step",
+        ):
+            assert overclaim not in text, f"{doc.name} overclaims: {overclaim!r}"
+
+
+def test_the_self_hosting_guide_separates_ci_and_installer_verification():
+    text = SELF_HOSTING_DOC.read_text(encoding="utf-8")
+    assert "Who verifies what about the image" in text
+    assert "Release workflow (CI)" in text
+    assert "the complete published OCI index" in text
+    assert "It does not re-derive" in text
+    assert "It pulls nothing and contacts no registry." in text
+
+
+def test_the_manual_setup_pages_state_the_stage_only_limit():
+    for doc in MANUAL_SETUP_DOCS:
+        text = doc.read_text(encoding="utf-8")
+        assert "does not pull" in text
+        assert "image-identity check happens only" in text
+
+
 # ── Target claim: parent trust and the download-window race ───────────
 
 

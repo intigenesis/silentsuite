@@ -52,9 +52,11 @@ Usage: install.sh [--version <tag>] [--stage-only <dir>]
   --version <tag>     Install a specific SilentSuite release (e.g. v0.1.0-beta).
                       Default: the newest published umbrella release that ships
                       verified self-host assets.
-  --stage-only <dir>  Download and fully verify the release bundle into <dir>,
-                      then stop. Nothing is installed and no container is
-                      started. Useful for auditing a release before installing.
+  --stage-only <dir>  Download and verify the release bundle into <dir>, then
+                      stop. Runs the release-metadata, tag-to-commit, checksum,
+                      manifest and archive checks; does NOT pull an image or
+                      contact the registry, so the live image-identity check is
+                      skipped. Nothing is installed and no container is started.
                       <dir> must not exist yet and its parent must be a
                       directory you own that other users cannot write.
   -h, --help          Show this message and exit.
@@ -682,6 +684,9 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
   cp "$CHECKSUM_FILE" "$STAGE_DIR/$CHECKSUM_NAME"
   echo "Verified release $VERSION staged in: $STAGE_DIR"
   echo "Server image: $SERVER_IMAGE"
+  echo "Note: staging stopped before the registry image-identity check."
+  echo "      The digest above is what the manifest names, not something this"
+  echo "      run pulled and confirmed. A real install performs that check."
   exit 0
 fi
 
@@ -690,6 +695,15 @@ fi
 # Still before any operator state is touched: pulling populates the local image
 # cache only. A mismatch here means the release manifest and the registry
 # disagree, which must never reach a running stack.
+#
+# Scope, stated precisely: this checks the image this host actually pulls — its
+# repo digest against the manifest's index digest, its platform against this
+# host, and its build revision against the manifest's expectedRevision — and
+# then the same digest and platform check for the pinned database image. It does
+# not re-derive the published index: one host pulls one platform, and the closed
+# two-platform index verification is done in CI by
+# scripts/verify-server-image-release.sh before the bundle is built. That
+# verifier needs registry credentials, which an operator installer must not hold.
 
 echo "Verifying the published server image..."
 if ! docker pull "$SERVER_IMAGE" >/dev/null; then

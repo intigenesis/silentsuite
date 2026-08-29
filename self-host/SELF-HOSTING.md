@@ -72,10 +72,21 @@ administrator can replace both together. GitHub's immutable-releases feature,
 which would close that gap, is not in use yet — see
 [issue #682](https://github.com/silent-suite/silentsuite/issues/682).
 
-What cannot be substituted underneath you is the image. The server runs the exact
-OCI index digest recorded in the manifest, and the installer checks that digest,
-its per-architecture children, and the image's build revision against the
-registry before anything starts.
+**Who verifies what about the image.** The two checks are different, and neither
+is the other:
+
+| Stage | What it verifies |
+|-------|------------------|
+| Release workflow (CI) | the complete published OCI index: both platform children by digest, their sizes and media types, the closed two-platform set, and the build revision on each — before the bundle is ever built |
+| `install.sh` (your machine) | the image it actually pulls: that its repo digest is the index digest the manifest names, that its platform is your host's, and that its build revision matches; then the same digest and platform check for the pinned PostgreSQL image |
+| `install.sh --stage-only` | release metadata, tag-to-commit binding, checksum, manifest and archive only. It pulls nothing and contacts no registry. |
+
+So the installer confirms that what will run on *your* host is the reviewed
+image, for your architecture, built from the named commit. It does not re-derive
+the whole index — a single host can only pull one platform, and reproducing the
+full index check would need registry credentials the installer has no business
+holding. The closed two-platform verification is CI's job, and its result is
+what the manifest records.
 
 `docker-compose.yml` contains no *server* image digest. It reads
 `SILENTSUITE_SERVER_IMAGE` from `.env`, which the installer writes as
@@ -106,7 +117,7 @@ The installer will:
 8. Confirm with GitHub that the release tag really points at the commit the manifest names
 9. Reject the archive unless every entry is a regular file or directory inside the bundle root and the file set is exactly the published inventory — nothing missing, nothing extra — then extract to a temporary staging directory
 10. Confirm the manifest inside the bundle is byte-identical to the separately published one
-11. Pull the image by digest and confirm the registry serves the promised digest, revision, and architecture
+11. Pull the image by digest and confirm the pulled image's repo digest, build revision, and architecture are the ones the manifest names — then do the same for the pinned PostgreSQL digest and platform
 12. Create `silentsuite-server/` with a single atomic `mkdir` — the first write outside its temporary workspace — then install the verified files, ask for your domain, generate secure random passwords, and write `.env` including the verified image digest
 13. Start the containers and wait for health checks to pass
 
@@ -148,24 +159,28 @@ verified server image, so it is not an installable source.
 bash install.sh --version v0.1.0-beta --stage-only ./silentsuite-release
 ```
 
-This performs every download and verification step and writes the verified
-bundle contents into `./silentsuite-release`, along with the original archive,
-its strict checksum sidecar, and the published manifest. It does not create an
-installation, pull an image, or start a container. The stage directory has a
-closed top-level inventory: the archive, sidecar, manifest, and the archive's
-verified managed files.
+This performs the release-metadata, tag-to-commit, checksum, manifest and
+archive checks — steps 3 through 10 above — and writes the verified bundle
+contents into `./silentsuite-release`, along with the original archive, its
+strict checksum sidecar, and the published manifest. It stops there: it does
+**not** pull an image, does not contact the registry, does not create an
+installation, and does not start a container. The live image-identity check in
+step 11 is part of installing, not of staging. The stage directory has a closed
+top-level inventory: the archive, sidecar, manifest, and the archive's verified
+managed files.
 
 The stage directory must not exist yet, and its parent must be a directory you
 own that other local users cannot write. Like an install, it is created by a
-single atomic `mkdir` only after every verification has passed.
+single atomic `mkdir` only after every check it performs has passed.
 
 ## Manual Setup
 
 > `install.sh --version vX.Y.Z --stage-only ./staged` performs the release-tag,
-> manifest, bundle, checksum, and archive checks, but not live registry image
-> verification. It writes the verified files out without installing or starting
-> anything.
-> Prefer it unless you specifically want to do this by hand.
+> manifest, bundle, checksum, and archive checks, but not the live registry
+> image-identity check — that happens only during a real install. It writes the
+> verified files out without installing or starting anything.
+> Prefer it unless you specifically want to do this by hand; step 4 below is the
+> image check you would otherwise be skipping.
 
 1. **Download and verify the release bundle** (replace `vX.Y.Z` with the release
    you want, from [the releases page](https://github.com/silent-suite/silentsuite/releases)):

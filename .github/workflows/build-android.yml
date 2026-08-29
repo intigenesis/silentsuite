@@ -778,32 +778,56 @@ jobs:
           retention-days: 14
 
   # ─────────────────────────────────────────────────────────────────────
-  # Release builds — signed, only on version tags.
+  # Release source admission — read-only, no secrets, no write scope.
+  #
+  # Runs the repository's shared admission helper: strict tag grammar, the tag
+  # object resolving to exactly this commit, the checkout being exactly this
+  # commit, and that commit being reachable from protected main. The signed
+  # build refuses to start until this passes, so signing material is never
+  # applied to a tag pushed at an unreviewed commit.
+  # ─────────────────────────────────────────────────────────────────────
+  release-admission:
+    name: Admit Android release source
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      commit: ${{ steps.source.outputs.commit }}
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Admit the release source
+        id: source
+        run: bash "$GITHUB_WORKSPACE/scripts/admit-release-source.sh"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Release builds — signed, only on admitted version tags.
+  #
   # Uses a protected GitHub Environment so signing secrets are not
   # accessible to PRs, forks, or non-tag pushes.
+  #
+  # This job holds signing material and therefore holds nothing else: no
+  # contents:write, no persisted checkout credential, no release API call, no
+  # attachment helper. It hands its signed output to `attach-release-assets`
+  # through a closed artifact, and that job — which has none of the signing
+  # material — is the only thing that can write a release.
   # ─────────────────────────────────────────────────────────────────────
   build-release:
     name: Build (signed, tag release)
-    needs: [signing-policy, conscrypt-r28]
+    needs: [signing-policy, conscrypt-r28, release-admission]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: android-release
     permissions:
-      contents: write
-    # Shared tag-scoped domain with the Bridge and self-host attachment jobs, so
-    # the three components never append to the same umbrella draft at once.
-    # Never cancel: a cancelled attachment silently drops a component.
-    #
-    # queue: max is load-bearing, not decoration. Under the default (single) the
-    # scheduler keeps only one pending job per group and replaces it, so with
-    # three components one attachment would be cancelled while merely waiting —
-    # the umbrella draft would come out a component short with nothing failing.
-    # max holds them in FIFO instead. It cannot be combined with
-    # cancel-in-progress: true, which is fine: never cancelling is the point.
-    concurrency:
-      group: umbrella-release-${{ github.ref_name }}
-      cancel-in-progress: false
-      queue: max
+      contents: read
     defaults:
       run:
         working-directory: android
@@ -811,6 +835,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up JDK 17
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
@@ -997,21 +1024,117 @@ jobs:
           sha256sum "silentsuite-android-${{ github.ref_name }}-native-debug-symbols.zip" \
             > "silentsuite-android-${{ github.ref_name }}-native-debug-symbols.sha256"
 
-      - name: Attach Android artifacts to umbrella GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      # Collect exactly the six release assets into one flat directory, so the
+      # artifact this job publishes has a closed, named inventory the attachment
+      # job can re-assert before it writes anything.
+      - name: Stage the closed release-asset set
+        run: |
+          set -euo pipefail
+          mkdir -p build/release-assets
+          mv "app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}.apk" \
+             "app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}-installer.sha256" \
+             "app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}.aab" \
+             "app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}-bundle.sha256" \
+             "app/build/outputs/native-debug-symbols/release/silentsuite-android-${{ github.ref_name }}-native-debug-symbols.zip" \
+             "app/build/outputs/native-debug-symbols/release/silentsuite-android-${{ github.ref_name }}-native-debug-symbols.sha256" \
+             build/release-assets/
+          ls -l build/release-assets
+
+      - name: Publish the closed release-asset set to the attachment job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: SilentSuite ${{ github.ref_name }}
-          draft: true
-          fail_on_unmatched_files: true
-          files: |
-            android/app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}.apk
-            android/app/build/outputs/apk/release/silentsuite-android-${{ github.ref_name }}-installer.sha256
-            android/app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}.aab
-            android/app/build/outputs/bundle/release/silentsuite-android-${{ github.ref_name }}-bundle.sha256
-            android/app/build/outputs/native-debug-symbols/release/silentsuite-android-${{ github.ref_name }}-native-debug-symbols.zip
-            android/app/build/outputs/native-debug-symbols/release/silentsuite-android-${{ github.ref_name }}-native-debug-symbols.sha256
+          name: silentsuite-android-release-assets-${{ github.sha }}
+          path: android/build/release-assets/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Cleanup keystore
         if: always()
         run: rm -rf "$RUNNER_TEMP/keystore"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Release attachment — the only Android job that can write a release.
+  #
+  # It has contents:write and no signing material: no `android-release`
+  # environment, no keystore, no signing secrets, no Gradle. All it does is
+  # download the closed asset set the signed job produced, re-assert that the
+  # inventory is exactly what was promised, and hand it to the hardened
+  # attachment helper.
+  #
+  # The helper — not a marketplace release action — is what writes. It refuses
+  # a published release outright, never deletes or replaces an asset, preserves
+  # siblings, and reads every upload back, so a delayed or repeated run can
+  # never damage an umbrella release that has already been published.
+  # ─────────────────────────────────────────────────────────────────────
+  attach-release-assets:
+    name: Attach Android assets to the draft release
+    needs: [release-admission, build-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Shared tag-scoped domain with the Bridge and self-host attachment jobs, so
+    # the three components never append to the same umbrella draft at once.
+    # Never cancel: a cancelled attachment silently drops a component.
+    #
+    # queue: max is load-bearing, not decoration. Under the default (single) the
+    # scheduler keeps only one pending job per group and replaces it, so with
+    # three components one attachment would be cancelled while merely waiting —
+    # the umbrella draft would come out a component short with nothing failing.
+    # max holds them in FIFO instead. It cannot be combined with
+    # cancel-in-progress: true, which is fine: never cancelling is the point.
+    concurrency:
+      group: umbrella-release-${{ github.ref_name }}
+      cancel-in-progress: false
+      queue: max
+    env:
+      RELEASE_TAG: ${{ needs.release-admission.outputs.tag }}
+
+    steps:
+      - name: Checkout attachment helper source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          persist-credentials: false
+
+      - name: Download the closed release-asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: silentsuite-android-release-assets-${{ github.sha }}
+          path: release-assets
+
+      # The signed job promised exactly six files. Anything else here means the
+      # artifact is not what was built, and nothing is uploaded.
+      - name: Re-assert the closed asset inventory
+        run: |
+          set -euo pipefail
+          EXPECTED="$(printf '%s\n' \
+            "silentsuite-android-${RELEASE_TAG}-bundle.sha256" \
+            "silentsuite-android-${RELEASE_TAG}-installer.sha256" \
+            "silentsuite-android-${RELEASE_TAG}-native-debug-symbols.sha256" \
+            "silentsuite-android-${RELEASE_TAG}-native-debug-symbols.zip" \
+            "silentsuite-android-${RELEASE_TAG}.aab" \
+            "silentsuite-android-${RELEASE_TAG}.apk" | LC_ALL=C sort)"
+          ACTUAL="$(find release-assets -mindepth 1 -printf '%P\n' | LC_ALL=C sort)"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Refusing attachment: the release-asset set is not the closed inventory" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "$EXPECTED" "$ACTUAL" >&2
+            exit 1
+          fi
+          echo "Closed inventory confirmed for ${RELEASE_TAG}"
+
+      - name: Attach the Android assets to the shared draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/attach-umbrella-release-assets.sh" \
+            --tag "$RELEASE_TAG" \
+            --directory release-assets \
+            --asset "silentsuite-android-${RELEASE_TAG}.apk" \
+            --asset "silentsuite-android-${RELEASE_TAG}-installer.sha256" \
+            --asset "silentsuite-android-${RELEASE_TAG}.aab" \
+            --asset "silentsuite-android-${RELEASE_TAG}-bundle.sha256" \
+            --asset "silentsuite-android-${RELEASE_TAG}-native-debug-symbols.zip" \
+            --asset "silentsuite-android-${RELEASE_TAG}-native-debug-symbols.sha256"

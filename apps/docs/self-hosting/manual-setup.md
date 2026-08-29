@@ -23,9 +23,10 @@ walkthrough, including the reverse-proxy step that follows it.
 ## Audit a release before installing it
 
 If what you wanted from manual setup was to see exactly what will be installed,
-stage it instead. This runs every download and verification step and writes the
-verified files out without installing anything, pulling an image, or starting a
-container:
+stage it instead. This runs the release-metadata, tag-to-commit, checksum,
+manifest and archive checks and writes the verified files out. It does not pull
+an image or contact the registry — the live image-identity check happens only
+during a real install:
 
 ```bash
 bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
