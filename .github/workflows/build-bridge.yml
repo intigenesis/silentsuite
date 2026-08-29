@@ -337,14 +337,6 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
-      # Runs before the release action below, which creates the draft on first
-      # use. Assets that can be replaced after publication cannot authenticate
-      # themselves, so nothing is attached until immutable releases are enabled.
-      - name: Require immutable published releases
-        env:
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
-        run: scripts/require-immutable-releases.sh
-
       # Create / append to the umbrella GitHub Release.
       # We deliberately do NOT set body/body_path here — the release notes
       # live in the umbrella release notes the operator pastes at publish

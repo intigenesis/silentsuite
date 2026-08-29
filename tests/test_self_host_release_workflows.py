@@ -154,45 +154,23 @@ def test_release_admission_runs_before_anything_is_built():
         assert "admit" in ([needs] if isinstance(needs, str) else needs)
 
 
-def test_immutability_is_proven_during_admission_before_any_registry_write():
-    """The gate belongs in admit, not only at attachment time.
+def test_admission_is_the_last_thing_that_happens_before_any_registry_write():
+    """`admit` is the whole lane's gate, and it only reads.
 
     Every other job needs admit, and the two jobs that can push a GHCR child or
-    move an alias are downstream of it, so a disabled or unreadable setting
-    stops the release before any byte reaches the registry.
+    move an alias are downstream of it, so an unadmitted tag stops the release
+    before any byte reaches the registry.
     """
 
     admit = RELEASE["jobs"]["admit"]
     names = step_names(admit)
     source = names.index("Require an immutable tag reachable from protected main")
-    guard = names.index("Require immutable published releases")
-    # Source admission first, so the settings secret is never exposed to a run
-    # that was not going to be admitted; the gate then closes the job.
-    assert guard == source + 1
-    assert guard == len(names) - 1, "the gate is the last thing admission does"
-
-    step = step_named(admit, "Require immutable published releases")
-    # Exact, not substring: a stray following line folds into this plain scalar
-    # and would silently turn the gate into a different command.
-    assert step["run"].strip() == GUARD_SCRIPT
-    assert step["env"] == {
-        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
-    }, "the gate reads with the dedicated Administration:read secret only"
-    # The job token stays read-only, and is not what authenticates the gate.
+    assert source == len(names) - 1, "admission is the last thing the job does"
     assert admit["permissions"] == {"contents": "read"}
 
     for registry_writer in ("build", "publish-index"):
         needs = RELEASE["jobs"][registry_writer]["needs"]
         assert "admit" in ([needs] if isinstance(needs, str) else needs)
-
-
-def test_the_admission_gate_does_not_replace_the_downstream_checks():
-    """Defense in depth: admit gates the lane, the writers gate themselves."""
-
-    assert "Require immutable published releases" in step_names(RELEASE["jobs"]["admit"])
-    assert "Require immutable published releases" in step_names(RELEASE["jobs"]["attach-release-assets"])
-    helper = (ROOT / "scripts" / "publish-self-host-release-assets.sh").read_text(encoding="utf-8")
-    assert '"$HELPER_DIR/require-immutable-releases.sh"' in helper
 
 
 # ── Release lane: per-platform build and smoke ────────────────────────
@@ -477,29 +455,22 @@ def test_every_workflow_action_is_pinned_to_an_immutable_commit():
     assert violations == []
 
 
-# ── Umbrella draft: serialization and immutable publication ───────────
+# ── Umbrella draft: serialization and draft-only publication ──────────
+#
+# GitHub immutable releases are deliberately deferred while `silent-suite` is
+# the repository's sole direct admin (issue #682), so no lane reads a repository
+# setting and none may hold a credential that could. What these lanes still owe
+# an operator is unchanged: the three components serialize onto one queue, only
+# ever create a draft, and never publish it.
 
 
 ANDROID_WORKFLOW = WORKFLOW_DIR / "build-android.yml"
 BRIDGE_WORKFLOW = WORKFLOW_DIR / "build-bridge.yml"
 UMBRELLA_GROUP = "umbrella-release-${{ github.ref_name }}"
-GUARD_SCRIPT = "scripts/require-immutable-releases.sh"
 PUBLISH_HELPER = ROOT / "scripts" / "publish-self-host-release-assets.sh"
-GUARD_STEP = "Require immutable published releases"
 
 # Every job that appends assets to the shared umbrella draft, and the step in it
 # that actually creates or uploads.
-# Exact gate command per lane. Android's `build-release` defaults to android/
-# and its signing boundary forbids a per-step working-directory, so that lane
-# addresses the guard by workspace-absolute path instead. Still exact, per lane
-# — never a substring, which would let a wrapper or a `|| true` slip past.
-WORKSPACE_GUARD_RUN = 'bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"'
-EXPECTED_GUARD_RUN = {
-    "release-server-image.yml": GUARD_SCRIPT,
-    "build-bridge.yml": GUARD_SCRIPT,
-    "build-android.yml": WORKSPACE_GUARD_RUN,
-}
-
 ATTACHMENT_JOBS = [
     (RELEASE_WORKFLOW, "attach-release-assets", "Attach the verified assets to the shared draft release"),
     (ANDROID_WORKFLOW, "build-release", "Attach Android artifacts to umbrella GitHub Release"),
@@ -580,109 +551,98 @@ def test_queue_max_is_never_paired_with_cancellation(path, job_name, attach_step
             assert declaration.get("cancel-in-progress") == "false"
 
 
-# Android runs its gate in a separate read-only prerequisite job so the
-# network-capable helper never executes beside the decoded keystore. The lane is
-# still gated — build-release cannot start until that job succeeds — the gate
-# just is not one of its steps.
-GATE_JOBS = {"build-android.yml": "release-immutability"}
+# Only the workflow token, and only where a release write actually happens.
+# Anything else named here would be a credential this lane has no use for — a
+# repository-settings reader most of all, since reading settings is precisely
+# the dependency issue #682 defers.
+ALLOWED_RELEASE_SECRETS = {
+    "GITHUB_TOKEN",
+    "ANDROID_KEYSTORE_BASE64",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_ALIAS",
+}
+SECRET_REFERENCE = re.compile(r"secrets\.\s*([A-Za-z_][A-Za-z0-9_-]*)")
 
 
-@pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
-def test_no_asset_is_attached_before_immutability_is_proven(path, job_name, attach_step):
-    workflow = load(path)
-    job = workflow["jobs"][job_name]
-    gate_job = GATE_JOBS.get(path.name)
+@pytest.mark.parametrize(
+    "path", [RELEASE_WORKFLOW, ANDROID_WORKFLOW, BRIDGE_WORKFLOW], ids=lambda p: p.name
+)
+def test_no_umbrella_lane_holds_a_repository_settings_credential(path):
+    """No lane may carry a credential beyond the reviewed release/signing set.
 
-    if gate_job is not None:
-        needs = job["needs"]
-        assert gate_job in ([needs] if isinstance(needs, str) else needs), (
-            f"{path.name}:{job_name} can attach without the immutability gate"
-        )
-        gate = workflow["jobs"][gate_job]
-        assert step_named(gate, GUARD_STEP)["run"].strip() == EXPECTED_GUARD_RUN[path.name]
-        assert GUARD_STEP not in step_names(job), (
-            "the gate must not also run beside signing material"
-        )
-        assert attach_step in step_names(job)
-        return
+    Structural rather than name-based: any *new* secret in a publishing lane is
+    rejected, which covers the deferred Administration:read token and anything
+    that would be introduced in its place.
+    """
 
-    names = step_names(job)
-    assert GUARD_STEP in names, f"{path.name}:{job_name} has no immutability gate"
-    guard_index = names.index(GUARD_STEP)
-    assert guard_index < names.index(attach_step)
-    assert step_named(job, GUARD_STEP)["run"].strip() == EXPECTED_GUARD_RUN[path.name]
-    # Every gate authenticates with the dedicated settings-read secret. The
-    # workflow token cannot hold repository Administration: read, so a lane that
-    # passed GITHUB_TOKEN here would fail in production for a permission reason
-    # that reads like "immutability is off".
-    assert step_named(job, GUARD_STEP)["env"] == {
-        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
-    }
-
-    # Nothing that can create a draft or upload an asset may precede the gate.
-    for step in steps(job)[:guard_index]:
-        assert "softprops/action-gh-release" not in str(step.get("uses", ""))
-        assert "publish-self-host-release-assets.sh" not in str(step.get("run", ""))
+    named = set(SECRET_REFERENCE.findall(path.read_text(encoding="utf-8")))
+    assert named <= ALLOWED_RELEASE_SECRETS, (
+        f"{path.name} names unreviewed credentials: "
+        f"{', '.join(sorted(named - ALLOWED_RELEASE_SECRETS))}"
+    )
 
 
-def test_the_publish_helper_step_carries_both_credentials():
-    """One token to read the setting, a different one to write the release."""
+def test_no_lane_calls_a_repository_settings_endpoint():
+    """Release lanes talk to releases and the registry, never to settings."""
+
+    sources = [PUBLISH_HELPER.read_text(encoding="utf-8")]
+    sources += [
+        path.read_text(encoding="utf-8")
+        for path in (RELEASE_WORKFLOW, ANDROID_WORKFLOW, BRIDGE_WORKFLOW, CI_WORKFLOW)
+    ]
+    for source in sources:
+        for endpoint in ("/immutable-releases", "/rulesets", "/actions/permissions"):
+            assert endpoint not in source, f"a repository-settings read reappeared: {endpoint}"
+
+
+def test_the_publish_helper_only_addresses_release_objects_and_assets():
+    """Every API path it builds is a release read/write, nothing wider."""
+
+    source = PUBLISH_HELPER.read_text(encoding="utf-8")
+    paths = set(re.findall(r'"/repos/\$\{GITHUB_REPOSITORY\}(/[^"$]*)', source))
+    assert paths, "the helper should address the releases API"
+    for path in paths:
+        assert path.startswith("/releases"), f"the helper reaches outside releases: {path}"
+
+
+def test_the_publish_helper_step_carries_only_the_workflow_token():
+    """One credential, scoped to the draft-release writes it performs."""
 
     step = step_named(
         RELEASE["jobs"]["attach-release-assets"],
         "Attach the verified assets to the shared draft release",
     )
-    assert step["env"] == {
-        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
-        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}",
-    }
+    assert step["env"] == {"GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}
     helper = PUBLISH_HELPER.read_text(encoding="utf-8")
-    assert 'IMMUTABLE_RELEASES_READ_TOKEN:?' in helper, "the helper requires it up front"
-    assert 'GITHUB_TOKEN:?' in helper
+    assert "GITHUB_TOKEN:?" in helper, "the helper requires it up front"
 
 
-def test_no_lane_authenticates_the_settings_read_with_the_workflow_token():
-    """The endpoint needs Administration: read, which GITHUB_TOKEN cannot hold.
+@pytest.mark.parametrize(("path", "job_name", "attach_step"), ATTACHMENT_JOBS, ids=ATTACHMENT_IDS)
+def test_every_attachment_writes_a_draft_and_never_publishes_it(path, job_name, attach_step):
+    """All three components only ever append to a draft. Publication is manual."""
 
-    Passing the workflow token would fail every release for a reason that looks
-    like "immutability is off", so no gate step may carry it.
-    """
+    job = load(path)["jobs"][job_name]
+    assert attach_step in step_names(job)
+    step = step_named(job, attach_step)
+    if "uses" in step:
+        assert "softprops/action-gh-release" in step["uses"]
+        assert step["with"]["draft"] == "true"
+        assert "make_latest" not in step["with"]
+    else:
+        assert "publish-self-host-release-assets.sh" in step["run"]
 
-    for path, job_name, _ in ATTACHMENT_JOBS:
-        workflow = load(path)
-        job = workflow["jobs"][GATE_JOBS.get(path.name, job_name)]
-        assert "GITHUB_TOKEN" not in step_named(job, GUARD_STEP)["env"], path.name
-    admit_gate = step_named(RELEASE["jobs"]["admit"], GUARD_STEP)
-    assert "GITHUB_TOKEN" not in admit_gate["env"]
-    # And the guard itself never reaches for it, even if it were in scope.
-    guard = (ROOT / GUARD_SCRIPT).read_text(encoding="utf-8")
-    for expansion in ("$GITHUB_TOKEN", "${GITHUB_TOKEN"):
-        assert expansion not in guard
-
-
-def test_the_publish_helper_gates_on_immutability_before_it_can_write():
-    """Defense in depth: the helper is what actually creates and uploads."""
-
-    source = PUBLISH_HELPER.read_text(encoding="utf-8")
-    guard = source.index('"$HELPER_DIR/require-immutable-releases.sh"')
-    for write in ('api POST "/repos/${GITHUB_REPOSITORY}/releases"', "${UPLOADS}/repos/"):
-        assert guard < source.index(write), f"the gate must precede {write!r}"
+    source = path.read_text(encoding="utf-8")
+    for forbidden in ("draft: false", "gh release edit", "gh release create", "make_latest"):
+        assert forbidden not in source, f"{path.name} can publish the umbrella release"
 
 
-def test_the_immutability_gate_never_changes_the_setting():
-    """Enabling immutability is an owner action; code only reads the value."""
+def test_the_shared_draft_helper_refuses_to_touch_a_published_release():
+    """Draft-only is enforced by the helper, not just by its callers."""
 
-    guard = (ROOT / GUARD_SCRIPT).read_text(encoding="utf-8")
-    assert "immutable-releases" in guard
-    for mutation in ("-X POST", "-X PUT", "-X PATCH", "-X DELETE"):
-        assert mutation not in guard
-
-
-def test_ci_covers_the_immutability_gate():
-    for event in ("push", "pull_request"):
-        assert GUARD_SCRIPT in CI["on"][event]["paths"]
-    syntax = step_named(CI["jobs"]["self-host-contracts"], "Check release and self-host shell syntax")["run"]
-    assert GUARD_SCRIPT in syntax
+    helper = PUBLISH_HELPER.read_text(encoding="utf-8")
+    assert "refusing to alter a published release" in helper
+    assert '[ "$RELEASE_DRAFT" != "true" ]' in helper
+    assert "publication remains manual" in helper
 
 
 # ── Production deploy isolation ───────────────────────────────────────
@@ -711,22 +671,3 @@ def test_production_deploy_remains_the_only_lane_running_in_its_environment():
             if job.get("environment") == "server-production":
                 owners.append(f"{path.name}:{job_name}")
     assert owners == ["deploy-server.yml:build-and-push", "deploy-server.yml:deploy"]
-
-
-def test_the_android_gate_job_is_isolated_from_signing_material():
-    """Cross-checked here as well as in the Android signing policy.
-
-    The gate runs a network-capable helper; the point of the separate job is
-    that it has no signing secrets, no release environment, and no write scope
-    to reach with them.
-    """
-
-    gate = load(ANDROID_WORKFLOW)["jobs"]["release-immutability"]
-    assert gate["permissions"] == {"contents": "read"}
-    assert "environment" not in gate
-    assert "ANDROID_" not in str(gate), "no Android signing secret may appear in the gate job"
-    checkout = step_named(gate, "Checkout release policy source")
-    assert checkout["with"]["persist-credentials"] == "false"
-    assert step_named(gate, GUARD_STEP)["env"] == {
-        "IMMUTABLE_RELEASES_READ_TOKEN": "${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"
-    }

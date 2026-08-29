@@ -16,11 +16,19 @@ set -euo pipefail
 #   * install from an unverified source — there is no branch fallback;
 #   * run a mutable image tag — the server image is selected by the immutable
 #     OCI index digest recorded in the release manifest;
-#   * install from a release whose assets can still be rewritten — the selected
-#     release must be published as an immutable GitHub release;
+#   * install from a draft, a mismatched tag, or a release missing the self-host
+#     assets;
 #   * touch an existing path. The target must not exist; it is created once,
 #     atomically, after every verification has passed. Re-running the installer
 #     is not the upgrade path (see SELF-HOSTING.md).
+#
+# What the checksum does and does not prove: it detects corruption in transit
+# and any inconsistency between the bundle, its sidecar, and the manifest as
+# they are published right now. It is not evidence that a release asset was
+# never replaced — a repository administrator can still replace a published
+# asset and its sidecar together. What cannot be swapped underneath you is the
+# image: the server runs the exact OCI index digest recorded in the manifest,
+# checked against the registry before anything starts.
 
 REPO="silent-suite/silentsuite"
 IMAGE_REPOSITORY="ghcr.io/silent-suite/silentsuite-server"
@@ -329,6 +337,26 @@ release_metadata() {
   curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/$1" 2>/dev/null
 }
 
+# GitHub returns pretty-printed JSON, so a top-level release field sits at
+# exactly two spaces. Nested objects (assets, author) are indented deeper, and
+# string values such as the release body are single escaped lines, so these
+# anchors cannot be satisfied from inside one. Exactly one declaration must
+# exist and it must be the literal the check names; absent, duplicated, quoted
+# or otherwise malformed all fail closed. Fixed-string matching throughout, so
+# a tag's dots cannot act as regex wildcards.
+
+release_is_published() {
+  local metadata="$1"
+  [ "$(printf '%s\n' "$metadata" | grep -cE '^  "draft":' | tr -d ' ')" = "1" ] || return 1
+  printf '%s\n' "$metadata" | grep -qxF -e '  "draft": false,' -e '  "draft": false'
+}
+
+release_tag_matches() {
+  local metadata="$1" tag="$2"
+  [ "$(printf '%s\n' "$metadata" | grep -cE '^  "tag_name":' | tr -d ' ')" = "1" ] || return 1
+  printf '%s\n' "$metadata" | grep -qxF -e "  \"tag_name\": \"${tag}\"," -e "  \"tag_name\": \"${tag}\""
+}
+
 release_has_self_host_assets() {
   local metadata="$1" tag="$2"
   printf '%s' "$metadata" | grep -q "\"name\": *\"silentsuite-self-host-${tag}\.tar\.gz\"" &&
@@ -360,6 +388,16 @@ if [ -n "$REQUESTED_VERSION" ] || [ -n "${SILENTSUITE_VERSION:-}" ]; then
     echo "       Check https://github.com/${REPO}/releases" >&2
     exit 1
   fi
+  if ! release_is_published "$RELEASE_METADATA"; then
+    echo "ERROR: release '$VERSION' is a draft, not a published release." >&2
+    echo "       A draft's assets are not final; refusing to install from one." >&2
+    exit 1
+  fi
+  if ! release_tag_matches "$RELEASE_METADATA" "$VERSION"; then
+    echo "ERROR: the release returned for '$VERSION' is tagged something else." >&2
+    echo "       Refusing to install a release that is not the one requested." >&2
+    exit 1
+  fi
   if ! release_has_self_host_assets "$RELEASE_METADATA" "$VERSION"; then
     echo "ERROR: release '$VERSION' does not ship verified self-host assets." >&2
     exit 1
@@ -371,6 +409,8 @@ else
     is_release_tag "$candidate" || continue
     metadata="$(release_metadata "$candidate" || true)"
     [ -n "$metadata" ] || continue
+    release_is_published "$metadata" || continue
+    release_tag_matches "$metadata" "$candidate" || continue
     if release_has_self_host_assets "$metadata" "$candidate"; then
       VERSION="$candidate"
       RELEASE_METADATA="$metadata"
@@ -389,36 +429,11 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-# ── Require an immutable published release ────────────────────────────
-#
-# The bundle is authenticated by a checksum sidecar published on the same
-# release, so that sidecar proves something only if the release cannot be
-# rewritten after publication. GitHub records immutability per release and never
-# applies the setting retroactively, which is exactly why this reads the
-# selected release object rather than a repository-wide setting: a release
-# published before immutability was enabled is still mutable, and is refused.
+# The discovery loop skips a candidate that fails any of the checks above, so a
+# selected version has already been proven published, correctly tagged, and in
+# possession of the self-host assets by the time it gets here.
 
-release_is_immutable() {
-  # GitHub returns pretty-printed JSON, so a top-level release field sits at
-  # exactly two spaces. Nested objects (assets, author) are indented deeper, and
-  # string values such as the release body are single escaped lines, so this
-  # anchor cannot be satisfied from inside one. Exactly one declaration must
-  # exist and it must be the literal boolean true; absent, false, duplicated,
-  # quoted or otherwise malformed all fail closed.
-  local metadata="$1"
-  [ "$(printf '%s\n' "$metadata" | grep -cE '^  "immutable":' | tr -d ' ')" = "1" ] || return 1
-  printf '%s\n' "$metadata" | grep -qE '^  "immutable": true,?$'
-}
-
-if ! release_is_immutable "$RELEASE_METADATA"; then
-  echo "ERROR: release '$VERSION' is not published as an immutable GitHub release." >&2
-  echo "       Its assets can still be replaced after you verify them, so the" >&2
-  echo "       published checksum would prove nothing. Nothing was downloaded." >&2
-  echo "       See https://github.com/${REPO}/releases" >&2
-  exit 1
-fi
-
-echo "Installing SilentSuite version: $VERSION (immutable release)"
+echo "Installing SilentSuite version: $VERSION (published release)"
 echo ""
 
 BUNDLE_NAME="silentsuite-self-host-${VERSION}.tar.gz"

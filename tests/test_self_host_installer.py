@@ -57,7 +57,7 @@ PREFIX = bundle_prefix(TAG)
 
 # GitHub pretty-prints release objects, so a top-level field sits at exactly two
 # spaces. The installer anchors on that; the variants below prove it.
-IMMUTABLE_TRUE = '  "immutable": true,\n'
+DRAFT_FALSE = '  "draft": false,\n'
 
 BUNDLE_FILES = (
     ".env.example",
@@ -265,7 +265,8 @@ class Release:
         extra: str | None = None,
         omit: str | None = None,
         compare: str | None = IDENTICAL_COMPARE,
-        immutable: str | None = IMMUTABLE_TRUE,
+        draft: str | None = DRAFT_FALSE,
+        tag_name: str | None = None,
         replace_compose: str | None = None,
     ) -> None:
         archive = self.fixtures / BUNDLE_NAME
@@ -286,8 +287,9 @@ class Release:
         asset_json = "".join(f'      "name": "{name}",\n' for name in self.assets)
         self.put(
             f"{API}/releases/tags/{TAG}",
-            '{\n  "tag_name": "' + TAG + '",\n  "draft": false,\n'
-            + (immutable or "")
+            "{\n"
+            + (tag_name if tag_name is not None else '  "tag_name": "' + TAG + '",\n')
+            + (draft or "")
             + '  "assets": [\n' + asset_json + "  ]\n}\n",
         )
         self.put(f"{DOWNLOAD}/{BUNDLE_NAME}", archive.read_bytes())
@@ -824,7 +826,13 @@ def test_a_foreign_non_empty_install_directory_is_refused_before_any_download(wo
     assert leftover_temporaries(workspace) == []
 
 
-# ── Immutable release admission ───────────────────────────────────────
+# ── Release admission ─────────────────────────────────────────────────
+#
+# GitHub immutable releases are deferred while the repository has a single
+# direct admin (issue #682), so the installer no longer requires a release to be
+# frozen. What it does require is that the release it selected is the published
+# release for the exact tag it asked for, and that it ships the self-host
+# assets — each proven before a single asset byte is fetched.
 
 
 def _downloaded_assets(workspace) -> list[str]:
@@ -835,44 +843,105 @@ def _downloaded_assets(workspace) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("immutable", "reason"),
+    ("draft", "reason"),
     [
-        ('  "immutable": false,\n', "explicitly mutable"),
-        (None, "no immutability recorded at all (a pre-setting legacy release)"),
-        ('  "immutable": true,\n  "immutable": false,\n', "duplicated declaration"),
-        ('  "immutable": "true",\n', "quoted, not a boolean"),
-        ('  "immutable": null,\n', "null"),
-        ('  "immutable":true,\n', "malformed spacing"),
-        ('      "immutable": true,\n', "nested at asset depth, not top level"),
+        ('  "draft": true,\n', "an unpublished draft"),
+        (None, "no draft state recorded at all"),
+        ('  "draft": false,\n  "draft": true,\n', "duplicated declaration"),
+        ('  "draft": "false",\n', "quoted, not a boolean"),
+        ('  "draft": null,\n', "null"),
+        ('  "draft":false,\n', "malformed spacing"),
+        ('      "draft": false,\n', "nested at asset depth, not top level"),
     ],
 )
-def test_a_release_that_is_not_immutable_is_never_downloaded(workspace, immutable, reason):
-    """The bundle checksum lives on the release it authenticates.
+def test_a_release_that_is_not_published_is_never_downloaded(workspace, draft, reason):
+    """A draft's assets are still being assembled, so nothing may be taken from one."""
 
-    That only proves something if the release cannot be rewritten afterwards, so
-    a release without an unambiguous top-level immutable:true is refused before
-    a single asset byte is fetched.
-    """
+    workspace["release"].publish(draft=draft)
 
-    workspace["release"].publish(immutable=immutable)
-
-    result = run_installer(workspace)
+    result = run_installer(workspace, "--version", TAG)
 
     assert result.returncode != 0, reason
-    assert "not published as an immutable GitHub release" in result.stderr
+    assert "is a draft, not a published release" in result.stderr
     assert _downloaded_assets(workspace) == []
     assert not install_dir(workspace).exists()
     assert leftover_temporaries(workspace) == []
 
 
-def test_an_immutable_release_is_admitted_and_reported(workspace):
+def test_discovery_skips_a_release_it_cannot_admit_instead_of_taking_it(workspace):
+    """With no --version, an unadmissible candidate is passed over, not installed."""
+
+    workspace["release"].publish(draft='  "draft": true,\n')
+
+    result = run_installer(workspace)
+
+    assert result.returncode != 0
+    assert "no published SilentSuite release with self-host assets was found" in result.stderr
+    assert _downloaded_assets(workspace) == []
+    assert not install_dir(workspace).exists()
+
+
+@pytest.mark.parametrize(
+    ("tag_name", "reason"),
+    [
+        ('  "tag_name": "v1.2.3",\n', "a different tag entirely"),
+        (f'  "tag_name": "{TAG}-rc1",\n', "a longer tag with the same prefix"),
+        ("", "no tag recorded at all"),
+        (f'  "tag_name": "{TAG}",\n  "tag_name": "v1.2.3",\n', "duplicated declaration"),
+        (f'      "tag_name": "{TAG}",\n', "nested at asset depth, not top level"),
+    ],
+)
+def test_a_release_tagged_something_else_is_never_downloaded(workspace, tag_name, reason):
+    """The tag is the operator's whole request; a substitute is not an answer."""
+
+    workspace["release"].publish(tag_name=tag_name)
+
+    result = run_installer(workspace, "--version", TAG)
+
+    assert result.returncode != 0, reason
+    assert "is tagged something else" in result.stderr
+    assert _downloaded_assets(workspace) == []
+    assert not install_dir(workspace).exists()
+    assert leftover_temporaries(workspace) == []
+
+
+def test_a_tag_whose_dots_could_act_as_wildcards_is_matched_literally(workspace):
+    """`v9.9.9-beta` must not match `v9x9y9-beta`: the compare is fixed-string."""
+
+    workspace["release"].publish(tag_name='  "tag_name": "v9x9y9-beta",\n')
+
+    result = run_installer(workspace, "--version", TAG)
+
+    assert result.returncode != 0
+    assert "is tagged something else" in result.stderr
+    assert _downloaded_assets(workspace) == []
+
+
+def test_a_published_release_for_the_requested_tag_is_admitted_and_reported(workspace):
     workspace["release"].publish()
 
     result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
 
     assert result.returncode == 0, result.stderr
-    assert "(immutable release)" in result.stdout
+    assert "(published release)" in result.stdout
     assert _downloaded_assets(workspace) != []
+
+
+def test_the_installer_never_asks_for_a_repository_setting(workspace):
+    """Issue #682 defers immutable releases; nothing may read repository settings."""
+
+    workspace["release"].publish()
+
+    result = run_installer(workspace, "--stage-only", str(workspace["root"] / "staged"))
+
+    assert result.returncode == 0, result.stderr
+    requested = (workspace["fixtures"] / "requests.log").read_text()
+    for endpoint in ("/immutable-releases", "/rulesets", "/actions/permissions"):
+        assert endpoint not in requested
+    # And it makes no claim that a published asset cannot be replaced.
+    source = INSTALLER.read_text(encoding="utf-8")
+    assert "immutable GitHub release" not in source
+    assert "cannot be rewritten" not in source
 
 
 # ── Target claim: parent trust and the download-window race ───────────

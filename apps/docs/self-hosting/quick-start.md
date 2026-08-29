@@ -10,16 +10,25 @@ curl -fsSL https://raw.githubusercontent.com/silent-suite/silentsuite/main/self-
 
 The installer will:
 
-1. Check that Docker and Docker Compose are installed.
-2. Create a `silentsuite-server/` directory in your current folder.
-3. Download the Docker Compose configuration.
-4. Ask for your domain name (e.g., `sync.example.com`).
-5. Generate strong random passwords for PostgreSQL.
-6. Write the `.env` file.
-7. Pull Docker images and start the containers.
-8. Wait for health checks to pass.
+1. Check that Docker, Docker Compose, and the download-verification tools are installed.
+2. Resolve the newest published release that ships verified self-host assets.
+3. Download the release bundle, its checksum, and `server-image.json`, then verify the checksum, the manifest, and the archive contents before extracting anything.
+4. Confirm with GitHub that the release tag points at the commit the manifest names, and confirm the registry serves the promised image digest, revision, and architecture.
+5. Create a `silentsuite-server/` directory in your current folder — only after every check above has passed.
+6. Ask for your domain name (e.g., `sync.example.com`).
+7. Generate strong random passwords for PostgreSQL.
+8. Write the `.env` file, including the verified server image digest.
+9. Pull the pinned images, start the containers, and wait for health checks to pass.
 
 The first user to sign up in the SilentSuite app becomes the server admin.
+
+To inspect a release before installing it, stage it first — this runs every
+verification step and writes the files out without installing, pulling an image,
+or starting a container:
+
+```bash
+bash install.sh --version vX.Y.Z --stage-only ./silentsuite-vX.Y.Z
+```
 
 ## 2. Set Up Your Reverse Proxy
 

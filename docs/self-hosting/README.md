@@ -8,7 +8,7 @@ Deploy and manage SilentSuite on your own infrastructure. Self-hosting gives you
 |---|---|
 | [Requirements](./requirements.md) | System requirements and prerequisites |
 | [Quick Start](./quick-start.md) | Fastest path from zero to running |
-| [Manual Setup](./manual-setup.md) | Step-by-step setup with full control |
+| [Manual Setup](./manual-setup.md) | Why setup goes through the installer, and how to audit a release first |
 | [Configuration](./configuration.md) | Environment variables and configuration reference |
 | [Updating](./updating.md) | How to update to new versions |
 | [Backup & Restore](./backup-and-restore.md) | Protect your data with backups |

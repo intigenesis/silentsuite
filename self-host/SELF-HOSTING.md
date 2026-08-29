@@ -61,10 +61,21 @@ Every SilentSuite release publishes three self-host assets:
 | `silentsuite-self-host-<tag>.tar.gz.sha256` | the bundle's checksum, as a single strict record |
 | `server-image.json` | the immutable image identity: release tag, source commit, OCI index digest, per-architecture digests, supported platforms, and the expected image revision label |
 
-Releases are published as immutable GitHub releases, so these assets cannot be
-replaced after publication. The installer requires that of the release it
-selects: a checksum published beside the bundle it authenticates only proves
-something if neither can be rewritten afterwards.
+The installer requires the release it selects to be published (never a draft),
+tagged exactly what you asked for, and in possession of all three assets.
+
+**What the checksum proves, and what it does not.** It detects corruption in
+transit and any inconsistency between the bundle, its sidecar, and the manifest
+*as they are published right now*. It is not evidence that an asset was never
+replaced: the checksum lives on the same release as the bundle, so a repository
+administrator can replace both together. GitHub's immutable-releases feature,
+which would close that gap, is not in use yet — see
+[issue #682](https://github.com/silent-suite/silentsuite/issues/682).
+
+What cannot be substituted underneath you is the image. The server runs the exact
+OCI index digest recorded in the manifest, and the installer checks that digest,
+its per-architecture children, and the image's build revision against the
+registry before anything starts.
 
 `docker-compose.yml` contains no *server* image digest. It reads
 `SILENTSUITE_SERVER_IMAGE` from `.env`, which the installer writes as
@@ -88,7 +99,7 @@ The installer will:
 1. Check that Docker, Docker Compose, and the download-verification tools are installed
 2. Refuse to continue if `silentsuite-server/` exists at all — as a directory, an empty directory, a file, or a symlink — and require its parent to be a directory you own that other local users cannot write
 3. Detect your architecture and resolve the newest published release that ships verified self-host assets
-4. Require that release to be published as an immutable GitHub release, so its assets cannot be rewritten after you verify them
+4. Require that release to be published rather than a draft, and to carry exactly the tag that was requested
 5. Download the release bundle, its checksum, and `server-image.json` into a private temporary directory
 6. Verify the checksum record's exact grammar and the bundle's exact bytes before anything is extracted
 7. Verify the manifest: schema, release tag, source commit, canonical image repository, index and per-architecture digests, supported platforms, and expected image revision
@@ -172,8 +183,11 @@ single atomic `mkdir` only after every verification has passed.
    tar -xzf silentsuite-self-host-vX.Y.Z.tar.gz
    ```
 
-   Do not skip the checksum step: it is the only thing standing between you and
-   an altered bundle.
+   Do not skip the checksum step: it is what catches a bundle altered in
+   transit, or one that does not match the sidecar published beside it. It
+   cannot tell you the release was never rewritten — both files live on the same
+   release. The registry check in step 4 is the part that binds what you install
+   to an image identity nobody can substitute.
 
 2. **Bind the manifest to the bundle you verified.** The checksum covers the
    archive only, so the separately downloaded `server-image.json` proves nothing

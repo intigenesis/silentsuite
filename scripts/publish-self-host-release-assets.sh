@@ -2,11 +2,10 @@
 set -euo pipefail
 
 # Attach the verified self-host release artefacts to the shared draft umbrella
-# release for one immutable tag.
+# release for one release tag.
 #
 # The Android and Bridge tag workflows append to the same draft concurrently, so
 # this script is deliberately defensive:
-#   * refuses to run at all unless published releases are immutable;
 #   * bounded idempotent lookup-or-create of the draft for this exact tag;
 #   * fails closed if more than one release claims the tag, if the release is not
 #     a draft, or if a same-named asset already exists with different bytes;
@@ -14,18 +13,19 @@ set -euo pipefail
 #   * records sibling asset names before uploading and re-asserts them after;
 #   * reads every uploaded asset back and compares its bytes to the local file.
 #
+# What it does not claim: nothing here freezes a published release. GitHub
+# immutable releases are deferred while the repository has a single direct admin
+# (issue #682), so an administrator can still replace an asset after publication.
+# The readback below proves the bytes GitHub accepted are the bytes this workflow
+# built; it is not a guarantee about the release's future.
+#
 # Usage:
 #   scripts/publish-self-host-release-assets.sh --tag vX.Y.Z --directory DIR \
 #     --asset NAME [--asset NAME ...]
 #
-# Credentials, deliberately two of them:
-#   GITHUB_TOKEN                    contents:write — every release read/write here
-#   IMMUTABLE_RELEASES_READ_TOKEN   repository Administration:read — used only by
-#                                   the immutability guard below, because no
-#                                   workflow token can hold that permission
-# Also requires GITHUB_REPOSITORY, curl and jq. Neither token is ever printed.
-
-HELPER_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+# Credential, exactly one:
+#   GITHUB_TOKEN   contents:write — every release read/write here
+# Also requires GITHUB_REPOSITORY, curl and jq. The token is never printed.
 
 TAG=""
 DIRECTORY=""
@@ -53,7 +53,6 @@ if [ -z "$TAG" ] || [ -z "$DIRECTORY" ] || [ "${#ASSETS[@]}" -eq 0 ]; then
   exit 2
 fi
 : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
-: "${IMMUTABLE_RELEASES_READ_TOKEN:?IMMUTABLE_RELEASES_READ_TOKEN must be set (repository Administration: read)}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 API="${GITHUB_API_URL:-https://api.github.com}"
 UPLOADS="${GITHUB_UPLOAD_URL_BASE:-https://uploads.github.com}"
@@ -64,13 +63,6 @@ for asset in "${ASSETS[@]}"; do
     exit 1
   fi
 done
-
-# Defense in depth: the calling workflow gates on this too, but the helper is
-# the thing that actually creates drafts and uploads bytes, so it refuses to do
-# either unless published releases are immutable. Checked before the first
-# create/upload, never after. The guard reads the setting with its own
-# Administration:read credential; GITHUB_TOKEN below is only ever used to write.
-"$HELPER_DIR/require-immutable-releases.sh"
 
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT

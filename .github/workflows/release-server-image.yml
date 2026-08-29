@@ -77,25 +77,6 @@ jobs:
           echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "Admitted ${TAG} at ${GITHUB_SHA} (reachable from origin/main)"
 
-      # Last step of admission, and the gate for the whole lane: every other job
-      # needs `admit`, so a disabled or unreadable setting stops the release
-      # before any job that could push a GHCR child or move an alias.
-      #
-      # It runs after the tag has been proven to be a real release tag reachable
-      # from protected main, so the settings-read secret is never exposed to a
-      # run that was not going to be admitted anyway.
-      #
-      # This uses IMMUTABLE_RELEASES_READ_TOKEN, not GITHUB_TOKEN: the endpoint
-      # needs repository Administration: read, which no workflow token can hold.
-      # The owner supplies that read-only secret and enables the setting; nothing
-      # here changes either. The attachment job and the publish helper re-check
-      # before they write.
-      - name: Require immutable published releases
-        shell: bash
-        env:
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
-        run: scripts/require-immutable-releases.sh
-
   build:
     name: Build and smoke (${{ matrix.platform }})
     needs: admit
@@ -481,24 +462,14 @@ jobs:
             --amd64-digest "$AMD64_DIGEST" \
             --arm64-digest "$ARM64_DIGEST"
 
-      # Before any draft is created or any byte is uploaded. A published asset
-      # only authenticates itself if the release cannot be rewritten afterwards.
-      # Reads the setting with the dedicated Administration:read secret; the
-      # workflow token below stays scoped to the release write it performs.
-      - name: Require immutable published releases
-        shell: bash
-        env:
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
-        run: scripts/require-immutable-releases.sh
-
-      # Both credentials, each for exactly one job: the read-only settings token
-      # for the helper's defense-in-depth re-check, the workflow token for the
-      # release writes themselves.
+      # One credential, for exactly one purpose: the workflow token, used only
+      # for the draft-release reads and writes the helper performs. The helper
+      # creates nothing but a draft, refuses to touch a published release, and
+      # never publishes one — the operator does that by hand.
       - name: Attach the verified assets to the shared draft release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
         run: |
           set -euo pipefail
           scripts/publish-self-host-release-assets.sh \

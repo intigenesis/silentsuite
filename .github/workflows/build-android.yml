@@ -778,43 +778,13 @@ jobs:
           retention-days: 14
 
   # ─────────────────────────────────────────────────────────────────────
-  # Release immutability gate — deliberately its own job.
-  #
-  # The gate runs a network-capable helper. Inside the signed release job it
-  # would execute alongside the decoded keystore, the plaintext bundletool
-  # password file, and a persisted contents:write credential, so a broadened
-  # helper could reach signing material without touching a signing secret's
-  # `env`. Here it has none of that: read-only token, no environment, no
-  # signing secrets, no artifacts, and a checkout that does not persist
-  # credentials. build-release simply refuses to start until it passes.
-  # ─────────────────────────────────────────────────────────────────────
-  release-immutability:
-    name: Require immutable published releases
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout release policy source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          clean: true
-          persist-credentials: false
-
-      - name: Require immutable published releases
-        env:
-          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
-        run: bash "$GITHUB_WORKSPACE/scripts/require-immutable-releases.sh"
-
-  # ─────────────────────────────────────────────────────────────────────
   # Release builds — signed, only on version tags.
   # Uses a protected GitHub Environment so signing secrets are not
   # accessible to PRs, forks, or non-tag pushes.
   # ─────────────────────────────────────────────────────────────────────
   build-release:
     name: Build (signed, tag release)
-    needs: [signing-policy, conscrypt-r28, release-immutability]
+    needs: [signing-policy, conscrypt-r28]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: android-release
