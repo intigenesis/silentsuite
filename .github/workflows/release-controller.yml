@@ -208,14 +208,16 @@ jobs:
       source_sha: ${{ needs.admit.outputs.commit }}
 
   # ───────────────────────────────────────────────────────────────────
-  # Read-only completeness proof. It reports whether the draft is ready
-  # for a human to publish; it cannot publish anything itself.
+  # Behaviorally read-only completeness proof. GitHub hides draft releases
+  # from an Actions integration token scoped to contents: read, so this caller
+  # grants the minimum capability that makes the existing GETs see the draft.
+  # The called workflow and boundary checker pin the exact GET-only behavior.
   # ───────────────────────────────────────────────────────────────────
   readiness:
     name: Umbrella draft readiness
     needs: [admit, android, bridge, server]
     permissions:
-      contents: read
+      contents: write
     uses: ./.github/workflows/release-readiness.yml
     with:
       release_tag: ${{ needs.admit.outputs.tag }}
