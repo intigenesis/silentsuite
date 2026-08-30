@@ -29,6 +29,7 @@ CONSCRYPT_BUILD_SCRIPT = Path("android/scripts/build-conscrypt-android-r28.sh")
 IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
 ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
+BRIDGE_STAGING_HELPER = Path("scripts/stage-bridge-release-assets.sh")
 KEYSTORE_HELPER = Path("scripts/verify-android-release-keystore.sh")
 ARTIFACT_ADMISSION_HELPER = Path("scripts/admit-unsigned-android-artifact.sh")
 SIGNING_HELPER = Path("scripts/sign-android-release.sh")
@@ -77,6 +78,7 @@ def fixture_root(tmp_path: Path) -> Path:
         IDENTITY_HELPER,
         ATTACHMENT_HELPER,
         READINESS_HELPER,
+        BRIDGE_STAGING_HELPER,
         KEYSTORE_HELPER,
         ARTIFACT_ADMISSION_HELPER,
         SIGNING_HELPER,
@@ -649,6 +651,16 @@ def test_mutating_the_readiness_helper_bytes_is_rejected(tmp_path: Path) -> None
     helper = root / READINESS_HELPER
     helper.write_text(helper.read_text(encoding="utf-8") + "\n# unreviewed\n", encoding="utf-8")
     assert_rejected(run_checker(root), f"{READINESS_HELPER} must match its exact reviewed digest")
+
+
+def test_mutating_the_bridge_staging_helper_bytes_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    helper = root / BRIDGE_STAGING_HELPER
+    helper.write_text(helper.read_text(encoding="utf-8") + "\n# unreviewed\n", encoding="utf-8")
+    assert_rejected(
+        run_checker(root),
+        f"{BRIDGE_STAGING_HELPER} must match its exact reviewed digest",
+    )
 
 
 def test_a_missing_helper_is_rejected(tmp_path: Path) -> None:
