@@ -20,6 +20,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -313,8 +314,10 @@ def test_the_signer_proves_the_pinned_certificate_on_both_outputs():
     assert 'require_pinned_certificate "AAB"' in code
     assert '"$APKSIGNER" verify --print-certs' in code
     assert "-printcert -jarfile" in code
-    assert '"$JARSIGNER" -verify "$SIGNED_AAB"' in code
-    assert '"$JARSIGNER" -verify -strict' not in code
+    assert '"$JARSIGNER" -verify -strict' in code
+    assert '-keystore "$KEYSTORE_PATH" -storepass:env KSTOREPWD' in code
+    assert "grep -Fxq 'jar verified.' \"$JARSIGNER_VERIFY_LOG\"" in code
+    assert '"$JARSIGNER" -verify "$SIGNED_AAB"' not in code
     assert "failed cryptographic integrity verification" in code
     assert 'head -c 4096 "$JARSIGNER_VERIFY_LOG"' in code
     assert "-J-Duser.language=en" in code, "keytool labels must not be locale-dependent"
@@ -394,6 +397,19 @@ def jdk_signing_fixture(tmp_path: Path, *, mode: str, expected: str | None = Non
     java_home = tmp_path / "jdk"
     bin_dir = java_home / "bin"
     bin_dir.mkdir(parents=True)
+    argv_log = tmp_path / "jarsigner.argv"
+    tamper_script = tmp_path / "tamper-signed-entry.py"
+    tamper_script.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "path = Path(os.environ['TAMPER_AAB'])\n"
+        "data = bytearray(path.read_bytes())\n"
+        "marker = b'minimal signed-entry fixture'\n"
+        "offset = data.index(marker)\n"
+        "data[offset] ^= 1\n"
+        "path.write_bytes(data)\n",
+        encoding="utf-8",
+    )
     (bin_dir / "java").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (bin_dir / "java").chmod(0o755)
     (bin_dir / "keytool").write_text(
@@ -408,7 +424,8 @@ def jdk_signing_fixture(tmp_path: Path, *, mode: str, expected: str | None = Non
         )
         + f'{shlex.quote(keytool_real)} "$@"\n'
         'status=$?\n'
-        + ('printf x >> "$TAMPER_AAB"\n' if mode == "tampered" else "")
+        + (f'{shlex.quote(sys.executable)} {shlex.quote(str(tamper_script))}\n'
+           if mode == "tampered" else "")
         + "exit $status\n",
         encoding="utf-8",
     )
@@ -422,13 +439,16 @@ def jdk_signing_fixture(tmp_path: Path, *, mode: str, expected: str | None = Non
             '    shift\n'
             "  done\n"
             "fi\n"
+            f'printf "%s\\n" "$@" >> {shlex.quote(str(argv_log))}\n'
             f'exec {shlex.quote(jarsigner_real)} "$@"\n'
         )
         (bin_dir / "jarsigner").write_text(jarsigner_body, encoding="utf-8")
         (bin_dir / "jarsigner").chmod(0o755)
     else:
         (bin_dir / "jarsigner").write_text(
-            f"#!/bin/sh\nexec {shlex.quote(jarsigner_real)} \"$@\"\n", encoding="utf-8"
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$@" >> {shlex.quote(str(argv_log))}\n'
+            f'exec {shlex.quote(jarsigner_real)} "$@"\n', encoding="utf-8"
         )
         (bin_dir / "jarsigner").chmod(0o755)
 
@@ -500,6 +520,9 @@ def jdk_signing_fixture(tmp_path: Path, *, mode: str, expected: str | None = Non
         },
     )
     assert password not in result.stdout + result.stderr
+    recorded_argv = argv_log.read_text(encoding="utf-8")
+    assert password not in recorded_argv
+    assert "-storepass:env\nKSTOREPWD" in recorded_argv
     return result
 
 

@@ -495,7 +495,7 @@ EXPECTED_CONTROLLER_ADMIT_SHA256 = "6423d79810b64d292382c9bccab15a7b0ed342a6ff6e
 EXPECTED_IDENTITY_HELPER_SHA256 = "855c557e36e8fb55979e6877b02808d1ed0e40dafb9e8b7195e711f76d4b5da7"
 EXPECTED_ATTACHMENT_HELPER_SHA256 = "f37f415e7ec9439fe2e16c7e68a32a7ff0f8927de77eb2266480549e93aca875"
 EXPECTED_ARTIFACT_ADMISSION_SHA256 = "5c810ac880a6f91c334dc108c456927a70dbbbd6284016f14fd11a4ea01c4b4e"
-EXPECTED_SIGNING_HELPER_SHA256 = "b7eb3fb80dfc9e802ab526575d8b13fb33bc086abdbaa348e7cbee21d26253ff"
+EXPECTED_SIGNING_HELPER_SHA256 = "6e36285e5837ac13eb8ef20e1a34d07eb88b857c1acaffbaff6af458ed94ade5"
 EXPECTED_KEYSTORE_HELPER_SHA256 = "b9b0c8046a85209754c5e206b9cc1778036d2366d0709caf9a60fbf741f5c9b6"
 EXPECTED_READINESS_HELPER_SHA256 = "c75ebfba772c4f7bd6559161f64df3127c9c390bf1e5a81e39236ba47cc6e26f"
 # The Conscrypt producer exists twice: unprivileged CI builds it from the
@@ -1510,7 +1510,9 @@ def check(root: Path) -> list[str]:
             '"$ZIPALIGN" -c -P 16 4',
             'canonical="$(readlink -f -- "$tool")"',
             "resolves outside its trusted root",
-            '"$JARSIGNER" -verify "$SIGNED_AAB"',
+            '"$JARSIGNER" -verify -strict \\\n'
+            '  -keystore "$KEYSTORE_PATH" -storepass:env KSTOREPWD',
+            "grep -Fxq 'jar verified.' \"$JARSIGNER_VERIFY_LOG\"",
             '-printcert -jarfile "$SIGNED_AAB"',
         ):
             if required not in signing_code:
@@ -1519,9 +1521,9 @@ def check(root: Path) -> list[str]:
             violations.append(f"{SIGNING_HELPER} must not resolve tools through PATH")
         if '"$ZIPALIGN" -p' in signing_code or '"$ZIPALIGN" -c -p' in signing_code:
             violations.append(f"{SIGNING_HELPER} must not use deprecated zipalign -p")
-        if '"$JARSIGNER" -verify -strict' in signing_code:
+        if '"$JARSIGNER" -verify "$SIGNED_AAB"' in signing_code:
             violations.append(
-                f"{SIGNING_HELPER} must not apply public-PKI strict policy to AAB integrity"
+                f"{SIGNING_HELPER} must not use unparsed plain AAB verification"
             )
 
     # The keystore preflight sits exactly between the decode and Gradle. A

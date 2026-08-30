@@ -110,27 +110,47 @@ def test_repository_workflows_satisfy_the_release_and_signing_boundary() -> None
     assert "boundary check passed" in result.stdout
 
 
-def test_aab_integrity_cannot_reintroduce_public_pki_strict_policy(tmp_path: Path) -> None:
+def test_aab_integrity_cannot_remove_explicit_keystore_trust(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
-    mutate(
+    mutate_last(
         root / SIGNING_HELPER,
-        '"$JARSIGNER" -verify "$SIGNED_AAB"',
-        '"$JARSIGNER" -verify -strict "$SIGNED_AAB"',
+        '-keystore "$KEYSTORE_PATH" -storepass:env KSTOREPWD',
+        '-keystore "$KEYSTORE_PATH"',
     )
-    assert_rejected(run_checker(root), "must not apply public-PKI strict policy")
+    assert_rejected(run_checker(root), '"$JARSIGNER" -verify -strict')
 
 
 def test_aab_integrity_verification_cannot_be_removed(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(
         root / SIGNING_HELPER,
-        'if ! "$JARSIGNER" -verify "$SIGNED_AAB"',
+        'if ! "$JARSIGNER" -verify -strict',
         'if ! /bin/true',
     )
     assert_rejected(
         run_checker(root),
-        'must contain \'"$JARSIGNER" -verify "$SIGNED_AAB"\'',
+        'must contain \'"$JARSIGNER" -verify -strict',
     )
+
+
+def test_aab_integrity_cannot_fall_back_to_plain_verify(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SIGNING_HELPER,
+        '"$JARSIGNER" -verify -strict \\',
+        '"$JARSIGNER" -verify "$SIGNED_AAB"; /bin/true \\',
+    )
+    assert_rejected(run_checker(root), "must not use unparsed plain AAB verification")
+
+
+def test_aab_integrity_cannot_remove_verified_result_check(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SIGNING_HELPER,
+        "grep -Fxq 'jar verified.' \"$JARSIGNER_VERIFY_LOG\"",
+        "/bin/true",
+    )
+    assert_rejected(run_checker(root), "grep -Fxq")
 
 
 def test_aab_certificate_pin_extraction_cannot_be_removed(tmp_path: Path) -> None:
