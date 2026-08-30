@@ -10,7 +10,7 @@ if (!Number.isInteger(runId) || runId < 1 || !Number.isInteger(runAttempt) || ru
 const sourcePath = 'contracts/annual-only-billing-v2.schema.json'
 const sourceBytes = await readFile(sourcePath)
 const source = JSON.parse(sourceBytes)
-const serializedDigest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+const serializedDigest = value => `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`
 const bytesDigest = bytes => `sha256:${createHash('sha256').update(bytes).digest('hex')}`
 const sign = (unsigned) => createHmac('sha256', key).update(serializedDigest(unsigned)).digest('hex')
 const disclosureUnsigned = { schemaVersion: 2, predicateType: 'https://silentsuite.io/attestations/annual-only-public-disclosure/v2', publicSha: env.PUBLIC_SHA, disclosure: { contractVersion: 2, source: sourcePath, sourceDigest: bytesDigest(sourceBytes), offer: { planIds: source.$defs.Offer.properties.planId.enum, billingInterval: source.$defs.Offer.properties.billingInterval.const, currency: source.$defs.Offer.properties.currency.const, providers: source.$defs.Offer.properties.providers.items.enum } } }
