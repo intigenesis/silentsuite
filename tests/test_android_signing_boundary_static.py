@@ -464,6 +464,73 @@ def test_readiness_that_does_not_wait_for_every_component_is_rejected(tmp_path: 
     assert_rejected(run_checker(root), "readiness must wait for every component lane")
 
 
+def test_readiness_caller_draft_visibility_ceiling_is_exact(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "  readiness:\n    name: Umbrella draft readiness\n    needs: [admit, android, bridge, server]\n    permissions:\n      contents: write\n",
+        "  readiness:\n    name: Umbrella draft readiness\n    needs: [admit, android, bridge, server]\n    permissions:\n      contents: read\n",
+    )
+    assert_rejected(run_checker(root), "job readiness must declare exactly {'contents': 'write'}")
+
+
+def test_called_readiness_draft_visibility_ceiling_is_exact(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / READINESS_WORKFLOW,
+        "    permissions:\n      contents: write\n",
+        "    permissions:\n      contents: read\n",
+    )
+    assert_rejected(run_checker(root), "readiness permissions must be exactly contents: write")
+
+
+@pytest.mark.parametrize(
+    ("extra_step", "message"),
+    [
+        ("      - run: curl -X POST https://api.github.com/repos/x/y/releases\n", "API mutation method"),
+        ("      - run: gh release edit v1.2.3\n", "must not use gh release"),
+        (
+            "      - run: scripts/attach-umbrella-release-assets.sh --tag v1.2.3\n",
+            "must not use release attachment helper",
+        ),
+        (
+            "      - uses: actions/upload-artifact@0123456789012345678901234567890123456789\n",
+            "must not use artifact upload action",
+        ),
+        ("      - uses: ./attacker-action\n", "must not invoke local actions"),
+    ],
+)
+def test_readiness_rejects_mutation_routes(
+    tmp_path: Path, extra_step: str, message: str
+) -> None:
+    root = fixture_root(tmp_path)
+    workflow = root / READINESS_WORKFLOW
+    workflow.write_text(workflow.read_text(encoding="utf-8") + extra_step, encoding="utf-8")
+    assert_rejected(run_checker(root), message)
+
+
+def test_readiness_rejects_any_unreviewed_extra_command(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    workflow = root / READINESS_WORKFLOW
+    workflow.write_text(
+        workflow.read_text(encoding="utf-8") + "      - run: printf 'extra step\\n'\n",
+        encoding="utf-8",
+    )
+    assert_rejected(run_checker(root), "must match its exact reviewed whole-job digest")
+
+
+def test_readiness_rejects_environment_and_extra_secrets(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / READINESS_WORKFLOW,
+        "    timeout-minutes: 20\n",
+        "    timeout-minutes: 20\n    environment: production\n    env:\n      TOKEN: ${{ secrets.RELEASE_TOKEN }}\n",
+    )
+    result = run_checker(root)
+    assert_rejected(result, "readiness must not bind an environment")
+    assert "may reference only secrets.GITHUB_TOKEN" in result.stdout
+
+
 # ── Candidate-sourced helper bypass ───────────────────────────────────
 
 

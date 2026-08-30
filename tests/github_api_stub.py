@@ -66,6 +66,11 @@ def default_state(tag: str = "v1.2.3", commit: str = "a" * 40) -> dict:
         "next_release_id": 100,
         "next_asset_id": 900,
         "requests": [],
+        # Optional authorization-model fixture. When set, drafts are included
+        # in release-list GETs only for these exact bearer tokens. This models
+        # observed GitHub integration behavior; it does not purport to prove
+        # which Actions permission produces either token capability.
+        "draft_visible_tokens": None,
         "fail": {},
         # Move the tag out from under a lane mid-run: after this many reads of
         # the tag ref, serve `moved_sha` instead. Models the window between a
@@ -184,7 +189,16 @@ class _Handler(BaseHTTPRequestHandler):
             page = int(query.get("page", ["1"])[0])
             per_page = int(query.get("per_page", ["30"])[0])
             start = (page - 1) * per_page
-            return self._send(200, self.state["releases"][start : start + per_page])
+            releases = self.state["releases"]
+            visible_tokens = self.state.get("draft_visible_tokens")
+            if visible_tokens is not None:
+                token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+                releases = [
+                    release
+                    for release in releases
+                    if not release.get("draft") or token in visible_tokens
+                ]
+            return self._send(200, releases[start : start + per_page])
 
         match = re.fullmatch(rf"{re.escape(prefix)}/releases/(\d+)", path)
         if match:

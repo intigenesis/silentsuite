@@ -12,6 +12,7 @@ mutating request, so it can never publish what it is judging.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -128,8 +129,14 @@ def publish_draft(
     return release
 
 
-def readiness(stub: GitHubStub, *, tag: str = TAG, commit: str = COMMIT):
-    environment = {**os.environ, **stub.environment(), "GITHUB_TOKEN": "test-token"}
+def readiness(
+    stub: GitHubStub,
+    *,
+    tag: str = TAG,
+    commit: str = COMMIT,
+    token: str = "test-token",
+):
+    environment = {**os.environ, **stub.environment(), "GITHUB_TOKEN": token}
     environment.pop("GITHUB_REF", None)
     return subprocess.run(
         [sys.executable, str(READINESS), "--tag", tag, "--commit", commit],
@@ -156,14 +163,34 @@ def test_the_gate_issues_no_mutating_request(stub, complete_assets):
     """It judges the draft; it must have no way to publish it."""
 
     publish_draft(stub, complete_assets)
+    before = copy.deepcopy(
+        {key: stub.state[key] for key in ("releases", "assets", "asset_bytes")}
+    )
 
     assert readiness(stub).returncode == 0
     assert [method for method, _ in stub.state["requests"] if method != "GET"] == []
+    after = {key: stub.state[key] for key in ("releases", "assets", "asset_bytes")}
+    assert after == before
     source = READINESS.read_text(encoding="utf-8")
     for mutation in ("POST", "PATCH", "DELETE", "PUT"):
         assert f'"{mutation}"' not in source
     assert "draft: false" not in source
     assert "make_latest" not in source
+
+
+def test_draft_visibility_capability_is_required_by_the_model(stub, complete_assets):
+    """Model the observed ceiling without treating the stub as permission proof."""
+
+    publish_draft(stub, complete_assets)
+    stub.state["draft_visible_tokens"] = {"write-capability-token"}
+
+    hidden = readiness(stub, token="read-capability-token")
+    visible = readiness(stub, token="write-capability-token")
+
+    assert hidden.returncode != 0
+    assert f"0 releases claim {TAG}" in hidden.stderr
+    assert visible.returncode == 0, visible.stderr
+    assert [method for method, _ in stub.state["requests"] if method != "GET"] == []
 
 
 def test_the_matching_draft_is_found_beyond_the_first_three_pages(stub, complete_assets):

@@ -1,12 +1,16 @@
 name: Release Readiness
 
-# The final, read-only gate of the protected-main release control plane.
+# The final, behaviorally read-only gate of the protected-main release control
+# plane.
 #
 # The three component lanes each append to one shared draft and none of them can
 # see what the others produced, so "every lane succeeded" has never meant "the
 # release is publishable". This job answers that question and nothing else: it
-# holds contents:read, issues only GET requests, and has no path to publishing.
-# Publication stays a deliberate human action.
+# needs contents:write only because GitHub does not expose draft releases to an
+# Actions integration token with contents:read. Its exact workflow, job and
+# helper bytes are pinned by the release-boundary checker; it issues only GET
+# requests and has no path to publishing. Publication stays a deliberate human
+# action.
 
 on:
   workflow_call:
@@ -28,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Check out the trusted controller revision

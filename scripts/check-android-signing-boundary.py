@@ -429,7 +429,7 @@ EXPECTED_CONTROLLER_CALLERS: dict[str, dict[str, Any]] = {
     },
     "readiness": {
         "uses": "./.github/workflows/release-readiness.yml",
-        "permissions": {"contents": "read"},
+        "permissions": {"contents": "write"},
     },
 }
 EXPECTED_CALLER_INPUTS = {
@@ -484,6 +484,12 @@ EXPECTED_RELEASE_JOB_SHA256 = "77295dce0752b35f290310f641c1d8b1eaf3a2b3db78445c9
 # The Android caller is the only controller job allowed to grant secrets. Pin
 # its entire semantic job after reviewing the exact three-name capability map.
 EXPECTED_CONTROLLER_ANDROID_JOB_SHA256 = "8caa709d1d1680daff0e2e53438072c113c265cfdd8fcb6064f9f2cc808df237"
+# Drafts are invisible to the Actions integration at contents:read. These
+# semantic pins make the exceptional write-capability caller and called job a
+# closed specification rather than a general-purpose release writer.
+EXPECTED_CONTROLLER_READINESS_JOB_SHA256 = "b1ebaab82df3634d071533f54a6ea43c510ad608b93ec940c9eeb17364f9f7f0"
+EXPECTED_READINESS_WORKFLOW_SHA256 = "f3331dd191728bb497a0df8b88df9cc4426da9fba40b8d0a1c20b912f50c0d4f"
+EXPECTED_READINESS_JOB_SHA256 = "debdf8eab733402d4ebb98b30ab5c3b5e93c7f78f14aa959669fe6308f9510bb"
 EXPECTED_UNSIGNED_JOB_SHA256 = "b20d7ce02bb1de96741fda2320c3b5993b63ff55ffec314ea534b83129f52823"
 # Same treatment for the one job that can write a release. It carries the write
 # credential, the attachment helper and the umbrella lock, so every byte of it
@@ -920,6 +926,10 @@ def check_control_plane(
             violations.append(
                 f"{CONTROLLER_WORKFLOW} readiness must wait for every component lane"
             )
+        if semantic_sha256(readiness) != EXPECTED_CONTROLLER_READINESS_JOB_SHA256:
+            violations.append(
+                f"{CONTROLLER_WORKFLOW} readiness must match its exact reviewed whole-job digest"
+            )
 
     # 5. Component workflows are reachable only by that call.
     for relative in COMPONENT_WORKFLOWS:
@@ -947,6 +957,81 @@ def check_control_plane(
             violations.append(f"{relative} must not declare callable secrets")
         if workflow.get("permissions") != {}:
             violations.append(f"{relative} must grant no default permissions")
+
+    # 5a. Draft visibility requires contents:write, but the readiness lane is
+    # behaviorally read-only. Close the exceptional capability around one exact
+    # workflow/job and reject recognizable release mutation routes explicitly,
+    # so a failure explains the violated boundary before the digest pin does.
+    readiness_workflow = loaded.get(READINESS_WORKFLOW)
+    if readiness_workflow is not None:
+        readiness_jobs = readiness_workflow.get("jobs") or {}
+        readiness_job = readiness_jobs.get("readiness")
+        if set(readiness_jobs) != {"readiness"}:
+            violations.append(f"{READINESS_WORKFLOW} must define exactly the readiness job")
+        if semantic_sha256(readiness_workflow) != EXPECTED_READINESS_WORKFLOW_SHA256:
+            violations.append(
+                f"{READINESS_WORKFLOW} must match its exact reviewed whole-workflow digest"
+            )
+        if isinstance(readiness_job, Mapping):
+            if readiness_job.get("permissions") != {"contents": "write"}:
+                violations.append(
+                    f"{READINESS_WORKFLOW} readiness permissions must be exactly contents: write"
+                )
+            if environment_name(readiness_job) is not None:
+                violations.append(f"{READINESS_WORKFLOW} readiness must not bind an environment")
+            if semantic_sha256(readiness_job) != EXPECTED_READINESS_JOB_SHA256:
+                violations.append(
+                    f"{READINESS_WORKFLOW} readiness must match its exact reviewed whole-job digest"
+                )
+
+            body = "\n".join(strings(readiness_job))
+            lowered = body.lower()
+            named_secrets = set(SECRET_REFERENCE.findall(body))
+            if named_secrets != {"GITHUB_TOKEN"} or UNSAFE_SECRET_EXPRESSION.search(body):
+                violations.append(
+                    f"{READINESS_WORKFLOW} readiness may reference only secrets.GITHUB_TOKEN"
+                )
+            helper_references = [
+                reference
+                for reference in trusted_helper_references(readiness_job)
+                if reference.endswith(f"scripts/{READINESS_HELPER.name}")
+            ]
+            if helper_references != [f"scripts/{READINESS_HELPER.name}"]:
+                violations.append(
+                    f"{READINESS_WORKFLOW} readiness must invoke the trusted "
+                    f"{READINESS_HELPER.name} exactly once"
+                )
+            forbidden_fragments = {
+                "attach-umbrella-release-assets.sh": "release attachment helper",
+                "gh release": "gh release",
+                "uploads.github.com": "release upload URL",
+                "upload_url": "release upload URL",
+                "softprops/action-gh-release": "marketplace release action",
+                "actions/upload-artifact": "artifact upload action",
+                "actions/download-artifact": "artifact download action",
+            }
+            for fragment, description in forbidden_fragments.items():
+                if fragment in lowered:
+                    violations.append(
+                        f"{READINESS_WORKFLOW} readiness must not use {description}"
+                    )
+            if re.search(r"\b(post|patch|put|delete)\b", lowered):
+                violations.append(
+                    f"{READINESS_WORKFLOW} readiness must not name an API mutation method"
+                )
+            if re.search(r"(^|[\n;&|])\s*(curl|wget|nc|ncat|socat)\b", lowered):
+                violations.append(
+                    f"{READINESS_WORKFLOW} readiness must not perform shell network access"
+                )
+            allowed_actions = {CHECKOUT_ACTION, SETUP_PYTHON_ACTION}
+            for target in action_uses(readiness_job):
+                if target.startswith("./"):
+                    violations.append(f"{READINESS_WORKFLOW} readiness must not invoke local actions")
+                elif target not in allowed_actions:
+                    violations.append(
+                        f"{READINESS_WORKFLOW} readiness action {target} is not one of the exact "
+                        "reviewed setup actions"
+                    )
 
     # 5b. Anything a component lane calls in turn is on the release path too.
     #     It may build the candidate, but it may not hold a write permission or

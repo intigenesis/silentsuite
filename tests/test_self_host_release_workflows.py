@@ -291,7 +291,7 @@ def test_the_controller_admits_structurally_before_it_builds():
                 "attestations": "write",
             },
         ),
-        ("readiness", {"contents": "read"}),
+        ("readiness", {"contents": "write"}),
     ],
 )
 def test_each_component_lane_declares_its_permission_ceiling(job, expected):
@@ -867,16 +867,24 @@ def test_the_publish_helper_only_addresses_release_objects_and_assets():
 # ── Readiness gate ────────────────────────────────────────────────────
 
 
-def test_the_readiness_gate_is_read_only_and_cannot_publish():
+def test_the_readiness_gate_is_behaviorally_read_only_and_cannot_publish():
     job = READINESS["jobs"]["readiness"]
-    assert job["permissions"] == {"contents": "read"}
+    # GitHub hides drafts from the Actions integration at contents:read. The
+    # checker pins this exceptional visibility capability around the exact
+    # workflow, job and GET-only helper.
+    assert job["permissions"] == {"contents": "write"}
     assert "environment" not in job
+    assert "secrets" not in READINESS["on"]["workflow_call"]
     assert checkouts(job) == [{"ref": TRUSTED_REF, "clean": "true", "persist-credentials": "false"}]
     run = step_named(job, "Prove the umbrella draft is complete")["run"]
     assert "scripts/verify-umbrella-release-readiness.py" in run
-    source = READINESS_WORKFLOW.read_text(encoding="utf-8")
-    for forbidden in ("draft: false", "gh release", "make_latest", "contents: write"):
-        assert forbidden not in source
+    workflow_source = READINESS_WORKFLOW.read_text(encoding="utf-8")
+    helper_source = (ROOT / "scripts" / "verify-umbrella-release-readiness.py").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in ("draft: false", "gh release", "make_latest"):
+        assert forbidden not in workflow_source
+        assert forbidden not in helper_source
 
 
 def test_the_readiness_gate_covers_every_component_inventory():
