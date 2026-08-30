@@ -368,29 +368,31 @@ def build_release_steps() -> list[dict]:
     workflow = yaml.load(
         ANDROID_RELEASE_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
     )
-    return workflow["jobs"]["build-release"]["steps"]
+    return workflow["jobs"]["sign-release"]["steps"]
 
 
-def test_the_verifier_runs_between_the_decode_and_gradle():
+def test_the_verifier_runs_between_the_decode_and_signing():
+    """Nothing may sit between the store being written and it being proven."""
+
     names = [step.get("name") for step in build_release_steps()]
     decode = names.index("Decode release keystore")
-    verify_index = names.index("Verify the release keystore before Gradle")
-    gradle = names.index("Build signed release APK and AAB")
+    verify_index = names.index("Verify the release keystore before signing")
+    signing = names.index("Sign the admitted APK and AAB")
 
-    assert verify_index == decode + 1, names[decode : gradle + 1]
-    assert gradle == verify_index + 1, names[decode : gradle + 1]
+    assert verify_index == decode + 1, names[decode : signing + 1]
+    assert signing == verify_index + 1, names[decode : signing + 1]
 
 
 def test_the_verifier_runs_trusted_code_with_only_the_signing_secrets():
     step = next(
-        s for s in build_release_steps() if s.get("name") == "Verify the release keystore before Gradle"
+        s for s in build_release_steps() if s.get("name") == "Verify the release keystore before signing"
     )
     assert step["env"] == {
         "KSTOREPWD": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     }
-    assert ".release-trusted/scripts/verify-android-release-keystore.sh" in step["run"]
-    assert "android/scripts" not in step["run"]
+    assert '"$GITHUB_WORKSPACE/scripts/verify-android-release-keystore.sh"' in step["run"]
+    assert "unsigned/" not in step["run"], "the verifier is trusted code, not candidate data"
 
 
 def test_the_decode_step_is_hardened_and_fails_closed():
@@ -440,7 +442,7 @@ def test_an_ambient_environment_variable_cannot_relax_the_expected_certificate(s
 
 def test_the_reviewed_workflow_supplies_no_override():
     step = next(
-        s for s in build_release_steps() if s.get("name") == "Verify the release keystore before Gradle"
+        s for s in build_release_steps() if s.get("name") == "Verify the release keystore before signing"
     )
     assert "--expect-sha256" not in step["run"]
 

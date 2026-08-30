@@ -80,7 +80,7 @@ def test_release_builds_fail_closed_without_rebuilt_conscrypt_aar():
         (
             RELEASE_WORKFLOW,
             "conscrypt-r28-${{ inputs.source_sha }}",
-            ("build-release",),
+            ("build-unsigned-release",),
         ),
     ],
     ids=("ci", "release"),
@@ -117,7 +117,7 @@ def test_workflow_builds_conscrypt_once_without_secrets_and_reuses_exact_run_art
 def test_final_apk_and_aab_gates_require_conscrypt_ndk_r28_identity():
     for path, job_name, step_name in (
         (CI_WORKFLOW, "build-pr", "Verify unsigned release native libraries"),
-        (RELEASE_WORKFLOW, "build-release", "Verify release native libraries"),
+        (RELEASE_WORKFLOW, "build-unsigned-release", "Verify unsigned release native libraries"),
     ):
         jobs = workflow_jobs(path)
         run = {step["name"]: step for step in jobs[job_name]["steps"]}[step_name]["run"]

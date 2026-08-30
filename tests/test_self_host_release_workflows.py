@@ -1021,7 +1021,7 @@ def test_only_the_signed_android_job_binds_a_deployment_environment():
         for job_name, job in load(path).get("jobs", {}).items():
             if job.get("environment") is not None:
                 owners.append(f"{path.name}:{job_name}")
-    assert owners == ["release-android.yml:build-release"]
+    assert owners == ["release-android.yml:sign-release"]
 
 
 def test_every_workflow_action_is_pinned_to_an_immutable_commit():
@@ -1148,13 +1148,8 @@ ANDROID_MUTATION_BOUNDARIES = [
     ),
     (
         "Revalidate the release identity before publishing signed artifacts",
-        "Upload signed tracker verification evidence",
+        "Upload signed split evidence",
         "android-signed-artifact-egress",
-    ),
-    (
-        "Revalidate the release identity before publishing signed release outputs",
-        "Upload signed release APK, AAB, and native debug symbols",
-        "android-release-output-egress",
     ),
     (
         "Revalidate the release identity before the attachment handoff",
@@ -1172,33 +1167,63 @@ def test_each_android_irreversible_step_is_immediately_preceded_by_a_revalidatio
 ):
     """Immediately: an inserted step would reopen the window this closes."""
 
-    names = step_names(ANDROID["jobs"]["build-release"])
+    names = step_names(ANDROID["jobs"]["sign-release"])
     assert guard in names, guard
     assert guarded in names, guarded
     assert names[names.index(guard) + 1] == guarded, (
         f"{guard!r} must sit directly before {guarded!r}, found "
         f"{names[names.index(guard) + 1]!r}"
     )
-    step = step_named(ANDROID["jobs"]["build-release"], guard)
+    step = step_named(ANDROID["jobs"]["sign-release"], guard)
     assert f"--stage {stage}" in step["run"]
 
 
-def test_the_android_revalidations_run_trusted_code_not_the_candidate_tree():
-    job = ANDROID["jobs"]["build-release"]
+def test_the_android_signing_job_never_checks_out_candidate_code():
+    """The fresh-runner boundary: no candidate byte reaches this job."""
+
+    job = ANDROID["jobs"]["sign-release"]
     assert checkouts(job) == [
-        {"ref": "${{ inputs.source_sha }}", "persist-credentials": "false"},
-        {"ref": TRUSTED_REF, "path": ".release-trusted", "persist-credentials": "false"},
+        {"ref": TRUSTED_REF, "clean": "true", "persist-credentials": "false"}
     ]
+    body = "\n".join(str(step.get("run", "")) for step in steps(job))
+    assert "gradlew" not in body, "candidate Gradle must not run beside the keystore"
     for guard, _, _ in ANDROID_MUTATION_BOUNDARIES:
         run = step_named(job, guard)["run"]
-        assert '"$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh"' in run
-        assert "android/scripts" not in run
+        assert '"$GITHUB_WORKSPACE/scripts/verify-release-identity.sh"' in run
+
+
+def test_the_unsigned_producer_holds_nothing_worth_taking():
+    """Candidate Gradle runs here, on a runner with no secret and no token."""
+
+    job = ANDROID["jobs"]["build-unsigned-release"]
+    assert job["permissions"] == {"contents": "read"}
+    assert "environment" not in job
+    body = ANDROID_WORKFLOW.read_text(encoding="utf-8")
+    producer = body.split("  build-unsigned-release:", 1)[1].split("\n  sign-release:", 1)[0]
+    for forbidden in (
+        "ANDROID_KEYSTORE_BASE64",
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_ALIAS",
+        "secrets.GITHUB_TOKEN",
+        "android-release",
+    ):
+        assert forbidden not in producer, f"the unsigned producer must not reference {forbidden}"
+    assert "silentsuite-android-unsigned-${{ inputs.source_sha }}" in producer
+
+
+def test_the_signing_job_admits_the_candidate_artifact_before_decoding():
+    job = ANDROID["jobs"]["sign-release"]
+    names = step_names(job)
+    assert names.index("Admit the unsigned build") < names.index("Decode release keystore")
+    admit = step_named(job, "Admit the unsigned build")["run"]
+    assert "scripts/admit-unsigned-android-artifact.sh" in admit
+    assert '--source-sha "$SOURCE_SHA"' in admit
 
 
 def test_only_the_android_revalidation_steps_receive_the_workflow_token():
     """Candidate Gradle and candidate scripts must never see it."""
 
-    job = ANDROID["jobs"]["build-release"]
+    job = ANDROID["jobs"]["sign-release"]
     carriers = [
         step.get("name")
         for step in steps(job)
