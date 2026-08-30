@@ -14,6 +14,7 @@ that has been disabled, relaxed, or given a bypass actor.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -472,12 +473,15 @@ def test_local_ancestry_refuses_a_commit_off_protected_main(lane):
 # ── Bridge asset staging ──────────────────────────────────────────────
 
 
-def stage(tmp_path: Path, names: dict[str, str]):
+def stage(tmp_path: Path, names: dict[str, str | bytes]):
     source = tmp_path / "artifacts"
     for relative, content in names.items():
         target = source / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            target.write_text(content, encoding="utf-8")
     return subprocess.run(
         ["bash", str(STAGE), str(source), str(tmp_path / "flat")],
         capture_output=True,
@@ -485,67 +489,117 @@ def stage(tmp_path: Path, names: dict[str, str]):
     )
 
 
-def test_staging_flattens_and_builds_a_deterministic_manifest(tmp_path: Path):
-    result = stage(
-        tmp_path,
-        {
-            "b/silentsuite-bridge-macos-arm64": "m\n",
-            "b/silentsuite-bridge-macos-arm64.sha256": "bbb  silentsuite-bridge-macos-arm64\n",
-            "a/silentsuite-bridge-linux-x86_64": "l\n",
-            "a/silentsuite-bridge-linux-x86_64.sha256": "aaa  silentsuite-bridge-linux-x86_64\n",
-        },
-    )
+BRIDGE_PAYLOADS = (
+    "silentsuite-bridge-linux-arm64",
+    "silentsuite-bridge-linux-x86_64",
+    "silentsuite-bridge-macos-arm64",
+    "silentsuite-bridge-macos-x86_64",
+    "silentsuite-bridge-windows-x86_64.exe",
+)
+
+
+def valid_bridge_tree(*, windows_binary_marker: bool = False) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    for index, name in enumerate(BRIDGE_PAYLOADS):
+        payload = f"payload-{index}-{name}\n".encode()
+        digest = hashlib.sha256(payload).hexdigest()
+        marker = "*" if windows_binary_marker and name.endswith(".exe") else " "
+        files[f"artifact-{index}/{name}"] = payload
+        files[f"artifact-{index}/{name}.sha256"] = f"{digest.upper()} {marker}{name}\n".encode()
+    return files
+
+
+def test_staging_verifies_all_platforms_and_builds_a_deterministic_manifest(tmp_path: Path):
+    result = stage(tmp_path, valid_bridge_tree(windows_binary_marker=True))
 
     assert result.returncode == 0, result.stderr
-    manifest = (tmp_path / "flat" / "SHA256SUMS.txt").read_text()
-    assert manifest == (
-        "aaa  silentsuite-bridge-linux-x86_64\nbbb  silentsuite-bridge-macos-arm64\n"
-    ), "the manifest order must not depend on artifact arrival"
+    flat = tmp_path / "flat"
+    records = [(flat / f"{name}.sha256").read_text() for name in sorted(BRIDGE_PAYLOADS)]
+    assert (flat / "SHA256SUMS.txt").read_text() == "".join(records)
+    assert all(record.split()[0].islower() for record in records)
+    assert records[-1].endswith("  silentsuite-bridge-windows-x86_64.exe\n")
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        (lambda digest, name: f"{digest}  {name}", "malformed checksum record"),
+        (lambda digest, name: f"{digest}  {name}\r\n", "unsafe top-level name"),
+        (lambda digest, name: f"{digest}  {name}\n{digest}  {name}\n", "malformed checksum record"),
+        (lambda digest, name: f"{digest}   {name}\n", "unsafe top-level name"),
+        (lambda digest, name: f"{digest}  ../{name}\n", "unsafe top-level name"),
+        (lambda digest, name: f"{digest}  wrong-name\n", "wrong filename"),
+        (lambda digest, name: f"{'0' * 64}  {name}\n", "checksum mismatch"),
+        (lambda digest, name: f"{digest}\t {name}\n", "malformed checksum record"),
+        (lambda digest, name: f"{digest}  {name}\x00\n", "unsafe top-level name"),
+    ],
+)
+def test_staging_refuses_malformed_or_untrusted_checksum_records(tmp_path, replacement, message):
+    files = valid_bridge_tree()
+    name = BRIDGE_PAYLOADS[0]
+    payload = files[f"artifact-0/{name}"]
+    files[f"artifact-0/{name}.sha256"] = replacement(
+        hashlib.sha256(payload).hexdigest(), name
+    ).encode()
+    result = stage(tmp_path, files)
+
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 def test_staging_refuses_an_asset_name_that_could_escape_its_directory(tmp_path: Path):
-    result = stage(
-        tmp_path,
-        {
-            "a/.hidden-asset": "x\n",
-            "a/silentsuite-bridge-linux-x86_64.sha256": "aaa  silentsuite-bridge-linux-x86_64\n",
-        },
-    )
+    files = valid_bridge_tree()
+    files["a/.hidden-asset"] = b"x\n"
+    result = stage(tmp_path, files)
 
     assert result.returncode != 0
     assert "unexpected name" in result.stderr
 
 
 def test_staging_refuses_two_artifacts_with_the_same_name(tmp_path: Path):
-    result = stage(
-        tmp_path,
-        {
-            "a/silentsuite-bridge-linux-x86_64": "one\n",
-            "b/silentsuite-bridge-linux-x86_64": "two\n",
-            "a/silentsuite-bridge-linux-x86_64.sha256": "aaa  silentsuite-bridge-linux-x86_64\n",
-        },
-    )
+    files = valid_bridge_tree()
+    files["duplicate/silentsuite-bridge-linux-x86_64"] = b"two\n"
+    result = stage(tmp_path, files)
 
     assert result.returncode != 0
     assert "both named" in result.stderr
 
 
-def test_staging_refuses_to_produce_an_empty_checksum_manifest(tmp_path: Path):
-    result = stage(tmp_path, {"a/silentsuite-bridge-linux-x86_64": "l\n"})
+def test_staging_refuses_missing_and_orphan_assets(tmp_path: Path):
+    files = valid_bridge_tree()
+    del files["artifact-0/silentsuite-bridge-linux-arm64.sha256"]
+    files["orphan.sha256"] = b"0" * 64 + b"  orphan\n"
+    result = stage(tmp_path, files)
 
     assert result.returncode != 0
-    assert "no per-asset checksum files" in result.stderr
+    assert "inventory mismatch" in result.stderr
 
 
 def test_staging_refuses_to_reuse_an_existing_directory(tmp_path: Path):
     (tmp_path / "flat").mkdir()
-    result = stage(
-        tmp_path,
-        {"a/silentsuite-bridge-linux-x86_64.sha256": "aaa  silentsuite-bridge-linux-x86_64\n"},
-    )
+    result = stage(tmp_path, valid_bridge_tree())
 
     assert result.returncode != 0
     assert "already exists" in result.stderr
+
+
+def test_staging_refuses_empty_payloads_and_symlinks(tmp_path: Path):
+    files = valid_bridge_tree()
+    name = BRIDGE_PAYLOADS[0]
+    files[f"artifact-0/{name}"] = b""
+    assert "payload is empty" in stage(tmp_path, files).stderr
+
+    source = tmp_path / "symlink-artifacts"
+    source.mkdir()
+    (source / "target").write_bytes(b"payload")
+    (source / "link").symlink_to("target")
+    result = subprocess.run(
+        ["bash", str(STAGE), str(source), str(tmp_path / "symlink-flat")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "symlink artifact" in result.stderr
 
 
 # ── Bridge artifact acquisition: the real mixed run ───────────────────
@@ -599,6 +653,17 @@ REAL_RUN_ARTIFACTS: dict[str, dict[str, str]] = {
         "org/conscrypt/conscrypt-android/2.6.3-r28/conscrypt-android-2.6.3-r28.aar": "aar\n",
     },
 }
+
+# Keep the historical tree shape, but make its producer sidecars cryptographically
+# valid now that staging verifies rather than blindly concatenating them.
+for _artifact_files in REAL_RUN_ARTIFACTS.values():
+    for _relative_name in tuple(_artifact_files):
+        if _relative_name.endswith(".sha256"):
+            _payload_name = _relative_name.removesuffix(".sha256")
+            _payload = _artifact_files[_payload_name].encode()
+            _artifact_files[_relative_name] = (
+                f"{hashlib.sha256(_payload).hexdigest()}  {_payload_name}\n"
+            )
 
 
 def workflow_expected_inventory() -> list[str]:
@@ -697,13 +762,9 @@ def test_a_missing_bridge_producer_fails_the_closed_inventory(tmp_path: Path):
     source = materialise(tmp_path, artifacts)
     staging = tmp_path / "flat"
 
-    assert run_staging(source, staging).returncode == 0
-    staged = sorted(entry.name for entry in staging.iterdir())
-    assert staged != workflow_expected_inventory()
-    assert set(workflow_expected_inventory()) - set(staged) == {
-        "silentsuite-bridge-macos-arm64",
-        "silentsuite-bridge-macos-arm64.sha256",
-    }
+    result = run_staging(source, staging)
+    assert result.returncode != 0
+    assert "inventory mismatch" in result.stderr
 
 
 def test_a_duplicated_bridge_producer_is_refused_by_the_helper(tmp_path: Path):
@@ -733,9 +794,6 @@ def test_an_unexpected_extra_bridge_asset_fails_the_closed_inventory(tmp_path: P
     # It matches the acquisition pattern, so the filter alone does not stop it;
     # the closed inventory is what does.
     assert fnmatch.fnmatch("silentsuite-bridge-freebsd-x86_64", BRIDGE_PATTERN)
-    assert run_staging(source, staging).returncode == 0
-    staged = sorted(entry.name for entry in staging.iterdir())
-    assert set(staged) - set(workflow_expected_inventory()) == {
-        "silentsuite-bridge-freebsd-x86_64",
-        "silentsuite-bridge-freebsd-x86_64.sha256",
-    }
+    result = run_staging(source, staging)
+    assert result.returncode != 0
+    assert "inventory mismatch" in result.stderr

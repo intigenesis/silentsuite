@@ -73,6 +73,7 @@ ENVIRONMENT_NAME = "android-release"
 IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
 ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
+BRIDGE_STAGING_HELPER = Path("scripts/stage-bridge-release-assets.sh")
 KEYSTORE_HELPER = Path("scripts/verify-android-release-keystore.sh")
 ARTIFACT_ADMISSION_HELPER = Path("scripts/admit-unsigned-android-artifact.sh")
 SIGNING_HELPER = Path("scripts/sign-android-release.sh")
@@ -504,6 +505,7 @@ EXPECTED_ARTIFACT_ADMISSION_SHA256 = "5c810ac880a6f91c334dc108c456927a70dbbbd628
 EXPECTED_SIGNING_HELPER_SHA256 = "6e36285e5837ac13eb8ef20e1a34d07eb88b857c1acaffbaff6af458ed94ade5"
 EXPECTED_KEYSTORE_HELPER_SHA256 = "b9b0c8046a85209754c5e206b9cc1778036d2366d0709caf9a60fbf741f5c9b6"
 EXPECTED_READINESS_HELPER_SHA256 = "c75ebfba772c4f7bd6559161f64df3127c9c390bf1e5a81e39236ba47cc6e26f"
+EXPECTED_BRIDGE_STAGING_HELPER_SHA256 = "b9dd8980fa763c485caa5ac999b2ba9f9d187a9545e02e3cc580425fc223e0b6"
 # The Conscrypt producer exists twice: unprivileged CI builds it from the
 # triggering ref, the release lane builds it from the admitted commit. Both are
 # pinned so neither can drift into an unreviewed native toolchain.
@@ -1302,6 +1304,7 @@ def check(root: Path) -> list[str]:
         (IDENTITY_HELPER, EXPECTED_IDENTITY_HELPER_SHA256),
         (ATTACHMENT_HELPER, EXPECTED_ATTACHMENT_HELPER_SHA256),
         (READINESS_HELPER, EXPECTED_READINESS_HELPER_SHA256),
+        (BRIDGE_STAGING_HELPER, EXPECTED_BRIDGE_STAGING_HELPER_SHA256),
         (KEYSTORE_HELPER, EXPECTED_KEYSTORE_HELPER_SHA256),
         (ARTIFACT_ADMISSION_HELPER, EXPECTED_ARTIFACT_ADMISSION_SHA256),
         (SIGNING_HELPER, EXPECTED_SIGNING_HELPER_SHA256),
