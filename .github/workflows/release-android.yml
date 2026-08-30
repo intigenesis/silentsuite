@@ -40,6 +40,19 @@ on:
         description: The admitted 40-hex source commit.
         required: true
         type: string
+    # These declarations are capabilities, not repository-scoped fallback
+    # values. The controller grants only these names; the sign-release job's
+    # android-release binding supplies the protected environment values.
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        description: Base64-encoded Android release keystore.
+        required: true
+      ANDROID_KEYSTORE_PASSWORD:
+        description: Password for the Android release keystore.
+        required: true
+      ANDROID_KEY_ALIAS:
+        description: Alias of the Android release signing key.
+        required: true
 
 permissions: {}
 

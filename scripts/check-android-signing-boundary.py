@@ -436,6 +436,9 @@ EXPECTED_CALLER_INPUTS = {
     "release_tag": "${{ needs.admit.outputs.tag }}",
     "source_sha": "${{ needs.admit.outputs.commit }}",
 }
+EXPECTED_ANDROID_CALLER_SECRETS = {
+    name: f"${{{{ secrets.{name} }}}}" for name in SIGNING_SECRETS
+}
 EXPECTED_COMPONENT_INPUTS = {
     "release_tag": {
         "description": "The admitted immutable release tag.",
@@ -446,6 +449,20 @@ EXPECTED_COMPONENT_INPUTS = {
         "description": "The admitted 40-hex source commit.",
         "required": "true",
         "type": "string",
+    },
+}
+EXPECTED_ANDROID_CALLABLE_SECRETS = {
+    "ANDROID_KEYSTORE_BASE64": {
+        "description": "Base64-encoded Android release keystore.",
+        "required": "true",
+    },
+    "ANDROID_KEYSTORE_PASSWORD": {
+        "description": "Password for the Android release keystore.",
+        "required": "true",
+    },
+    "ANDROID_KEY_ALIAS": {
+        "description": "Alias of the Android release signing key.",
+        "required": "true",
     },
 }
 
@@ -464,6 +481,9 @@ REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
 # Covers the whole reviewed signing job: the explicit literal checks state the
 # intent, this digest makes any other edit to the job fail closed as well.
 EXPECTED_RELEASE_JOB_SHA256 = "77295dce0752b35f290310f641c1d8b1eaf3a2b3db78445c90679b75459f105e"
+# The Android caller is the only controller job allowed to grant secrets. Pin
+# its entire semantic job after reviewing the exact three-name capability map.
+EXPECTED_CONTROLLER_ANDROID_JOB_SHA256 = "8caa709d1d1680daff0e2e53438072c113c265cfdd8fcb6064f9f2cc808df237"
 EXPECTED_UNSIGNED_JOB_SHA256 = "b20d7ce02bb1de96741fda2320c3b5993b63ff55ffec314ea534b83129f52823"
 # Same treatment for the one job that can write a release. It carries the write
 # credential, the attachment helper and the umbrella lock, so every byte of it
@@ -851,8 +871,9 @@ def check_control_plane(
                 )
 
     # 4. Each component lane is called from this protected revision, with the
-    #    admitted pair, under a declared permission ceiling, and with no secret
-    #    handed across the call boundary.
+    #    admitted pair and under a declared permission ceiling. Android alone
+    #    receives the exact named signing capabilities required by its called
+    #    workflow; no sibling lane receives any secret.
     for job_name, expected in EXPECTED_CONTROLLER_CALLERS.items():
         job = controller_jobs.get(job_name)
         if not isinstance(job, Mapping):
@@ -872,10 +893,19 @@ def check_control_plane(
             violations.append(
                 f"{CONTROLLER_WORKFLOW} job {job_name} must pass exactly the admitted tag and commit"
             )
-        if "secrets" in job:
+        if job_name == "android":
+            if job.get("secrets") != EXPECTED_ANDROID_CALLER_SECRETS:
+                violations.append(
+                    f"{CONTROLLER_WORKFLOW} job android must grant exactly the three Android "
+                    "signing secrets, each from its same-name secrets context value"
+                )
+            if semantic_sha256(job) != EXPECTED_CONTROLLER_ANDROID_JOB_SHA256:
+                violations.append(
+                    f"{CONTROLLER_WORKFLOW} job android must match its exact reviewed whole-job digest"
+                )
+        elif "secrets" in job:
             violations.append(
-                f"{CONTROLLER_WORKFLOW} job {job_name} must not pass secrets across the call "
-                "boundary; environment secrets belong to the called job that binds the environment"
+                f"{CONTROLLER_WORKFLOW} job {job_name} must not receive any secrets"
             )
         needs = job.get("needs")
         needs = [needs] if isinstance(needs, str) else (needs or [])
@@ -907,7 +937,13 @@ def check_control_plane(
         declared = call.get("inputs") if isinstance(call, Mapping) else None
         if declared != EXPECTED_COMPONENT_INPUTS:
             violations.append(f"{relative} must accept exactly the admitted tag and commit")
-        if isinstance(call, Mapping) and "secrets" in call:
+        declared_secrets = call.get("secrets") if isinstance(call, Mapping) else None
+        if relative == ROOT_WORKFLOW:
+            if declared_secrets != EXPECTED_ANDROID_CALLABLE_SECRETS:
+                violations.append(
+                    f"{relative} must declare exactly the three Android signing secrets as required"
+                )
+        elif declared_secrets is not None:
             violations.append(f"{relative} must not declare callable secrets")
         if workflow.get("permissions") != {}:
             violations.append(f"{relative} must grant no default permissions")
@@ -1094,6 +1130,18 @@ def check(root: Path) -> list[str]:
         loaded[relative] = workflow
         jobs = as_mapping(workflow.get("jobs"), f"{relative} jobs", violations)
         workflow_scope = {key: value for key, value in workflow.items() if key != "jobs"}
+        # The Android workflow_call declaration contains secret *names* as its
+        # least-privilege interface. It is reviewed exactly below and is not a
+        # secret value reference or an exposure at workflow scope.
+        if relative == ROOT_WORKFLOW:
+            workflow_scope = dict(workflow_scope)
+            root_triggers = dict(triggers(workflow_scope))
+            root_call = root_triggers.get("workflow_call")
+            if isinstance(root_call, Mapping):
+                root_call = dict(root_call)
+                root_call.pop("secrets", None)
+                root_triggers["workflow_call"] = root_call
+                workflow_scope["on"] = root_triggers
 
         scope_refs = signing_references(workflow_scope)
         if scope_refs:
@@ -1113,7 +1161,10 @@ def check(root: Path) -> list[str]:
                 continue
             refs = signing_references(raw_job)
             env = environment_name(raw_job)
-            is_allowed = relative == ROOT_WORKFLOW and job_name == ALLOWED_JOB
+            is_allowed = (
+                (relative == ROOT_WORKFLOW and job_name == ALLOWED_JOB)
+                or (relative == CONTROLLER_WORKFLOW and job_name == "android")
+            )
             if refs and not is_allowed:
                 violations.append(
                     f"{relative} job {job_name} references Android signing secrets: "
@@ -1225,6 +1276,11 @@ def check(root: Path) -> list[str]:
     for relative, workflow in loaded.items():
         for job_name, raw_job in (workflow.get("jobs") or {}).items():
             if not isinstance(raw_job, Mapping) or not signing_references(raw_job):
+                continue
+            if relative == CONTROLLER_WORKFLOW and job_name == "android":
+                # A reusable-workflow call job does not run steps or receive
+                # secret values itself. Its exact same-name grant is validated
+                # above; the called environment-bound signing job receives it.
                 continue
             scanned = dict(raw_job)
             if relative == ROOT_WORKFLOW and job_name == ALLOWED_JOB:

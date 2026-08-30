@@ -45,6 +45,11 @@ NATIVE_RUNNERS = {"ubuntu-24.04": "linux/amd64", "ubuntu-24.04-arm": "linux/arm6
 SMOKE_SCRIPT = "scripts/self-host-image-smoke.sh"
 TRUSTED_REF = "${{ github.sha }}"
 UMBRELLA_GROUP = "umbrella-release-${{ github.event.client_payload.release_tag }}"
+ANDROID_SIGNING_SECRET_NAMES = {
+    "ANDROID_KEYSTORE_BASE64",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "ANDROID_KEY_ALIAS",
+}
 
 PRODUCTION_MARKERS = (
     "server-production",
@@ -309,7 +314,12 @@ def test_each_component_lane_is_called_locally_with_the_admitted_pair(job, targe
         "release_tag": "${{ needs.admit.outputs.tag }}",
         "source_sha": "${{ needs.admit.outputs.commit }}",
     }
-    assert "secrets" not in lane, "environment secrets belong to the called job"
+    if job == "android":
+        assert lane["secrets"] == {
+            name: f"${{{{ secrets.{name} }}}}" for name in ANDROID_SIGNING_SECRET_NAMES
+        }
+    else:
+        assert "secrets" not in lane
 
 
 @pytest.mark.parametrize("path", COMPONENT_WORKFLOWS, ids=lambda p: p.name)
@@ -329,7 +339,12 @@ def test_component_lanes_are_reachable_only_by_that_call(path):
             "type": "string",
         },
     }
-    assert "secrets" not in workflow["on"]["workflow_call"]
+    if path == ANDROID_WORKFLOW:
+        declarations = workflow["on"]["workflow_call"]["secrets"]
+        assert set(declarations) == ANDROID_SIGNING_SECRET_NAMES
+        assert all(value["required"] == "true" for value in declarations.values())
+    else:
+        assert "secrets" not in workflow["on"]["workflow_call"]
 
 
 def test_the_bridge_build_is_shared_with_an_unprivileged_dispatch_lane():

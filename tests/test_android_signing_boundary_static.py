@@ -222,19 +222,86 @@ def test_widening_a_caller_permission_ceiling_is_rejected(tmp_path: Path) -> Non
     assert_rejected(run_checker(root), "job bridge must declare exactly")
 
 
-def test_passing_secrets_across_the_call_boundary_is_rejected(tmp_path: Path) -> None:
+def test_removing_an_android_callable_secret_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "      ANDROID_KEY_ALIAS:\n"
+        "        description: Alias of the Android release signing key.\n"
+        "        required: true\n",
+        "",
+    )
+    assert_rejected(run_checker(root), "must declare exactly the three Android signing secrets")
+
+
+def test_removing_an_android_caller_secret_grant_is_rejected(tmp_path: Path) -> None:
     root = fixture_root(tmp_path)
     mutate(
         root / CONTROLLER,
-        "    uses: ./.github/workflows/release-android.yml\n",
-        "    uses: ./.github/workflows/release-android.yml\n"
+        "      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n",
+        "",
+    )
+    assert_rejected(run_checker(root), "job android must grant exactly the three Android signing secrets")
+
+
+def test_adding_a_fourth_android_callable_secret_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / ROOT_WORKFLOW,
+        "    secrets:\n",
         "    secrets:\n"
-        "      KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}\n",
+        "      EXTRA_SIGNING_SECRET:\n"
+        "        description: Must never be admitted.\n"
+        "        required: true\n",
+    )
+    assert_rejected(run_checker(root), "must declare exactly the three Android signing secrets")
+
+
+def test_mapping_an_android_grant_from_the_wrong_secret_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n",
+        "      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}\n",
+    )
+    assert_rejected(run_checker(root), "job android must grant exactly the three Android signing secrets")
+
+
+def test_mapping_an_android_grant_under_the_wrong_name_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n",
+        "      ANDROID_KEY_NAME: ${{ secrets.ANDROID_KEY_ALIAS }}\n",
+    )
+    assert_rejected(run_checker(root), "job android must grant exactly the three Android signing secrets")
+
+
+def test_adding_a_fourth_android_caller_grant_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "    secrets:\n      ANDROID_KEYSTORE_BASE64:",
+        "    secrets:\n"
+        "      EXTRA_SIGNING_SECRET: ${{ secrets.EXTRA_SIGNING_SECRET }}\n"
+        "      ANDROID_KEYSTORE_BASE64:",
+    )
+    assert_rejected(run_checker(root), "job android must grant exactly the three Android signing secrets")
+
+
+def test_exposing_android_signing_secrets_to_another_lane_is_rejected(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / CONTROLLER,
+        "    uses: ./.github/workflows/release-bridge.yml\n",
+        "    uses: ./.github/workflows/release-bridge.yml\n"
+        "    secrets:\n"
+        "      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}\n",
     )
     result = run_checker(root)
     assert result.returncode == 1
-    assert "must not pass secrets across the call boundary" in result.stdout
-    assert "job android references Android signing secrets" in result.stdout
+    assert "job bridge must not receive any secrets" in result.stdout
+    assert "job bridge references Android signing secrets" in result.stdout
 
 
 def test_a_component_lane_running_without_admission_is_rejected(tmp_path: Path) -> None:
