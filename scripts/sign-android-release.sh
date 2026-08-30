@@ -172,8 +172,18 @@ require_pinned_certificate "APK" \
 require_pinned_certificate "AAB" \
   "$("$KEYTOOL" "${KEYTOOL_LOCALE[@]}" -printcert -jarfile "$SIGNED_AAB" 2>/dev/null | leaf_fingerprint || true)"
 
-"$JARSIGNER" -verify -strict "$SIGNED_AAB" >/dev/null \
-  || refuse "the signed AAB did not verify"
+# `-strict` turns public-PKI chain and timestamp warnings into failures. The
+# upload certificate is deliberately self-signed, so those warnings are not
+# the trust decision here: the exact certificate pin above is. Plain verify
+# still fails when the JAR signature or any signed entry has been damaged.
+JARSIGNER_VERIFY_LOG="$WORKDIR/jarsigner-verify.log"
+if ! "$JARSIGNER" -verify "$SIGNED_AAB" >"$JARSIGNER_VERIFY_LOG" 2>&1; then
+  echo "Refusing to sign: the signed AAB failed cryptographic integrity verification" >&2
+  echo "  jarsigner diagnostic (sanitized, first 4096 bytes):" >&2
+  head -c 4096 "$JARSIGNER_VERIFY_LOG" | LC_ALL=C tr -cd '\11\12\15\40-\176' >&2
+  echo >&2
+  exit 1
+fi
 
 # ── Signed split evidence ─────────────────────────────────────────────
 #

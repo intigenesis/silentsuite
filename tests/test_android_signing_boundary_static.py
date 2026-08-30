@@ -110,6 +110,42 @@ def test_repository_workflows_satisfy_the_release_and_signing_boundary() -> None
     assert "boundary check passed" in result.stdout
 
 
+def test_aab_integrity_cannot_reintroduce_public_pki_strict_policy(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SIGNING_HELPER,
+        '"$JARSIGNER" -verify "$SIGNED_AAB"',
+        '"$JARSIGNER" -verify -strict "$SIGNED_AAB"',
+    )
+    assert_rejected(run_checker(root), "must not apply public-PKI strict policy")
+
+
+def test_aab_integrity_verification_cannot_be_removed(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SIGNING_HELPER,
+        'if ! "$JARSIGNER" -verify "$SIGNED_AAB"',
+        'if ! /bin/true',
+    )
+    assert_rejected(
+        run_checker(root),
+        'must contain \'"$JARSIGNER" -verify "$SIGNED_AAB"\'',
+    )
+
+
+def test_aab_certificate_pin_extraction_cannot_be_removed(tmp_path: Path) -> None:
+    root = fixture_root(tmp_path)
+    mutate(
+        root / SIGNING_HELPER,
+        '-printcert -jarfile "$SIGNED_AAB"',
+        '-printcert -file "$SIGNED_AAB"',
+    )
+    assert_rejected(
+        run_checker(root),
+        'must contain \'-printcert -jarfile "$SIGNED_AAB"\'',
+    )
+
+
 def test_the_unmutated_fixture_is_clean(tmp_path: Path) -> None:
     """Every rejection below must be caused by its own mutation, not the copy."""
 
