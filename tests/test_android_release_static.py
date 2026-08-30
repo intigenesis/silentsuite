@@ -48,7 +48,15 @@ def job_steps(job: str) -> dict[str, dict[str, object]]:
 
 
 def release_steps() -> dict[str, dict[str, object]]:
-    return job_steps("build-release")
+    """Steps of the signing job — where the release assets are produced."""
+
+    return job_steps("sign-release")
+
+
+def unsigned_steps() -> dict[str, dict[str, object]]:
+    """Steps of the candidate producer, which builds but never signs."""
+
+    return job_steps("build-unsigned-release")
 
 
 def attachment_steps() -> dict[str, dict[str, object]]:
@@ -103,16 +111,15 @@ def test_android_release_checksum_generation_matches_uploads():
     bundle_checksum = f"silentsuite-android-{tag}-bundle.sha256"
     symbols_checksum = f"silentsuite-android-{tag}-native-debug-symbols.sha256"
 
-    rename_run = steps["Rename Android artifacts for release"]["run"]
-    assert checksum_outputs(rename_run) == {
+    stage_run = steps["Stage the closed release-asset set"]["run"]
+    assert checksum_outputs(stage_run) == {
         apk: installer_checksum,
         aab: bundle_checksum,
         symbols: symbols_checksum,
     }
 
-    # The signed job stages exactly the six renamed assets into one closed
+    # The signing job stages exactly the six versioned assets into one closed
     # directory; it no longer attaches them itself.
-    stage_run = steps["Stage the closed release-asset set"]["run"]
     for name in (apk, installer_checksum, aab, bundle_checksum, symbols, symbols_checksum):
         assert name in stage_run, name
 
@@ -144,8 +151,7 @@ def test_android_release_checksum_generation_matches_uploads():
 
 def test_android_release_checksum_sidecars_do_not_match_orion_apk_filter():
     steps = release_steps()
-    rename_run = steps["Rename Android artifacts for release"]["run"]
-    sidecars = checksum_outputs(rename_run).values()
+    sidecars = checksum_outputs(steps["Stage the closed release-asset set"]["run"]).values()
 
     def looks_installable(name: str) -> bool:
         lowered_name = name.lower()
@@ -188,7 +194,7 @@ def test_release_build_type_does_not_claim_agp_emits_symbol_zip():
     assert "native-debug-symbols" not in release
 
 
-@pytest.mark.parametrize("job", ["build-pr", "build-release"])
+@pytest.mark.parametrize("job", ["build-pr", "build-unsigned-release"])
 def test_native_symbol_verification_gates_both_release_builds(job: str):
     run = job_steps(job)["Verify release native debug symbols"]["run"]
     assert "scripts/verify-native-debug-symbols.py" in run
@@ -203,7 +209,7 @@ def test_native_symbol_verification_gates_both_release_builds(job: str):
     )
 
 
-@pytest.mark.parametrize("job", ["build-pr", "build-release"])
+@pytest.mark.parametrize("job", ["build-pr", "build-unsigned-release"])
 def test_manual_symbol_packaging_precedes_verification(job: str):
     steps = job_steps(job)
     ordered = list(steps)
@@ -227,23 +233,25 @@ def test_release_symbols_upload_is_gated_by_verifier_and_release_attach():
     the attach step's fail_on_unmatched_files; if-no-files-found stays only
     as defense in depth.
     """
+    produced = unsigned_steps()
+    produced_order = list(produced)
+    assert produced_order.index("Verify release native debug symbols") < produced_order.index(
+        "Stage the closed unsigned handoff"
+    )
+    handoff = produced["Publish the unsigned build to the signing job"]
+    assert handoff["with"]["if-no-files-found"] == "error"
+
+    # Release assets leave the signing job as a closed artifact instead of being
+    # attached there; the inventory re-assertion downstream is what now fails
+    # closed if the symbols ZIP is missing.
     steps = release_steps()
     ordered = list(steps)
-    upload = steps["Upload signed release APK, AAB, and native debug symbols"]
-    assert SYMBOLS_ZIP_BUILD_PATH in upload["with"]["path"].splitlines()
-    assert upload["with"]["if-no-files-found"] == "error"
-    assert ordered.index("Verify release native debug symbols") < ordered.index(
-        "Upload signed release APK, AAB, and native debug symbols"
-    )
-    # Release assets leave this job as a closed artifact instead of being
-    # attached here; the inventory re-assertion downstream is what now fails
-    # closed if the symbols ZIP is missing.
     stage_run = steps["Stage the closed release-asset set"]["run"]
     assert "native-debug-symbols.zip" in stage_run
     artifact = steps["Publish the closed release-asset set to the attachment job"]
     assert artifact["with"]["if-no-files-found"] == "error"
-    assert ordered.index("Verify release native debug symbols") < ordered.index(
-        "Stage the closed release-asset set"
+    assert ordered.index("Stage the closed release-asset set") < ordered.index(
+        "Publish the closed release-asset set to the attachment job"
     )
     inventory = attachment_steps()["Re-assert the closed asset inventory"]["run"]
     assert "native-debug-symbols.zip" in inventory
@@ -296,7 +304,7 @@ def test_release_job_hash_constant_matches_workflow():
     spec.loader.exec_module(checker)
     workflow = checker.load_workflow(ANDROID_RELEASE_WORKFLOW)
     assert (
-        checker.semantic_sha256(workflow["jobs"]["build-release"])
+        checker.semantic_sha256(workflow["jobs"]["sign-release"])
         == checker.EXPECTED_RELEASE_JOB_SHA256
     )
 

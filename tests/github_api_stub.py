@@ -73,6 +73,9 @@ def default_state(tag: str = "v1.2.3", commit: str = "a" * 40) -> dict:
         "tag_moves_after": None,
         "moved_sha": "f" * 40,
         "tag_reads": 0,
+        # Every Content-Type the release-creation endpoint refused, so a test
+        # can assert *why* a request failed rather than only that it did.
+        "rejected_media_types": [],
     }
 
 
@@ -229,8 +232,39 @@ class _Handler(BaseHTTPRequestHandler):
         if path == f"{prefix}/releases":
             status = self._override("create_release")
             if status:
-                return self._send(status, {"message": "forced"})
-            payload = json.loads(body.decode("utf-8"))
+                return self._send(status, self.state.get("create_release_body", {"message": "forced"}))
+            # GitHub parses a request body by its declared media type. curl's
+            # `-d` defaults to application/x-www-form-urlencoded, so a JSON
+            # document sent without this header arrives as one nonsense form
+            # field and the release is rejected — the exact defect that left
+            # v0.5.4-beta with no draft. Modelled faithfully so the regression
+            # cannot come back unnoticed.
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.split(";")[0].strip().lower() != "application/json":
+                self.state["rejected_media_types"].append(content_type)
+                return self._send(
+                    400,
+                    {
+                        "message": "Body should be a JSON object",
+                        "documentation_url": "https://docs.github.com/rest",
+                    },
+                )
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("not an object")
+            except (ValueError, UnicodeDecodeError):
+                return self._send(400, {"message": "Problems parsing JSON"})
+            # A tag may hold exactly one release; a losing sibling in the
+            # create/create race gets GitHub's 422, not a second draft.
+            if any(r["tag_name"] == payload.get("tag_name") for r in self.state["releases"]):
+                return self._send(
+                    422,
+                    {
+                        "message": "Validation Failed",
+                        "errors": [{"resource": "Release", "code": "already_exists"}],
+                    },
+                )
             release = {
                 "id": self.state["next_release_id"],
                 "tag_name": payload["tag_name"],

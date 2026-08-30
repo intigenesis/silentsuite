@@ -131,6 +131,61 @@ api() {
     "$@" "${API}${path}"
 }
 
+# POST a JSON document and return GitHub's HTTP status on stdout.
+#
+# The media type is the whole point of this function existing. curl sends `-d`
+# as application/x-www-form-urlencoded unless told otherwise, and the Accept
+# header only describes the response, so a JSON body sent through the plain
+# `api` helper reaches GitHub as form fields. That is what happened to
+# v0.5.4-beta: six draft-creation POSTs across two lanes were rejected, none
+# returned an `.id`, and the tag ended up with no release at all.
+#
+# The body goes through a file rather than argv: it is not secret, but a request
+# document belongs on disk under this run's private WORKDIR, not in a process
+# listing. The token stays in a header, as everywhere else in this script.
+# Exactly three digits on stdout, always. On a transport failure curl both
+# writes `000` through `-w` *and* exits non-zero, so a `|| printf '000'`
+# fallback appends a second one and the caller reports `HTTP 000000`. The status
+# is therefore taken from the write-out alone and then validated; anything that
+# is not three digits — including the empty string from a curl that died before
+# writing — becomes the single canonical `000`.
+api_post_json() {
+  local path="$1" body="$2" out="$3" request="$WORKDIR/request.json" status
+  printf '%s' "$body" > "$request"
+  # curl does not create the -o file when it never connects, and the caller's
+  # diagnostic reads it either way. An empty file yields the fixed
+  # "unparseable response" label instead of a missing-path error.
+  : > "$out"
+  status="$(curl -sS -o "$out" -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --data-binary "@${request}" \
+    "${API}${path}")" || true
+  if ! printf '%s' "$status" | grep -Eq '^[0-9]{3}$'; then
+    status="000"
+  fi
+  printf '%s' "$status"
+}
+
+# What a failed creation is allowed to say out loud.
+#
+# GitHub's error bodies carry a short human `.message` ("Validation Failed",
+# "Not Found", "Bad credentials"), which is exactly the diagnostic the last run
+# needed and did not have. Nothing else is echoed: no response headers, no other
+# response field, no request. The message is stripped of control characters and
+# truncated, so a hostile or malformed body cannot flood the log or smuggle
+# terminal escapes into it.
+sanitized_api_message() {
+  local body="$1" message
+  if ! message="$(jq -er '.message | select(type == "string")' "$body" 2>/dev/null)"; then
+    printf 'unparseable response'
+    return 0
+  fi
+  printf '%s' "$message" | tr -c '[:print:]' ' ' | cut -c1-200
+}
+
 local_digest() {
   sha256sum "$1" | cut -d' ' -f1
 }
@@ -209,6 +264,7 @@ assert_release_identity() {
 revalidate "pre"
 
 RELEASE_ID=""
+CREATE_STATUS="none"
 for attempt in $(seq 1 "$ATTEMPTS"); do
   if find_release; then
     RELEASE_ID="$(jq -r '.id' "$WORKDIR/matches.json")"
@@ -220,20 +276,25 @@ for attempt in $(seq 1 "$ATTEMPTS"); do
   # releases, so the identity is re-proved here rather than inherited from the
   # check at the top of the script.
   revalidate "before-create"
-  api POST "/repos/${GITHUB_REPOSITORY}/releases" \
-    -d "$(jq -n --arg tag "$TAG" --arg target "$EXPECTED_COMMIT" \
+  CREATE_STATUS="$(api_post_json "/repos/${GITHUB_REPOSITORY}/releases" \
+    "$(jq -n --arg tag "$TAG" --arg target "$EXPECTED_COMMIT" \
       '{tag_name: $tag, target_commitish: $target, name: ("SilentSuite " + $tag), draft: true}')" \
-    > "$WORKDIR/created.json" || true
+    "$WORKDIR/created.json")"
   if jq -e '.id? // empty' "$WORKDIR/created.json" >/dev/null 2>&1; then
     RELEASE_ID="$(jq -r '.id' "$WORKDIR/created.json")"
     break
   fi
-  echo "release lookup/create attempt ${attempt} did not settle; retrying in ${RETRY_DELAY}s" >&2
+  # A losing sibling in the create/create race sees 422 here and finds the
+  # winner's draft on the next lookup, so this is a retry, not a failure — but
+  # it says why, which the run that produced no draft at all could not.
+  echo "draft creation attempt ${attempt} did not settle: HTTP ${CREATE_STATUS}: $(sanitized_api_message "$WORKDIR/created.json")" >&2
+  echo "retrying in ${RETRY_DELAY}s" >&2
   sleep "$RETRY_DELAY"
 done
 
 if [ -z "$RELEASE_ID" ] || ! printf '%s' "$RELEASE_ID" | grep -Eq '^[0-9]+$'; then
   echo "ERROR: could not resolve a single draft release for ${TAG} within ${ATTEMPTS} attempts" >&2
+  echo "       last creation attempt: HTTP ${CREATE_STATUS}: $(sanitized_api_message "$WORKDIR/created.json")" >&2
   exit 1
 fi
 

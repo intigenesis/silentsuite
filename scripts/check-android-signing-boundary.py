@@ -61,7 +61,8 @@ PRODUCTION_WORKFLOW = WORKFLOW_DIR / "deploy-server.yml"
 PRODUCTION_ENVIRONMENT = "server-production"
 
 DISPATCH_EVENT_TYPE = "silentsuite_release"
-ALLOWED_JOB = "build-release"
+ALLOWED_JOB = "sign-release"
+UNSIGNED_JOB = "build-unsigned-release"
 POLICY_JOB = "signing-policy"
 REVALIDATION_JOB = "revalidate-signing"
 CONSCRYPT_JOB = "conscrypt-r28"
@@ -72,7 +73,17 @@ ENVIRONMENT_NAME = "android-release"
 IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
 ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
+KEYSTORE_HELPER = Path("scripts/verify-android-release-keystore.sh")
+ARTIFACT_ADMISSION_HELPER = Path("scripts/admit-unsigned-android-artifact.sh")
+SIGNING_HELPER = Path("scripts/sign-android-release.sh")
+# The developer upload certificate the signed build must produce. It is pinned
+# here as well as in the helper so that changing which key the project ships
+# under cannot pass as a routine script edit.
+EXPECTED_UPLOAD_CERT_SHA256 = (
+    "8035a4ff1511e2045c579c905d26e93af6009b239e741ef78542ae04e7a7ca79"
+)
 RELEASE_ASSET_ARTIFACT = "silentsuite-android-release-assets-${{ inputs.source_sha }}"
+UNSIGNED_ARTIFACT = "silentsuite-android-unsigned-${{ inputs.source_sha }}"
 
 # The server lane's irreversible act and the check that must immediately precede
 # it. `publish_alias` returns early when the alias already exists, so verifying
@@ -87,6 +98,9 @@ ALIAS_REVALIDATION_HELPER = "trusted/scripts/verify-release-identity.sh"
 # executed only through a checkout of the protected controller revision.
 TRUSTED_HELPERS = (
     "verify-release-identity.sh",
+    "verify-android-release-keystore.sh",
+    "admit-unsigned-android-artifact.sh",
+    "sign-android-release.sh",
     "attach-umbrella-release-assets.sh",
     "verify-umbrella-release-readiness.py",
     "check-android-signing-boundary.py",
@@ -182,13 +196,11 @@ EXPECTED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
     "Decode release keystore": {
         "KEYSTORE_BASE64": "${{ secrets.ANDROID_KEYSTORE_BASE64 }}",
     },
-    "Build signed release APK and AAB": {
+    "Verify the release keystore before signing": {
         "KSTOREPWD": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     },
-    "Capture release dependency graph and generate signed-release splits": {
-        "BUNDLETOOL_VERSION": "1.18.1",
-        "BUNDLETOOL_SHA256": "675786493983787ffa11550bdb7c0715679a44e1643f3ff980a529e9c822595c",
+    "Sign the admitted APK and AAB": {
         "KSTOREPWD": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     },
@@ -197,8 +209,34 @@ EXPECTED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
 # the "a step environment is reviewed or absent" rule intact now that the
 # admitted tag reaches the job as an input rather than as github.ref_name.
 EXPECTED_RELEASE_PLAIN_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
-    "Rename Android artifacts for release": {"RELEASE_TAG": "${{ inputs.release_tag }}"},
     "Stage the closed release-asset set": {"RELEASE_TAG": "${{ inputs.release_tag }}"},
+    "Admit the unsigned build": {"SOURCE_SHA": "${{ inputs.source_sha }}"},
+    "Fetch the pinned bundletool": {
+        "BUNDLETOOL_VERSION": "1.18.1",
+        "BUNDLETOOL_SHA256": "675786493983787ffa11550bdb7c0715679a44e1643f3ff980a529e9c822595c",
+    },
+}
+EXPECTED_BUILD_TOOLS_INSTALL_STEP = {
+    "name": "Install the exact Android signing tools",
+    "run": """set -euo pipefail
+SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+[ -f "$SDKMANAGER" ] && [ -x "$SDKMANAGER" ] \\
+  || { echo "fixed Android sdkmanager is missing or not executable" >&2; exit 1; }
+CANONICAL_ANDROID_HOME="$(readlink -f -- "$ANDROID_HOME")"
+CANONICAL_SDKMANAGER="$(readlink -f -- "$SDKMANAGER")"
+case "$CANONICAL_SDKMANAGER" in
+  "$CANONICAL_ANDROID_HOME"/*) ;;
+  *) echo "fixed Android sdkmanager resolves outside ANDROID_HOME" >&2; exit 1 ;;
+esac
+"$SDKMANAGER" "build-tools;36.0.0"
+BUILD_TOOLS="$ANDROID_HOME/build-tools/36.0.0"
+[ -d "$BUILD_TOOLS" ] \\
+  || { echo "build-tools;36.0.0 was not installed at its exact path" >&2; exit 1; }
+for tool in zipalign apksigner; do
+  [ -f "$BUILD_TOOLS/$tool" ] && [ -x "$BUILD_TOOLS/$tool" ] \\
+    || { echo "build-tools;36.0.0/$tool is missing or not executable" >&2; exit 1; }
+done
+""",
 }
 # The umbrella-draft attachment lock, shared by all three component lanes.
 # Reviewed as an exact literal so a release cannot be quietly re-scoped: a
@@ -238,18 +276,9 @@ SECRET_REFERENCE = re.compile(r"secrets\.\s*([A-Za-z_][A-Za-z0-9_-]*)")
 # clean sweep remove it.
 EXPECTED_RELEASE_CHECKOUTS: list[dict[str, Any]] = [
     {
-        "name": "Checkout",
-        "uses": CHECKOUT_ACTION,
-        "with": {"ref": "${{ inputs.source_sha }}", "persist-credentials": "false"},
-    },
-    {
         "name": "Check out the trusted controller revision",
         "uses": CHECKOUT_ACTION,
-        "with": {
-            "ref": TRUSTED_REF,
-            "path": ".release-trusted",
-            "persist-credentials": "false",
-        },
+        "with": {"ref": TRUSTED_REF, "clean": "true", "persist-credentials": "false"},
     },
 ]
 
@@ -267,7 +296,7 @@ def _revalidation_step(name: str, stage: str) -> dict[str, Any]:
         },
         "run": (
             "set -euo pipefail\n"
-            'bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-release-identity.sh" \\\n'
+            'bash "$GITHUB_WORKSPACE/scripts/verify-release-identity.sh" \\\n'
             '  --tag "$RELEASE_TAG" \\\n'
             '  --commit "$SOURCE_SHA" \\\n'
             f"  --stage {stage}\n"
@@ -275,14 +304,17 @@ def _revalidation_step(name: str, stage: str) -> dict[str, Any]:
     }
 
 
+# The keystore must be proven readable, correctly aliased and bound to the
+# reviewed certificate between decoding it and handing it to Gradle.
+KEYSTORE_DECODE_STEP = "Decode release keystore"
+KEYSTORE_VERIFY_STEP = "Verify the release keystore before signing"
+KEYSTORE_CONSUMER_STEP = "Sign the admitted APK and AAB"
+
 # revalidation step name -> the step name it must immediately precede.
 RELEASE_MUTATION_BOUNDARIES: dict[str, str] = {
     "Revalidate the release identity before decoding signing material": "Decode release keystore",
     "Revalidate the release identity before publishing signed artifacts": (
-        "Upload signed tracker verification evidence"
-    ),
-    "Revalidate the release identity before publishing signed release outputs": (
-        "Upload signed release APK, AAB, and native debug symbols"
+        "Upload signed split evidence"
     ),
     "Revalidate the release identity before the attachment handoff": (
         "Publish the closed release-asset set to the attachment job"
@@ -296,10 +328,6 @@ EXPECTED_RELEASE_REVALIDATION_STEPS: dict[str, dict[str, Any]] = {
     "Revalidate the release identity before publishing signed artifacts": _revalidation_step(
         "Revalidate the release identity before publishing signed artifacts",
         "android-signed-artifact-egress",
-    ),
-    "Revalidate the release identity before publishing signed release outputs": _revalidation_step(
-        "Revalidate the release identity before publishing signed release outputs",
-        "android-release-output-egress",
     ),
     "Revalidate the release identity before the attachment handoff": _revalidation_step(
         "Revalidate the release identity before the attachment handoff",
@@ -422,11 +450,9 @@ EXPECTED_COMPONENT_INPUTS = {
 }
 
 EXPECTED_SECRET_STEP_SHA256 = {
-    "Decode release keystore": "44c1231395b5f7347980a05fa641b0e7d866451e10ddb88958e61459f649ffba",
-    "Build signed release APK and AAB": "e9e02db295ff745dfe2ead024747b996b246ddb2fc2cc0f195ed2244b1a86776",
-    "Capture release dependency graph and generate signed-release splits": (
-        "69ded7eab4c4ff48deff2da950aacf8e627da05373ffa507f358fbcc986a7a6a"
-    ),
+    "Decode release keystore": "d0893a6a12d2aa1b8add481df288b4f70e91d9eaa1d6c4f92c4b4ff696c538b7",
+    "Verify the release keystore before signing": "f0e6e9ad363f19af8682bfa48c7d9f42cc89b8bd199b03cd57b2a3156d7ef881",
+    "Sign the admitted APK and AAB": "70ee6491fc048b35aa47860c854ed590d732082ab72930cc02e3470d471545a8",
 }
 # Signing steps and the two reviewed plain-environment steps are the only steps
 # in the release job permitted to carry an environment at all.
@@ -437,16 +463,20 @@ REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
 }
 # Covers the whole reviewed signing job: the explicit literal checks state the
 # intent, this digest makes any other edit to the job fail closed as well.
-EXPECTED_RELEASE_JOB_SHA256 = "2789fa4a1277514497c625a87e3c091894c47b797101b1d08fb320eaabf1a01c"
+EXPECTED_RELEASE_JOB_SHA256 = "77295dce0752b35f290310f641c1d8b1eaf3a2b3db78445c90679b75459f105e"
+EXPECTED_UNSIGNED_JOB_SHA256 = "b20d7ce02bb1de96741fda2320c3b5993b63ff55ffec314ea534b83129f52823"
 # Same treatment for the one job that can write a release. It carries the write
 # credential, the attachment helper and the umbrella lock, so every byte of it
 # is reviewed.
-EXPECTED_ATTACHMENT_JOB_SHA256 = "1d58283e8697f63a21627dc6ea037e5d2d0e1de50d5c72d6c9eb8781599a2cca"
+EXPECTED_ATTACHMENT_JOB_SHA256 = "a7ca21a04a0f403520773be23fb89aa9a39b6ebc91c74d970dc23f8312be5a0e"
 EXPECTED_CONTROLLER_ADMIT_SHA256 = "6423d79810b64d292382c9bccab15a7b0ed342a6ff6e7272972502a868a3d958"
 # The helpers those jobs execute. Hashing the step is not enough: the step text
 # is stable while the file it runs is what reaches the network and the API.
-EXPECTED_IDENTITY_HELPER_SHA256 = "5782b71552a0e08c3d011cab58112bd5998d92e561cbf4c78875ca147248c9e9"
-EXPECTED_ATTACHMENT_HELPER_SHA256 = "4ca8ca30a843abbb8305bdd63a8e04541c8791cb4bc04e0c6006e7474e463ebf"
+EXPECTED_IDENTITY_HELPER_SHA256 = "855c557e36e8fb55979e6877b02808d1ed0e40dafb9e8b7195e711f76d4b5da7"
+EXPECTED_ATTACHMENT_HELPER_SHA256 = "f37f415e7ec9439fe2e16c7e68a32a7ff0f8927de77eb2266480549e93aca875"
+EXPECTED_ARTIFACT_ADMISSION_SHA256 = "5c810ac880a6f91c334dc108c456927a70dbbbd6284016f14fd11a4ea01c4b4e"
+EXPECTED_SIGNING_HELPER_SHA256 = "4956cc84f364a951b72e35ed95581e2322ecbedef863bcd4e4daa1c2fcc34dbd"
+EXPECTED_KEYSTORE_HELPER_SHA256 = "b9b0c8046a85209754c5e206b9cc1778036d2366d0709caf9a60fbf741f5c9b6"
 EXPECTED_READINESS_HELPER_SHA256 = "c75ebfba772c4f7bd6559161f64df3127c9c390bf1e5a81e39236ba47cc6e26f"
 # The Conscrypt producer exists twice: unprivileged CI builds it from the
 # triggering ref, the release lane builds it from the admitted commit. Both are
@@ -463,7 +493,6 @@ ALLOWED_RELEASE_JOB_KEYS = {
     "runs-on",
     "environment",
     "permissions",
-    "defaults",
     "steps",
 }
 ALLOWED_ATTACHMENT_JOB_KEYS = {
@@ -1137,6 +1166,9 @@ def check(root: Path) -> list[str]:
         (IDENTITY_HELPER, EXPECTED_IDENTITY_HELPER_SHA256),
         (ATTACHMENT_HELPER, EXPECTED_ATTACHMENT_HELPER_SHA256),
         (READINESS_HELPER, EXPECTED_READINESS_HELPER_SHA256),
+        (KEYSTORE_HELPER, EXPECTED_KEYSTORE_HELPER_SHA256),
+        (ARTIFACT_ADMISSION_HELPER, EXPECTED_ARTIFACT_ADMISSION_SHA256),
+        (SIGNING_HELPER, EXPECTED_SIGNING_HELPER_SHA256),
     ):
         path = root / helper
         if not path.is_file():
@@ -1294,10 +1326,10 @@ def check(root: Path) -> list[str]:
             f"{ALLOWED_JOB} must not carry an event guard; this lane is reachable only through "
             "the protected controller"
         )
-    if release.get("needs") != [POLICY_JOB, CONSCRYPT_JOB, REVALIDATION_JOB]:
+    if release.get("needs") != [POLICY_JOB, CONSCRYPT_JOB, REVALIDATION_JOB, UNSIGNED_JOB]:
         violations.append(
-            f"{ALLOWED_JOB} must require successful {POLICY_JOB}, {CONSCRYPT_JOB} and "
-            f"{REVALIDATION_JOB}"
+            f"{ALLOWED_JOB} must require successful {POLICY_JOB}, {CONSCRYPT_JOB}, "
+            f"{REVALIDATION_JOB} and {UNSIGNED_JOB}"
         )
     if release.get("permissions") != {"contents": "read"}:
         violations.append(
@@ -1341,6 +1373,189 @@ def check(root: Path) -> list[str]:
                 f"{release_step_names[guard_index + 1 : guard_index + 2]}"
             )
 
+    # The unsigned producer runs candidate Gradle. It must therefore hold
+    # nothing a compromise could take: no protected environment, no signing
+    # secret, no workflow token, and no write permission. This is the half of
+    # the split that makes the fresh-runner boundary meaningful.
+    unsigned = jobs.get(UNSIGNED_JOB)
+    if not isinstance(unsigned, Mapping):
+        violations.append(f"{ROOT_WORKFLOW} must define the {UNSIGNED_JOB} job")
+    else:
+        if semantic_sha256(unsigned) != EXPECTED_UNSIGNED_JOB_SHA256:
+            violations.append(
+                f"{UNSIGNED_JOB} must match the exact reviewed producer specification"
+            )
+        if environment_name(unsigned) is not None:
+            violations.append(f"{UNSIGNED_JOB} must not bind a deployment environment")
+        if signing_references(unsigned):
+            violations.append(f"{UNSIGNED_JOB} must never reference Android signing secrets")
+        if unsigned.get("permissions") != {"contents": "read"}:
+            violations.append(f"{UNSIGNED_JOB} permissions must be exactly contents: read")
+        unsigned_body = "\n".join(strings(unsigned))
+        if WORKFLOW_TOKEN in unsigned_body:
+            violations.append(f"{UNSIGNED_JOB} must not carry the workflow token")
+        for marker in RELEASE_WRITE_MARKERS:
+            if marker in unsigned_body:
+                violations.append(f"{UNSIGNED_JOB} must not be able to write a release: {marker}")
+        if UNSIGNED_ARTIFACT not in unsigned_body:
+            violations.append(f"{UNSIGNED_JOB} must publish {UNSIGNED_ARTIFACT}")
+        if unsigned.get("needs") != [POLICY_JOB, CONSCRYPT_JOB]:
+            violations.append(
+                f"{UNSIGNED_JOB} must require successful {POLICY_JOB} and {CONSCRYPT_JOB}"
+            )
+
+    # The signing job must never see candidate code. Its only checkout is the
+    # protected revision; no Gradle, no candidate script, no candidate path.
+    release_body = "\n".join(strings(release))
+    for candidate_marker in ("./gradlew", "gradlew", "inputs.source_sha }}\n          persist"):
+        if candidate_marker in release_body:
+            violations.append(
+                f"{ALLOWED_JOB} must not execute candidate build tooling ({candidate_marker})"
+            )
+    if UNSIGNED_ARTIFACT not in release_body:
+        violations.append(f"{ALLOWED_JOB} must consume {UNSIGNED_ARTIFACT}")
+    if str(ARTIFACT_ADMISSION_HELPER) not in release_body:
+        violations.append(
+            f"{ALLOWED_JOB} must admit the unsigned build through {ARTIFACT_ADMISSION_HELPER}"
+        )
+    if str(SIGNING_HELPER) not in release_body:
+        violations.append(f"{ALLOWED_JOB} must sign through {SIGNING_HELPER}")
+    admit_index = (
+        release_step_names.index("Admit the unsigned build")
+        if "Admit the unsigned build" in release_step_names
+        else -1
+    )
+    decode_index = (
+        release_step_names.index(KEYSTORE_DECODE_STEP)
+        if KEYSTORE_DECODE_STEP in release_step_names
+        else -1
+    )
+    if admit_index < 0 or decode_index < 0 or admit_index > decode_index:
+        violations.append(
+            f"{ALLOWED_JOB} must admit the candidate artifact before the keystore is decoded"
+        )
+
+    # The signing helper resolves its tools by absolute path under a verified
+    # root; a PATH lookup is what a poisoned producer would aim at.
+    signing_helper_path = root / SIGNING_HELPER
+    if signing_helper_path.is_file():
+        signing_code = "\n".join(
+            line
+            for line in signing_helper_path.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        for required in (
+            'ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}',
+            'JAVA_HOME}/bin/jarsigner',
+            "--ks-pass \"env:KSTOREPWD\"",
+            "-storepass:env KSTOREPWD",
+            EXPECTED_UPLOAD_CERT_SHA256,
+            '"$ZIPALIGN" -P 16 -f 4',
+            '"$ZIPALIGN" -c -P 16 4',
+            'canonical="$(readlink -f -- "$tool")"',
+            "resolves outside its trusted root",
+        ):
+            if required not in signing_code:
+                violations.append(f"{SIGNING_HELPER} must contain {required!r}")
+        if "$(command -v" in signing_code:
+            violations.append(f"{SIGNING_HELPER} must not resolve tools through PATH")
+        if '"$ZIPALIGN" -p' in signing_code or '"$ZIPALIGN" -c -p' in signing_code:
+            violations.append(f"{SIGNING_HELPER} must not use deprecated zipalign -p")
+
+    # The keystore preflight sits exactly between the decode and Gradle. A
+    # verifier that ran earlier would check a file that did not exist yet; one
+    # that ran later would be reporting on a store Gradle had already opened.
+    if KEYSTORE_VERIFY_STEP in release_step_names:
+        decode = release_step_names.index(KEYSTORE_DECODE_STEP) if KEYSTORE_DECODE_STEP in release_step_names else -1
+        verify = release_step_names.index(KEYSTORE_VERIFY_STEP)
+        consume = (
+            release_step_names.index(KEYSTORE_CONSUMER_STEP)
+            if KEYSTORE_CONSUMER_STEP in release_step_names
+            else -1
+        )
+        if decode < 0 or verify != decode + 1:
+            violations.append(
+                f"{ALLOWED_JOB} must verify the keystore immediately after {KEYSTORE_DECODE_STEP!r}"
+            )
+        if consume < 0 or consume != verify + 1:
+            violations.append(
+                f"{ALLOWED_JOB} must run {KEYSTORE_CONSUMER_STEP!r} immediately after the "
+                "keystore verification"
+            )
+        verify_step = next(
+            step for step in release_step_list if step.get("name") == KEYSTORE_VERIFY_STEP
+        )
+        verify_body = "\n".join(strings(verify_step))
+        if str(KEYSTORE_HELPER) not in verify_body:
+            violations.append(f"{ALLOWED_JOB} must verify the keystore with {KEYSTORE_HELPER}")
+        if '"$GITHUB_WORKSPACE/scripts/' not in verify_body:
+            violations.append(
+                f"{ALLOWED_JOB} must run the keystore verifier from the trusted controller "
+                "checkout, not the candidate tree"
+            )
+    else:
+        violations.append(f"{ALLOWED_JOB} must define the {KEYSTORE_VERIFY_STEP!r} step")
+
+    # The reviewed certificate is pinned in both the helper and this policy, so
+    # a change of signing identity cannot pass as an ordinary script edit.
+    keystore_helper_path = root / KEYSTORE_HELPER
+    if keystore_helper_path.is_file():
+        keystore_source = keystore_helper_path.read_text(encoding="utf-8")
+        # Argument-vector rules are about what the script *executes*. The
+        # comments deliberately name the two constructs being avoided, so they
+        # are stripped before the executable text is scanned.
+        keystore_code = "\n".join(
+            line for line in keystore_source.splitlines() if not line.lstrip().startswith("#")
+        )
+        if EXPECTED_UPLOAD_CERT_SHA256 not in keystore_source:
+            violations.append(
+                f"{KEYSTORE_HELPER} must pin the reviewed upload certificate "
+                f"{EXPECTED_UPLOAD_CERT_SHA256}"
+            )
+        if "-storepass:env" not in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must take the store password through the environment, "
+                "never as an argument"
+            )
+        # The alias must not reach *any* child process's argument vector, and
+        # `ps` on a shared runner shows arguments. `keytool -alias` and
+        # `awk -v alias=` are the two ways it previously could.
+        for argv_leak in ("-alias ", "-v alias=", "-v ALIAS="):
+            if argv_leak in keystore_code:
+                violations.append(
+                    f"{KEYSTORE_HELPER} must not pass the signing alias in a child argument "
+                    f"vector ({argv_leak.strip()})"
+                )
+        if 'ENVIRON["KEY_ALIAS"]' not in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must read the alias from the environment, not an argument"
+            )
+        # keytool's labels are translated. Without a pinned locale the parser
+        # silently matches nothing on a non-English runner.
+        for flag in ("-J-Duser.language=en", "-J-Duser.country=US"):
+            if flag not in keystore_code:
+                violations.append(
+                    f"{KEYSTORE_HELPER} must pin keytool's locale with {flag} so its labels "
+                    "are machine-readable"
+                )
+        # The expected fingerprint is validated before it can reach a log line.
+        if "^[0-9a-f]{64}$" not in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must validate the expected fingerprint as 64 hex characters"
+            )
+        # An override must not be reachable from the environment: an earlier
+        # step in the signed job writes $GITHUB_ENV, so a variable is candidate
+        # controllable while a reviewed step's `run` text is not.
+        if "EXPECTED_CERT_SHA256:-" in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must not take the expected fingerprint from the "
+                "environment; $GITHUB_ENV is writable by an earlier candidate step"
+            )
+        if "--expect-sha256" in verify_body:
+            violations.append(
+                f"{ALLOWED_JOB} must not override the reviewed upload certificate"
+            )
+
     # The workflow token is admissible only inside those reviewed steps. Any
     # other appearance would put it in reach of candidate Gradle or a candidate
     # script running beside the decoded keystore.
@@ -1371,8 +1586,10 @@ def check(root: Path) -> list[str]:
         violations.append(f"{ALLOWED_JOB} must bind the {ENVIRONMENT_NAME} environment")
     if release.get("runs-on") != "ubuntu-latest":
         violations.append(f"{ALLOWED_JOB} must run exactly on GitHub-hosted ubuntu-latest")
-    if release.get("defaults") != {"run": {"working-directory": "android"}}:
-        violations.append(f"{ALLOWED_JOB} must use the exact Android working-directory defaults")
+    if "defaults" in release:
+        violations.append(
+            f"{ALLOWED_JOB} must not declare defaults; it has no candidate tree to run in"
+        )
     # The umbrella lock belongs on the attachment job. Leaving it here would put
     # the signing job back in the shared write domain it no longer belongs to.
     if "concurrency" in release:
@@ -1399,6 +1616,20 @@ def check(root: Path) -> list[str]:
     if not isinstance(release_steps, list):
         violations.append(f"{ALLOWED_JOB} steps must be a sequence")
     else:
+        install_steps = [
+            step for step in release_steps
+            if isinstance(step, Mapping)
+            and step.get("name") == EXPECTED_BUILD_TOOLS_INSTALL_STEP["name"]
+        ]
+        if install_steps != [EXPECTED_BUILD_TOOLS_INSTALL_STEP]:
+            violations.append(
+                f"{ALLOWED_JOB} must install and check exact build-tools;36.0.0 "
+                "with the reviewed fixed-path step"
+            )
+        elif release_step_names.index(EXPECTED_BUILD_TOOLS_INSTALL_STEP["name"]) > decode_index:
+            violations.append(
+                f"{ALLOWED_JOB} must install Android signing tools before decoding the keystore"
+            )
         for step in release_steps:
             if not isinstance(step, Mapping):
                 violations.append(f"{ALLOWED_JOB} steps must contain only mappings")

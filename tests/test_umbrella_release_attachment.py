@@ -11,7 +11,9 @@ against a live stand-in for the GitHub API in exactly those states.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -406,3 +408,295 @@ def test_an_identical_rerun_revalidates_but_performs_no_write(stub, assets: Path
     log = request_log(stub)
     assert [event for event in log if event != "revalidate"] == []
     assert log.count("revalidate") == 2, "an unchanged rerun still brackets its reads"
+
+
+# ── Draft creation media type ─────────────────────────────────────────
+#
+# v0.5.4-beta produced no GitHub release at all: six draft-creation POSTs across
+# the self-host and Bridge lanes were rejected and none returned an `.id`. The
+# body was JSON, but curl's `-d` declares application/x-www-form-urlencoded and
+# the `Accept` header only describes the response, so GitHub parsed the document
+# as form fields. These cases pin both halves — the old request must fail, the
+# new one must succeed — and the diagnostics that make the next such failure
+# legible without leaking anything.
+
+
+def create_release_directly(stub: GitHubStub, *, content_type: str | None) -> tuple[int, str]:
+    """Replay one draft-creation POST with a chosen media type, via curl."""
+
+    body = json.dumps(
+        {
+            "tag_name": TAG,
+            "target_commitish": COMMIT,
+            "name": f"SilentSuite {TAG}",
+            "draft": True,
+        }
+    )
+    command = [
+        "curl", "-sS", "-o", "/dev/stdout", "-w", "\\n%{http_code}", "-X", "POST",
+        "-H", "Authorization: Bearer test-token",
+        "-H", "Accept: application/vnd.github+json",
+        "-H", "X-GitHub-Api-Version: 2022-11-28",
+    ]
+    if content_type is not None:
+        command += ["-H", f"Content-Type: {content_type}"]
+    command += ["-d", body, f"{stub.url}/repos/{stub.state['repository']}/releases"]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    payload, _, status = result.stdout.rpartition("\n")
+    return int(status), payload
+
+
+def test_the_pre_fix_form_encoded_request_is_rejected(stub):
+    """curl's default media type is what broke the release."""
+
+    status, payload = create_release_directly(stub, content_type=None)
+
+    assert status == 400
+    assert "id" not in json.loads(payload)
+    assert stub.state["releases"] == []
+    assert stub.state["rejected_media_types"] == ["application/x-www-form-urlencoded"]
+
+
+def test_an_explicit_json_media_type_creates_the_draft(stub):
+    status, payload = create_release_directly(stub, content_type="application/json")
+
+    assert status == 201
+    assert json.loads(payload)["tag_name"] == TAG
+    assert stub.state["rejected_media_types"] == []
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["application/x-www-form-urlencoded", "text/plain", "application/vnd.github+json"],
+)
+def test_only_the_exact_json_media_type_is_accepted(stub, content_type: str):
+    """`application/vnd.github+json` describes the response, not the request."""
+
+    status, _ = create_release_directly(stub, content_type=content_type)
+
+    assert status == 400
+    assert stub.state["releases"] == []
+
+
+def test_the_helper_declares_the_json_media_type_on_the_creation_post(stub, assets: Path):
+    assert attach(stub, assets).returncode == 0
+
+    assert stub.state["rejected_media_types"] == [], "the helper sent a body GitHub cannot parse"
+    assert len(stub.state["releases"]) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403, 404, 422, 500, 502, 503])
+def test_a_failed_creation_reports_the_status_and_the_sanitized_message(
+    stub, assets: Path, status: int
+):
+    stub.state["fail"]["create_release"] = status
+    stub.state["create_release_body"] = {"message": "Validation Failed", "errors": ["private"]}
+
+    result = attach(stub, assets)
+
+    assert result.returncode != 0
+    assert f"HTTP {status}: Validation Failed" in result.stderr
+    assert "could not resolve a single draft release" in result.stderr
+    # Only `.message` — never another response field, never a header.
+    assert "private" not in result.stderr
+    assert "errors" not in result.stderr
+    assert stub.state["releases"] == []
+
+
+def test_an_unparseable_response_is_labelled_rather_than_dumped(stub, assets: Path):
+    stub.state["fail"]["create_release"] = 502
+    stub.state["create_release_body"] = "<html><body>bad gateway</body></html>"
+
+    result = attach(stub, assets)
+
+    assert result.returncode != 0
+    assert "HTTP 502: unparseable response" in result.stderr
+    assert "html" not in result.stderr.lower()
+
+
+def test_a_hostile_api_message_is_bounded_and_stripped(stub, assets: Path):
+    stub.state["fail"]["create_release"] = 422
+    stub.state["create_release_body"] = {"message": "\x1b[31mboom\x1b[0m " + "A" * 500}
+
+    result = attach(stub, assets)
+
+    assert result.returncode != 0
+    assert "\x1b" not in result.stderr, "terminal escapes must not reach the log"
+    longest = max(len(line) for line in result.stderr.splitlines())
+    assert longest < 320, f"an unbounded message reached the log ({longest} chars)"
+
+
+def test_no_diagnostic_ever_prints_the_token(stub, assets: Path):
+    stub.state["fail"]["create_release"] = 401
+    stub.state["create_release_body"] = {"message": "Bad credentials"}
+
+    result = attach(stub, assets)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "test-token" not in combined
+    assert "Authorization" not in combined
+    assert "Bearer" not in combined
+
+
+def test_a_sibling_that_wins_the_creation_race_is_joined_not_duplicated(stub, assets: Path):
+    """The loser's 422 is a retry signal, not a second draft."""
+
+    winner = stub.add_release(TAG, target=COMMIT)
+
+    result = attach(stub, assets)
+
+    assert result.returncode == 0, result.stderr
+    assert [r["id"] for r in stub.state["releases"]] == [winner["id"]]
+    assert set(uploaded(stub, winner["id"])) == {
+        "server-image.json",
+        f"silentsuite-self-host-{TAG}.tar.gz",
+    }
+
+
+def test_a_second_creation_for_the_same_tag_is_refused_by_the_api(stub):
+    """The stub enforces GitHub's one-release-per-tag rule, so a duplicate
+    draft cannot be manufactured by a test and pass unnoticed."""
+
+    assert create_release_directly(stub, content_type="application/json")[0] == 201
+    status, payload = create_release_directly(stub, content_type="application/json")
+
+    assert status == 422
+    assert json.loads(payload)["message"] == "Validation Failed"
+    assert len(stub.state["releases"]) == 1
+
+
+def test_the_request_body_never_reaches_the_process_arguments(stub, assets: Path):
+    """The document goes through a file under the run's private workdir."""
+
+    helper = ATTACH.read_text(encoding="utf-8")
+    assert '--data-binary "@${request}"' in helper
+    assert '-H "Content-Type: application/json"' in helper
+    # And the only other POST body — an asset — is already a file upload.
+    assert '--data-binary "@${DIRECTORY}/${asset}"' in helper
+
+
+def test_a_transport_failure_reports_exactly_one_canonical_status(assets: Path, tmp_path: Path):
+    """curl writes `000` through -w *and* exits non-zero on a dead endpoint.
+
+    A `|| printf '000'` fallback therefore concatenated, and the helper reported
+    `HTTP 000000`. The status is now taken from the write-out and validated to
+    exactly three digits.
+    """
+
+    # Port 1 on loopback refuses immediately: no listener, no DNS, no timeout.
+    dead = "http://127.0.0.1:1"
+    environment = {
+        **os.environ,
+        "GITHUB_API_URL": dead,
+        "GITHUB_UPLOAD_URL_BASE": dead,
+        "GITHUB_REPOSITORY": "silent-suite/silentsuite",
+        "GITHUB_TOKEN": "test-token",
+    }
+    environment.pop("GITHUB_REF", None)
+    result = subprocess.run(
+        [
+            "bash", str(ATTACH),
+            "--tag", TAG,
+            "--expected-commit", COMMIT,
+            "--directory", str(assets),
+            "--attempts", "1",
+            "--retry-delay", "0",
+            "--asset", "server-image.json",
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "000000" not in combined, "the status was concatenated again"
+    for impossible in ("HTTP 0000", "HTTP  ", "HTTP :"):
+        assert impossible not in combined
+    assert "test-token" not in combined
+    assert "Bearer" not in combined
+
+
+def test_a_transport_failure_inside_the_creation_step_reports_http_000(
+    stub, assets: Path, tmp_path: Path
+):
+    """Identity checks pass, then the creation POST cannot connect.
+
+    A curl stand-in fails only the release-creation call, so the run reaches the
+    diagnostic under test instead of stopping at the first identity read.
+    """
+
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    real_curl = shutil.which("curl")
+    (shim_dir / "curl").write_text(
+        "#!/usr/bin/env bash\n"
+        "for argument in \"$@\"; do\n"
+        "  if [[ \"$argument\" == *'/releases' && \"$*\" == *'-X POST'* ]]; then\n"
+        "    for previous in \"$@\"; do\n"
+        "      if [[ \"$previous\" == '%{http_code}' ]]; then printf '000'; fi\n"
+        "    done\n"
+        "    exit 7\n"
+        "  fi\n"
+        "done\n"
+        f"exec {real_curl} \"$@\"\n",
+        encoding="utf-8",
+    )
+    (shim_dir / "curl").chmod(0o755)
+
+    environment = {
+        **os.environ,
+        **stub.environment(),
+        "GITHUB_TOKEN": "test-token",
+        "PATH": f"{shim_dir}:{os.environ['PATH']}",
+    }
+    environment.pop("GITHUB_REF", None)
+    result = subprocess.run(
+        [
+            "bash", str(ATTACH),
+            "--tag", TAG,
+            "--expected-commit", COMMIT,
+            "--directory", str(assets),
+            "--attempts", "1",
+            "--retry-delay", "0",
+            "--asset", "server-image.json",
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "HTTP 000: unparseable response" in result.stderr, result.stderr
+    assert "000000" not in result.stderr
+    assert "test-token" not in result.stdout + result.stderr
+    assert stub.state["releases"] == [], "nothing was created"
+
+
+def executable_lines(path: Path) -> str:
+    """Source with comments removed: these rules are about what runs."""
+
+    return "\n".join(
+        line for line in path.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+@pytest.mark.parametrize(
+    "script",
+    ["attach-umbrella-release-assets.sh", "verify-release-identity.sh"],
+)
+def test_no_curl_status_is_taken_from_a_concatenating_fallback(script: str):
+    """Both helpers read `%{http_code}`; both had the same defect."""
+
+    code = executable_lines(ROOT / "scripts" / script)
+    assert "'^[0-9]{3}$'" in code, "the write-out must be validated to three digits"
+    assert 'status="000"' in code
+    for fallback in ("|| printf '000'", "|| echo 000"):
+        assert fallback not in code, f"{script}: {fallback} concatenates with curl's own 000"
+
+
+def test_the_creation_response_file_always_exists_for_the_diagnostic():
+    code = executable_lines(ATTACH)
+    assert ': > "$out"' in code, "curl does not create -o when it never connects"
