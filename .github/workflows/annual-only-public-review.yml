@@ -20,9 +20,14 @@ jobs:
           ref: ${{ inputs.expected_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Re-fetch and assert live main immediately before signing
+      - name: Fetch live main, assert immutable identity, and sign closed public Annual review
         env:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
+          PUBLIC_SHA: ${{ inputs.expected_sha }}
+          PUBLIC_RUN_ID: ${{ github.run_id }}
+          PUBLIC_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ANNUAL_PUBLIC_REVIEW_HMAC_KEY: ${{ secrets.ANNUAL_PUBLIC_REVIEW_HMAC_KEY }}
+          ANNUAL_PUBLIC_REVIEW_OUTPUT_DIRECTORY: ${{ runner.temp }}/annual-public-review
         run: |
           set -euo pipefail
           [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -31,14 +36,8 @@ jobs:
           test "$GITHUB_REF" = refs/heads/main
           test "$GITHUB_SHA" = "$EXPECTED_SHA"
           git checkout --detach "$EXPECTED_SHA"
-      - name: Sign closed public Annual review
-        env:
-          PUBLIC_SHA: ${{ inputs.expected_sha }}
-          PUBLIC_RUN_ID: ${{ github.run_id }}
-          PUBLIC_RUN_ATTEMPT: ${{ github.run_attempt }}
-          ANNUAL_PUBLIC_REVIEW_HMAC_KEY: ${{ secrets.ANNUAL_PUBLIC_REVIEW_HMAC_KEY }}
-          ANNUAL_PUBLIC_REVIEW_OUTPUT_DIRECTORY: ${{ runner.temp }}/annual-public-review
-        run: node scripts/sign-annual-public-review.mjs
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          node scripts/sign-annual-public-review.mjs
       - name: Upload exactly the two signed public review files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
