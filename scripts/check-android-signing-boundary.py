@@ -72,6 +72,13 @@ ENVIRONMENT_NAME = "android-release"
 IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
 ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
+KEYSTORE_HELPER = Path("scripts/verify-android-release-keystore.sh")
+# The developer upload certificate the signed build must produce. It is pinned
+# here as well as in the helper so that changing which key the project ships
+# under cannot pass as a routine script edit.
+EXPECTED_UPLOAD_CERT_SHA256 = (
+    "8035a4ff1511e2045c579c905d26e93af6009b239e741ef78542ae04e7a7ca79"
+)
 RELEASE_ASSET_ARTIFACT = "silentsuite-android-release-assets-${{ inputs.source_sha }}"
 
 # The server lane's irreversible act and the check that must immediately precede
@@ -87,6 +94,7 @@ ALIAS_REVALIDATION_HELPER = "trusted/scripts/verify-release-identity.sh"
 # executed only through a checkout of the protected controller revision.
 TRUSTED_HELPERS = (
     "verify-release-identity.sh",
+    "verify-android-release-keystore.sh",
     "attach-umbrella-release-assets.sh",
     "verify-umbrella-release-readiness.py",
     "check-android-signing-boundary.py",
@@ -186,6 +194,10 @@ EXPECTED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
         "KSTOREPWD": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
         "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
     },
+    "Verify the release keystore before Gradle": {
+        "KSTOREPWD": "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}",
+        "KEY_ALIAS": "${{ secrets.ANDROID_KEY_ALIAS }}",
+    },
     "Capture release dependency graph and generate signed-release splits": {
         "BUNDLETOOL_VERSION": "1.18.1",
         "BUNDLETOOL_SHA256": "675786493983787ffa11550bdb7c0715679a44e1643f3ff980a529e9c822595c",
@@ -274,6 +286,12 @@ def _revalidation_step(name: str, stage: str) -> dict[str, Any]:
         ),
     }
 
+
+# The keystore must be proven readable, correctly aliased and bound to the
+# reviewed certificate between decoding it and handing it to Gradle.
+KEYSTORE_DECODE_STEP = "Decode release keystore"
+KEYSTORE_VERIFY_STEP = "Verify the release keystore before Gradle"
+KEYSTORE_CONSUMER_STEP = "Build signed release APK and AAB"
 
 # revalidation step name -> the step name it must immediately precede.
 RELEASE_MUTATION_BOUNDARIES: dict[str, str] = {
@@ -422,7 +440,8 @@ EXPECTED_COMPONENT_INPUTS = {
 }
 
 EXPECTED_SECRET_STEP_SHA256 = {
-    "Decode release keystore": "44c1231395b5f7347980a05fa641b0e7d866451e10ddb88958e61459f649ffba",
+    "Verify the release keystore before Gradle": "443aeb93567e5668e6ed7e0f210fbf663f9b2241d680079f43365569625e1cd9",
+    "Decode release keystore": "d0893a6a12d2aa1b8add481df288b4f70e91d9eaa1d6c4f92c4b4ff696c538b7",
     "Build signed release APK and AAB": "e9e02db295ff745dfe2ead024747b996b246ddb2fc2cc0f195ed2244b1a86776",
     "Capture release dependency graph and generate signed-release splits": (
         "69ded7eab4c4ff48deff2da950aacf8e627da05373ffa507f358fbcc986a7a6a"
@@ -437,7 +456,7 @@ REVIEWED_RELEASE_STEP_ENVIRONMENTS: dict[str, dict[str, str]] = {
 }
 # Covers the whole reviewed signing job: the explicit literal checks state the
 # intent, this digest makes any other edit to the job fail closed as well.
-EXPECTED_RELEASE_JOB_SHA256 = "2789fa4a1277514497c625a87e3c091894c47b797101b1d08fb320eaabf1a01c"
+EXPECTED_RELEASE_JOB_SHA256 = "9d58d8a0bfcd0d4cd21e61552caaddd3702652a5471dae7ea2d96f13acd8062c"
 # Same treatment for the one job that can write a release. It carries the write
 # credential, the attachment helper and the umbrella lock, so every byte of it
 # is reviewed.
@@ -445,8 +464,9 @@ EXPECTED_ATTACHMENT_JOB_SHA256 = "1d58283e8697f63a21627dc6ea037e5d2d0e1de50d5c72
 EXPECTED_CONTROLLER_ADMIT_SHA256 = "6423d79810b64d292382c9bccab15a7b0ed342a6ff6e7272972502a868a3d958"
 # The helpers those jobs execute. Hashing the step is not enough: the step text
 # is stable while the file it runs is what reaches the network and the API.
-EXPECTED_IDENTITY_HELPER_SHA256 = "5782b71552a0e08c3d011cab58112bd5998d92e561cbf4c78875ca147248c9e9"
-EXPECTED_ATTACHMENT_HELPER_SHA256 = "4ca8ca30a843abbb8305bdd63a8e04541c8791cb4bc04e0c6006e7474e463ebf"
+EXPECTED_IDENTITY_HELPER_SHA256 = "855c557e36e8fb55979e6877b02808d1ed0e40dafb9e8b7195e711f76d4b5da7"
+EXPECTED_ATTACHMENT_HELPER_SHA256 = "f37f415e7ec9439fe2e16c7e68a32a7ff0f8927de77eb2266480549e93aca875"
+EXPECTED_KEYSTORE_HELPER_SHA256 = "b9b0c8046a85209754c5e206b9cc1778036d2366d0709caf9a60fbf741f5c9b6"
 EXPECTED_READINESS_HELPER_SHA256 = "c75ebfba772c4f7bd6559161f64df3127c9c390bf1e5a81e39236ba47cc6e26f"
 # The Conscrypt producer exists twice: unprivileged CI builds it from the
 # triggering ref, the release lane builds it from the admitted commit. Both are
@@ -1137,6 +1157,7 @@ def check(root: Path) -> list[str]:
         (IDENTITY_HELPER, EXPECTED_IDENTITY_HELPER_SHA256),
         (ATTACHMENT_HELPER, EXPECTED_ATTACHMENT_HELPER_SHA256),
         (READINESS_HELPER, EXPECTED_READINESS_HELPER_SHA256),
+        (KEYSTORE_HELPER, EXPECTED_KEYSTORE_HELPER_SHA256),
     ):
         path = root / helper
         if not path.is_file():
@@ -1339,6 +1360,100 @@ def check(root: Path) -> list[str]:
                 f"{ALLOWED_JOB} must revalidate the release identity immediately before "
                 f"{guarded_name!r}; {guard_name!r} is followed by "
                 f"{release_step_names[guard_index + 1 : guard_index + 2]}"
+            )
+
+    # The keystore preflight sits exactly between the decode and Gradle. A
+    # verifier that ran earlier would check a file that did not exist yet; one
+    # that ran later would be reporting on a store Gradle had already opened.
+    if KEYSTORE_VERIFY_STEP in release_step_names:
+        decode = release_step_names.index(KEYSTORE_DECODE_STEP) if KEYSTORE_DECODE_STEP in release_step_names else -1
+        verify = release_step_names.index(KEYSTORE_VERIFY_STEP)
+        consume = (
+            release_step_names.index(KEYSTORE_CONSUMER_STEP)
+            if KEYSTORE_CONSUMER_STEP in release_step_names
+            else -1
+        )
+        if decode < 0 or verify != decode + 1:
+            violations.append(
+                f"{ALLOWED_JOB} must verify the keystore immediately after {KEYSTORE_DECODE_STEP!r}"
+            )
+        if consume < 0 or consume != verify + 1:
+            violations.append(
+                f"{ALLOWED_JOB} must run {KEYSTORE_CONSUMER_STEP!r} immediately after the "
+                "keystore verification"
+            )
+        verify_step = next(
+            step for step in release_step_list if step.get("name") == KEYSTORE_VERIFY_STEP
+        )
+        verify_body = "\n".join(strings(verify_step))
+        if str(KEYSTORE_HELPER) not in verify_body:
+            violations.append(f"{ALLOWED_JOB} must verify the keystore with {KEYSTORE_HELPER}")
+        if ".release-trusted/" not in verify_body:
+            violations.append(
+                f"{ALLOWED_JOB} must run the keystore verifier from the trusted controller "
+                "checkout, not the candidate tree"
+            )
+    else:
+        violations.append(f"{ALLOWED_JOB} must define the {KEYSTORE_VERIFY_STEP!r} step")
+
+    # The reviewed certificate is pinned in both the helper and this policy, so
+    # a change of signing identity cannot pass as an ordinary script edit.
+    keystore_helper_path = root / KEYSTORE_HELPER
+    if keystore_helper_path.is_file():
+        keystore_source = keystore_helper_path.read_text(encoding="utf-8")
+        # Argument-vector rules are about what the script *executes*. The
+        # comments deliberately name the two constructs being avoided, so they
+        # are stripped before the executable text is scanned.
+        keystore_code = "\n".join(
+            line for line in keystore_source.splitlines() if not line.lstrip().startswith("#")
+        )
+        if EXPECTED_UPLOAD_CERT_SHA256 not in keystore_source:
+            violations.append(
+                f"{KEYSTORE_HELPER} must pin the reviewed upload certificate "
+                f"{EXPECTED_UPLOAD_CERT_SHA256}"
+            )
+        if "-storepass:env" not in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must take the store password through the environment, "
+                "never as an argument"
+            )
+        # The alias must not reach *any* child process's argument vector, and
+        # `ps` on a shared runner shows arguments. `keytool -alias` and
+        # `awk -v alias=` are the two ways it previously could.
+        for argv_leak in ("-alias ", "-v alias=", "-v ALIAS="):
+            if argv_leak in keystore_code:
+                violations.append(
+                    f"{KEYSTORE_HELPER} must not pass the signing alias in a child argument "
+                    f"vector ({argv_leak.strip()})"
+                )
+        if 'ENVIRON["KEY_ALIAS"]' not in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must read the alias from the environment, not an argument"
+            )
+        # keytool's labels are translated. Without a pinned locale the parser
+        # silently matches nothing on a non-English runner.
+        for flag in ("-J-Duser.language=en", "-J-Duser.country=US"):
+            if flag not in keystore_code:
+                violations.append(
+                    f"{KEYSTORE_HELPER} must pin keytool's locale with {flag} so its labels "
+                    "are machine-readable"
+                )
+        # The expected fingerprint is validated before it can reach a log line.
+        if "^[0-9a-f]{64}$" not in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must validate the expected fingerprint as 64 hex characters"
+            )
+        # An override must not be reachable from the environment: an earlier
+        # step in the signed job writes $GITHUB_ENV, so a variable is candidate
+        # controllable while a reviewed step's `run` text is not.
+        if "EXPECTED_CERT_SHA256:-" in keystore_code:
+            violations.append(
+                f"{KEYSTORE_HELPER} must not take the expected fingerprint from the "
+                "environment; $GITHUB_ENV is writable by an earlier candidate step"
+            )
+        if "--expect-sha256" in verify_body:
+            violations.append(
+                f"{ALLOWED_JOB} must not override the reviewed upload certificate"
             )
 
     # The workflow token is admissible only inside those reviewed steps. Any

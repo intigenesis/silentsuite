@@ -258,13 +258,40 @@ jobs:
             --commit "$SOURCE_SHA" \
             --stage android-signing-material
 
+      # `echo` mangles a value containing backslashes or a leading `-`, and a
+      # failing `base64 -d` inside a pipeline is invisible without pipefail — the
+      # decode that produced v0.5.4-beta's unreadable store reported success.
+      # Now: private mode, literal write, strict decode, and a store that must
+      # exist as a non-empty regular file before anything else runs.
       - name: Decode release keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
+          set -euo pipefail
+          umask 077
           mkdir -p "$RUNNER_TEMP/keystore"
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/silentsuite-release.jks"
-          echo "KEYSTORE_PATH=$RUNNER_TEMP/keystore/silentsuite-release.jks" >> "$GITHUB_ENV"
+          KEYSTORE_FILE="$RUNNER_TEMP/keystore/silentsuite-release.jks"
+          if ! printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"; then
+            echo "Refusing to sign: the encoded keystore secret is not valid base64" >&2
+            exit 1
+          fi
+          if [ ! -f "$KEYSTORE_FILE" ] || [ ! -s "$KEYSTORE_FILE" ]; then
+            echo "Refusing to sign: the decoded keystore is missing or empty" >&2
+            exit 1
+          fi
+          echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
+
+      # Trusted code, from the controller checkout, opening the store with
+      # keytool before Gradle ever sees it. It reports only whether the store
+      # opens, whether the configured alias is a PrivateKeyEntry, and the public
+      # certificate fingerprint — never the password, the alias or key material.
+      - name: Verify the release keystore before Gradle
+        env:
+          KSTOREPWD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.release-trusted/scripts/verify-android-release-keystore.sh"
 
       - name: Build signed release APK and AAB
         env:

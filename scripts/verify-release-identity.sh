@@ -110,17 +110,24 @@ api_get() {
       if [ "$mode" = "token" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
         continue
       fi
+      # curl writes `000` through -w on a transport failure *and* exits
+      # non-zero, so `|| echo 000` appended a second one: the status became
+      # `000000`, which matched neither the success test nor the retry case
+      # below, and reported nonsense. Take the write-out alone, then validate.
       if [ "$mode" = "token" ]; then
         status="$(curl -sS -o "$destination" -w '%{http_code}' \
           -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
           -H "Accept: application/vnd.github+json" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
-          "${API}${path}" || echo 000)"
+          "${API}${path}")" || true
       else
         status="$(curl -sS -o "$destination" -w '%{http_code}' \
           -H "Accept: application/vnd.github+json" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
-          "${API}${path}" || echo 000)"
+          "${API}${path}")" || true
+      fi
+      if ! printf '%s' "$status" | grep -Eq '^[0-9]{3}$'; then
+        status="000"
       fi
       if [ "$status" = "200" ]; then
         return 0

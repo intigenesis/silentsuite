@@ -29,6 +29,7 @@ CONSCRYPT_BUILD_SCRIPT = Path("android/scripts/build-conscrypt-android-r28.sh")
 IDENTITY_HELPER = Path("scripts/verify-release-identity.sh")
 ATTACHMENT_HELPER = Path("scripts/attach-umbrella-release-assets.sh")
 READINESS_HELPER = Path("scripts/verify-umbrella-release-readiness.py")
+KEYSTORE_HELPER = Path("scripts/verify-android-release-keystore.sh")
 
 RELEASE_NEEDS = "    needs: [signing-policy, conscrypt-r28, revalidate-signing]\n"
 RELEASE_CHECKOUT = (
@@ -85,7 +86,7 @@ def fixture_root(tmp_path: Path) -> Path:
     # The control plane executes these with network and API access, so the
     # policy pins their bytes; the fixture must carry them for the digest
     # checks to be real.
-    for helper in (IDENTITY_HELPER, ATTACHMENT_HELPER, READINESS_HELPER):
+    for helper in (IDENTITY_HELPER, ATTACHMENT_HELPER, READINESS_HELPER, KEYSTORE_HELPER):
         (root / helper).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / helper, root / helper)
     return root

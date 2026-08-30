@@ -1234,7 +1234,7 @@ def test_the_attachment_helper_revalidates_before_each_individual_write():
     assert 'revalidate "before-upload:${asset}"' in helper
     lines = [line.strip() for line in helper.splitlines()]
     # Immediately before the two POST bodies, not merely somewhere above them.
-    create = lines.index('api POST "/repos/${GITHUB_REPOSITORY}/releases" \\')
+    create = lines.index('CREATE_STATUS="$(api_post_json "/repos/${GITHUB_REPOSITORY}/releases" \\')
     assert lines[create - 1] == 'revalidate "before-create"'
     upload = lines.index('echo "  ${asset}: uploading"')
     assert lines[upload - 1] == 'revalidate "before-upload:${asset}"'
