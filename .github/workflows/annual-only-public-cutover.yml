@@ -17,6 +17,9 @@ concurrency:
 jobs:
   deploy-web:
     if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
+    permissions:
+      contents: read
+      packages: write
     uses: ./.github/workflows/deploy-web.yml
     with:
       expected_sha: ${{ inputs.expected_sha }}
@@ -35,6 +38,9 @@ jobs:
 
   deploy-docs:
     if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/deploy-docs.yml
     with:
       expected_sha: ${{ inputs.expected_sha }}
