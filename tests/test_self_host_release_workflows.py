@@ -901,6 +901,20 @@ def test_the_readiness_gate_covers_every_component_inventory():
 # ── Pre-release CI ────────────────────────────────────────────────────
 
 
+def _triggered_by(paths, required):
+    """True when `required` is listed verbatim or covered by a directory wildcard.
+
+    A broader `dir/**` entry triggers on strictly more than an individual file
+    under `dir/`, so it satisfies the requirement without the redundant entry.
+    """
+    if required in paths:
+        return True
+    return any(
+        pattern.endswith("/**") and required.startswith(pattern[:-2])
+        for pattern in paths
+    )
+
+
 def test_ci_server_covers_every_surface_that_can_change_the_image():
     triggers = CI["on"]
     for event in ("push", "pull_request"):
@@ -935,7 +949,9 @@ def test_ci_server_covers_every_surface_that_can_change_the_image():
             ".github/workflows/release-server-image.yml",
             ".github/workflows/release-readiness.yml",
         ):
-            assert required in paths, f"{event}: {required} is not a CI trigger path"
+            assert _triggered_by(paths, required), (
+                f"{event}: {required} is not a CI trigger path"
+            )
 
 
 def test_ci_server_builds_and_smokes_both_native_architectures():

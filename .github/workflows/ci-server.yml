@@ -28,12 +28,13 @@ on:
       - 'tests/test_self_host_*.py'
       - 'tests/test_umbrella_release_*.py'
       - 'tests/test_server_image_verifier.py'
-      - '.github/workflows/ci-server.yml'
-      - '.github/workflows/release-controller.yml'
-      - '.github/workflows/release-android.yml'
-      - '.github/workflows/release-bridge.yml'
-      - '.github/workflows/release-server-image.yml'
-      - '.github/workflows/release-readiness.yml'
+      - 'tests/test_reusable_workflow_caller_permissions.py'
+      # Any checked-in workflow can be, or become, a local reusable caller or
+      # callee, so the caller/callee permission-subset contract this job runs
+      # is only truthfully enforced by watching the whole directory. This also
+      # subsumes the release-controller/android/bridge/server-image/readiness
+      # entries this replaced.
+      - '.github/workflows/**'
   pull_request:
     branches: [main]
     paths:
@@ -61,12 +62,13 @@ on:
       - 'tests/test_self_host_*.py'
       - 'tests/test_umbrella_release_*.py'
       - 'tests/test_server_image_verifier.py'
-      - '.github/workflows/ci-server.yml'
-      - '.github/workflows/release-controller.yml'
-      - '.github/workflows/release-android.yml'
-      - '.github/workflows/release-bridge.yml'
-      - '.github/workflows/release-server-image.yml'
-      - '.github/workflows/release-readiness.yml'
+      - 'tests/test_reusable_workflow_caller_permissions.py'
+      # Any checked-in workflow can be, or become, a local reusable caller or
+      # callee, so the caller/callee permission-subset contract this job runs
+      # is only truthfully enforced by watching the whole directory. This also
+      # subsumes the release-controller/android/bridge/server-image/readiness
+      # entries this replaced.
+      - '.github/workflows/**'
 
 concurrency:
   group: ci-server-${{ github.ref }}
@@ -181,6 +183,9 @@ jobs:
             tests/test_self_host_*.py \
             tests/test_umbrella_release_*.py \
             tests/test_server_image_verifier.py
+
+      - name: Check reusable-workflow caller/callee permission subsets
+        run: python -m pytest -q tests/test_reusable_workflow_caller_permissions.py
 
       - name: Verify the effective self-host Compose configuration
         run: scripts/self-host-compose-effective-check.sh
