@@ -26,6 +26,7 @@ test('the public review signer fetches live main and asserts every identity in t
 const actionRun = source('.github/actions/verify-annual-pre-public-admission/action.yml').match(/\n      run: \|\n([\s\S]+)$/)?.[1].replace(/^ {8}/gm, '')
 assert.ok(actionRun, 'Stage A composite action must contain an executable shell program')
 const privateSha = 'a'.repeat(40)
+const deployedSha = '5'.repeat(40)
 const publicSha = 'b'.repeat(40)
 const runId = 918273645
 const runAttempt = 2
@@ -44,8 +45,8 @@ function runStageAAction(mutate = () => {}) {
   writeFileSync(join(root, 'scripts', 'verify-annual-pre-public-admission.mjs'), readFileSync(resolve('scripts/verify-annual-pre-public-admission.mjs')))
 
   const unsignedAdmission = {
-    schemaVersion: 1,
-    predicateType: 'https://silentsuite.io/attestations/annual-only-pre-public-admission/v1',
+    schemaVersion: 2,
+    predicateType: 'https://silentsuite.io/attestations/annual-only-pre-public-admission/v2',
     privateSha,
     expectedPublicSha: publicSha,
     billingImageDigest: `sha256:${'c'.repeat(64)}`,
@@ -53,9 +54,12 @@ function runStageAAction(mutate = () => {}) {
     buildAttestationDigest: `sha256:${'e'.repeat(64)}`,
     qaAttestationDigest: `sha256:${'f'.repeat(64)}`,
     providerRegistryDigest: `sha256:${'1'.repeat(64)}`,
+    providerAdmission: { artifactId: 88, archiveDigest: `sha256:${'3'.repeat(64)}`, statementDigest: `sha256:${'4'.repeat(64)}`, runId: 33368609150, runAttempt: 1 },
     disclosureDigest: `sha256:${'2'.repeat(64)}`,
-    providerAdmission: { artifactId: 88, archiveDigest: `sha256:${'3'.repeat(64)}`, statementDigest: `sha256:${'4'.repeat(64)}`, runId, runAttempt },
-    privateDeploymentRun: { runId, runAttempt },
+    producerRun: { runId, runAttempt },
+    // The deployed identity is separate from the producer head: a re-attestation from a
+    // later private main truthfully reports the older deployed SHA here.
+    deployedRuntime: { privateSha: deployedSha, imageDigest: `sha256:${'c'.repeat(64)}`, phase: 'additive', deployedAt: '2026-08-30T10:00:00Z', observedAt: '2026-08-31T09:00:00Z', reobservedAt: '2026-08-31T09:00:05Z' },
     publicReview: { schemaVersion: 2, predicateType: 'https://silentsuite.io/attestations/annual-only-public-review/v2', repository: 'silent-suite/silentsuite', publicSha, runId: 44, runAttempt: 2, disclosureDigest: `sha256:${'2'.repeat(64)}`, signature: '0'.repeat(64) },
   }
   const reviewUnsigned = { ...unsignedAdmission.publicReview }; delete reviewUnsigned.signature
@@ -148,6 +152,12 @@ cp "$GH_FIXTURE_ADMISSION" "$destination/annual-only-pre-public-admission.json"
   return result
 }
 
+test('Stage A action admits both canonical producers: the additive deployment and the non-mutating re-attestation workflow', () => {
+  assert.equal(runStageAAction().status, 0)
+  const reattested = runStageAAction((fixture) => { fixture.workflow.path = '.github/workflows/annual-only-stage-a-reattest.yml' })
+  assert.equal(reattested.status, 0, `${reattested.stdout}${reattested.stderr}`)
+  assert.match(reattested.stdout, /Pre-public admission verified for private a{40} \(deployed 5{40}\)/)
+})
 test('Stage A action rejects each GitHub API provenance and archive substitution before its HMAC verifier can admit deployment', () => {
   assert.equal(runStageAAction().status, 0)
   const substitutes = [
@@ -159,6 +169,8 @@ test('Stage A action rejects each GitHub API provenance and archive substitution
     ['run conclusion', (fixture) => { fixture.run.conclusion = 'failure' }],
     ['run event', (fixture) => { fixture.run.event = 'push' }],
     ['producer workflow path', (fixture) => { fixture.workflow.path = '.github/workflows/other.yml' }],
+    ['producer workflow path that only consumes Stage A', (fixture) => { fixture.workflow.path = '.github/workflows/annual-only-rollout.yml' }],
+    ['run head substituted by the deployed SHA', (fixture) => { fixture.run.head_sha = deployedSha; fixture.artifact.workflow_run.head_sha = deployedSha }],
     ['run head SHA', (fixture) => { fixture.run.head_sha = 'f'.repeat(40) }],
     ['artifact ID', (fixture) => { fixture.artifact.id = 999 }],
     ['artifact name', (fixture) => { fixture.artifact.name = 'annual-only-pre-public-admission-99-1' }],

@@ -30,7 +30,9 @@ export function buildPublicServedAttestation({ admissionBytes, expectedPublicSha
   const verifiedAt = now()
   assert(validTimestamp(verifiedAt), 'Public served verification timestamp is invalid')
   assert(Date.parse(verifiedAt) >= Date.parse(clientServedAt), 'Public served timestamp order is invalid')
-  const unsigned = { schemaVersion: 1, predicateType: 'https://silentsuite.io/attestations/annual-only-public-served/v1', privateSha: admission.privateSha, publicSha: expectedPublicSha, privateAdmissionDigest: admissionDigest, billingImageDigest: admission.billingImageDigest, disclosureDigest: admission.disclosureDigest, privateDeploymentRun: admission.privateDeploymentRun, publicDeploymentRun, publicArtifact, clientServedAt, verifiedAt }
+  // Stage B v2 carries the Stage A producer run and the separately bound deployed
+  // runtime verbatim; it makes no deployment claim of its own beyond serving.
+  const unsigned = { schemaVersion: 2, predicateType: 'https://silentsuite.io/attestations/annual-only-public-served/v2', privateSha: admission.privateSha, publicSha: expectedPublicSha, privateAdmissionDigest: admissionDigest, billingImageDigest: admission.billingImageDigest, disclosureDigest: admission.disclosureDigest, deployedRuntime: admission.deployedRuntime, producerRun: admission.producerRun, publicDeploymentRun, publicArtifact, clientServedAt, verifiedAt }
   const attestation = { ...unsigned, signature: signed(publicServedHmacKey, unsigned) }
   return { attestation, bytes: Buffer.from(`${JSON.stringify(attestation)}\n`) }
 }
