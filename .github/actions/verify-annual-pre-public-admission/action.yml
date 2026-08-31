@@ -1,5 +1,5 @@
 name: Verify exact annual-only private pre-public admission
-description: Fetches one immutable private artifact by exact run/attempt/ID and verifies its closed Stage A signature before any public deployment work.
+description: Fetches one immutable private artifact by exact run/attempt/ID and verifies its closed Stage A v2 signature, producer binding, and separately bound deployed runtime before any public deployment work.
 inputs:
   token: { required: true }
   private_run_id: { required: true }
@@ -42,7 +42,12 @@ runs:
         [[ "$PRIVATE_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]
         private_workflow="$(gh api "repos/$PRIVATE_REPOSITORY/actions/workflows/$PRIVATE_WORKFLOW_ID")"
         test "$(jq -r .id <<<"$private_workflow")" = "$PRIVATE_WORKFLOW_ID"
-        test "$(jq -r .path <<<"$private_workflow")" = .github/workflows/deploy.yml
+        # Exactly two private workflows may produce a Stage A: the additive deployment
+        # and the non-mutating re-attestation from a later private main.
+        case "$(jq -r .path <<<"$private_workflow")" in
+          .github/workflows/deploy.yml|.github/workflows/annual-only-stage-a-reattest.yml) ;;
+          *) echo 'private run is not a Stage A producer workflow' >&2; exit 1 ;;
+        esac
         private_artifact_name="annual-only-pre-public-admission-${PRIVATE_RUN_ID}-${PRIVATE_RUN_ATTEMPT}"
         private_artifact="$(gh api "repos/$PRIVATE_REPOSITORY/actions/artifacts/$PRIVATE_ARTIFACT_ID")"
         test "$(jq -r .id <<<"$private_artifact")" = "$PRIVATE_ARTIFACT_ID"
