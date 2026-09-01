@@ -15,7 +15,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  admission:
+    name: Assert every owner approval is armed for the exact live main SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      # Each reusable callee gates its own jobs on its own deploy-surface
+      # approval variable. Observing only this workflow's variable is what let
+      # two armed dispatches conclude `skipped` with zero jobs and zero logs.
+      ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA: ${{ vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA }}
+      WEB_DEPLOY_APPROVED_SHA: ${{ vars.WEB_DEPLOY_APPROVED_SHA }}
+      DOCS_DEPLOY_APPROVED_SHA: ${{ vars.DOCS_DEPLOY_APPROVED_SHA }}
+    steps:
+      - name: Refuse an unarmed or mismatched cutover with an explicit diagnostic per condition
+        shell: bash
+        run: |
+          set -uo pipefail
+          refused=0
+          fail() { echo "::error::$1"; refused=1; }
+          if [ "$GITHUB_REF" != 'refs/heads/main' ]; then
+            fail "Stage B runs only from refs/heads/main; this dispatch ran from $GITHUB_REF"
+          fi
+          if ! printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            fail "expected_sha must be a full 40-character lowercase commit SHA"
+          fi
+          if [ "$GITHUB_SHA" != "$EXPECTED_SHA" ]; then
+            fail "dispatched head $GITHUB_SHA is not the reviewed expected_sha $EXPECTED_SHA"
+          fi
+          for name in ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA WEB_DEPLOY_APPROVED_SHA DOCS_DEPLOY_APPROVED_SHA; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              fail "repository variable $name is not armed; arm it to $EXPECTED_SHA for this one dispatch, then clear it after the run"
+            elif [ "$value" != "$EXPECTED_SHA" ]; then
+              fail "repository variable $name is armed for a different SHA than expected_sha $EXPECTED_SHA"
+            fi
+          done
+          if [ "$refused" -ne 0 ]; then
+            echo "Refusing Stage B: the owner-approved exact-SHA admission is incomplete, so no job may run."
+            exit 1
+          fi
+          echo "Admission complete: every owner approval is armed for exact live main $EXPECTED_SHA"
+
   deploy-web:
+    needs: [admission]
     if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
     permissions:
       contents: read
@@ -37,6 +82,7 @@ jobs:
       VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
 
   deploy-docs:
+    needs: [admission]
     if: github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && vars.ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA == inputs.expected_sha
     permissions:
       actions: read
@@ -128,3 +174,35 @@ jobs:
           ANNUAL_PUBLIC_SERVED_CLIENT_SERVED_AT: ${{ steps.served-identities.outputs.client_served_at }}
           EXPECTED_PUBLIC_SHA: ${{ inputs.expected_sha }}
         run: node scripts/publish-annual-public-served-attestation.mjs
+
+  cutover-outcome:
+    name: Refuse a silent cutover that executed no admitted work
+    needs: [admission, deploy-web, deploy-docs, attest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      ADMISSION_RESULT: ${{ needs['admission'].result }}
+      DEPLOY_WEB_RESULT: ${{ needs['deploy-web'].result }}
+      DEPLOY_DOCS_RESULT: ${{ needs['deploy-docs'].result }}
+      ATTEST_RESULT: ${{ needs['attest'].result }}
+    steps:
+      - name: Report every admitted job result and fail unless Stage B actually completed
+        shell: bash
+        run: |
+          set -uo pipefail
+          refused=0
+          for pair in "admission:$ADMISSION_RESULT" "deploy-web:$DEPLOY_WEB_RESULT" "deploy-docs:$DEPLOY_DOCS_RESULT" "attest:$ATTEST_RESULT"; do
+            job="${pair%%:*}"
+            result="${pair#*:}"
+            echo "$job: $result"
+            if [ "$result" != 'success' ]; then
+              echo "::error::$job concluded $result; Stage B did not complete"
+              refused=1
+            fi
+          done
+          if [ "$refused" -ne 0 ]; then
+            echo "Stage B produced no truthful public-served attestation. Clear ANNUAL_PUBLIC_CUTOVER_APPROVED_SHA, WEB_DEPLOY_APPROVED_SHA, and DOCS_DEPLOY_APPROVED_SHA before any remediation."
+            exit 1
+          fi
