@@ -11,6 +11,9 @@ vi.mock('../TaskListPanel', () => ({
 vi.mock('../ContactListPanel', () => ({
   ContactListPanel: () => <div data-testid="contact-panel">contacts</div>,
 }))
+vi.mock('../NotebookListPanel', () => ({
+  NotebookListPanel: () => <div data-testid="note-panel">notes</div>,
+}))
 
 import { MobileCollectionSheet } from '../MobileCollectionSheet'
 
@@ -34,6 +37,15 @@ describe('MobileCollectionSheet', () => {
     expect(screen.getByTestId('contact-panel')).toBeInTheDocument()
     expect(screen.queryByTestId('cal-panel')).not.toBeInTheDocument()
     expect(screen.queryByTestId('task-panel')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('note-panel')).not.toBeInTheDocument()
+  })
+
+  it('renders the notebook panel when open with type "notes"', () => {
+    render(<MobileCollectionSheet type="notes" open onClose={() => {}} />)
+    expect(screen.getByTestId('note-panel')).toBeInTheDocument()
+    expect(screen.queryByTestId('cal-panel')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('task-panel')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('contact-panel')).not.toBeInTheDocument()
   })
 
   it('renders the Collections header and close button when open', () => {

@@ -4,8 +4,9 @@ import { X } from 'lucide-react'
 import { CalendarListPanel } from './CalendarListPanel'
 import { TaskListPanel } from './TaskListPanel'
 import { ContactListPanel } from './ContactListPanel'
+import { NotebookListPanel } from './NotebookListPanel'
 
-export type MobileCollectionType = 'calendar' | 'tasks' | 'contacts'
+export type MobileCollectionType = 'calendar' | 'tasks' | 'contacts' | 'notes'
 
 interface MobileCollectionSheetProps {
   type: MobileCollectionType
@@ -56,6 +57,7 @@ export function MobileCollectionSheet({ type, open, onClose }: MobileCollectionS
           {type === 'calendar' && <CalendarListPanel />}
           {type === 'tasks' && <TaskListPanel />}
           {type === 'contacts' && <ContactListPanel />}
+          {type === 'notes' && <NotebookListPanel />}
         </div>
       </div>
     </>
