@@ -270,9 +270,9 @@ describe('NotesPage', () => {
     expect(screen.getByRole('button', { name: 'Preview' }).className).toContain('touch-target')
     expect(screen.getByRole('button', { name: 'Delete note' }).className).toContain('touch-target')
     fireEvent.click(screen.getByRole('button', { name: 'Delete note' }))
-    // The dialog overlay is aria-hidden, so its buttons need the hidden query.
-    expect(screen.getByText('Delete note?')).toBeInTheDocument()
-    fireEvent.click(screen.getAllByRole('button', { name: 'Delete note', hidden: true }).at(-1)!)
+    // The confirm dialog is exposed to assistive technology: query it by role.
+    const dialog = screen.getByRole('dialog', { name: 'Delete note?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete note' }))
 
     await vi.waitFor(() => expect(storeMock.noteState.deleteNote).toHaveBeenCalledWith('note-1'))
   })

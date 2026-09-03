@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent } from '@testing-library/react'
+import { screen, fireEvent, within } from '@testing-library/react'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 
 const updateCollectionMeta = vi.fn()
@@ -94,7 +94,8 @@ describe('NotebookListPanel', () => {
     expect(screen.getByText(/"Personal" and the 2 notes in it will be permanently deleted/)).toBeInTheDocument()
     expect(mockEtebaseState.deleteCollection).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'Delete notebook', hidden: true }).at(-1)!)
+    const dialog = screen.getByRole('dialog', { name: 'Delete notebook?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete notebook' }))
     await vi.waitFor(() => expect(mockEtebaseState.deleteCollection).toHaveBeenCalledWith('notes', 'notes-1'))
     expect(screen.queryByText('Delete notebook?')).not.toBeInTheDocument()
   })
@@ -105,7 +106,7 @@ describe('NotebookListPanel', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete notebook' }))
     expect(screen.getByText(/"Work" and the 1 note in it/)).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel', hidden: true }))
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Delete notebook?' })).getByRole('button', { name: 'Cancel' }))
     expect(screen.queryByText('Delete notebook?')).not.toBeInTheDocument()
     expect(mockEtebaseState.deleteCollection).not.toHaveBeenCalled()
   })
