@@ -54,6 +54,21 @@ describe('MobileCollectionSheet', () => {
     expect(screen.getByLabelText('Close collections')).toBeInTheDocument()
   })
 
+  it('renders into the body above the bottom nav and pads for the safe area', () => {
+    const { container } = render(<MobileCollectionSheet type="notes" open onClose={() => {}} />)
+    const sheet = screen.getByRole('dialog', { name: 'Collections' })
+    const backdrop = sheet.previousElementSibling!
+    // The page's main element is a stacking context, so the sheet must leave it
+    // (portal) and outrank the z-50 bottom nav to be visible and tappable.
+    expect(container.contains(sheet)).toBe(false)
+    expect(sheet.parentElement).toBe(document.body)
+    expect(sheet.className).toContain('z-[60]')
+    expect(backdrop.getAttribute('aria-hidden')).toBe('true')
+    expect(backdrop.className).toContain('z-[60]')
+    expect(sheet.className).toContain('pb-[env(safe-area-inset-bottom)]')
+    expect(sheet.className).toContain('max-h-[80dvh]')
+  })
+
   it('calls onClose when the close button is clicked', () => {
     const onClose = vi.fn()
     render(<MobileCollectionSheet type="calendar" open onClose={onClose} />)
