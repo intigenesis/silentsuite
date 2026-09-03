@@ -45,7 +45,7 @@ export function MobileCollectionSheet({ type, open, onClose }: MobileCollectionS
         role="dialog"
         aria-modal="true"
         aria-label="Collections"
-        className="fixed inset-x-0 bottom-0 z-[60] max-h-[80dvh] overflow-y-auto rounded-t-xl border-t border-[rgb(var(--border))] bg-[rgb(var(--background))] pb-[env(safe-area-inset-bottom)] shadow-2xl"
+        className="fixed inset-x-0 bottom-0 z-[60] max-h-[80vh] overflow-y-auto rounded-t-xl border-t border-[rgb(var(--border))] bg-[rgb(var(--background))] pb-[env(safe-area-inset-bottom)] shadow-2xl supports-[height:1dvh]:max-h-[80dvh]"
       >
         {/* Header */}
         <div className="sticky top-0 flex items-center justify-between border-b border-[rgb(var(--border))] bg-[rgb(var(--background))] px-4 py-3">

@@ -66,7 +66,9 @@ describe('MobileCollectionSheet', () => {
     expect(backdrop.getAttribute('aria-hidden')).toBe('true')
     expect(backdrop.className).toContain('z-[60]')
     expect(sheet.className).toContain('pb-[env(safe-area-inset-bottom)]')
-    expect(sheet.className).toContain('max-h-[80dvh]')
+    // vh is the baseline; dvh only where the engine supports it, so older engines still get a height cap.
+    expect(sheet.className).toContain('max-h-[80vh]')
+    expect(sheet.className).toContain('supports-[height:1dvh]:max-h-[80dvh]')
   })
 
   it('calls onClose when the close button is clicked', () => {
