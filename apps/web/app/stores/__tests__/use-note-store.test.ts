@@ -141,6 +141,7 @@ describe('useNoteStore', () => {
       expect(updateItem).toHaveBeenCalledWith('notes', 'note-1', 'new body', {
         meta: { name: 'Updated', mtime: stored.updated_at.getTime() },
         persistEncryptedOfflineContent: true,
+        collectionUid: 'notes-1',
       })
     })
 
@@ -165,7 +166,7 @@ describe('useNoteStore', () => {
       errorSpy.mockRestore()
     })
 
-    it('ignores unknown notes, notes in read-only notebooks, and notes that never reached Etebase', async () => {
+    it('ignores unknown notes and notes in read-only notebooks', async () => {
       const updateItem = vi.fn(async () => 'remote')
       etebase({ updateItem, itemCache: new Map([['shared-1', {}]]) })
       useNotebookStore.setState({
@@ -174,14 +175,29 @@ describe('useNoteStore', () => {
           { id: 'shared', name: 'Shared', color: '#fff', visible: true, accessLevel: 0 },
         ],
       })
-      useNoteStore.setState({ notes: [note('shared-1', { notebookId: 'shared' }), note('local-only')] })
+      useNoteStore.setState({ notes: [note('shared-1', { notebookId: 'shared' })] })
 
       await expect(useNoteStore.getState().updateNote('missing', { title: 'x' })).resolves.toBe(false)
       await expect(useNoteStore.getState().updateNote('shared-1', { title: 'x' })).resolves.toBe(false)
-      await expect(useNoteStore.getState().updateNote('local-only', { title: 'x' })).resolves.toBe(false)
 
       expect(updateItem).not.toHaveBeenCalled()
       expect(useNoteStore.getState().notes[0]!.title).toBe('Note')
+    })
+
+    it('still hands an edit to the store when no Etebase item is in memory, as after a reload while offline', async () => {
+      const updateItem = vi.fn(async () => 'queued' as const)
+      etebase({ updateItem, itemCache: new Map() })
+      useNoteStore.setState({ notes: [note('cached-1', { title: 'Cached', content: 'old' })] })
+
+      await expect(useNoteStore.getState().updateNote('cached-1', { content: 'edited after reload' })).resolves.toBe(true)
+
+      const stored = useNoteStore.getState().notes[0]!
+      expect(stored.content).toBe('edited after reload')
+      expect(updateItem).toHaveBeenCalledWith('notes', 'cached-1', 'edited after reload', {
+        meta: { name: 'Cached', mtime: stored.updated_at.getTime() },
+        persistEncryptedOfflineContent: true,
+        collectionUid: 'notes-1',
+      })
     })
   })
 
@@ -193,7 +209,18 @@ describe('useNoteStore', () => {
 
       await expect(useNoteStore.getState().deleteNote('note-1')).resolves.toBe(true)
 
-      expect(deleteItem).toHaveBeenCalledWith('notes', 'note-1')
+      expect(deleteItem).toHaveBeenCalledWith('notes', 'note-1', { collectionUid: 'notes-1' })
+      expect(useNoteStore.getState().notes).toEqual([])
+    })
+
+    it('hands a delete to the store when no Etebase item is in memory and keeps the note removed once queued', async () => {
+      const deleteItem = vi.fn(async () => 'queued' as const)
+      etebase({ deleteItem, itemCache: new Map() })
+      useNoteStore.setState({ notes: [note('cached-1')] })
+
+      await expect(useNoteStore.getState().deleteNote('cached-1')).resolves.toBe(true)
+
+      expect(deleteItem).toHaveBeenCalledWith('notes', 'cached-1', { collectionUid: 'notes-1' })
       expect(useNoteStore.getState().notes).toEqual([])
     })
 

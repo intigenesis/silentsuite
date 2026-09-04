@@ -94,8 +94,7 @@ export const useNoteStore = create<NoteState & NoteActions>()(
       set((state) => ({ notes: state.notes.map((n) => (n.id === id ? updated : n)) }))
 
       const etebase = useEtebaseStore.getState()
-      // Not an Etebase item yet (creation still in flight or failed): nothing to update remotely.
-      if (!etebase.account || !etebase.itemCache.has(id)) return false
+      if (!etebase.account) return false
 
       try {
         const { noteToItemMeta } = await import('@silentsuite/core')
@@ -104,6 +103,10 @@ export const useNoteStore = create<NoteState & NoteActions>()(
           // Offline edits keep their body and title in the encrypted local
           // cache; the queue entry itself stays content-free.
           persistEncryptedOfflineContent: true,
+          // After a reload while offline the note is known only from the local
+          // cache, with no Etebase item in memory; the store then queues the
+          // edit by UID under its notebook instead of dropping it.
+          collectionUid: existing.notebookId,
         })
         return outcome !== false
       } catch (err) {
@@ -121,10 +124,11 @@ export const useNoteStore = create<NoteState & NoteActions>()(
       set((state) => ({ notes: state.notes.filter((n) => n.id !== id) }))
 
       const etebase = useEtebaseStore.getState()
-      if (!etebase.account || !etebase.itemCache.has(id)) return true
+      if (!etebase.account) return true
 
       try {
-        const outcome = await etebase.deleteItem('notes', id)
+        // The notebook lets the store queue the delete by UID when no item is in memory.
+        const outcome = await etebase.deleteItem('notes', id, { collectionUid: note.notebookId })
         if (outcome !== false) return true
       } catch (err) {
         console.error('[note-store] Failed to sync note deletion to Etebase', getSafeErrorDetails(err))

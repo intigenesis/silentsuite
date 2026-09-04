@@ -222,6 +222,66 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
     expect(await getAll(queueGuard())).toEqual([])
   })
 
+  it('queues an edit made after a reload while offline for a note known only from the cache, then replays it by fetching the item', async () => {
+    _setEncryptedQueuePersistenceAvailableForTests(false)
+    // Reload while offline: the session is restored, but no collections or item objects are in memory.
+    setNoteAccount([])
+    useEtebaseStore.setState({ collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] } })
+
+    await expect(useEtebaseStore.getState().updateItem(
+      'notes',
+      'note-1',
+      'EDITED AFTER RELOAD',
+      { persistEncryptedOfflineContent: true, meta: { name: 'Cached title', mtime: 444 }, collectionUid: 'notes-1' },
+    )).resolves.toBe('queued')
+    expect(coreMock.updateItem).not.toHaveBeenCalled()
+
+    const [entry] = await getAll(queueGuard())
+    expect(entry).toMatchObject({ type: 'update', itemUid: 'note-1', collectionUid: 'notes-1' })
+    expect(entry!.content).toBeUndefined()
+    expect(JSON.stringify(entry)).not.toContain('EDITED AFTER RELOAD')
+    expect(JSON.stringify(await readRawCacheItems())).not.toContain('EDITED AFTER RELOAD')
+
+    // Back online: collections are listed again, but the item map stays empty until the replay fetches the item.
+    const remote = { ...cachedItem('note-1'), getMeta: vi.fn(() => ({ name: 'Cached title', mtime: 1 })) }
+    useEtebaseStore.setState({ collections: { calendar: [], tasks: [], contacts: [], notes: [collection('notes-1')], preferences: [] } })
+    coreMock.listItems.mockResolvedValue({ items: [remote], stoken: null, done: true })
+    coreMock.updateItem.mockResolvedValueOnce(remote)
+
+    await replay(
+      (queued, checkpoint) => useEtebaseStore.getState().replayQueuedMutation(queued, queueGuard(), checkpoint),
+      queueGuard(),
+    )
+    expect(coreMock.updateItem).toHaveBeenCalledWith(
+      useEtebaseStore.getState().account,
+      expect.objectContaining({ uid: 'notes-1' }),
+      remote,
+      'EDITED AFTER RELOAD',
+      { name: 'Cached title', mtime: 444 },
+    )
+    expect(await getAll(queueGuard())).toEqual([])
+    expect(useEtebaseStore.getState().itemCache.get('note-1')).toBe(remote)
+    expect(useEtebaseStore.getState().itemCollectionMap.get('note-1')).toBe('notes-1')
+  })
+
+  it('queues a delete for a cached note with no item in memory and replays it by fetching the item', async () => {
+    setNoteAccount([])
+
+    await expect(useEtebaseStore.getState().deleteItem('notes', 'note-1', { collectionUid: 'notes-1' })).resolves.toBe('queued')
+    expect(coreMock.deleteItem).not.toHaveBeenCalled()
+    expect((await getAll(queueGuard()))[0]).toMatchObject({ type: 'delete', itemUid: 'note-1', collectionUid: 'notes-1' })
+
+    const remote = cachedItem('note-1')
+    coreMock.listItems.mockResolvedValue({ items: [remote], stoken: null, done: true })
+    coreMock.deleteItem.mockResolvedValueOnce(undefined)
+    await replay(
+      (queued, checkpoint) => useEtebaseStore.getState().replayQueuedMutation(queued, queueGuard(), checkpoint),
+      queueGuard(),
+    )
+    expect(coreMock.deleteItem).toHaveBeenCalledWith(useEtebaseStore.getState().account, expect.objectContaining({ uid: 'notes-1' }), remote)
+    expect(await getAll(queueGuard())).toEqual([])
+  })
+
   it('drops queued note edits once a newer online update or a delete succeeds', async () => {
     const item = cachedItem('note-1')
     setNoteAccount([{ uid: 'note-1', collectionUid: 'notes-1', item }])
