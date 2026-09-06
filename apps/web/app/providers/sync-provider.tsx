@@ -126,6 +126,12 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
           },
         })
         assertCurrentAccountEpoch(accountEpoch)
+        // Every visible domain has reached a terminal state by now. Offline,
+        // collection setup fails silently and the notes callback above never
+        // fires, so clear the provider-owned flag here or the list is stuck on
+        // its skeleton. Runs after the epoch assert, so a switched account
+        // keeps its own loading state.
+        useNoteStore.setState({ isLoading: false })
         safeLogSyncTiming('etebase-initialize', etebaseStartedAt)
 
         // Wire SyncEngine change events
