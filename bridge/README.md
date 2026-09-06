@@ -48,6 +48,32 @@ If Apple Internet Accounts still fails after HTTPS setup, collect redacted bridg
 
 The local bridge cache contains decrypted calendar/contact/task data. Use `--remove-account` when retiring a shared or untrusted machine.
 
+## Listener Settings and Auto-Start
+
+The bridge binds to `127.0.0.1:37358` unless you configure it otherwise. The listener profile is resolved from three layers, highest precedence first:
+
+1. Environment variables: `SILENTSUITE_LISTEN_ADDRESS`, `SILENTSUITE_LISTEN_PORT`, `SILENTSUITE_SERVER_HOSTS`, `SILENTSUITE_ALLOW_REMOTE`.
+2. The persisted `"network"` object in `settings.json` (keys `listenAddress`, `listenPort`, `serverHosts`, `allowRemote`).
+3. Built-in loopback defaults.
+
+Auto-start entries (systemd user service, launchd agent, Windows Run entry) execute the bridge with a clean environment. `--install-autostart` therefore validates the effective configuration and persists **only the variables you explicitly exported** among the four above into `settings.json` before it writes the entry; nothing else from the environment (server URL, data directory, log destinations, SSL paths, credentials) is ever captured. A fresh installation with no exported variables writes no `"network"` object and keeps the loopback defaults.
+
+```bash
+SILENTSUITE_LISTEN_PORT=45123 silentsuite-bridge --install-autostart
+```
+
+Semantics:
+
+- A non-loopback bind without `SILENTSUITE_ALLOW_REMOTE=1` is refused before anything is written. Permission is persisted alongside the bind so the clean-environment restart is validated too. The dashboard stays disabled on remote binds.
+- Reinstalling merges newly exported variables over the retained profile; values you do not export again are kept. `--remove-autostart` removes the entry but keeps the profile. To reset, delete the `"network"` object from `settings.json`.
+- `--remove-autostart` runs before the profile is validated, so it still works when `settings.json` holds an invalid `"network"` object. On Linux/macOS it exits non-zero and keeps the entry for a retry when systemd/launchd does not confirm the stop/unload. On Windows it only deletes the sign-in Run entry; a bridge that is already running is not stopped.
+- Every write to `settings.json` (network profile, sync interval, SSL settings) is atomic (temp file + replace, then a directory sync on Linux/macOS). A failure before the replace leaves the existing `settings.json` unchanged; if only the directory sync fails, the command says the new content is visible but not confirmed durable. A `settings.json` that is not a JSON object is refused rather than overwritten.
+- Two overlapping `--install-autostart` runs apply one after the other: the second reads, merges and validates its profile inside the same lock it writes under, so the disjoint settings of both survive and a permission the first run removed stays removed.
+- Writers are also serialized across processes: each one holds an exclusive lock on `settings.json.lock` (next to `settings.json`, created on first write and kept) for its whole read, merge and replace, so a dashboard interval change can never overwrite a profile that `--install-autostart` persisted moments earlier. A writer that cannot get the lock within 30 seconds fails without writing and says so; the dashboard shows the server's reason (`Not saved: ...`) instead of `Saved` whenever the settings request does not succeed.
+- The persisted profile is validated strictly at every startup (types, port range, host syntax, unknown keys). An invalid profile, or a `settings.json` that is not valid JSON, stops the bridge before it binds; the error names the offending key or file, never its content, and unrelated settings are left untouched. `--remove-autostart` still works in that state.
+- `SILENTSUITE_DATA_DIR` (and, on Linux, `XDG_DATA_HOME`) is not supported together with `--install-autostart` (the restarted process would read the default directory); the command refuses and changes nothing.
+- `--install-autostart` exits non-zero when the service manager did not confirm the start; the installers report that honestly instead of claiming success.
+
 ## Self-Update
 
 The Bridge can check for and apply updates from the CLI:
