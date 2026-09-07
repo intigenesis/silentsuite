@@ -2,6 +2,9 @@
 
 import io
 import json
+import shutil
+import subprocess
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +27,9 @@ from silentsuite_bridge.web import (
     forget_account_status,
     update_status,
 )
+from tests.settings_lock_holder import hold_settings_lock
+
+NODE = shutil.which("node")
 
 # Default Host header matching a localhost variant so the SEC-R7.4 Host check
 # accepts the request. Tests that exercise the rejection path set this explicitly.
@@ -1060,3 +1066,556 @@ def test_dashboard_settings_post_accepts_valid_csrf(tmp_path, monkeypatch):
     assert status == 200
     assert headers["Content-Type"] == "application/json"
     assert json.loads(response_body) == {"ok": True, "syncInterval": 60}
+
+
+# --- Settings failures must never look like success (#658) ------------------
+
+
+def _isolated_settings(tmp_path, monkeypatch, current_interval=900):
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_FILE", str(settings_file))
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "SYNC_INTERVAL", current_interval)
+    return settings_file
+
+
+def _post_interval(seconds):
+    body = json.dumps({"syncInterval": seconds}).encode()
+    return Web.__new__(Web).post(
+        _post_environ(body=body, csrf_token=_dashboard_csrf_token),
+        "",
+        "/.web/api/settings",
+        None,
+    )
+
+
+def test_dashboard_settings_post_reports_unconfirmed_durability_as_failure(tmp_path, monkeypatch):
+    settings_file = _isolated_settings(tmp_path, monkeypatch)
+    settings_file.write_text(json.dumps({"network": {"listenPort": 45123}}), encoding="utf-8")
+
+    def refuse_directory_sync(directory):
+        raise OSError("EIO")
+
+    monkeypatch.setattr(config, "_fsync_directory", refuse_directory_sync)
+
+    status, headers, response_body = _post_interval(60)
+
+    assert status == 500
+    assert headers["Content-Type"] == "application/json"
+    error = json.loads(response_body)["error"]
+    assert "not confirmed durable" in error
+    assert "retry" in error
+    # The replace completed (content visible, profile intact) but the running
+    # interval was not switched on an unconfirmed write.
+    assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+        "network": {"listenPort": 45123},
+        "syncInterval": 60,
+    }
+    assert config.SYNC_INTERVAL == 900
+
+
+def test_dashboard_settings_post_reports_write_failure_and_keeps_interval(tmp_path, monkeypatch):
+    settings_file = _isolated_settings(tmp_path, monkeypatch)
+    settings_file.write_text(json.dumps({"network": {"listenPort": 45123}}), encoding="utf-8")
+    original = settings_file.read_text(encoding="utf-8")
+
+    def refuse_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(config.os, "replace", refuse_replace)
+
+    status, _, response_body = _post_interval(60)
+
+    assert status == 500
+    assert "was not changed" in json.loads(response_body)["error"]
+    assert settings_file.read_text(encoding="utf-8") == original
+    assert config.SYNC_INTERVAL == 900
+
+
+def test_dashboard_settings_post_waits_for_a_concurrent_install_and_keeps_its_profile(tmp_path, monkeypatch):
+    settings_file = _isolated_settings(tmp_path, monkeypatch)
+    settings_file.write_text(json.dumps({"syncInterval": 900}), encoding="utf-8")
+    outcome = {}
+
+    def post():
+        try:
+            outcome["response"] = _post_interval(60)
+        except BaseException as exc:  # reported by the main thread
+            outcome["error"] = exc
+
+    # --install-autostart in another process has read settings.json and holds
+    # the lock; the dashboard's write must wait for it rather than interleave.
+    with hold_settings_lock(tmp_path, {"network": {"listenPort": 45123}}) as installer:
+        assert installer.snapshot == {"syncInterval": 900}
+
+        request = threading.Thread(target=post)
+        request.start()
+        request.join(timeout=1.0)
+
+        assert request.is_alive(), outcome
+        assert json.loads(settings_file.read_text(encoding="utf-8")) == {"syncInterval": 900}
+        assert config.SYNC_INTERVAL == 900
+
+        assert installer.written == {"syncInterval": 900, "network": {"listenPort": 45123}}
+
+    request.join(timeout=config.SETTINGS_LOCK_TIMEOUT + 5)
+    assert not request.is_alive()
+    assert "error" not in outcome, outcome
+    status, _, response_body = outcome["response"]
+    assert status == 200
+    assert json.loads(response_body) == {"ok": True, "syncInterval": 60}
+    assert config.SYNC_INTERVAL == 60
+    # The dashboard merged over the completed install: the profile survived.
+    assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+        "syncInterval": 60,
+        "network": {"listenPort": 45123},
+    }
+
+
+def test_dashboard_settings_post_reports_lock_contention_without_changing_interval(tmp_path, monkeypatch):
+    settings_file = _isolated_settings(tmp_path, monkeypatch)
+    settings_file.write_text(json.dumps({"syncInterval": 900}), encoding="utf-8")
+    original = settings_file.read_text(encoding="utf-8")
+    monkeypatch.setattr(config, "SETTINGS_LOCK_TIMEOUT", 0.2)
+
+    with hold_settings_lock(tmp_path, {"network": {"listenPort": 45123}}) as installer:
+        status, headers, response_body = _post_interval(60)
+
+        assert status == 503
+        assert headers["Content-Type"] == "application/json"
+        error = json.loads(response_body)["error"]
+        assert "Another bridge process is updating settings.json" in error
+        assert "was not changed" in error
+        assert settings_file.read_text(encoding="utf-8") == original
+        assert config.SYNC_INTERVAL == 900
+
+        assert installer.written == {"syncInterval": 900, "network": {"listenPort": 45123}}
+
+    assert json.loads(settings_file.read_text(encoding="utf-8")) == {
+        "syncInterval": 900,
+        "network": {"listenPort": 45123},
+    }
+
+
+def _extract_js_function(html, name):
+    """Return the source of top-level ``function name(...) {...}`` from the dashboard script."""
+    start = html.index(f"function {name}(")
+    depth = 0
+    for index in range(html.index("{", start), len(html)):
+        if html[index] == "{":
+            depth += 1
+        elif html[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return html[start:index + 1]
+    raise AssertionError(f"unterminated function {name}")
+
+
+def _rendered_scripts(html):
+    """Every complete <script> block of the rendered dashboard, in document order."""
+    scripts = []
+    position = 0
+    while True:
+        start = html.find("<script>", position)
+        if start == -1:
+            return scripts
+        end = html.index("</script>", start)
+        scripts.append(html[start + len("<script>"):end])
+        position = end
+
+
+def test_rendered_dashboard_scripts_keep_javascript_escapes_through_the_python_template(tmp_path, monkeypatch):
+    """The template is a Python string: a lone backslash escape is consumed by
+    Python and reaches the browser unescaped, which breaks the whole script
+    block (and with it every handler in it, including the interval save)."""
+    monkeypatch.setattr(config, "CREDS_FILE", str(tmp_path / "creds.json"))
+
+    html = _render_dashboard()
+    scripts = _rendered_scripts(html)
+
+    assert len(scripts) == 3
+    remove_prompt = [s for s in scripts if "function removeAccount(" in s][0]
+    assert "that account\\'s local decrypted bridge cache" in remove_prompt
+    assert "that account's local" not in remove_prompt
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required to parse the rendered dashboard scripts")
+def test_rendered_dashboard_scripts_parse_completely(tmp_path, monkeypatch):
+    """Parse each complete rendered <script> block with node, not extracted functions."""
+    _reset_status()
+    monkeypatch.setattr(config, "CREDS_FILE", str(tmp_path / "creds.json"))
+    monkeypatch.setattr(web_module, "_account_fingerprint", lambda _creds, username: f"fingerprint for {username}")
+    creds = Credentials()
+    creds.set_etebase("alice@example.com", "alice-session", "https://server-a.test")
+    creds.save()
+
+    html = _render_dashboard()
+    scripts = _rendered_scripts(html)
+    assert len(scripts) == 3
+
+    for index, script in enumerate(scripts):
+        path = tmp_path / f"dashboard-script-{index}.js"
+        path.write_text(script, encoding="utf-8")
+        check = subprocess.run([NODE, "--check", str(path)], capture_output=True, text=True, timeout=60)
+        assert check.returncode == 0, f"script block {index} does not parse:\n{check.stderr}"
+
+
+def _interval_script(html):
+    """The dashboard's interval-save code: its script-level state plus the two functions it uses."""
+    state_start = html.index("var intervalSave = {")
+    state = html[state_start:html.index("};", state_start) + 2]
+    functions = (_extract_js_function(html, name) for name in ("handleJsonResponse", "updateInterval"))
+    return "\n".join([state, *functions])
+
+
+def test_dashboard_interval_script_checks_the_http_status_before_reporting_saved(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CREDS_FILE", str(tmp_path / "creds.json"))
+
+    html = _render_dashboard()
+    source = _extract_js_function(html, "updateInterval")
+
+    assert ".then(handleJsonResponse)" in source
+    assert "return r.json()" not in source
+    assert "'Saved'" in source.split(".then(handleJsonResponse)", 1)[1]
+    assert "sel.setAttribute('data-saved', sel.value)" in html
+    # Serialized saves: in-flight guard, disabled selector, cancelled clear timer.
+    assert "if (intervalSave.pending)" in source
+    assert "select.disabled = true;" in source
+    assert "clearTimeout(intervalSave.clearTimer)" in source
+
+
+DURABILITY_ERROR = "settings.json was replaced but not confirmed durable; retry to confirm the sync interval"
+WRITE_ERROR = "Could not write settings.json; the sync interval was not changed"
+LOCK_ERROR = "Another bridge process is updating settings.json; the sync interval was not changed, retry shortly"
+
+UPDATE_INTERVAL_SCENARIOS = [
+    {"id": "ok", "status": 200, "body": {"ok": True, "syncInterval": 300}},
+    {"id": "durability-unconfirmed", "status": 500, "body": {"error": DURABILITY_ERROR}},
+    {"id": "write-failed", "status": 500, "body": {"error": WRITE_ERROR}},
+    {"id": "lock-held", "status": 503, "body": {"error": LOCK_ERROR}},
+    {"id": "csrf-rejected", "status": 403, "body": {"error": "Invalid dashboard CSRF token"}},
+    {"id": "non-json-error-page", "status": 502, "body": None},
+    {"id": "transport-failure", "status": 0, "body": None, "transportError": True},
+]
+
+# Runs the extracted dashboard functions in a bare V8 context with a fake
+# document/fetch: the same code path a browser executes, minus the DOM.
+UPDATE_INTERVAL_HARNESS = r"""
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const scenarios = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+
+function element(value) {
+    const attributes = {};
+    return {
+        value: value,
+        textContent: '',
+        style: {},
+        getAttribute: function(name) {
+            return Object.prototype.hasOwnProperty.call(attributes, name) ? attributes[name] : null;
+        },
+        setAttribute: function(name, v) { attributes[name] = String(v); }
+    };
+}
+
+function response(spec) {
+    if (spec.transportError) return Promise.reject(new TypeError('Failed to fetch'));
+    return Promise.resolve({
+        ok: spec.status >= 200 && spec.status < 300,
+        status: spec.status,
+        json: function() {
+            if (spec.body === null) return Promise.reject(new SyntaxError('Unexpected token < in JSON'));
+            return Promise.resolve(spec.body);
+        }
+    });
+}
+
+async function flush() {
+    for (let i = 0; i < 20; i++) await new Promise(function(r) { setImmediate(r); });
+}
+
+// Page state shared by both modes: fake select/status elements, a fetch that
+// either answers immediately (single-request mode) or hands out deferreds the
+// scenario settles explicitly (step mode), and timers that are only fired on
+// request so stale-timer cancellation is observable.
+function page(scenario) {
+    const select = element('300');
+    select.disabled = false;
+    select.setAttribute('data-saved', '900');
+    const status = element('');
+    const requests = [];
+    const deferreds = [];
+    const timers = [];
+    const sandbox = {
+        window: { SILENTSUITE_DASHBOARD_CSRF: 'csrf-token' },
+        document: {
+            getElementById: function(id) {
+                if (id === 'syncInterval') return select;
+                if (id === 'syncIntervalStatus') return status;
+                return null;
+            }
+        },
+        fetch: function(url, init) {
+            requests.push({ url: url, method: init.method, csrf: init.headers['X-SilentSuite-CSRF'], body: init.body });
+            if (!scenario.steps) return response(scenario);
+            let settle;
+            const promise = new Promise(function(resolve) { settle = resolve; });
+            deferreds.push(function(spec) { settle(response(spec)); });
+            return promise;
+        },
+        setTimeout: function(fn, delay) {
+            timers.push({ fn: fn, delay: delay, cleared: false, fired: false });
+            return timers.length - 1;
+        },
+        clearTimeout: function(id) { if (timers[id]) timers[id].cleared = true; }
+    };
+    const context = vm.createContext(sandbox);
+    vm.runInContext(source, context);
+    return { select: select, status: status, requests: requests, deferreds: deferreds, timers: timers, context: context };
+}
+
+function snapshot(p) {
+    return {
+        status: p.status.textContent,
+        color: p.status.style.color,
+        selected: p.select.value,
+        saved: p.select.getAttribute('data-saved'),
+        disabled: p.select.disabled,
+        requests: p.requests.map(function(r) { return r.body; }),
+        timers: p.timers.map(function(t) { return { delay: t.delay, cleared: t.cleared, fired: t.fired }; })
+    };
+}
+
+async function run(scenario) {
+    const p = page(scenario);
+    let result = vm.runInContext('updateInterval()', p.context);
+    try { await result; } catch (e) {}
+    await flush();
+    const state = snapshot(p);
+    return {
+        id: scenario.id,
+        status: state.status,
+        color: state.color,
+        selected: state.selected,
+        saved: state.saved,
+        disabled: state.disabled,
+        requests: p.requests,
+        timers: p.timers.map(function(t) { return t.delay; })
+    };
+}
+
+// Step mode: each step sets the dropdown and calls updateInterval(), settles a
+// pending request out of order, fires live timers, or records a snapshot.
+async function runSteps(scenario) {
+    const p = page(scenario);
+    const calls = [];
+    const snapshots = {};
+    for (const step of scenario.steps) {
+        if (step.set !== undefined) {
+            p.select.value = step.set;
+            const promise = vm.runInContext('updateInterval()', p.context);
+            calls.push({ sameAsFirst: calls.length > 0 && promise === calls[0].promise, promise: promise });
+        } else if (step.settle !== undefined) {
+            if (!p.deferreds[step.settle]) throw new Error('no request #' + step.settle + ' to settle in ' + scenario.id);
+            p.deferreds[step.settle](step);
+        } else if (step.fireTimers) {
+            for (const t of p.timers) { if (!t.cleared && !t.fired) { t.fired = true; t.fn(); } }
+        } else if (step.snapshot) {
+            snapshots[step.snapshot] = snapshot(p);
+        }
+        await flush();
+    }
+    for (const call of calls) { try { await call.promise; } catch (e) {} }
+    await flush();
+    snapshots.final = snapshot(p);
+    return { id: scenario.id, snapshots: snapshots, calls: calls.map(function(c) { return { sameAsFirst: c.sameAsFirst }; }) };
+}
+
+(async function() {
+    const results = [];
+    for (const scenario of scenarios) results.push(scenario.steps ? await runSteps(scenario) : await run(scenario));
+    process.stdout.write(JSON.stringify(results));
+})().catch(function(err) { console.error(err && err.stack || err); process.exit(1); });
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required to execute the dashboard script")
+def test_dashboard_update_interval_never_shows_saved_on_http_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CREDS_FILE", str(tmp_path / "creds.json"))
+    html = _render_dashboard()
+    script = tmp_path / "dashboard-interval.js"
+    script.write_text(_interval_script(html), encoding="utf-8")
+    scenarios = tmp_path / "scenarios.json"
+    scenarios.write_text(json.dumps(UPDATE_INTERVAL_SCENARIOS), encoding="utf-8")
+    harness = tmp_path / "harness.js"
+    harness.write_text(UPDATE_INTERVAL_HARNESS, encoding="utf-8")
+
+    run = subprocess.run(
+        [NODE, str(harness), str(script), str(scenarios)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert run.returncode == 0, run.stderr
+    results = {result["id"]: result for result in json.loads(run.stdout)}
+    assert set(results) == {scenario["id"] for scenario in UPDATE_INTERVAL_SCENARIOS}
+
+    ok = results["ok"]
+    assert ok["status"] == "Saved"
+    assert ok["selected"] == "300"
+    assert ok["saved"] == "300"
+    assert ok["disabled"] is False
+    assert ok["timers"] == [2000]
+    assert ok["requests"] == [
+        {"url": "/.web/api/settings", "method": "POST", "csrf": "csrf-token", "body": '{"syncInterval":300}'}
+    ]
+
+    for scenario in UPDATE_INTERVAL_SCENARIOS:
+        if scenario["id"] == "ok":
+            continue
+        failed = results[scenario["id"]]
+        assert failed["status"] != "Saved", scenario["id"]
+        assert failed["status"].startswith("Not saved: "), scenario["id"]
+        assert failed["color"] == "#ff8a8a", scenario["id"]
+        # The dropdown goes back to the last confirmed value and the error stays visible.
+        assert failed["selected"] == "900", scenario["id"]
+        assert failed["saved"] == "900", scenario["id"]
+        assert failed["disabled"] is False, scenario["id"]
+        assert failed["timers"] == [], scenario["id"]
+        assert len(failed["requests"]) == 1, scenario["id"]
+        if scenario["body"] and "error" in scenario["body"]:
+            assert failed["status"] == "Not saved: " + scenario["body"]["error"], scenario["id"]
+    assert results["transport-failure"]["status"] == "Not saved: Failed to fetch"
+
+
+# Overlapping programmatic saves. Each step either changes the dropdown and
+# calls updateInterval(), settles a specific outstanding request (any order),
+# fires the timers still alive, or records a snapshot of the page state.
+OVERLAP_SCENARIOS = [
+    {
+        # The review case: 300 then 60 while 300 is in flight; the newer save
+        # fails after the older one succeeded. The dropdown must end on the
+        # acknowledged 300, the error must stay visible, and no stale
+        # "Saved" clear timer may wipe it.
+        "id": "later-failure-after-earlier-success",
+        "steps": [
+            {"set": "300"},
+            {"snapshot": "first-sent"},
+            {"set": "60"},
+            {"snapshot": "second-queued"},
+            {"settle": 0, "status": 200, "body": {"ok": True, "syncInterval": 300}},
+            {"snapshot": "first-acknowledged"},
+            {"settle": 1, "status": 500, "body": {"error": WRITE_ERROR}},
+            {"snapshot": "second-failed"},
+            {"fireTimers": True},
+        ],
+    },
+    {
+        "id": "both-succeed-in-order",
+        "steps": [
+            {"set": "300"},
+            {"set": "60"},
+            {"settle": 0, "status": 200, "body": {"ok": True, "syncInterval": 300}},
+            {"snapshot": "first-acknowledged"},
+            {"settle": 1, "status": 200, "body": {"ok": True, "syncInterval": 60}},
+            {"snapshot": "second-acknowledged"},
+            {"fireTimers": True},
+        ],
+    },
+    {
+        "id": "acknowledged-value-wins",
+        "steps": [
+            {"set": "300"},
+            {"settle": 0, "status": 200, "body": {"ok": True, "syncInterval": 60}},
+        ],
+    },
+    {
+        "id": "repeat-of-acknowledged-value-is-not-resent",
+        "steps": [
+            {"set": "300"},
+            {"set": "300"},
+            {"settle": 0, "status": 200, "body": {"ok": True, "syncInterval": 300}},
+        ],
+    },
+]
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required to execute the dashboard script")
+def test_dashboard_update_interval_serializes_overlapping_saves_and_cancels_stale_timers(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "CREDS_FILE", str(tmp_path / "creds.json"))
+    html = _render_dashboard()
+    script = tmp_path / "dashboard-interval.js"
+    script.write_text(_interval_script(html), encoding="utf-8")
+    scenarios = tmp_path / "scenarios.json"
+    scenarios.write_text(json.dumps(OVERLAP_SCENARIOS), encoding="utf-8")
+    harness = tmp_path / "harness.js"
+    harness.write_text(UPDATE_INTERVAL_HARNESS, encoding="utf-8")
+
+    run = subprocess.run(
+        [NODE, str(harness), str(script), str(scenarios)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert run.returncode == 0, run.stderr
+    results = {result["id"]: result for result in json.loads(run.stdout)}
+    assert set(results) == {scenario["id"] for scenario in OVERLAP_SCENARIOS}
+
+    review_case = results["later-failure-after-earlier-success"]
+    snaps = review_case["snapshots"]
+    first_sent = snaps["first-sent"]
+    assert first_sent["requests"] == ['{"syncInterval":300}']
+    assert first_sent["disabled"] is True
+    assert first_sent["status"] == "Saving..."
+    # The second call while one is in flight sends nothing and shares the pending promise.
+    queued = snaps["second-queued"]
+    assert queued["requests"] == ['{"syncInterval":300}']
+    assert queued["disabled"] is True
+    assert review_case["calls"][1]["sameAsFirst"] is True
+    # Once 300 is acknowledged the queued 60 goes out immediately, still
+    # serialized: the selector stays disabled and the "Saved" clear timer from
+    # the first save is cancelled before it can touch the second save's status.
+    acknowledged = snaps["first-acknowledged"]
+    assert acknowledged["status"] == "Saving..."
+    assert acknowledged["saved"] == "300"
+    assert acknowledged["requests"] == ['{"syncInterval":300}', '{"syncInterval":60}']
+    assert acknowledged["disabled"] is True
+    assert acknowledged["timers"] == [{"delay": 2000, "cleared": True, "fired": False}]
+    # The failure of 60 reverts to the acknowledged 300 (not the original 900),
+    # re-enables the selector and schedules nothing that could hide the error.
+    failed = snaps["second-failed"]
+    assert failed["status"] == "Not saved: " + WRITE_ERROR
+    assert failed["selected"] == "300"
+    assert failed["saved"] == "300"
+    assert failed["disabled"] is False
+    assert failed["timers"] == [{"delay": 2000, "cleared": True, "fired": False}]
+    # Firing whatever timers are still alive leaves the error visible.
+    assert snaps["final"]["status"] == "Not saved: " + WRITE_ERROR
+    assert snaps["final"]["selected"] == "300"
+
+    ordered = results["both-succeed-in-order"]["snapshots"]
+    assert ordered["first-acknowledged"]["saved"] == "300"
+    assert ordered["second-acknowledged"]["status"] == "Saved"
+    assert ordered["second-acknowledged"]["selected"] == "60"
+    assert ordered["second-acknowledged"]["saved"] == "60"
+    assert ordered["second-acknowledged"]["disabled"] is False
+    assert [t["cleared"] for t in ordered["second-acknowledged"]["timers"]] == [True, False]
+    # Only the live timer clears the "Saved" text.
+    assert ordered["final"]["status"] == ""
+    assert [t["fired"] for t in ordered["final"]["timers"]] == [False, True]
+
+    reconciled = results["acknowledged-value-wins"]["snapshots"]["final"]
+    assert reconciled["status"] == "Saved"
+    assert reconciled["selected"] == "60"
+    assert reconciled["saved"] == "60"
+    assert reconciled["disabled"] is False
+
+    repeated = results["repeat-of-acknowledged-value-is-not-resent"]
+    assert repeated["calls"][1]["sameAsFirst"] is True
+    assert repeated["snapshots"]["final"]["requests"] == ['{"syncInterval":300}']
+    assert repeated["snapshots"]["final"]["status"] == "Saved"
+    assert repeated["snapshots"]["final"]["disabled"] is False

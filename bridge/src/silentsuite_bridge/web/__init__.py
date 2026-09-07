@@ -852,6 +852,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 sel.value = '{{SYNC_INTERVAL}}';
                 // fallback if value doesn't match any option
                 if (sel.selectedIndex === -1) sel.value = '900';
+                // Remember the displayed value so a failed save can restore it.
+                sel.setAttribute('data-saved', sel.value);
             })();
             function setAccountStatus(message, isError) {
                 var el = document.getElementById('accountActionStatus');
@@ -939,7 +941,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 accountAction(
                     '/.web/api/accounts/remove',
                     button,
-                    'Remove {account}? This deletes local bridge credentials and that account\'s local decrypted bridge cache on this computer. Other accounts are not affected.'
+                    'Remove {account}? This deletes local bridge credentials and that account\\'s local decrypted bridge cache on this computer. Other accounts are not affected.'
                 );
             }
             function toggleFingerprint(id, button) {
@@ -1008,13 +1010,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         btn.disabled = false;
                     });
             }
+            // Interval saves are serialized: one request in flight at a time, the
+            // selector disabled meanwhile, and the latest choice made while a save
+            // is pending sent afterwards. Out-of-order responses therefore cannot
+            // pair one request's failure with another's "Saved".
+            var intervalSave = { pending: null, queued: null, clearTimer: null };
             function updateInterval() {
-                var val = document.getElementById('syncInterval').value;
+                var select = document.getElementById('syncInterval');
                 var st = document.getElementById('syncIntervalStatus');
-                fetch('/.web/api/settings', {method:'POST', headers:{'Content-Type':'application/json','X-SilentSuite-CSRF': window.SILENTSUITE_DASHBOARD_CSRF}, body: JSON.stringify({syncInterval: parseInt(val)})})
-                    .then(function(r) { return r.json(); })
-                    .then(function() { st.textContent = 'Saved'; setTimeout(function() { st.textContent = ''; }, 2000); })
-                    .catch(function() { st.textContent = 'Error'; });
+                if (intervalSave.pending) {
+                    intervalSave.queued = select.value;
+                    return intervalSave.pending;
+                }
+                var val = select.value;
+                // Last value the server acknowledged; restored when this save fails.
+                var previous = select.getAttribute('data-saved') || '';
+                if (intervalSave.clearTimer !== null) {
+                    clearTimeout(intervalSave.clearTimer);
+                    intervalSave.clearTimer = null;
+                }
+                select.disabled = true;
+                st.textContent = 'Saving...';
+                st.style.color = '#555';
+                // The promise is returned so the chain can be awaited in tests.
+                intervalSave.pending = fetch('/.web/api/settings', {method:'POST', headers:{'Content-Type':'application/json','X-SilentSuite-CSRF': window.SILENTSUITE_DASHBOARD_CSRF}, body: JSON.stringify({syncInterval: parseInt(val)})})
+                    .then(handleJsonResponse)
+                    .then(function(data) {
+                        // Reconcile with what the server acknowledged, not what was sent.
+                        var acknowledged = String(data.syncInterval);
+                        select.setAttribute('data-saved', acknowledged);
+                        select.value = acknowledged;
+                        st.textContent = 'Saved';
+                        st.style.color = '#555';
+                        intervalSave.clearTimer = setTimeout(function() {
+                            intervalSave.clearTimer = null;
+                            st.textContent = '';
+                        }, 2000);
+                    })
+                    .catch(function(error) {
+                        // Non-2xx (write failed, durability unconfirmed, lock held,
+                        // CSRF) or a transport failure: never report "Saved", show
+                        // the server's reason, and put the dropdown back.
+                        if (previous) select.value = previous;
+                        st.textContent = 'Not saved: ' + ((error && error.message) || 'request failed');
+                        st.style.color = '#ff8a8a';
+                    })
+                    .then(function() {
+                        intervalSave.pending = null;
+                        select.disabled = false;
+                        var queued = intervalSave.queued;
+                        intervalSave.queued = null;
+                        if (queued !== null && queued !== select.getAttribute('data-saved')) {
+                            select.value = queued;
+                            return updateInterval();
+                        }
+                    });
+                return intervalSave.pending;
             }
             // Live sync-status pill. Polls /api/progress every 2s so users see
             // a running sync without waiting for the 30s full-page refresh.
@@ -1458,10 +1509,27 @@ class Web(BaseWeb):
                 if new_interval < 30:
                     new_interval = 30  # enforce minimum
 
-                # Save to settings.json
-                settings = config.get_settings()
-                settings["syncInterval"] = new_interval
-                config.save_settings(settings)
+                # Save through the shared safe writer: settings.json also holds
+                # the durable network profile, which a failed write must not destroy.
+                try:
+                    config.save_settings({"syncInterval": new_interval})
+                except config.SettingsDurabilityError:
+                    return _json_response(
+                        500,
+                        {"error": "settings.json was replaced but not confirmed durable; retry to confirm the sync interval"},
+                    )
+                except config.SettingsLockError:
+                    # Another writer (for example --install-autostart) held the
+                    # settings lock; nothing was read or written.
+                    return _json_response(
+                        503,
+                        {"error": "Another bridge process is updating settings.json; the sync interval was not changed, retry shortly"},
+                    )
+                except (config.SettingsFileError, OSError):
+                    return _json_response(
+                        500,
+                        {"error": "Could not write settings.json; the sync interval was not changed"},
+                    )
 
                 # Update running config
                 config.SYNC_INTERVAL = new_interval
