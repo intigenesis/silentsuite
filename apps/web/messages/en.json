@@ -68,6 +68,8 @@
     "bodyPlaceholder": "Write in Markdown\u2026",
     "bodyLabel": "Note body",
     "nothingToPreview": "Nothing to preview yet.",
+    "imageBlocked": "Image not shown",
+    "imageBlockedWithAlt": "Image not shown: {alt}",
     "offlineMessage": "You are offline. Encrypted changes will sync when reconnected.",
     "backToNotes": "Back to notes",
     "subscriptionRequired": "Subscription required",

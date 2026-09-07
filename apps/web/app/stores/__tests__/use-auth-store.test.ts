@@ -1188,6 +1188,42 @@ describe('useAuthStore', () => {
     expect(offlineQueueClearAll).toHaveBeenCalledTimes(1)
   })
 
+  it('logout removes every persisted list store, including notebooks', async () => {
+    const persistedKeys = [
+      'silentsuite-calendar-lists',
+      'silentsuite-task-lists',
+      'silentsuite-contact-lists',
+      'silentsuite-notebooks',
+      'silentsuite-label-colors',
+    ]
+    for (const key of persistedKeys) localStorage.setItem(key, '{"state":{"lists":[{"id":"private"}]}}')
+    useAuthStore.setState({
+      user: { id: 'user-1', email: 'test@example.com', planId: 'pro' },
+      isAuthenticated: true,
+    })
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response)
+
+    await useAuthStore.getState().logout()
+
+    for (const key of persistedKeys) expect(localStorage.getItem(key)).toBeNull()
+  })
+
+  it('removes persisted notebooks even when the in-memory reset fails', async () => {
+    localStorage.setItem('silentsuite-notebooks', '{"state":{"lists":[{"id":"private"}]}}')
+    notebookSetState.mockImplementationOnce(() => {
+      throw new Error('notebook reset failed')
+    })
+    useAuthStore.setState({
+      user: { id: 'user-1', email: 'test@example.com', planId: 'pro' },
+      isAuthenticated: true,
+    })
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true } as Response)
+
+    await useAuthStore.getState().logout()
+
+    expect(localStorage.getItem('silentsuite-notebooks')).toBeNull()
+  })
+
   it('login clears the offline queue after Etebase credentials succeed but before storing a new session', async () => {
     const { secureSet } = await import('@/app/lib/secure-storage')
     vi.mocked(secureSet).mockClear()

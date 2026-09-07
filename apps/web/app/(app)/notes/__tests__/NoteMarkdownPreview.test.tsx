@@ -27,7 +27,55 @@ const HOSTILE_NOTE = [
   '[safe](https://example.com/page)',
 ].join('\n')
 
+// Anything that can make the browser issue a request on its own.
+const REQUEST_CAPABLE = 'img, picture, source, iframe, object, embed, video, audio, link, svg, image, track'
+
+const IMAGE_URLS = [
+  ['https', 'https://tracker.example/pixel.png'],
+  ['http', 'http://tracker.example/pixel.png'],
+  ['protocol-relative', '//tracker.example/pixel.png'],
+  ['root-relative', '/tracker.example/pixel.png'],
+  ['relative', 'tracker.example/pixel.png'],
+]
+
 describe('NoteMarkdownPreview', () => {
+  it.each(IMAGE_URLS)('never fetches a %s image in a note', (_kind, url) => {
+    const view = renderWithIntl(<NoteMarkdownPreview content={`![beacon](${url})`} />)
+
+    expect(view.container.querySelector(REQUEST_CAPABLE)).toBeNull()
+    expect(view.container.innerHTML).not.toContain('tracker.example')
+    expect(view.container.textContent).toContain('beacon')
+  })
+
+  it('blocks reference-style and title-carrying images too', () => {
+    const view = renderWithIntl(
+      <NoteMarkdownPreview
+        content={'![ref image][beacon]\n\n![titled](https://tracker.example/b.png "hover")\n\n[beacon]: https://tracker.example/ref.png'}
+      />,
+    )
+
+    expect(view.container.querySelector(REQUEST_CAPABLE)).toBeNull()
+    expect(view.container.innerHTML).not.toContain('tracker.example')
+  })
+
+  it('shows blocked-image alt text as escaped text, never as markup', () => {
+    const view = renderWithIntl(
+      <NoteMarkdownPreview content={'![<img src=x onerror="window.__note_xss = true">](https://tracker.example/c.png)'} />,
+    )
+
+    expect(view.container.querySelector(REQUEST_CAPABLE)).toBeNull()
+    expect(view.container.querySelector('[onerror], [onload]')).toBeNull()
+    expect(view.container.textContent).toContain('onerror="window.__note_xss = true"')
+    expect((window as { __note_xss?: boolean }).__note_xss).toBeUndefined()
+  })
+
+  it('uses a localized placeholder for an image with no alt text', () => {
+    const view = renderWithIntl(<NoteMarkdownPreview content="![](https://tracker.example/d.png)" />)
+
+    expect(view.container.querySelector(REQUEST_CAPABLE)).toBeNull()
+    expect(screen.getByText('Image not shown')).toBeInTheDocument()
+  })
+
   it('never turns raw HTML into DOM nodes and strips dangerous URL schemes', () => {
     const view = renderWithIntl(<NoteMarkdownPreview content={HOSTILE_NOTE} />)
 
@@ -36,10 +84,8 @@ describe('NoteMarkdownPreview', () => {
       expect(view.container.querySelector(tag)).toBeNull()
     }
     expect(view.container.querySelector('[onerror], [onload]')).toBeNull()
-    // The Markdown image survives as an element, but its javascript: source is gone.
-    for (const image of Array.from(view.container.querySelectorAll('img'))) {
-      expect(image.getAttribute('src') ?? '').toBe('')
-    }
+    // Markdown images never become elements at all, so no source can be fetched.
+    expect(view.container.querySelector('img')).toBeNull()
     // Raw HTML is displayed as escaped text instead.
     expect(view.container.textContent).toContain('<script>window.__note_xss = true</script>')
     expect(view.container.textContent).toContain('<img src=x onerror="window.__note_xss = true">')
