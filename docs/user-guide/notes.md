@@ -4,6 +4,8 @@ Your notes live at [app.silentsuite.io/notes](https://app.silentsuite.io/notes).
 
 Notes use the [Etebase Markdown notes](https://docs.etebase.com/type-specs/notes) collection type (`etebase.md.note`), so existing EteSync Notes notebooks on the same account appear in SilentSuite without conversion.
 
+Notes is an experimental feature, currently available only in the web app, including mobile browsers. Editing the same note on multiple devices at once may overwrite changes; avoid editing the same note simultaneously.
+
 ## Notebooks
 
 Notes are grouped into notebooks. Each notebook is its own encrypted collection, and you can share one the same way you share a calendar or task list.
@@ -34,7 +36,7 @@ The search box above the list matches note titles and text, within the notebook 
 
 ## Preview Markdown
 
-Click **Preview** to render the body, and click it again to return to editing. Standard Markdown is supported: headings, lists, links, code blocks, quotes. Raw HTML inside a note is shown as text, never executed.
+Click **Preview** to render the body, and click it again to return to editing. Standard Markdown is supported: headings, lists, links, code blocks, quotes. Raw HTML inside a note is shown as text, never executed. Images are never loaded in Markdown previews, so opening a note cannot leak your reading to the servers the images come from.
 
 ## Edit a Note
 
@@ -46,7 +48,9 @@ Open the note, click **Delete** in the row below the title, and confirm. The del
 
 ## Offline
 
-Edits made while offline are encrypted locally and replayed when you reconnect. Creating a brand-new note or moving one to another notebook requires a connection.
+Edits made while offline to a note that is already open are encrypted locally and replayed when you reconnect. Creating a brand-new note or moving one to another notebook requires a connection.
+
+Reloading the page while offline and reading previously opened notes depends on how the deployment is configured: it needs the encrypted local cache to be enabled, and it only covers notes already loaded on that device. Where the cache is not enabled, an offline reload cannot show your notes.
 
 ## Sharing
 
