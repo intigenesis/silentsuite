@@ -114,7 +114,7 @@ class EditCollectionFragment : Fragment() {
         desc.isSaveEnabled = false
 
         val meta = cachedCollection.meta
-        draft.initialize(meta.name.orEmpty(), meta.description, LocalCalendar.parseColor(meta.color))
+        draft.initialize(meta.name.orEmpty(), meta.description, LocalCalendar.parseColorOrNull(meta.color) ?: LocalCalendar.defaultColor)
         title.setText(draft.name)
         desc.setText(draft.description)
         title.addTextChangedListener(DraftWatcher { draft.name = it })

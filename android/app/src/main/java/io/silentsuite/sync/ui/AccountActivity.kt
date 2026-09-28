@@ -1252,8 +1252,9 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
             // Display only: a collection another client wrote with metadata this client cannot
             // decode is left off the card instead of failing the whole dashboard load.
             synchronized(etebaseLocalCache) {
-                return etebaseLocalCache.decodableCollectionList(colMgr, strType) { uid, error ->
-                    Logger.log.warning("Skipping a collection that could not be decoded (uid $uid): ${error.message}")
+                return etebaseLocalCache.decodableCollectionList(colMgr, strType) { _, error ->
+                    // The binding's message can quote a decrypted value; log only the exception class.
+                    Logger.log.warning("Skipping a collection that could not be decoded: ${error.javaClass.name}")
                 }
                     .map {
                         val meta = it.meta
@@ -1261,8 +1262,7 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
                         val isReadOnly = accessLevel == CollectionAccessLevel.ReadOnly
                         val isAdmin = accessLevel == CollectionAccessLevel.Admin
 
-                        val metaColor = meta.color
-                        val color = if (!metaColor.isNullOrBlank()) LocalCalendar.parseColor(metaColor) else null
+                        val color = LocalCalendar.parseColorOrNull(meta.color)
                         // Notebooks created by other clients may carry no name; the row falls back to the uid.
                         val displayName = if (type == CollectionInfo.Type.NOTES) meta.name.orEmpty() else meta.name!!
                         CollectionListItemInfo(it.col.uid, type, displayName, meta.description

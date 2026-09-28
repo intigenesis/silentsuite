@@ -31,6 +31,7 @@ import io.silentsuite.sync.ui.notes.NoteViewFragment
 import io.silentsuite.sync.ui.notes.NotebookListFragment
 import io.silentsuite.sync.ui.notes.NotebookRow
 import io.silentsuite.sync.ui.notes.NotesActivity
+import io.silentsuite.sync.ui.notes.NotesEmptyState
 import io.silentsuite.sync.ui.notes.NotesRuntimeFixture
 import io.silentsuite.sync.ui.notes.notesFixtureOverride
 import io.silentsuite.sync.ui.settings.SettingsCategory
@@ -188,18 +189,50 @@ class NotesRuntimeTest {
             NoteContent("note-old", "Older note", "# Older\nFirst line of the older note", 1_000L),
             NoteContent("note-new", "Newer note", "- item one\n- item two", 2_000L),
         ))
+        val identity = ExactAccountIdentity(account.type, account.name, generation)
+        // The cache starts empty, as it is before the first Notes sync fills it.
+        val rows = AtomicReference(emptyList<NotebookRow>())
+        val loads = java.util.concurrent.atomic.AtomicInteger()
         notesFixtureOverride = { _, exact, creationId ->
-            if (exact == account && creationId == generation) NotesRuntimeFixture(listOf(own, shared), notes) else null
+            loads.incrementAndGet()
+            if (exact == account && creationId == generation) NotesRuntimeFixture(rows.get(), notes) else null
         }
         NotesSyncCoordinator.runnerOverride = { _, _, _, _ -> }
         val routes = mutableListOf<Intent>()
         NotebookListFragment.notebookRouteLauncherOverride = { routes += Intent(it) }
         try {
             ActivityScenario.launch<NotesActivity>(NotesActivity.newIntent(context, account, generation)).use { scenario ->
-                waitUntil("notebooks rendered") { notebookFragment(scenario)?.renderedNotebooks?.size == 2 }
+                // Before any Notes sync has succeeded, an empty cache is not "no notebooks": no
+                // create prompt, and pull to refresh stays available.
+                waitUntil("unsynced empty state") { notebookFragment(scenario)?.renderedEmptyState == NotesEmptyState.NOT_SYNCED }
+                scenario.onActivity { activity ->
+                    assertEquals(View.GONE, activity.findViewById<View>(R.id.notebooks_create).visibility)
+                    assertEquals(View.VISIBLE, activity.findViewById<View>(R.id.notebooks_refresh).visibility)
+                    assertEquals(activity.getString(R.string.notes_not_synced),
+                        activity.findViewById<TextView>(R.id.notebooks_empty_text).text.toString())
+                }
+                // Once a Notes sync has succeeded, the same empty cache means there are none.
+                check(SyncStatusStore(context).recordSuccess(account, SyncStatusStore.Service.NOTES))
+                NotesSyncCoordinator.request(context, account, generation, NotesSyncPolicy.Trigger.SCREEN)
+                waitUntil("synced empty state") { notebookFragment(scenario)?.renderedEmptyState == NotesEmptyState.EMPTY }
+                var adapterBeforeRows: android.widget.ListAdapter? = null
+                scenario.onActivity { activity ->
+                    assertEquals(View.VISIBLE, activity.findViewById<View>(R.id.notebooks_create).visibility)
+                    adapterBeforeRows = activity.findViewById<ListView>(R.id.notebooks_list).adapter
+                }
+
+                // Enough notebooks that the list scrolls, so the kept position can be checked.
+                val fillers = (0 until 60).map { NotebookRow("nb-fill-$it", "Filler $it", "", null, readOnly = false, shared = false) }
+                rows.set(listOf(own, shared) + fillers)
+                NotesSyncCoordinator.request(context, account, generation, NotesSyncPolicy.Trigger.SCREEN)
+                waitUntil("notebooks rendered") { notebookFragment(scenario)?.renderedNotebooks?.size == 62 }
                 scenario.onActivity { activity ->
                     val list = activity.findViewById<ListView>(R.id.notebooks_list)
-                    assertEquals(2, list.adapter.count)
+                    assertTrue("a reload after sync updates the list's adapter in place, which keeps the scroll position",
+                        adapterBeforeRows === list.adapter)
+                    assertNull(notebookFragment(scenario)?.renderedEmptyState)
+                    assertEquals(View.GONE, activity.findViewById<View>(R.id.notebooks_empty).visibility)
+                    assertEquals(62, list.adapter.count)
                     val ownRow = list.adapter.getView(0, null, list)
                     assertEquals(View.GONE, ownRow.findViewById<View>(R.id.read_only).visibility)
                     assertEquals(View.GONE, ownRow.findViewById<View>(R.id.shared).visibility)
@@ -213,6 +246,20 @@ class NotesRuntimeTest {
                 assertEquals(account, routes.single().getParcelableExtra<Account>(CollectionActivity.EXTRA_ACCOUNT))
                 assertEquals(generation, routes.single().getStringExtra(CollectionActivity.EXTRA_CREATION_ID))
                 assertEquals("nb-shared", routes.single().getStringExtra(CollectionActivity.EXTRA_COLLECTION_UID))
+
+                scenario.onActivity { it.findViewById<ListView>(R.id.notebooks_list).setSelection(20) }
+                waitUntil("notebook list scrolled") { notebookListPosition(scenario) == 20 }
+                // A sync while the list is scrolled reloads it and must not move it.
+                val loadsBeforeSync = loads.get()
+                NotesSyncCoordinator.request(context, account, generation, NotesSyncPolicy.Trigger.SCREEN)
+                waitUntil("sync after scrolling settled") {
+                    !NotesSyncCoordinator.isActive(identity) && !NotesSyncCoordinator.isPending(identity) &&
+                        loads.get() > loadsBeforeSync
+                }
+                repeat(10) {
+                    assertEquals("the list stays where the user scrolled it", 20, notebookListPosition(scenario))
+                    android.os.SystemClock.sleep(100)
+                }
 
                 scenario.onActivity { activity ->
                     val list = activity.findViewById<ListView>(R.id.notebooks_list)
@@ -238,6 +285,14 @@ class NotesRuntimeTest {
                 scenario.onActivity { activity ->
                     assertEquals("Newer note", activity.findViewById<TextView>(R.id.note_title).text.toString())
                 }
+
+                // Back to the notebooks, through a recreation while they were on the back stack: the
+                // list comes back where the user left it.
+                scenario.onActivity { it.onSupportNavigateUp() }
+                waitUntil("notes rendered after going back") { noteListFragment(scenario)?.renderedNotes?.size == 2 }
+                scenario.onActivity { it.onSupportNavigateUp() }
+                waitUntil("notebooks rendered after going back") { notebookFragment(scenario)?.renderedNotebooks?.size == 62 }
+                waitUntil("notebook list position restored") { notebookListPosition(scenario) == 20 }
             }
         } finally {
             notesFixtureOverride = null
@@ -335,6 +390,12 @@ class NotesRuntimeTest {
         activity.supportFragmentManager.executePendingTransactions()
         val fragment = activity.supportFragmentManager.findFragmentById(android.R.id.content) as AppSettingsActivity.CategoryFragment
         return fragment.findPreference("notes_enabled")!!
+    }
+
+    private fun notebookListPosition(scenario: ActivityScenario<NotesActivity>): Int {
+        var position = -1
+        scenario.onActivity { position = it.findViewById<ListView?>(R.id.notebooks_list)?.firstVisiblePosition ?: -1 }
+        return position
     }
 
     private fun notebookFragment(scenario: ActivityScenario<NotesActivity>): NotebookListFragment? {

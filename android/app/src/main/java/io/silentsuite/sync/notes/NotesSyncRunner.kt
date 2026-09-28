@@ -7,6 +7,8 @@ import com.etebase.client.Collection
 import com.etebase.client.CollectionManager
 import com.etebase.client.FetchOptions
 import com.etebase.client.exceptions.ConnectionException
+import com.etebase.client.exceptions.NotFoundException
+import com.etebase.client.exceptions.PermissionDeniedException
 import com.etebase.client.exceptions.TemporaryServerErrorException
 import com.etebase.client.exceptions.UnauthorizedException
 import io.silentsuite.sync.AccountSettings
@@ -74,7 +76,7 @@ internal object NotesSyncRunner {
             }
             if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
 
-            HttpClient.Builder(appContext, settings).setForeground(false).build().use { httpClient ->
+            val outcome = HttpClient.Builder(appContext, settings).setForeground(false).build().use { httpClient ->
                 CollectionListRefresh.run(appContext, account, settings, httpClient.okHttpClient, forceRefresh = false)
                 if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
 
@@ -87,14 +89,12 @@ internal object NotesSyncRunner {
                 val notebooks = synchronized(cache) {
                     cache.collections(colMgr, type = Constants.ETEBASE_TYPE_NOTES)
                 }
-                for (notebook in notebooks) {
-                    if (Thread.interrupted()) throw InterruptedException()
-                    if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
+                fetchEachNotebook(notebooks, ::exactGenerationStillCurrent) { notebook ->
                     fetchNotebookItems(cache, colMgr, notebook)
                 }
             }
-            if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
-            recordSuccess()
+            if (outcome == NotebooksOutcome.STALE || !exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
+            if (outcome == NotebooksOutcome.SOME_FAILED) recordFailure(SyncStatusStore.FailureCategory.UNKNOWN) else recordSuccess()
         } catch (e: InterruptedException) {
             Logger.log.info("Notes sync cancelled")
             finishWithoutOutcome()
@@ -121,6 +121,62 @@ internal object NotesSyncRunner {
             Logger.log.log(Level.SEVERE, "Notes sync failed with an error", e)
             recordFailure(SyncStatusStore.FailureCategory.UNKNOWN)
         }
+    }
+
+    /** What one notebook's failed fetch means for the rest of the run. */
+    internal enum class NotebookFailure {
+        /**
+         * Credentials, connectivity, an unavailable server, or a permission denial: every other
+         * notebook would fail the same way. The server answers a read with 403 only for the whole
+         * account (for example a user no longer in the LDAP directory), never for one notebook.
+         */
+        ABORT_RUN,
+
+        /** The notebook was deleted or unshared after the list refresh (the server answers 404); the next refresh drops it. */
+        LOST_ACCESS,
+
+        /** A problem with this notebook alone: the others still sync, and the run is recorded as failed. */
+        NOTEBOOK_FAILED,
+    }
+
+    internal fun notebookFailure(e: Exception): NotebookFailure = when (e) {
+        is UnauthorizedException, is PermissionDeniedException, is ConnectionException,
+        is TemporaryServerErrorException -> NotebookFailure.ABORT_RUN
+        is NotFoundException -> NotebookFailure.LOST_ACCESS
+        else -> NotebookFailure.NOTEBOOK_FAILED
+    }
+
+    internal enum class NotebooksOutcome { ALL_FETCHED, SOME_FAILED, STALE }
+
+    /**
+     * Fetches each notebook in turn so one notebook cannot stop the others: only failures that
+     * would hit every notebook, and cancellation, end the run by propagating. STALE means the exact
+     * account generation went away between notebooks.
+     */
+    internal fun <T> fetchEachNotebook(notebooks: List<T>, stillCurrent: () -> Boolean, fetch: (T) -> Unit): NotebooksOutcome {
+        var failed = 0
+        for (notebook in notebooks) {
+            if (Thread.interrupted()) throw InterruptedException()
+            if (!stillCurrent()) return NotebooksOutcome.STALE
+            try {
+                fetch(notebook)
+            } catch (e: InterruptedException) {
+                throw e
+            } catch (e: Exception) {
+                when (notebookFailure(e)) {
+                    NotebookFailure.ABORT_RUN -> throw e
+                    NotebookFailure.LOST_ACCESS ->
+                        Logger.log.info("Skipping a notebook this account can no longer read: ${e.javaClass.name}")
+                    NotebookFailure.NOTEBOOK_FAILED -> {
+                        // A cancellation can surface as any exception; let the run record it as one.
+                        if (Thread.currentThread().isInterrupted) throw e
+                        Logger.log.log(Level.WARNING, "A notebook could not be synced; continuing with the others", e)
+                        failed++
+                    }
+                }
+            }
+        }
+        return if (failed > 0) NotebooksOutcome.SOME_FAILED else NotebooksOutcome.ALL_FETCHED
     }
 
     /**

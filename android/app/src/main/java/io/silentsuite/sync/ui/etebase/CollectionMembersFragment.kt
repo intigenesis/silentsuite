@@ -92,7 +92,7 @@ class CollectionMembersFragment : Fragment() {
         val meta = cachedCollection.meta
         val collectionType = cachedCollection.collectionType
         val colorSquare = v.findViewById<View>(R.id.color)
-        val color = LocalCalendar.parseColor(meta.color)
+        val color = LocalCalendar.parseColorOrNull(meta.color) ?: LocalCalendar.defaultColor
         when (collectionType) {
             Constants.ETEBASE_TYPE_CALENDAR -> {
                 colorSquare.setBackgroundColor(color)

@@ -275,6 +275,7 @@ class ListEntriesFragment : ListFragment(), AdapterView.OnItemClickListener {
                 }
             }
             Constants.ETEBASE_TYPE_ADDRESS_BOOK -> R.string.journal_entries_list_empty_contacts
+            Constants.ETEBASE_TYPE_NOTES -> R.string.journal_entries_list_empty_notes
             else -> R.string.journal_entries_list_empty
         }
     }

@@ -102,7 +102,7 @@ class ViewCollectionFragment : Fragment() {
         val isAdmin = col.accessLevel == CollectionAccessLevel.Admin
 
         val colorSquare = container.findViewById<View>(R.id.color)
-        val color = LocalCalendar.parseColor(meta.color)
+        val color = LocalCalendar.parseColorOrNull(meta.color) ?: LocalCalendar.defaultColor
         when (cachedCollection.collectionType) {
             Constants.ETEBASE_TYPE_CALENDAR -> {
                 colorSquare.setBackgroundColor(color)
@@ -148,7 +148,9 @@ class ViewCollectionFragment : Fragment() {
         super.onPrepareOptionsMenu(menu)
         // Notebooks have no import or export in this version: a generic text export would drop
         // note titles and the notebook structure, so the actions stay hidden rather than misleading.
-        val type = runtimeFixture(requireContext(), requireIdentity())?.type ?: collectionModel.value?.collectionType
+        // The identity carries the type from the start; the loaded collection can still be null
+        // here, for example right after the activity is restored.
+        val type = runtimeFixture(requireContext(), requireIdentity())?.type ?: requireIdentity().collectionType
         val notebook = type == Constants.ETEBASE_TYPE_NOTES
         menu.findItem(R.id.on_import)?.isVisible = !notebook
         menu.findItem(R.id.on_export)?.isVisible = !notebook

@@ -14,6 +14,7 @@ import io.silentsuite.sync.HttpClient
 import io.silentsuite.sync.InvalidAccountException
 import io.silentsuite.sync.log.Logger
 import io.silentsuite.sync.resource.LocalCalendar
+import io.silentsuite.sync.syncadapter.SyncStatusStore
 import io.silentsuite.sync.ui.setup.ExactAccountRouting
 import java.util.logging.Level
 
@@ -74,8 +75,9 @@ internal object NotesLoader {
             val itemMgr = colMgr.getItemManager(collection.col)
             // One note another app wrote in a shape this client cannot decode is left out, not
             // allowed to fail the whole notebook.
-            val notes = cache.decodableItemList(itemMgr, notebookUid) { uid, error ->
-                Logger.log.warning("Skipping a note that could not be decoded (uid $uid): ${error.message}")
+            val notes = cache.decodableItemList(itemMgr, notebookUid) { _, error ->
+                // The binding's message can quote a decrypted value; log only the exception class.
+                Logger.log.warning("Skipping a note that could not be decoded: ${error.javaClass.name}")
             }
                 .filter { isMarkdownNote(it.meta.itemType) }
                 .map { NoteRow(it.item.uid, titleOf(it.meta), previewOf(it.content), it.meta.mtime) }
@@ -95,6 +97,12 @@ internal object NotesLoader {
             if (cached.item.isDeleted || !isMarkdownNote(cached.meta.itemType)) return@load null
             NoteContent(cached.item.uid, titleOf(cached.meta), cached.content, cached.meta.mtime)
         }
+    }
+
+    /** Whether a Notes sync has ever succeeded for this account generation. Reads storage: call off the main thread. */
+    fun everSynced(context: Context, account: Account, creationId: String): Boolean {
+        val store = SyncStatusStore(context.applicationContext)
+        return store.status(store.identity(account, creationId), SyncStatusStore.Service.NOTES).lastSuccessAt != null
     }
 
     /**
@@ -120,17 +128,17 @@ internal object NotesLoader {
         notes.sortedWith(compareByDescending<NoteRow> { it.editedAt ?: Long.MIN_VALUE }.thenBy { it.title.lowercase() })
 
     private fun notebookRows(cache: EtebaseLocalCache, colMgr: CollectionManager): List<NotebookRow> =
-        cache.decodableCollectionList(colMgr, Constants.ETEBASE_TYPE_NOTES) { uid, error ->
-            Logger.log.warning("Skipping a notebook that could not be decoded (uid $uid): ${error.message}")
+        cache.decodableCollectionList(colMgr, Constants.ETEBASE_TYPE_NOTES) { _, error ->
+            // The binding's message can quote a decrypted value; log only the exception class.
+            Logger.log.warning("Skipping a notebook that could not be decoded: ${error.javaClass.name}")
         }
             .map { cached ->
                 val meta = cached.meta
-                val metaColor = meta.color
                 NotebookRow(
                     uid = cached.col.uid,
                     name = meta.name.orEmpty(),
                     description = meta.description.orEmpty(),
-                    color = if (!metaColor.isNullOrBlank()) LocalCalendar.parseColor(metaColor) else null,
+                    color = LocalCalendar.parseColorOrNull(meta.color),
                     readOnly = cached.col.accessLevel == CollectionAccessLevel.ReadOnly,
                     shared = cached.col.accessLevel != CollectionAccessLevel.Admin,
                 )

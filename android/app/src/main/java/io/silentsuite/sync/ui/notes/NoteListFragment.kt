@@ -3,6 +3,7 @@ package io.silentsuite.sync.ui.notes
 import android.accounts.Account
 import android.content.Context
 import android.os.Bundle
+import android.os.Parcelable
 import android.text.format.DateUtils
 import android.view.LayoutInflater
 import android.view.View
@@ -29,8 +30,19 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
     private lateinit var creationId: String
     private lateinit var notebookUid: String
     private var swipe: SwipeRefreshLayout? = null
+    private var list: ListView? = null
+    // One adapter per view, updated in place, so a reload after each sync keeps the scroll position.
+    private var noteAdapter: NoteRowAdapter? = null
+    // Scroll position to put back once rows arrive after returning from a note.
+    private var listState: Parcelable? = null
+    private var loaded = false
+    private var everSynced = false
 
     internal var renderedNotes: List<NoteRow> = emptyList()
+        private set
+
+    /** What the empty list currently says, or null while rows show; observation point for runtime tests. */
+    internal var renderedEmptyState: NotesEmptyState? = null
         private set
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -38,6 +50,7 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
         account = requireNotNull(requireArguments().getParcelable(ARG_ACCOUNT))
         creationId = requireNotNull(requireArguments().getString(ARG_CREATION_ID))
         notebookUid = requireNotNull(requireArguments().getString(ARG_NOTEBOOK_UID))
+        listState = savedInstanceState?.getParcelable(STATE_LIST)
     }
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View =
@@ -45,6 +58,20 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        loaded = false
+        val rowsAdapter = NoteRowAdapter(requireContext()).also { noteAdapter = it }
+        list = view.findViewById<ListView>(R.id.notes_list).apply {
+            adapter = rowsAdapter
+            setOnItemClickListener { _, _, position, _ ->
+                val note = renderedNotes.getOrNull(position) ?: return@setOnItemClickListener
+                val host = host() ?: return@setOnItemClickListener
+                if (!host.exactAccountStillCurrent()) { host.finish(); return@setOnItemClickListener }
+                parentFragmentManager.commit {
+                    replace(R.id.fragment_container, NoteViewFragment.newInstance(account, creationId, notebookUid, note.uid))
+                    addToBackStack(NoteViewFragment::class.java.name)
+                }
+            }
+        }
         swipe = view.findViewById<SwipeRefreshLayout>(R.id.notes_refresh_layout).apply {
             setColorSchemeResources(R.color.semantic_primary, R.color.semantic_secondary_action, R.color.semantic_success, R.color.semantic_focus)
             setOnRefreshListener {
@@ -53,15 +80,9 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
                 NotesSyncCoordinator.request(host.applicationContext, account, creationId, NotesSyncPolicy.Trigger.SCREEN)
                 renderSyncState()
             }
-        }
-        view.findViewById<ListView>(R.id.notes_list).setOnItemClickListener { _, _, position, _ ->
-            val note = renderedNotes.getOrNull(position) ?: return@setOnItemClickListener
-            val host = host() ?: return@setOnItemClickListener
-            if (!host.exactAccountStillCurrent()) { host.finish(); return@setOnItemClickListener }
-            parentFragmentManager.commit {
-                replace(R.id.fragment_container, NoteViewFragment.newInstance(account, creationId, notebookUid, note.uid))
-                addToBackStack(NoteViewFragment::class.java.name)
-            }
+            // The direct child is a FrameLayout holding the list and the empty text, so ask the
+            // list itself whether it can still scroll up.
+            setOnChildScrollUpCallback { _, _ -> list?.canScrollVertically(-1) == true }
         }
     }
 
@@ -77,26 +98,51 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
         super.onStop()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // A position still waiting for rows wins over the live list, which is empty until they arrive.
+        (listState ?: list?.onSaveInstanceState())?.let { outState.putParcelable(STATE_LIST, it) }
+    }
+
+    override fun onDestroyView() {
+        // Only a view that goes away needs its position kept; while it lives, updating the adapter
+        // in place already keeps it.
+        if (listState == null && loaded) list?.let { listState = it.onSaveInstanceState() }
+        list = null
+        swipe = null
+        noteAdapter = null
+        super.onDestroyView()
+    }
+
     override fun onNotesSyncStateChanged(identity: ExactAccountIdentity) {
         if (identity != host()?.identity()) return
-        renderSyncState()
-        if (!NotesSyncCoordinator.isActive(identity)) reload()
+        swipe?.isRefreshing = syncing(identity)
+        // A run that is not active reloads, and that result, with fresh sync evidence, decides the
+        // empty text; rendering it now would flash "not synced" right after a first success.
+        if (NotesSyncCoordinator.isActive(identity)) renderEmptyState() else reload()
     }
 
     private fun host(): NotesActivity? = activity as? NotesActivity
 
+    private fun syncing(identity: ExactAccountIdentity) =
+        NotesSyncCoordinator.isActive(identity) || NotesSyncCoordinator.isPending(identity)
+
     private fun renderSyncState() {
         val identity = host()?.identity() ?: return
-        swipe?.isRefreshing = NotesSyncCoordinator.isActive(identity) || NotesSyncCoordinator.isPending(identity)
+        swipe?.isRefreshing = syncing(identity)
+        renderEmptyState()
     }
 
     private fun reload() {
         val host = host() ?: return
         val appContext = host.applicationContext
         viewLifecycleOwner.lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) { NotesLoader.notebook(appContext, account, creationId, notebookUid) }
+            val (result, synced) = withContext(Dispatchers.IO) {
+                NotesLoader.notebook(appContext, account, creationId, notebookUid) to NotesLoader.everSynced(appContext, account, creationId)
+            }
             val view = view ?: return@launch
             val current = host() ?: return@launch
+            everSynced = synced
             when (result) {
                 is NotesLoad.Stale -> current.finish()
                 is NotesLoad.Failed -> {
@@ -111,16 +157,46 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
 
     private fun render(view: View, contents: NotebookContents) {
         renderedNotes = contents.notes
+        loaded = true
         host()?.title = contents.notebook.name.ifBlank { getString(R.string.notes_untitled) }
         view.findViewById<TextView>(R.id.note_list_read_only).apply {
             text = getString(R.string.notes_read_only_hint)
             visibility = View.VISIBLE
         }
-        view.findViewById<ListView>(R.id.notes_list).adapter = NoteRowAdapter(requireContext(), contents.notes)
-        view.findViewById<View>(R.id.notes_empty).visibility = if (contents.notes.isEmpty()) View.VISIBLE else View.GONE
+        noteAdapter?.apply {
+            setNotifyOnChange(false)
+            clear()
+            addAll(contents.notes)
+            notifyDataSetChanged()
+        }
+        if (contents.notes.isNotEmpty()) listState?.let { state ->
+            list?.onRestoreInstanceState(state)
+            listState = null
+        }
+        renderEmptyState()
     }
 
-    private class NoteRowAdapter(context: Context, notes: List<NoteRow>) : ArrayAdapter<NoteRow>(context, R.layout.note_list_item, notes) {
+    private fun renderEmptyState() {
+        val view = view ?: return
+        val identity = host()?.identity() ?: return
+        val empty = loaded && renderedNotes.isEmpty()
+        view.findViewById<View>(R.id.notes_empty).visibility = if (empty) View.VISIBLE else View.GONE
+        if (!empty) {
+            renderedEmptyState = null
+            return
+        }
+        // A failed load leaves this screen, so only the sync states apply here.
+        val state = NotesEmptyState.of(syncing(identity), loadFailed = false, everSynced)
+        renderedEmptyState = state
+        view.findViewById<TextView>(R.id.notes_empty).setText(when (state) {
+            NotesEmptyState.SYNCING -> R.string.notes_syncing_notes
+            NotesEmptyState.NOT_SYNCED -> R.string.notes_not_synced
+            NotesEmptyState.FAILED -> R.string.notes_loading_failed
+            NotesEmptyState.EMPTY -> R.string.notes_empty_notes
+        })
+    }
+
+    private class NoteRowAdapter(context: Context) : ArrayAdapter<NoteRow>(context, R.layout.note_list_item) {
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
             val view = convertView ?: LayoutInflater.from(context).inflate(R.layout.note_list_item, parent, false)
             val note = getItem(position)!!
@@ -145,6 +221,7 @@ class NoteListFragment : Fragment(), NotesSyncCoordinator.Listener {
         private const val ARG_ACCOUNT = "notes.account"
         private const val ARG_CREATION_ID = "notes.creationId"
         private const val ARG_NOTEBOOK_UID = "notes.notebookUid"
+        private const val STATE_LIST = "notes.noteList"
 
         fun newInstance(account: Account, creationId: String, notebookUid: String) = NoteListFragment().apply {
             arguments = Bundle().apply {
