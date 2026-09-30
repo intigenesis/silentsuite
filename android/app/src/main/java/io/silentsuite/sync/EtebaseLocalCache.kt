@@ -27,8 +27,25 @@ class EtebaseLocalCache private constructor(context: Context, username: String) 
         return File(colDir, "items")
     }
 
+    /**
+     * Held for each check-then-write of a sync run ([writeIfCurrent]) and by [clearUserCache], so
+     * a sign-out cleanup never falls between a run's generation check and its write. Never held
+     * across a network call, so cleanup never waits on one. Taken after this instance's monitor
+     * where both are held, and never the other way round.
+     */
+    private val writeFence = Any()
+
+    /** Runs [write] and returns true only if [mayWrite] still holds, with no cleanup in between. */
+    fun writeIfCurrent(mayWrite: () -> Boolean, write: () -> Unit): Boolean = synchronized(writeFence) {
+        if (!mayWrite()) return@synchronized false
+        write()
+        true
+    }
+
     private fun clearUserCache() {
-        fsCache.clearUserCache()
+        synchronized(writeFence) {
+            fsCache.clearUserCache()
+        }
     }
 
     fun saveStoken(stoken: String) {

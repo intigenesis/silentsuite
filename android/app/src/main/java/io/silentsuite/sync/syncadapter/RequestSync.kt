@@ -72,6 +72,7 @@ fun requestSync(
     }
 
     if (account != null && notesCreationId != null) {
-        NotesSyncCoordinator.request(context, account, notesCreationId, NotesSyncPolicy.Trigger.MANUAL, requestId)
+        NotesSyncCoordinator.request(context, account, notesCreationId, NotesSyncPolicy.Trigger.MANUAL, requestId,
+            forceRefresh = forceCollectionRefresh)
     }
 }

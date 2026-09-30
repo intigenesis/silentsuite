@@ -10,6 +10,7 @@ import com.etebase.client.exceptions.TemporaryServerErrorException
 import com.etebase.client.exceptions.UnauthorizedException
 import io.silentsuite.sync.notes.NotesSyncRunner.NotebookFailure
 import io.silentsuite.sync.notes.NotesSyncRunner.NotebooksOutcome
+import io.silentsuite.sync.syncadapter.StaleSyncRunException
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
@@ -106,6 +107,21 @@ class NotesSyncRunnerNotebookFailureTest {
             fail("an interrupted run must propagate")
         } catch (_: ServerErrorException) {
             assertTrue(Thread.currentThread().isInterrupted)
+        }
+        assertEquals(listOf("a"), fetched)
+    }
+
+    @Test fun `a run that may no longer write stops, instead of counting one failed notebook`() {
+        // The guard refused a page write: the account was replaced, the run was cancelled, or
+        // Notes was turned off while that notebook's page was in flight.
+        val fetched = mutableListOf<String>()
+        try {
+            NotesSyncRunner.fetchEachNotebook(listOf("a", "b", "c"), { true }) { notebook ->
+                if (notebook == "b") throw StaleSyncRunException()
+                fetched += notebook
+            }
+            fail("a stale run must propagate")
+        } catch (_: StaleSyncRunException) {
         }
         assertEquals(listOf("a"), fetched)
     }

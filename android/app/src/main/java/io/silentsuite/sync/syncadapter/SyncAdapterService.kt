@@ -173,6 +173,11 @@ abstract class SyncAdapterService : Service() {
                 // Shouldn't be needed - not sure why it doesn't fail
                 onSecurityException(account, extras, authority, syncResult)
                 persistStatus(syncResult) { recordFailure(account, extras, SyncStatusStore.FailureCategory.PERMISSION) }
+            } catch (e: StaleSyncRunException) {
+                // The account was removed or replaced while the collection list was in flight:
+                // nothing was written for it, and there is no failure to report to the new one.
+                Logger.log.info("Sync stopped: the account generation changed during the collection refresh")
+                persistStatus(syncResult) { finishWithoutOutcome(account, extras) }
             } catch (e: TemporaryServerErrorException) {
                 syncResult.stats.numIoExceptions++
                 syncResult.delayUntil = Constants.DEFAULT_RETRY_DELAY
@@ -314,9 +319,12 @@ abstract class SyncAdapterService : Service() {
             internal fun run() {
                 Logger.log.info("Refreshing " + serviceType + " collections of service #" + serviceType.toString() + if (forceRefresh) " (forced)" else "")
 
+                // The generation this refresh writes for, read with the settings (and session) it uses.
+                val creationId = AccountManager.get(context).getUserData(account, AccountSettings.KEY_CREATION_ID)
+                    ?.takeIf { it.isNotBlank() }
                 val settings = AccountSettings(context, account)
                 HttpClient.Builder(context, settings).setForeground(false).build().use { httpClient ->
-                    CollectionListRefresh.run(context, account, settings, httpClient.okHttpClient, forceRefresh)
+                    CollectionListRefresh.run(context, account, settings, httpClient.okHttpClient, forceRefresh, creationId)
                 }
             }
         }

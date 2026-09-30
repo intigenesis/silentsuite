@@ -32,6 +32,12 @@ object NotesSyncCoordinator {
     private val lock = Any()
     private val slots = HashMap<ExactAccountIdentity, NotesSyncPolicy.Slot>()
     private val futures = HashMap<ExactAccountIdentity, Future<*>>()
+
+    /**
+     * The token of the run in progress for each identity. [cancel] removes it, so a run learns it
+     * was cancelled even when its interrupt was consumed inside a network call.
+     */
+    private val runs = HashMap<ExactAccountIdentity, Any>()
     private val listeners = CopyOnWriteArrayList<Listener>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
@@ -42,18 +48,23 @@ object NotesSyncCoordinator {
     @VisibleForTesting
     @JvmField internal var runnerOverride: ((Context, Account, String, NotesSyncRunner.Request) -> Unit)? = null
 
+    /**
+     * @param forceRefresh list the collections from scratch rather than from the saved cursor, as
+     * the adapters do after an invitation is accepted; kept through coalescing (see [NotesSyncPolicy]).
+     */
     fun request(
         context: Context,
         account: Account,
         creationId: String,
         trigger: NotesSyncPolicy.Trigger,
         requestId: String? = null,
+        forceRefresh: Boolean = false,
     ): NotesSyncPolicy.Decision {
         require(creationId.isNotBlank()) { "Notes sync needs the exact account generation" }
         val identity = ExactAccountIdentity(account.type, account.name, creationId)
         val decision: NotesSyncPolicy.Decision
         synchronized(lock) {
-            val (next, decided) = policy.request(slots[identity] ?: NotesSyncPolicy.Slot(), trigger, requestId)
+            val (next, decided) = policy.request(slots[identity] ?: NotesSyncPolicy.Slot(), trigger, requestId, forceRefresh)
             slots[identity] = next
             decision = decided
             if (decision == NotesSyncPolicy.Decision.START) submit(context.applicationContext, account, identity)
@@ -81,6 +92,7 @@ object NotesSyncCoordinator {
         synchronized(lock) {
             future = futures.remove(identity)
             slots.remove(identity)
+            runs.remove(identity)
         }
         future?.cancel(true)
         notify(identity)
@@ -91,6 +103,14 @@ object NotesSyncCoordinator {
         val matching = synchronized(lock) { slots.keys.filter { it.type == type && it.name == name } }
         matching.forEach(::cancel)
     }
+
+    /**
+     * Test seam: waits until every job submitted before this call has finished, cancelled ones
+     * included (the single executor runs them in order). False if that took longer than [timeoutMillis].
+     */
+    @VisibleForTesting
+    internal fun drainForTesting(timeoutMillis: Long): Boolean =
+        runCatching { executor.submit {}.get(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS) }.isSuccess
 
     /** Process-only diagnostic for runtime tests; never used in production paths. */
     @VisibleForTesting
@@ -112,31 +132,42 @@ object NotesSyncCoordinator {
     }
 
     private fun execute(appContext: Context, account: Account, identity: ExactAccountIdentity) {
-        val running: NotesSyncPolicy.Slot
+        val request: NotesSyncRunner.Request
+        val token = Any()
         synchronized(lock) {
             val slot = slots[identity]
             // A cancellation between submission and start leaves nothing to run.
             if (slot == null || slot.state != NotesSyncPolicy.State.PENDING) return
-            running = policy.started(slot)
-            slots[identity] = running
+            runs[identity] = token
+            request = NotesSyncRunner.Request(slot.queuedRequestId, slot.manual, slot.forceRefresh) {
+                synchronized(lock) { runs[identity] === token }
+            }
+            slots[identity] = policy.started(slot)
         }
         notify(identity)
+        var listedCollections = false
         try {
-            val request = NotesSyncRunner.Request(running.queuedRequestId, running.manual)
-            runnerOverride?.invoke(appContext, account, identity.creationId, request)
-                ?: NotesSyncRunner.run(appContext, account, identity.creationId, request)
+            val override = runnerOverride
+            listedCollections = if (override != null) {
+                override(appContext, account, identity.creationId, request)
+                true
+            } else {
+                NotesSyncRunner.run(appContext, account, identity.creationId, request)
+            }
         } catch (e: Throwable) {
             // The runner records its own outcomes; anything escaping it must not kill the executor.
             Logger.log.log(Level.SEVERE, "Notes sync job failed unexpectedly", e)
         } finally {
             synchronized(lock) {
+                if (runs[identity] === token) runs.remove(identity)
                 val slot = slots[identity]
                 // Only settle the slot this run owns. After cancel() removed it, a PENDING slot in
                 // the map belongs to a newer request whose queued task must be left alone.
                 if (slot != null && slot.state == NotesSyncPolicy.State.RUNNING) {
-                    val (next, _) = policy.finished(slot)
+                    val (next, _) = policy.finished(slot, forcedRefreshOwed = request.forceRefresh && !listedCollections)
                     if (next.state == NotesSyncPolicy.State.IDLE) {
-                        slots.remove(identity)
+                        // An idle slot stays only to carry a forced refresh this run still owes.
+                        if (next.forceRefresh) slots[identity] = next else slots.remove(identity)
                         futures.remove(identity)
                     } else {
                         slots[identity] = next

@@ -84,4 +84,79 @@ class NotesSyncPolicyTest {
         val result = runCatching { policy.started(NotesSyncPolicy.Slot()) }
         assertTrue(result.exceptionOrNull() is IllegalStateException)
     }
+
+    // ---- a forced collection refresh (after an invitation is accepted) ----
+
+    @Test fun `a forced refresh starts a forced run and survives every merge into a pending run`() {
+        val (forced, decision) = policy.request(NotesSyncPolicy.Slot(), Trigger.MANUAL, "accept", forceRefresh = true)
+        assertEquals(Decision.START, decision)
+        assertTrue(forced.forceRefresh)
+        val (afterPiggyback, _) = policy.request(forced, Trigger.PIGGYBACK, null)
+        assertTrue("a later automatic request never clears it", afterPiggyback.forceRefresh)
+
+        val pending = policy.request(NotesSyncPolicy.Slot(), Trigger.SCREEN_OPEN, null).first
+        assertFalse(pending.forceRefresh)
+        val (merged, mergedDecision) = policy.request(pending, Trigger.MANUAL, "accept", forceRefresh = true)
+        assertEquals(Decision.COALESCED, mergedDecision)
+        assertTrue("a forced request upgrades the pending run", merged.forceRefresh)
+        assertEquals("accept", merged.queuedRequestId)
+    }
+
+    @Test fun `a forced refresh during a run always queues a forced follow-up, even from an automatic trigger`() {
+        val running = policy.started(policy.request(NotesSyncPolicy.Slot(), Trigger.SCREEN_OPEN, null).first)
+        val (afterUser, userDecision) = policy.request(running, Trigger.MANUAL, "accept", forceRefresh = true)
+        assertEquals(Decision.COALESCED, userDecision)
+        assertTrue(afterUser.rerun)
+        assertTrue(afterUser.forceRefresh)
+        val (next, runAgain) = policy.finished(afterUser)
+        assertTrue(runAgain)
+        assertEquals(State.PENDING, next.state)
+        assertTrue("the follow-up run lists from scratch", next.forceRefresh)
+
+        // The running run may already be past its listing, so a forced request is never dropped.
+        val (afterAutomatic, automaticDecision) = policy.request(running, Trigger.PIGGYBACK, null, forceRefresh = true)
+        assertEquals(Decision.COALESCED, automaticDecision)
+        assertTrue(afterAutomatic.rerun)
+        assertTrue(afterAutomatic.forceRefresh)
+        assertFalse("an automatic request does not bypass Wi-Fi-only", afterAutomatic.manual)
+
+        // The same while a user's run is in progress: the follow-up is still automatic.
+        val runningManual = policy.started(policy.request(NotesSyncPolicy.Slot(), Trigger.MANUAL, "sync-now").first)
+        val (automaticFollowUp, _) = policy.finished(policy.request(runningManual, Trigger.PIGGYBACK, null, forceRefresh = true).first)
+        assertTrue(automaticFollowUp.forceRefresh)
+        assertFalse("it does not inherit the running run's Wi-Fi-only bypass", automaticFollowUp.manual)
+        assertNull("nor its request id, which that run closes", automaticFollowUp.queuedRequestId)
+
+        // A user follow-up that was already queued keeps its request id and bypass.
+        val queued = policy.request(runningManual, Trigger.TOGGLE, "toggle").first
+        val (userFollowUp, _) = policy.finished(policy.request(queued, Trigger.PIGGYBACK, null, forceRefresh = true).first)
+        assertTrue(userFollowUp.forceRefresh)
+        assertTrue(userFollowUp.manual)
+        assertEquals("toggle", userFollowUp.queuedRequestId)
+    }
+
+    @Test fun `a run takes its forced refresh when it starts, so only a later one reaches the follow-up`() {
+        val forced = policy.request(NotesSyncPolicy.Slot(), Trigger.MANUAL, "accept", forceRefresh = true).first
+        val running = policy.started(forced)
+        assertFalse("the running run took it; the slot now collects for a follow-up", running.forceRefresh)
+        val (afterScreen, _) = policy.request(running, Trigger.SCREEN, null)
+        val (next, _) = policy.finished(afterScreen)
+        assertFalse("a plain follow-up is not forced", next.forceRefresh)
+    }
+
+    @Test fun `a forced run that did not finish its listing leaves the force owed to the next run`() {
+        val running = policy.started(policy.request(NotesSyncPolicy.Slot(), Trigger.MANUAL, "accept", forceRefresh = true).first)
+        val (idle, runAgain) = policy.finished(running, forcedRefreshOwed = true)
+        assertFalse("nothing is scheduled by itself, so a failure cannot loop", runAgain)
+        assertEquals(State.IDLE, idle.state)
+        assertTrue(idle.forceRefresh)
+        val (next, decision) = policy.request(idle, Trigger.SCREEN_OPEN, null)
+        assertEquals(Decision.START, decision)
+        assertTrue("the next run of any kind lists from scratch", next.forceRefresh)
+
+        val withFollowUp = policy.request(running, Trigger.SCREEN, null).first
+        assertTrue("an owed force also joins a follow-up already queued",
+            policy.finished(withFollowUp, forcedRefreshOwed = true).first.forceRefresh)
+        assertEquals("a run that finished its listing owes nothing", NotesSyncPolicy.Slot(), policy.finished(running).first)
+    }
 }

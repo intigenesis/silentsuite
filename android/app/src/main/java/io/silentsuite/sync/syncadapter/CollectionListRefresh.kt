@@ -31,20 +31,33 @@ internal object CollectionListRefresh {
     /** The saved cursor is only valid for the exact type set it was produced with. */
     internal val discoveryTypesKey: String = Constants.SYNCED_COLLECTION_TYPES.joinToString(",")
 
+    /**
+     * @param creationId the account generation this run belongs to, read together with [settings].
+     * Every write after a list request goes through a [SyncRunGuard]: once that generation is gone,
+     * or [stillWanted] turns false, nothing more is written and the run ends with
+     * [StaleSyncRunException].
+     */
     fun run(
         context: Context,
         account: Account,
         settings: AccountSettings,
         httpClient: OkHttpClient,
         forceRefresh: Boolean,
+        creationId: String?,
+        stillWanted: () -> Boolean = { true },
     ) {
+        val guard = SyncRunGuard(context, account, creationId, stillWanted)
         val etebaseLocalCache = EtebaseLocalCache.getInstance(context, account.name)
         synchronized(etebaseLocalCache) {
+            // The burst window belongs to one account generation, so a same-name account that
+            // replaced this one is never skipped because the old one listed a moment ago.
+            val fetchKey = "${account.name}\u0000${creationId.orEmpty()}"
             val now = System.currentTimeMillis()
-            val lastCollectionsFetch = collectionLastFetchMap[account.name] ?: 0
+            val lastCollectionsFetch = collectionLastFetchMap[fetchKey] ?: 0
             if (!forceRefresh && abs(now - lastCollectionsFetch) <= CACHE_AGE_MILLIS) {
                 return@synchronized
             }
+            guard.check()
 
             val etebase = EtebaseLocalCache.getEtebase(context, httpClient, settings)
             val colMgr = etebase.collectionManager
@@ -61,34 +74,37 @@ internal object CollectionListRefresh {
                 var stoken = startStoken
                 var done = false
                 while (!done) {
+                    guard.check()
                     val colList = colMgr.list(Constants.SYNCED_COLLECTION_TYPES, FetchOptions().stoken(stoken))
-                    for (col in colList.data) {
-                        etebaseLocalCache.collectionSet(colMgr, col)
-                    }
+                    // A page is written only if this run is still current when its answer arrives.
+                    guard.write(etebaseLocalCache) {
+                        for (col in colList.data) {
+                            etebaseLocalCache.collectionSet(colMgr, col)
+                        }
 
-                    for (col in colList.removedMemberships) {
-                        etebaseLocalCache.collectionUnset(colMgr, col.uid())
-                    }
+                        for (col in colList.removedMemberships) {
+                            etebaseLocalCache.collectionUnset(colMgr, col.uid())
+                        }
 
+                        colList.stoken?.let { etebaseLocalCache.saveStoken(it) }
+                    }
                     stoken = colList.stoken
                     done = colList.isDone
-                    if (stoken != null) {
-                        etebaseLocalCache.saveStoken(stoken)
-                    }
                 }
             }
 
-            if (discoveryChanged && !forceRefresh) {
+            if (forceRefresh || discoveryChanged) {
                 // A cursor-free listing has no "since" point and reports no removed memberships, so
-                // apply everything pending under the old cursor first.
+                // apply everything pending under the old cursor first. Otherwise a collection this
+                // account lost since the last listing would stay cached for good.
                 etebaseLocalCache.loadStoken()?.let { listFrom(it) }
             }
             var stoken = if (forceRefresh || discoveryChanged) null else etebaseLocalCache.loadStoken()
             listFrom(stoken)
-            if (discoveryChanged) {
-                AccountSettings.writeCollectionListTypes(manager, account, discoveryTypesKey)
+            guard.write(etebaseLocalCache) {
+                if (discoveryChanged) AccountSettings.writeCollectionListTypes(manager, account, discoveryTypesKey)
+                collectionLastFetchMap[fetchKey] = now
             }
-            collectionLastFetchMap[account.name] = now
         }
     }
 }

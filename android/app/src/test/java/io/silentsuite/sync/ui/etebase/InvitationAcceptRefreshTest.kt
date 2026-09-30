@@ -56,7 +56,7 @@ class InvitationAcceptRefreshTest {
         )
         assertTrue(
             "the adapter must hand the forced flag to the shared collection-list refresh",
-            syncAdapterSource.contains("CollectionListRefresh.run(context, account, settings, httpClient.okHttpClient, forceRefresh)")
+            syncAdapterSource.contains("CollectionListRefresh.run(context, account, settings, httpClient.okHttpClient, forceRefresh, creationId)")
         )
         assertTrue(
             "forced refresh must bypass the 5 second collection refresh suppression",

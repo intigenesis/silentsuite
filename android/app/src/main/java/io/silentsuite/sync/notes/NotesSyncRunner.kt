@@ -16,9 +16,12 @@ import io.silentsuite.sync.App
 import io.silentsuite.sync.Constants
 import io.silentsuite.sync.EtebaseLocalCache
 import io.silentsuite.sync.HttpClient
+import io.silentsuite.sync.InvalidAccountException
 import io.silentsuite.sync.billing.BillingManager
 import io.silentsuite.sync.log.Logger
 import io.silentsuite.sync.syncadapter.CollectionListRefresh
+import io.silentsuite.sync.syncadapter.StaleSyncRunException
+import io.silentsuite.sync.syncadapter.SyncRunGuard
 import io.silentsuite.sync.syncadapter.SyncStatusStore
 import io.silentsuite.sync.syncadapter.syncConditionsAllow
 import io.silentsuite.sync.ui.setup.ExactAccountRouting
@@ -32,15 +35,30 @@ import java.util.logging.Level
  * outcome is recorded into [SyncStatusStore] under the NOTES service exactly like an adapter would.
  */
 internal object NotesSyncRunner {
-    /** @property manual user-initiated runs ignore the Wi-Fi-only restriction, like manual adapter syncs. */
-    data class Request(val requestId: String?, val manual: Boolean)
+    /**
+     * @property manual user-initiated runs ignore the Wi-Fi-only restriction, like manual adapter syncs.
+     * @property forceRefresh list the collections from scratch, not from the saved cursor (after an
+     * invitation is accepted), so a newly shared notebook is seen whatever ran before.
+     * @property stillScheduled false once the coordinator cancelled this run (sign-out, Notes turned
+     * off), whether or not the thread's interrupt survived the network call it was in.
+     */
+    data class Request(
+        val requestId: String?,
+        val manual: Boolean,
+        val forceRefresh: Boolean = false,
+        val stillScheduled: () -> Boolean = { true },
+    )
 
-    fun run(context: Context, account: Account, creationId: String, request: Request) {
+    /**
+     * Returns whether the collection list refresh completed, so a forced refresh that did not can
+     * stay owed to the next run (see [NotesSyncPolicy.finished]).
+     */
+    fun run(context: Context, account: Account, creationId: String, request: Request): Boolean {
         val appContext = context.applicationContext
         val manager = AccountManager.get(appContext)
         fun exactGenerationStillCurrent() =
             ExactAccountRouting.validate(account, creationId, App.accountType, manager) != null
-        if (!exactGenerationStillCurrent()) return
+        if (!exactGenerationStillCurrent()) return false
 
         val store = SyncStatusStore(appContext)
         val identity = store.identity(account, creationId)
@@ -49,36 +67,58 @@ internal object NotesSyncRunner {
             System.currentTimeMillis(), request.requestId)
         if (admission == SyncStatusStore.MutationResult.REJECTED) {
             Logger.log.info("Notes sync skipped: another request owns the lifecycle")
-            return
+            return false
         }
-        fun finishWithoutOutcome() = store.finishWithoutOutcomeResult(identity, SyncStatusStore.Service.NOTES, attemptId)
-        fun recordFailure(category: SyncStatusStore.FailureCategory) = store.recordFailureResult(
-            identity, SyncStatusStore.Service.NOTES, attemptId, request.requestId, category, System.currentTimeMillis())
-        fun recordSuccess() = store.recordSuccessResult(
-            identity, SyncStatusStore.Service.NOTES, attemptId, request.requestId, System.currentTimeMillis())
+        // Each of these ends the run. A cancellation's interrupt must not fail that last status
+        // write: SharedPreferences gives up on a commit made from an interrupted thread, and the
+        // store would record that as a storage fault. A cancel that lands after the run's last
+        // check still lets it record the outcome of the work it finished.
+        fun finishWithoutOutcome(): SyncStatusStore.MutationResult {
+            Thread.interrupted()
+            return store.finishWithoutOutcomeResult(identity, SyncStatusStore.Service.NOTES, attemptId)
+        }
+        fun recordFailure(category: SyncStatusStore.FailureCategory): SyncStatusStore.MutationResult {
+            Thread.interrupted()
+            return store.recordFailureResult(
+                identity, SyncStatusStore.Service.NOTES, attemptId, request.requestId, category, System.currentTimeMillis())
+        }
+        fun recordSuccess(): SyncStatusStore.MutationResult {
+            Thread.interrupted()
+            return store.recordSuccessResult(
+                identity, SyncStatusStore.Service.NOTES, attemptId, request.requestId, System.currentTimeMillis())
+        }
 
+        // Nothing is written after a network call once the run is cancelled (sign-out, Notes turned
+        // off), Notes is off, or the exact account generation is gone: a same-name account that
+        // replaced this one shares the cache directory, its cursors, and the discovery key.
+        fun cancelled() = Thread.currentThread().isInterrupted || !request.stillScheduled()
+        fun stillWanted() = !cancelled() && AccountSettings.notesEnabled(manager, account)
+        val guard = SyncRunGuard(appContext, account, creationId, ::stillWanted)
+        var listedCollections = false
         try {
             if (!AccountSettings.notesEnabled(manager, account)) {
                 Logger.log.info("Notes sync skipped: Notes is off for this account")
                 finishWithoutOutcome()
-                return
+                return false
             }
             if (!BillingManager.getInstance().isSyncAllowed(appContext, account)) {
                 Logger.log.info("Notes sync skipped: subscription inactive")
                 finishWithoutOutcome()
-                return
+                return false
             }
-            if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
+            if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return false }
             val settings = AccountSettings(appContext, account)
             if (!request.manual && !syncConditionsAllow(appContext, settings)) {
                 finishWithoutOutcome()
-                return
+                return false
             }
-            if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
+            if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return false }
 
             val outcome = HttpClient.Builder(appContext, settings).setForeground(false).build().use { httpClient ->
-                CollectionListRefresh.run(appContext, account, settings, httpClient.okHttpClient, forceRefresh = false)
-                if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
+                CollectionListRefresh.run(appContext, account, settings, httpClient.okHttpClient, request.forceRefresh,
+                    creationId, ::stillWanted)
+                listedCollections = true
+                if (!exactGenerationStillCurrent()) { finishWithoutOutcome(); return true }
 
                 val cache = EtebaseLocalCache.getInstance(appContext, account.name)
                 val etebase = EtebaseLocalCache.getEtebase(appContext, httpClient.okHttpClient, settings)
@@ -89,31 +129,46 @@ internal object NotesSyncRunner {
                 val notebooks = synchronized(cache) {
                     cache.collections(colMgr, type = Constants.ETEBASE_TYPE_NOTES)
                 }
-                fetchEachNotebook(notebooks, ::exactGenerationStillCurrent) { notebook ->
-                    fetchNotebookItems(cache, colMgr, notebook)
+                fetchEachNotebook(notebooks, guard::mayWrite) { notebook ->
+                    fetchNotebookItems(cache, colMgr, notebook, guard)
                 }
             }
-            if (outcome == NotebooksOutcome.STALE || !exactGenerationStillCurrent()) { finishWithoutOutcome(); return }
+            if (outcome == NotebooksOutcome.STALE || !guard.mayWrite()) { finishWithoutOutcome(); return true }
             if (outcome == NotebooksOutcome.SOME_FAILED) recordFailure(SyncStatusStore.FailureCategory.UNKNOWN) else recordSuccess()
         } catch (e: InterruptedException) {
             Logger.log.info("Notes sync cancelled")
             finishWithoutOutcome()
-        } catch (e: UnauthorizedException) {
-            Logger.log.log(Level.WARNING, "Notes sync could not authenticate", e)
-            recordFailure(SyncStatusStore.FailureCategory.AUTHENTICATION)
-        } catch (e: TemporaryServerErrorException) {
-            Logger.log.log(Level.WARNING, "Notes sync hit a temporary server error", e)
-            recordFailure(SyncStatusStore.FailureCategory.NETWORK)
-        } catch (e: ConnectionException) {
-            Logger.log.log(Level.WARNING, "Notes sync could not reach the server", e)
-            recordFailure(SyncStatusStore.FailureCategory.NETWORK)
+        } catch (e: StaleSyncRunException) {
+            Logger.log.info("Notes sync stopped: cancelled, Notes turned off, or the account replaced while a request was in flight")
+            finishWithoutOutcome()
+        } catch (e: InvalidAccountException) {
+            // The account row went away between the generation check and the settings read.
+            Logger.log.info("Notes sync stopped: the account was removed")
+            finishWithoutOutcome()
         } catch (e: Exception) {
-            if (Thread.currentThread().isInterrupted) {
-                Logger.log.info("Notes sync cancelled")
-                finishWithoutOutcome()
-            } else {
-                Logger.log.log(Level.SEVERE, "Notes sync failed", e)
-                recordFailure(SyncStatusStore.FailureCategory.UNKNOWN)
+            when {
+                // A cancellation can surface as any exception, a broken connection included, and
+                // can consume the thread's interrupt on the way: it is never recorded as a failure.
+                cancelled() -> {
+                    Logger.log.info("Notes sync cancelled")
+                    finishWithoutOutcome()
+                }
+                e is UnauthorizedException -> {
+                    Logger.log.log(Level.WARNING, "Notes sync could not authenticate", e)
+                    recordFailure(SyncStatusStore.FailureCategory.AUTHENTICATION)
+                }
+                e is TemporaryServerErrorException -> {
+                    Logger.log.log(Level.WARNING, "Notes sync hit a temporary server error", e)
+                    recordFailure(SyncStatusStore.FailureCategory.NETWORK)
+                }
+                e is ConnectionException -> {
+                    Logger.log.log(Level.WARNING, "Notes sync could not reach the server", e)
+                    recordFailure(SyncStatusStore.FailureCategory.NETWORK)
+                }
+                else -> {
+                    Logger.log.log(Level.SEVERE, "Notes sync failed", e)
+                    recordFailure(SyncStatusStore.FailureCategory.UNKNOWN)
+                }
             }
         } catch (e: Error) {
             // An OutOfMemoryError from decrypting a large notebook page must still close the
@@ -121,6 +176,7 @@ internal object NotesSyncRunner {
             Logger.log.log(Level.SEVERE, "Notes sync failed with an error", e)
             recordFailure(SyncStatusStore.FailureCategory.UNKNOWN)
         }
+        return listedCollections
     }
 
     /** What one notebook's failed fetch means for the rest of the run. */
@@ -162,6 +218,9 @@ internal object NotesSyncRunner {
                 fetch(notebook)
             } catch (e: InterruptedException) {
                 throw e
+            } catch (e: StaleSyncRunException) {
+                // The run itself is over, not this notebook.
+                throw e
             } catch (e: Exception) {
                 when (notebookFailure(e)) {
                     NotebookFailure.ABORT_RUN -> throw e
@@ -182,9 +241,10 @@ internal object NotesSyncRunner {
     /**
      * Mirrors the adapters' item fetch: skip when the notebook's cursor is unchanged, else page until
      * done. The cached copy is compared by revision only and never decoded, so a note whose metadata
-     * this client cannot decode cannot fail the page and pin the cursor.
+     * this client cannot decode cannot fail the page and pin the cursor. A page and its cursor are
+     * written only if [guard] still allows it when the page arrives.
      */
-    private fun fetchNotebookItems(cache: EtebaseLocalCache, colMgr: CollectionManager, notebook: Collection) {
+    private fun fetchNotebookItems(cache: EtebaseLocalCache, colMgr: CollectionManager, notebook: Collection, guard: SyncRunGuard) {
         val colUid = notebook.uid
         val itemMgr = colMgr.getItemManager(notebook)
         var stoken = synchronized(cache) { cache.collectionLoadStoken(colUid) }
@@ -194,14 +254,17 @@ internal object NotesSyncRunner {
         }
         do {
             if (Thread.interrupted()) throw InterruptedException()
+            guard.check()
             val itemList = itemMgr.list(FetchOptions().stoken(stoken))
             synchronized(cache) {
-                for (item in itemList.data) {
-                    if (cache.itemEtag(itemMgr, colUid, item.uid) != item.etag) {
-                        cache.itemSet(itemMgr, colUid, item)
+                guard.write(cache) {
+                    for (item in itemList.data) {
+                        if (cache.itemEtag(itemMgr, colUid, item.uid) != item.etag) {
+                            cache.itemSet(itemMgr, colUid, item)
+                        }
                     }
+                    itemList.stoken?.let { cache.collectionSaveStoken(colUid, it) }
                 }
-                itemList.stoken?.let { cache.collectionSaveStoken(colUid, it) }
             }
             stoken = itemList.stoken
         } while (!itemList.isDone)
