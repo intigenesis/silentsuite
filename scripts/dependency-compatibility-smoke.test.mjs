@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import test from 'node:test'
@@ -8,13 +10,18 @@ function requireFrom(packagePath) {
   return createRequire(resolve(import.meta.dirname, '..', packagePath))
 }
 
-const minimatch3 = requireFrom('node_modules/.pnpm/minimatch@3.1.5/node_modules/minimatch/package.json')('.')
-const minimatch5 = requireFrom('node_modules/.pnpm/minimatch@5.1.9/node_modules/minimatch/package.json')('.')
-const minimatch10 = requireFrom('node_modules/.pnpm/minimatch@10.2.4/node_modules/minimatch/package.json')('.').minimatch
+const minimatch3Require = requireFrom('node_modules/.pnpm/minimatch@3.1.5/node_modules/minimatch/package.json')
+const minimatch5Require = requireFrom('node_modules/.pnpm/minimatch@5.1.9/node_modules/minimatch/package.json')
+const minimatch10Require = requireFrom('node_modules/.pnpm/minimatch@10.2.4/node_modules/minimatch/package.json')
+const minimatch3 = minimatch3Require('.')
+const minimatch5 = minimatch5Require('.')
+const minimatch10 = minimatch10Require('.').minimatch
 const ajvRequire = requireFrom('node_modules/.pnpm/ajv@8.18.0/node_modules/ajv/package.json')
 const Ajv = ajvRequire('.')
 const addFormats = requireFrom('node_modules/.pnpm/ajv-formats@2.1.1_ajv@8.18.0/node_modules/ajv-formats/package.json')('.')
 const { JSDOM } = requireFrom('apps/web/package.json')('jsdom')
+const undiciRequire = createRequire(requireFrom('apps/web/package.json').resolve('jsdom'))
+const undici = undiciRequire('undici')
 const eslintRequire = createRequire(requireFrom('apps/web/package.json').resolve('eslint/package.json'))
 const yamlRequire = createRequire(eslintRequire.resolve('@eslint/eslintrc'))
 const yaml = yamlRequire('js-yaml')
@@ -29,6 +36,19 @@ for (const [line, minimatch] of [['3', minimatch3], ['5', minimatch5], ['10', mi
     assert.equal(minimatch('file4.txt', 'file{1..3}.txt'), false)
     assert.equal(minimatch('literal{a}.txt', 'literal\\{a\\}.txt'), true)
     assert.equal(minimatch('src/c.js', 'src/{a,b}.js'), false)
+  })
+}
+
+for (const [line, minimatch, minimatchRequire, braceVersion] of [
+  ['3', minimatch3, minimatch3Require, '1.1.21'],
+  ['5', minimatch5, minimatch5Require, '2.1.7'],
+  ['10', minimatch10, minimatch10Require, '5.0.12'],
+]) {
+  test(`minimatch ${line} expands deeply nested brace groups without exhausting the stack`, () => {
+    assert.equal(minimatchRequire('brace-expansion/package.json').version, braceVersion)
+    const depth = 30000
+    const pattern = `${'{'.repeat(depth)}a,b${'}'.repeat(depth)}`
+    assert.equal(minimatch('src/a.js', pattern), false)
   })
 }
 
@@ -94,6 +114,60 @@ test('jsdom constructs and tears down through its patched undici dependency path
   dom.window.close()
 })
 
+test('jsdom undici 7 fails a WebSocket handshake that selects an unrequested subprotocol', async () => {
+  assert.equal(undiciRequire('undici/package.json').version, '7.29.1')
+  const sockets = []
+  const server = createServer()
+  server.on('upgrade', (request, socket) => {
+    sockets.push(socket)
+    const accept = createHash('sha1')
+      .update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64')
+    socket.write([
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${accept}`,
+      'Sec-WebSocket-Protocol: unrequested',
+      '',
+      '',
+    ].join('\r\n'))
+  })
+  await new Promise((done) => server.listen(0, '127.0.0.1', done))
+  try {
+    const socket = new undici.WebSocket(`ws://127.0.0.1:${server.address().port}`)
+    const events = []
+    socket.addEventListener('open', () => events.push('open'))
+    socket.addEventListener('error', () => events.push('error'))
+    const close = await new Promise((done) => socket.addEventListener('close', done))
+    assert.deepEqual(events, ['error'])
+    assert.equal(close.code, 1006)
+    assert.equal(socket.protocol, '')
+  } finally {
+    for (const socket of sockets) socket.destroy()
+    await new Promise((done) => server.close(done))
+  }
+})
+
+test('jsdom undici 7 BalancedPool forwards connect options to its upstream pools', async () => {
+  const checkServerIdentity = () => undefined
+  const upstreams = []
+  const pool = new undici.BalancedPool(['https://silent-suite.example'], {
+    connect: { rejectUnauthorized: true, checkServerIdentity },
+    factory: (origin, options) => {
+      upstreams.push(options)
+      return new undici.Pool(origin, options)
+    },
+  })
+  try {
+    assert.equal(upstreams.length, 1)
+    assert.equal(upstreams[0].connect.rejectUnauthorized, true)
+    assert.equal(upstreams[0].connect.checkServerIdentity, checkServerIdentity)
+  } finally {
+    await pool.close()
+  }
+})
+
 test('js-yaml 4 parses representative ESLint configuration data', () => {
   assert.deepEqual(yaml.load('rules:\n  no-debugger: error\n'), {
     rules: { 'no-debugger': 'error' },
@@ -152,6 +226,17 @@ test('security overrides remain scoped to compatible vulnerable major lines', ()
     'fast-uri@>=3.0.0 <3.1.8',
     'fast-uri@>=4.0.0 <4.1.5',
   ])
+  assert.deepEqual(
+    Object.entries(manifest.pnpm.overrides).filter(([selector]) => /^(undici|brace-expansion)(@|$)/.test(selector)),
+    [
+      ['undici@>=7.0.0 <7.29.1', '7.29.1'],
+      ['undici@>=8.0.0 <8.10.2', '8.10.2'],
+      ['brace-expansion@<1.1.21', '1.1.21'],
+      ['brace-expansion@>=2.0.0 <2.1.7', '2.1.7'],
+      ['brace-expansion@>=3.0.0 <3.0.9', '3.0.9'],
+      ['brace-expansion@>=5.0.0 <5.0.12', '5.0.12'],
+    ],
+  )
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'js-yaml'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.18'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'browserslist'), false)
