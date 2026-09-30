@@ -10,6 +10,16 @@ function requireFrom(packagePath) {
   return createRequire(resolve(import.meta.dirname, '..', packagePath))
 }
 
+// Bounded wait: rejects instead of hanging when a handshake never settles, and always
+// clears its timer so a settled wait cannot keep the test process alive.
+function boundedWait(promise, ms, message) {
+  let timer
+  const expiration = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  return Promise.race([promise, expiration]).finally(() => clearTimeout(timer))
+}
+
 const minimatch3Require = requireFrom('node_modules/.pnpm/minimatch@3.1.5/node_modules/minimatch/package.json')
 const minimatch5Require = requireFrom('node_modules/.pnpm/minimatch@5.1.9/node_modules/minimatch/package.json')
 const minimatch10Require = requireFrom('node_modules/.pnpm/minimatch@10.2.4/node_modules/minimatch/package.json')
@@ -116,10 +126,11 @@ test('jsdom constructs and tears down through its patched undici dependency path
 
 test('jsdom undici 7 fails a WebSocket handshake that selects an unrequested subprotocol', async () => {
   assert.equal(undiciRequire('undici/package.json').version, '7.29.1')
-  const sockets = []
+  const upgradeSockets = new Set()
   const server = createServer()
   server.on('upgrade', (request, socket) => {
-    sockets.push(socket)
+    upgradeSockets.add(socket)
+    socket.on('error', () => {})
     const accept = createHash('sha1')
       .update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
       .digest('base64')
@@ -133,19 +144,94 @@ test('jsdom undici 7 fails a WebSocket handshake that selects an unrequested sub
       '',
     ].join('\r\n'))
   })
-  await new Promise((done) => server.listen(0, '127.0.0.1', done))
+
+  const events = []
+  let client
+  let onOpen
+  let onError
+  let onClose
+
+  const teardown = () => {
+    if (client) {
+      client.removeEventListener('open', onOpen)
+      client.removeEventListener('error', onError)
+      client.removeEventListener('close', onClose)
+      try {
+        client.close()
+      } catch {}
+    }
+    for (const socket of upgradeSockets) socket.destroy()
+    upgradeSockets.clear()
+    return server.listening ? new Promise((done) => server.close(() => done())) : Promise.resolve()
+  }
+
   try {
-    const socket = new undici.WebSocket(`ws://127.0.0.1:${server.address().port}`)
-    const events = []
-    socket.addEventListener('open', () => events.push('open'))
-    socket.addEventListener('error', () => events.push('error'))
-    const close = await new Promise((done) => socket.addEventListener('close', done))
+    await boundedWait(new Promise((listening, failed) => {
+      server.once('error', failed)
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', failed)
+        listening()
+      })
+    }), 2000, 'test server did not start listening')
+
+    client = new undici.WebSocket(`ws://127.0.0.1:${server.address().port}`)
+    const opened = new Promise((resolve) => { onOpen = () => { events.push('open'); resolve() } })
+    const errored = new Promise((resolve) => { onError = () => { events.push('error'); resolve() } })
+    const closed = new Promise((resolve) => { onClose = (event) => resolve(event) })
+    client.addEventListener('open', onOpen)
+    client.addEventListener('error', onError)
+    client.addEventListener('close', onClose)
+
+    await boundedWait(Promise.race([opened, errored]), 5000, 'the rejected handshake neither opened nor errored')
+    assert.equal(events.includes('error'), true, 'the rejected handshake must surface an error event')
+    const close = await boundedWait(closed, 5000, 'the rejected handshake did not close the socket')
     assert.deepEqual(events, ['error'])
     assert.equal(close.code, 1006)
-    assert.equal(socket.protocol, '')
+    assert.equal(client.protocol, '')
   } finally {
-    for (const socket of sockets) socket.destroy()
-    await new Promise((done) => server.close(done))
+    await teardown()
+  }
+})
+
+test('a peer that accepts the upgrade and never answers is bounded and cleaned up', async () => {
+  const acceptedSockets = new Set()
+  const server = createServer()
+  server.on('upgrade', (request, socket) => {
+    acceptedSockets.add(socket)
+    socket.on('error', () => {})
+    // Deliberately never answer, so the client handshake stays pending.
+  })
+  const events = []
+  let client
+
+  try {
+    await boundedWait(new Promise((listening, failed) => {
+      server.once('error', failed)
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', failed)
+        listening()
+      })
+    }), 2000, 'test server did not start listening')
+
+    client = new undici.WebSocket(`ws://127.0.0.1:${server.address().port}`)
+    const settled = new Promise((resolve) => {
+      client.addEventListener('open', () => { events.push('open'); resolve() })
+      client.addEventListener('error', () => { events.push('error'); resolve() })
+    })
+    await assert.rejects(
+      boundedWait(settled, 250, 'the pending handshake was not bounded'),
+      /the pending handshake was not bounded/,
+    )
+    assert.deepEqual(events, [])
+  } finally {
+    if (client) {
+      try {
+        client.close()
+      } catch {}
+    }
+    for (const socket of acceptedSockets) socket.destroy()
+    acceptedSockets.clear()
+    if (server.listening) await new Promise((done) => server.close(() => done()))
   }
 })
 
@@ -233,10 +319,15 @@ test('security overrides remain scoped to compatible vulnerable major lines', ()
       ['undici@>=8.0.0 <8.10.2', '8.10.2'],
       ['brace-expansion@<1.1.21', '1.1.21'],
       ['brace-expansion@>=2.0.0 <2.1.7', '2.1.7'],
-      ['brace-expansion@>=3.0.0 <3.0.9', '3.0.9'],
       ['brace-expansion@>=5.0.0 <5.0.12', '5.0.12'],
     ],
   )
+  assert.deepEqual(
+    Object.keys(manifest.pnpm.overrides).filter((selector) => /^brace-expansion@>=3\./.test(selector)),
+    [],
+    'no brace-expansion 3.x selector: GHSA-3jxr-9vmj-r5cp spans >=3.0.0 <5.0.7 with no patched 3.x release, so a 3.x consumer must fail the audit instead of being forced across a major',
+  )
+  assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'brace-expansion@>=3.0.0 <3.0.9'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'js-yaml'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.18'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'browserslist'), false)
