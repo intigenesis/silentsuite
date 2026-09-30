@@ -11,7 +11,8 @@ function requireFrom(packagePath) {
 const minimatch3 = requireFrom('node_modules/.pnpm/minimatch@3.1.5/node_modules/minimatch/package.json')('.')
 const minimatch5 = requireFrom('node_modules/.pnpm/minimatch@5.1.9/node_modules/minimatch/package.json')('.')
 const minimatch10 = requireFrom('node_modules/.pnpm/minimatch@10.2.4/node_modules/minimatch/package.json')('.').minimatch
-const Ajv = requireFrom('node_modules/.pnpm/ajv@8.18.0/node_modules/ajv/package.json')('.')
+const ajvRequire = requireFrom('node_modules/.pnpm/ajv@8.18.0/node_modules/ajv/package.json')
+const Ajv = ajvRequire('.')
 const addFormats = requireFrom('node_modules/.pnpm/ajv-formats@2.1.1_ajv@8.18.0/node_modules/ajv-formats/package.json')('.')
 const { JSDOM } = requireFrom('apps/web/package.json')('jsdom')
 const eslintRequire = createRequire(requireFrom('apps/web/package.json').resolve('eslint/package.json'))
@@ -37,6 +38,53 @@ test('AJV 8 validates URI format through patched fast-uri', () => {
   const validate = ajv.compile({ type: 'string', format: 'uri' })
   assert.equal(validate('https://silent-suite.example/path?item=1'), true)
   assert.equal(validate('not a uri'), false)
+})
+
+test('AJV 8 resolves schema references through its patched fast-uri resolver', () => {
+  assert.equal(ajvRequire('fast-uri/package.json').version, '3.1.8')
+  const ajv = new Ajv({ strict: false })
+  assert.equal(ajv.opts.uriResolver, ajvRequire('fast-uri'))
+  ajv.addSchema({
+    $id: 'https://silent-suite.example/schemas/defs.json',
+    $defs: { name: { type: 'string', minLength: 1 } },
+  })
+  const validate = ajv.compile({
+    $id: 'https://silent-suite.example/schemas/root.json',
+    $ref: 'defs.json#/$defs/name',
+  })
+  assert.equal(validate('calendar'), true)
+  assert.equal(validate(''), false)
+})
+
+test('fast-uri 3 rejects authority injection through a malformed serialize port', () => {
+  const uri = new Ajv({ strict: false }).opts.uriResolver
+  assert.throws(() => uri.serialize({
+    scheme: 'https',
+    host: 'silent-suite.example',
+    port: '443@attacker.example',
+    path: '/path',
+  }), { name: 'TypeError', message: /port is malformed/ })
+  for (const port of [8443, '8443']) {
+    assert.equal(
+      uri.serialize({ scheme: 'https', host: 'silent-suite.example', port, path: '/path' }),
+      'https://silent-suite.example:8443/path',
+    )
+  }
+})
+
+test('fast-uri 3 flags an unclosed bracket host and keeps closed IP literals', () => {
+  const uri = new Ajv({ strict: false }).opts.uriResolver
+  assert.equal(uri.parse('https://[attacker.example/path').error, 'URI host is malformed.')
+  const literal = uri.parse('https://[::1]:8443/path')
+  assert.equal(literal.error, undefined)
+  assert.equal(literal.host, '::1')
+  assert.equal(literal.port, 8443)
+})
+
+test('fast-uri 3 folds percent-encoded host octets to one canonical case', () => {
+  const uri = new Ajv({ strict: false }).opts.uriResolver
+  assert.equal(uri.normalize('https://silent-suite.%45xample/path'), 'https://silent-suite.example/path')
+  assert.equal(uri.equal('https://silent-suite.%45xample/path', 'https://silent-suite.example/path'), true)
 })
 
 test('jsdom constructs and tears down through its patched undici dependency path', () => {
@@ -96,6 +144,14 @@ test('security overrides remain scoped to compatible vulnerable major lines', ()
   assert.equal(manifest.pnpm.overrides['js-yaml@>=3.0.0 <3.15.2'], '3.15.2')
   assert.equal(manifest.pnpm.overrides['nanoid@>=3.0.0 <3.3.18'], '3.3.18')
   assert.equal(manifest.pnpm.overrides['browserslist@>=4.0.0 <4.28.8'], '4.28.8')
+  assert.equal(manifest.pnpm.overrides['fast-uri@>=2.0.0 <2.4.7'], '2.4.7')
+  assert.equal(manifest.pnpm.overrides['fast-uri@>=3.0.0 <3.1.8'], '3.1.8')
+  assert.equal(manifest.pnpm.overrides['fast-uri@>=4.0.0 <4.1.5'], '4.1.5')
+  assert.deepEqual(Object.keys(manifest.pnpm.overrides).filter((selector) => selector.startsWith('fast-uri')), [
+    'fast-uri@>=2.0.0 <2.4.7',
+    'fast-uri@>=3.0.0 <3.1.8',
+    'fast-uri@>=4.0.0 <4.1.5',
+  ])
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'js-yaml'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.18'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'browserslist'), false)
