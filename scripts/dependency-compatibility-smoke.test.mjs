@@ -100,3 +100,42 @@ test('security overrides remain scoped to compatible vulnerable major lines', ()
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'nanoid@<3.3.18'), false)
   assert.equal(Object.hasOwn(manifest.pnpm.overrides, 'browserslist'), false)
 })
+
+// Active and dormant selectors both pin the same-major patched floor for GHSA-6j4f-fj2g-mc7p,
+// GHSA-qhr7-859c-m2p7, GHSA-q2hr-2g5m-vwhr (brace-expansion), GHSA-qw65-cvwx-89v3,
+// GHSA-hrr3-gc8f-f4qj (fast-uri) and GHSA-rfgv-xxqx-mfg5, GHSA-w293-vg96-wgc3 (undici).
+// undici 8 has no selector: its only patched release (8.10.2) requires Node >=22.19.0, above the
+// root engine floor, so a future undici 8 consumer must surface in the audit instead of being
+// pinned to a known-vulnerable 8.x or silently forced past the declared runtime contract.
+const patchedFloors = {
+  'undici@>=7.0.0 <7.29.1': '7.29.1',
+  'fast-uri@>=2.0.0 <2.4.7': '2.4.7',
+  'fast-uri@>=3.0.0 <3.1.8': '3.1.8',
+  'fast-uri@>=4.0.0 <4.1.5': '4.1.5',
+  'brace-expansion@<1.1.21': '1.1.21',
+  'brace-expansion@>=2.0.0 <2.1.7': '2.1.7',
+  'brace-expansion@>=3.0.0 <3.0.9': '3.0.9',
+  'brace-expansion@>=5.0.0 <5.0.12': '5.0.12',
+}
+
+test('brace-expansion, fast-uri and undici selectors pin exactly their patched same-major floors', () => {
+  const managed = Object.keys(manifest.pnpm.overrides).filter((key) => /^(undici|fast-uri|brace-expansion)(@|$)/.test(key))
+  assert.deepEqual(managed.sort(), Object.keys(patchedFloors).sort())
+  for (const [selector, target] of Object.entries(patchedFloors)) assert.equal(manifest.pnpm.overrides[selector], target, selector)
+  assert.equal(manifest.engines.node, '>=22.12.0')
+})
+
+function installedVersion(consumerRequire, name) {
+  const entry = consumerRequire.resolve(name)
+  const marker = `/node_modules/${name}/`
+  return JSON.parse(readFileSync(entry.slice(0, entry.lastIndexOf(marker) + marker.length) + 'package.json', 'utf8')).version
+}
+
+test('active consumers resolve the patched brace-expansion, fast-uri and undici releases', () => {
+  const consumer = (path) => createRequire(resolve(import.meta.dirname, '..', path))
+  assert.equal(installedVersion(consumer('node_modules/.pnpm/minimatch@3.1.5/node_modules/minimatch/package.json'), 'brace-expansion'), '1.1.21')
+  assert.equal(installedVersion(consumer('node_modules/.pnpm/minimatch@5.1.9/node_modules/minimatch/package.json'), 'brace-expansion'), '2.1.7')
+  assert.equal(installedVersion(consumer('node_modules/.pnpm/minimatch@10.2.4/node_modules/minimatch/package.json'), 'brace-expansion'), '5.0.12')
+  assert.equal(installedVersion(consumer('node_modules/.pnpm/ajv@8.18.0/node_modules/ajv/package.json'), 'fast-uri'), '3.1.8')
+  assert.equal(installedVersion(createRequire(requireFrom('apps/web/package.json').resolve('jsdom')), 'undici'), '7.29.1')
+})
