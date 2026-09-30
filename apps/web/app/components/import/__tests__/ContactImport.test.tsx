@@ -92,7 +92,7 @@ describe('ContactImport categories normalization', () => {
     expect(payload[0]).toMatchObject({
       displayName: 'René', name: { family: 'Ex;ample', given: 'René' },
       phones: [{ type: 'Büro', value: '111' }, { type: 'home,voice', value: '222' }],
-      emails: [{ type: 'x-emergency', value: 'a@example.invalid' }],
+      emails: [{ type: 'Emergency', value: 'a@example.invalid' }],
       addresses: [{ type: 'Postal desk', street: 'Street' }],
       notes: 'First\n日本', categories: ['Team, West', 'Café'], favorite: true, listId: 'default',
     })
