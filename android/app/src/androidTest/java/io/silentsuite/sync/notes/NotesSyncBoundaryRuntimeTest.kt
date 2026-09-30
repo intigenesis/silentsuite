@@ -3,8 +3,12 @@ package io.silentsuite.sync.notes
 import android.accounts.Account
 import android.accounts.AccountManager
 import android.content.ContentResolver
+import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.provider.CalendarContract
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import at.bitfire.ical4android.TaskProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import com.etebase.client.Client
 import com.etebase.client.ItemMetadata
@@ -54,6 +58,21 @@ class NotesSyncBoundaryRuntimeTest {
     private val dispatched = CopyOnWriteArrayList<Bundle>()
     private var previousMasterSync = true
 
+    /**
+     * Android 5 and 6 handle an account change on system_server's main thread by walking
+     * SyncManager's list of running syncs, which its handler thread changes without a lock
+     * (android-5.0.2_r1 SyncManager.java:189, 231-240, 268-288, 2699, 2880; moved to the handler
+     * thread in 7.0). A platform sync that starts or ends meanwhile throws there and restarts the
+     * whole system. With master sync off, the only syncs the platform starts for this class's
+     * accounts are the task adapters' initialization syncs, so on those releases every account is
+     * unsyncable before its account-change broadcast is handled, and every account change here waits
+     * until no platform sync runs.
+     */
+    private val syncManagerRacesAccountChanges = Build.VERSION.SDK_INT < Build.VERSION_CODES.N
+    private val taskAuthorities = TaskProvider.TASK_PROVIDERS.map { it.authority }
+    /** Task adapters first: they are the only ones the platform starts while master sync is off. */
+    private val adapterAuthorities = taskAuthorities + listOf(CalendarContract.AUTHORITY, App.addressBooksAuthority)
+
     /** The server side as the test sees it: the same Etebase user, talking to the same stand-in. */
     private val server by lazy {
         com.etebase.client.Account.restore(Client.create(OkHttpClient.Builder().addInterceptor(fake).build(), fake.baseUrl), session, null)
@@ -82,6 +101,8 @@ class NotesSyncBoundaryRuntimeTest {
                     forgetLastListing(name)
                 }.exceptionOrNull()?.let(problems::add)
             }
+            // No platform sync started for this class's accounts is left running for the next class.
+            runCatching { awaitSyncManagerQuiet() }.exceptionOrNull()?.let(problems::add)
         } finally {
             HttpClient.testInterceptor = null
             requestSyncDispatchOverride = null
@@ -283,7 +304,13 @@ class NotesSyncBoundaryRuntimeTest {
                            discoveryKey: Boolean = true): Account {
         val account = Account(name, App.accountType)
         names += name
+        awaitSyncManagerQuiet()
+        // Unsyncable before the row exists, so the broadcast the add sends never finds the task
+        // adapters in the unknown state that schedules their initialization syncs. Set again right
+        // after, in case a broadcast still in flight dropped the then-absent name's settings.
+        if (syncManagerRacesAccountChanges) silenceSyncAdapters(account)
         check(manager.addAccountExplicitly(account, null, null))
+        silenceSyncAdapters(account)
         AccountSettings.setUserData(manager, account, URI(fake.baseUrl), account.name)
         check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
         check(AccountSettings.writeNotesEnabled(manager, account, true))
@@ -302,6 +329,7 @@ class NotesSyncBoundaryRuntimeTest {
 
     private fun removeAccount(account: Account) {
         if (account !in manager.getAccountsByType(account.type)) return
+        awaitSyncManagerQuiet()
         val removed = CountDownLatch(1)
         var confirmed = false
         AndroidCompat.removeAccount(manager, account) {
@@ -310,6 +338,57 @@ class NotesSyncBoundaryRuntimeTest {
         }
         assertTrue("account removal callback timed out", removed.await(10, TimeUnit.SECONDS))
         assertTrue("account removal was not confirmed", confirmed)
+        awaitRemovalSeenBySyncManager(account)
+    }
+
+    /** Nothing is scheduled or started for [account] by any of this app's sync adapters. */
+    private fun silenceSyncAdapters(account: Account) {
+        for (authority in adapterAuthorities) ContentResolver.setIsSyncable(account, authority, 0)
+    }
+
+    /**
+     * Before Android 7: waits until, for [QUIET_MILLIS] in a row, no platform sync runs and every
+     * account of this app's type is unsyncable for every adapter of this app. That includes accounts
+     * another class left behind, whose initialization syncs or queued manual retries could otherwise
+     * start during an account change here. Pending operations are not waited for: at 0 they are
+     * dropped before they start. There is no cancelSync either, since a cancel changes the very list
+     * the broadcast walks.
+     */
+    private fun awaitSyncManagerQuiet() {
+        if (!syncManagerRacesAccountChanges) return
+        check(!ContentResolver.getMasterSyncAutomatically()) { "master sync must stay off while this class changes accounts" }
+        val deadline = SystemClock.uptimeMillis() + 30_000
+        var quietSince = SystemClock.uptimeMillis()
+        while (true) {
+            var busy = false
+            for (present in manager.getAccountsByType(App.accountType)) {
+                for (authority in adapterAuthorities) {
+                    if (ContentResolver.getIsSyncable(present, authority) != 0) {
+                        ContentResolver.setIsSyncable(present, authority, 0)
+                        busy = true
+                    }
+                }
+            }
+            val running = ContentResolver.getCurrentSyncs()
+            if (running.isNotEmpty()) busy = true
+            val now = SystemClock.uptimeMillis()
+            if (busy) quietSince = now else if (now - quietSince >= QUIET_MILLIS) return
+            if (now >= deadline) throw AssertionError("platform syncs did not settle: ${running.joinToString { it.authority }}")
+            SystemClock.sleep(20)
+        }
+    }
+
+    /**
+     * Before Android 7: waits until system_server has handled an account change after [account]
+     * was removed. Handling one drops every sync setting of an absent account, so the 0 left before
+     * the removal reads back as unknown. The removal's own broadcast follows at most right behind,
+     * and the quiet wait and second seed in [newAccount] cover a same-name account added next.
+     */
+    private fun awaitRemovalSeenBySyncManager(account: Account) {
+        if (!syncManagerRacesAccountChanges) return
+        waitUntil("the platform to handle the removal of ${account.name}", 10_000) {
+            ContentResolver.getIsSyncable(account, taskAuthorities.first()) < 0
+        }
     }
 
     private fun uploadNotebook(name: String): String {
@@ -366,6 +445,7 @@ class NotesSyncBoundaryRuntimeTest {
     companion object {
         private val LIST = Regex("collection/list_multi/")
         private val ITEMS = Regex("collection/[^/]+/item/")
+        private const val QUIET_MILLIS = 300L
 
         /**
          * One Etebase signup for the whole class: its key derivation takes seconds, and the session
