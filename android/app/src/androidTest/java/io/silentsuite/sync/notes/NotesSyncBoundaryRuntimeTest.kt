@@ -341,6 +341,61 @@ class NotesSyncBoundaryRuntimeTest {
         assertEquals("no list page was requested after the held one", listing.request, listings(0).last())
     }
 
+    @Test fun aRequestHeldForOneAccountDoesNotDelayAnotherAccountsSync() {
+        val slow = newAccount("gen-slow")
+        val slowIdentity = ExactAccountIdentity(slow.type, slow.name, "gen-slow")
+        val other = newAccount("gen-other")
+        val notebook = uploadNotebook("Seen by both")
+        uploadNotes(notebook, "One")
+
+        // The first account's collection list hangs, as a slow or stalled connection would leave it.
+        val listing = fake.hold("POST", LIST)
+        NotesSyncCoordinator.request(context, slow, "gen-slow", NotesSyncPolicy.Trigger.MANUAL)
+        listing.awaitArrival()
+
+        NotesSyncCoordinator.request(context, other, "gen-other", NotesSyncPolicy.Trigger.MANUAL)
+        waitUntil("the other account's sync to finish while the first is still waiting") {
+            status(other, "gen-other").lastSuccessAt != null
+        }
+        assertEquals(setOf("One"), cachedNotes(other, notebook))
+        // The waiting listing holds its own account's cache, so only the coordinator is asked about it.
+        assertTrue("the first account's run is still waiting for its answer", NotesSyncCoordinator.isActive(slowIdentity))
+
+        listing.release()
+        awaitSettled(slowIdentity)
+        assertEquals(setOf("One"), cachedNotes(slow, notebook))
+        assertNotNull(status(slow, "gen-slow").lastSuccessAt)
+    }
+
+    @Test fun runsForOneAccountNameStayInOrderAcrossItsGenerations() {
+        val name = "notes-boundary-${System.nanoTime()}@example.invalid"
+        val account = newAccount("gen-first", name)
+        val nextIdentity = ExactAccountIdentity(account.type, name, "gen-second")
+        val notebook = uploadNotebook("Mine")
+        uploadNotes(notebook, "One")
+
+        // The first generation's run waits for a page of notes, which it does without holding the
+        // cache, so nothing but the worker's order keeps the next generation's run behind it.
+        val page = fake.hold("GET", ITEMS)
+        NotesSyncCoordinator.request(context, account, "gen-first", NotesSyncPolicy.Trigger.MANUAL)
+        page.awaitArrival()
+        replaceAccount(account, "gen-second")
+        val listing = fake.hold("POST", LIST)
+        assertEquals(NotesSyncPolicy.Decision.START,
+            NotesSyncCoordinator.request(context, account, "gen-second", NotesSyncPolicy.Trigger.MANUAL))
+        assertFalse("the next generation's run has not started", listing.arrivesWithin(500))
+        assertTrue(NotesSyncCoordinator.isPending(nextIdentity))
+        assertEquals(SyncStatusStore.Status(), status(account, "gen-second"))
+
+        page.release()
+        listing.awaitArrival()
+        assertClosedWithoutOutcome(status(account, "gen-first"))
+        listing.release()
+        awaitSettled(nextIdentity)
+        assertEquals(setOf("One"), cachedNotes(account, notebook))
+        assertNotNull(status(account, "gen-second").lastSuccessAt)
+    }
+
     @Test fun signOutWhileANotesRequestIsInFlightLeavesNothingBehind() {
         val account = newAccount("gen-out")
         val notebook = uploadNotebook("Signed out of")

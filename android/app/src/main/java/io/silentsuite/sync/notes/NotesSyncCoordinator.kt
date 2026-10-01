@@ -10,9 +10,10 @@ import io.silentsuite.sync.AccountSettings
 import io.silentsuite.sync.log.Logger
 import io.silentsuite.sync.ui.ExactAccountIdentity
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.logging.Level
 
 /**
@@ -40,9 +41,15 @@ object NotesSyncCoordinator {
     private val runs = HashMap<ExactAccountIdentity, Any>()
     private val listeners = CopyOnWriteArrayList<Listener>()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "silentsuite-notes-sync").apply { isDaemon = true }
-    }
+
+    /**
+     * One worker per account name, so a slow request for one account never delays another. Runs
+     * for the same name keep the order they were submitted in, whatever their generation: they
+     * share that name's cache directory. A worker's thread ends once it has been idle for
+     * [WORKER_IDLE_SECONDS]. Guarded by [lock].
+     */
+    private val workers = HashMap<Pair<String, String>, ThreadPoolExecutor>()
+    private const val WORKER_IDLE_SECONDS = 30L
 
     /** Test seam: replaces the network job; production leaves this null. */
     @VisibleForTesting
@@ -106,11 +113,16 @@ object NotesSyncCoordinator {
 
     /**
      * Test seam: waits until every job submitted before this call has finished, cancelled ones
-     * included (the single executor runs them in order). False if that took longer than [timeoutMillis].
+     * included (each worker runs its jobs in order). False if that took longer than [timeoutMillis].
      */
     @VisibleForTesting
-    internal fun drainForTesting(timeoutMillis: Long): Boolean =
-        runCatching { executor.submit {}.get(timeoutMillis, java.util.concurrent.TimeUnit.MILLISECONDS) }.isSuccess
+    internal fun drainForTesting(timeoutMillis: Long): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        val markers = synchronized(lock) { workers.values.map { it.submit {} } }
+        return markers.all { marker ->
+            runCatching { marker.get(deadline - System.nanoTime(), TimeUnit.NANOSECONDS) }.isSuccess
+        }
+    }
 
     /** Process-only diagnostic for runtime tests; never used in production paths. */
     @VisibleForTesting
@@ -128,7 +140,12 @@ object NotesSyncCoordinator {
     }
 
     private fun submit(appContext: Context, account: Account, identity: ExactAccountIdentity) {
-        futures[identity] = executor.submit { execute(appContext, account, identity) }
+        val worker = workers.getOrPut(identity.type to identity.name) {
+            ThreadPoolExecutor(1, 1, WORKER_IDLE_SECONDS, TimeUnit.SECONDS, LinkedBlockingQueue()) { runnable ->
+                Thread(runnable, "silentsuite-notes-sync").apply { isDaemon = true }
+            }.apply { allowCoreThreadTimeOut(true) }
+        }
+        futures[identity] = worker.submit { execute(appContext, account, identity) }
     }
 
     private fun execute(appContext: Context, account: Account, identity: ExactAccountIdentity) {
@@ -175,7 +192,7 @@ object NotesSyncCoordinator {
                     }
                 }
             }
-            Thread.interrupted() // clear a cancellation flag before the executor thread is reused
+            Thread.interrupted() // clear a cancellation flag before the worker thread is reused
             notify(identity)
         }
     }

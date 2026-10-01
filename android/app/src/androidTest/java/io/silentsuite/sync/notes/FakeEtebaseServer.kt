@@ -90,6 +90,9 @@ class FakeEtebaseServer(val baseUrl: String = "https://etebase-fake.invalid/") :
             check(arrivedLatch.await(seconds, TimeUnit.SECONDS)) { "the held request never arrived" }
         }
 
+        /** Whether the held request reaches the server within [millis]. */
+        fun arrivesWithin(millis: Long): Boolean = arrivedLatch.await(millis, TimeUnit.MILLISECONDS)
+
         fun release() = releaseLatch.countDown()
     }
 
@@ -138,7 +141,7 @@ class FakeEtebaseServer(val baseUrl: String = "https://etebase-fake.invalid/") :
     /** The item cursor a full fetch of [uid] ends at. */
     fun itemStoken(uid: String): String = synchronized(lock) { collections.getValue(uid).itemStoken }
 
-    /** Lets every parked request go, so no test leaves the shared Notes thread waiting. */
+    /** Lets every parked request go, so no test leaves a Notes worker waiting. */
     fun releaseAll() = holds.forEach { it.release() }
 
     override fun intercept(chain: Interceptor.Chain): Response {

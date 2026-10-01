@@ -319,8 +319,11 @@ class NotesRuntimeTest {
         val started = CountDownLatch(2)
         val interrupted = CountDownLatch(1)
         val firstRunManual = AtomicReference<Boolean?>(null)
+        val firstRunUnwound = AtomicBoolean(false)
+        val followUpStartedAfterTheFirstUnwound = AtomicReference<Boolean?>(null)
         NotesSyncCoordinator.runnerOverride = { _, _, _, request ->
             val first = started.count == 2L
+            if (!first) followUpStartedAfterTheFirstUnwound.set(firstRunUnwound.get())
             started.countDown()
             if (first) {
                 firstRunManual.set(request.manual)
@@ -332,6 +335,7 @@ class NotesRuntimeTest {
                     // so a request that arrives right after cancellation queues behind it.
                     val until = android.os.SystemClock.uptimeMillis() + 500
                     while (android.os.SystemClock.uptimeMillis() < until) Thread.yield()
+                    firstRunUnwound.set(true)
                 }
             }
         }
@@ -363,6 +367,8 @@ class NotesRuntimeTest {
                     NotesSyncCoordinator.request(context, account, generation, NotesSyncPolicy.Trigger.SCREEN))
                 assertTrue("the follow-up request runs after the cancelled task unwinds: " +
                     NotesSyncCoordinator.snapshotForTesting(identity), started.await(10, TimeUnit.SECONDS))
+                assertEquals("the follow-up started only once the cancelled run had unwound",
+                    true, followUpStartedAfterTheFirstUnwound.get())
                 waitUntil("follow-up run settles") { !NotesSyncCoordinator.isActive(identity) && !NotesSyncCoordinator.isPending(identity) }
             }
 
