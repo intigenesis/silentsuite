@@ -85,6 +85,23 @@ describe('declared quoted-printable text', () => {
 });
 
 describe('legacy contact labels', () => {
+  it('preserves unlabeled vCard 2.1 phone numbers without inventing missing custom labels', () => {
+    const parsed = parseVCard(card('N:Example;Contact;;;', 'TEL;HOME:111', 'TEL;:222', 'TEL;:333',
+      'ADR;HOME;ENCODING=QUOTED-PRINTABLE:;;=31=30=30=20=54=65=73=74=20=53=74=',
+      '=0A=45=78=61=6D=70=6C=65=20=43=69=74=79;;;;'), { strictTextEncoding: true });
+    expect(parsed.tel).toEqual([{ type: 'home', value: '111' }, { type: 'other', value: '222' }, { type: 'other', value: '333' }]);
+    expect(parsed.adr?.[0]).toMatchObject({ type: 'home', street: '100 Test St\nExample City' });
+    expect(parseVCard(generateVCard(parsed))).toEqual(parsed);
+  });
+
+  it('recovers a bare custom phone label alongside a folded vCard 2.1 photo', () => {
+    const parsed = parseVCard(card('TEL;WORK:111', 'TEL;HOME:222', 'TEL;CELL:333', 'TEL;X-Desk:444',
+      'PHOTO;ENCODING=BASE64;JPEG:/9j/', ' 2Q==', ''), { strictTextEncoding: true });
+    expect(parsed.tel).toEqual([{ type: 'work', value: '111' }, { type: 'home', value: '222' }, { type: 'cell', value: '333' }, { type: 'Desk', value: '444' }]);
+    expect(parsed.photo).toBe('data:image/jpeg;base64,/9j/2Q==');
+    expect(parseVCard(generateVCard(parsed))).toEqual(parsed);
+  });
+
   it('preserves case in wrapped custom labels, canonicalizing only known standard labels', () => {
     const parsed = parseVCard(card('item1.TEL:111', 'item1.X-ABLabel:_$!<Desk West>!$_'));
     expect(parsed.tel?.[0]?.type).toBe('Desk West');
