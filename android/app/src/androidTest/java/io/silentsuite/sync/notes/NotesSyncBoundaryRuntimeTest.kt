@@ -547,7 +547,7 @@ class NotesSyncBoundaryRuntimeTest {
 
         // The replacement's notes were in the cache all along, readable by the same loader.
         val theirNotebooks = NotesLoader.notebooks(context, account, "gen-new")
-        assertEquals(listOf("Replacement notebook"), (theirNotebooks as NotesLoad.Loaded).value.map { it.name })
+        assertEquals(listOf("Replacement notebook"), (theirNotebooks as NotesLoad.Loaded).value.notebooks.map { it.name })
         val theirNote = NotesLoader.note(context, account, "gen-new", notebook, note.uid)
         assertEquals(NoteContent(note.uid, "Replacement note", "Replacement body", 2_000L), (theirNote as NotesLoad.Loaded).value)
     }
