@@ -888,6 +888,9 @@ def test_context_aware_vector_roles_and_tint_consumers_are_exact():
     for icon, consumers in system_bar_icons.items():
         vector = ET.parse(RES / f"drawable/{icon}.xml").getroot()
         assert {path.attrib.get("{http://schemas.android.com/apk/res/android}fillColor") for path in vector.findall("path")} == {"@color/semantic_on_system_bar"}, icon
+        # The white fill is only right on a dark action bar. The theme tint makes the glyph follow
+        # the toolbar it sits on: dark on the light Material3 toolbars, white on the dark overlay.
+        assert vector.attrib.get("{http://schemas.android.com/apk/res/android}tint") == "?attr/colorControlNormal", icon
         for consumer in consumers:
             assert f"@drawable/{icon}" in source(f"android/app/src/main/res/{consumer}"), (icon, consumer)
 
