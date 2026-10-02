@@ -78,9 +78,12 @@ import kotlin.concurrent.thread
  * The Notes job, the shared collection refresh and the Notes screens' loader, run for real
  * (coordinator, runner, refresh, loader, Etebase binding, local cache, account store, status store)
  * against an in-process stand-in for the server ([FakeEtebaseServer]) that serves real encrypted
- * notebooks and notes a page at a time and can hold a request in flight. The sync cases hold one
- * request, change something while it is in flight, release it, and check exactly what was written.
- * The loader cases read what a real sync cached, with no fixture in between.
+ * notebooks and notes a page at a time, can hold a request in flight, and can make a listing
+ * never finish. Most sync cases hold one request, change something while it is in flight,
+ * release it, and check exactly what was written. The stall cases make a listing never finish
+ * and check where each paging loop stops and how the next run recovers; one of them runs the
+ * calendar adapter's own sync manager against a local calendar. The loader cases read what a
+ * real sync cached, with no fixture in between.
  */
 @RunWith(AndroidJUnit4::class)
 class NotesSyncBoundaryRuntimeTest {
