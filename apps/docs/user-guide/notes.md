@@ -57,7 +57,7 @@ Reloading the page while offline and reading previously opened notes depends on 
 
 ## Sharing
 
-Share a notebook from **Settings → Sharing**. Members see the same encrypted notebook; the server never sees plaintext. Read-only members can read notes but cannot change them.
+Share a notebook from **Settings → Sharing**. Members see the same notebook, end-to-end encrypted to the public keys you confirm. Before you share or accept, compare security fingerprints with each person over a separate channel, such as in person or on a call; the server supplies usernames and keys, so an unverified fingerprint gives no assurance about who receives access. Read-only members can read notes but cannot change them.
 
 ## What is not in this release
 
