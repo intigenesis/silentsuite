@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import PaymentChoicePanel from '../payment-choice-panel'
 
 vi.mock('next/dynamic', () => ({
-  default: () => () => <div data-testid="stripe-payment-form" />,
+  default: () => ({ submitLabel }: { submitLabel?: string }) => <div data-testid="stripe-payment-form" data-submit-label={submitLabel} />,
 }))
 
 vi.mock('@silentsuite/ui', () => ({
@@ -152,8 +152,8 @@ describe('PaymentChoicePanel direct progression with terms before choice', () =>
       return response({}, false)
     })
     render(<BitcoinPanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
-    expect(await screen.findByText(/current access period \(paid or free trial\)/i)).toBeInTheDocument()
-    expect(screen.queryByText(/paid access/i)).not.toBeInTheDocument()
+    expect(await screen.findByText(/current subscription period is still running/i)).toBeInTheDocument()
+    expect(screen.queryByText(/paid or free trial/i)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /pay .* with bitcoin, lightning and monero/i }))
     await waitFor(() => expect(called('/subscription/payment-flows/v2')).toHaveLength(1))
@@ -323,7 +323,7 @@ describe('PaymentChoicePanel direct progression with terms before choice', () =>
     })
     render(<BitcoinPanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
 
-    expect(await screen.findByText(/current access period \(paid or free trial\)/i)).toBeInTheDocument()
+    expect(await screen.findByText(/current subscription period is still running/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /resume cryptocurrency payment/i }))
     await waitFor(() => expect(called('/subscription/payment-flows/v2/resume')).toHaveLength(1))
     expect(JSON.parse(String(called('/subscription/payment-flows/v2/resume')[0]![1]!.body))).toEqual({ contractVersion: 2, authorityId: serverFlowId })
@@ -348,6 +348,212 @@ describe('PaymentChoicePanel direct progression with terms before choice', () =>
     fireEvent.click(screen.getByRole('button', { name: 'Cancel card payment' }))
     await waitFor(() => expect(called('/subscription/payment-flows/cancel')).toHaveLength(1))
     expect(JSON.parse(String(called('/subscription/payment-flows/cancel')[0]![1]!.body))).toMatchObject({ expectedAuthorityId: serverFlowId })
+  })
+})
+
+// Review correction: an owned authority is recovered from its own frozen terms,
+// independently of whether a fresh purchase is offered today.
+describe('PaymentChoicePanel owned-flow recovery without a fresh offer', () => {
+  const ownedCard = { ...activeFlow, status: 'provider_creation_reconciling', authorityId: serverFlowId, disclosure: cardDisclosure() }
+  const ownedBitcoin = {
+    flowKind: 'btcpay_annual', provider: 'btcpay', status: 'provider_creation_reconciling', planId: 'early_annual', amount: '36.00',
+    currency: 'EUR', createdAt: '2026-08-10T12:00:00Z', cancellable: true, checkoutUrl: 'https://btcpay.test/i/abc123',
+    authorityId: serverFlowId, disclosure: bitcoinDisclosure,
+  }
+  const freshOfferStates = [
+    ['the account profile is absent (issuance off or rolled back)', () => response(annualOffer)],
+    ['the fresh offer is refused', () => response({ detail: 'The selected annual checkout is unavailable.', type: 'https://api.silentsuite.io/errors/plan-not-purchasable' }, false, 409)],
+    ['the offer service is unavailable', () => response({}, false, 503)],
+  ] as const
+
+  it.each(freshOfferStates)('resumes an owned card authority when %s, with zero activation or creation', async (_name, offerReply) => {
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: ownedCard })
+      if (path === '/subscription/offers/v2') return offerReply()
+      if (path === '/subscription/payment-flows/v2/resume') return response({ contractVersion: 2, kind: 'stripe', authorityId: serverFlowId, clientSecret: 'pi_resumed', disclosure: cardDisclosure() })
+      return response({}, false)
+    })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: /resume card payment/i }))
+    expect(await screen.findByTestId('stripe-payment-form')).toHaveAttribute('data-submit-label', 'Pay €36.00')
+    expect(JSON.parse(String(called('/subscription/payment-flows/v2/resume')[0]![1]!.body))).toEqual({ contractVersion: 2, authorityId: serverFlowId })
+    expect(called('/subscription/offers/v2/activate')).toHaveLength(0)
+    expect(called('/subscription/payment-flows/v2')).toHaveLength(0)
+  })
+
+  it.each(freshOfferStates)('resumes an owned Bitcoin invoice when %s, keeping the BTCPay origin check', async (_name, offerReply) => {
+    const BitcoinPanel = await bitcoinEnabledPanel()
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: ownedBitcoin })
+      if (path === '/subscription/offers/v2') return offerReply()
+      if (path === '/subscription/payment-flows/v2/resume') return response({ contractVersion: 2, kind: 'btcpay', authorityId: serverFlowId, checkoutUrl: 'https://btcpay.test/i/abc123', invoiceId: 'invoice-1', invoiceLookupToken: 'lookup-token', disclosure: bitcoinDisclosure })
+      return response({}, false)
+    })
+    render(<BitcoinPanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
+    expect(await screen.findByRole('link', { name: 'Continue in BTCPay' })).toHaveAttribute('href', 'https://btcpay.test/i/abc123')
+    fireEvent.click(screen.getByRole('button', { name: /resume cryptocurrency payment/i }))
+    expect(await screen.findByText(/pay €36\.00\/year annual with bitcoin, lightning and monero/i)).toBeInTheDocument()
+    expect(called('/subscription/offers/v2/activate')).toHaveLength(0)
+    expect(called('/subscription/payment-flows/v2')).toHaveLength(0)
+  })
+
+  it('still refuses a resumed Bitcoin URL outside the configured BTCPay origin', async () => {
+    const BitcoinPanel = await bitcoinEnabledPanel()
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: ownedBitcoin })
+      if (path === '/subscription/offers/v2') return response(annualOffer)
+      if (path === '/subscription/payment-flows/v2/resume') return response({ contractVersion: 2, kind: 'btcpay', authorityId: serverFlowId, checkoutUrl: 'https://evil.test/i/abc123', invoiceId: 'invoice-1', invoiceLookupToken: 'lookup-token', disclosure: bitcoinDisclosure })
+      return response({}, false)
+    })
+    render(<BitcoinPanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /resume cryptocurrency payment/i }))
+    expect(await screen.findByText('Cryptocurrency checkout returned an unexpected payment URL.')).toBeInTheDocument()
+    expect(screen.queryByText(/with bitcoin, lightning and monero/i)).not.toBeInTheDocument()
+  })
+
+  it('does not offer resume for a flow whose authority or frozen terms are not proven', async () => {
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: { ...ownedCard, disclosure: { ...cardDisclosure(), refundWindowDays: 14 } } })
+      if (path === '/subscription/offers/v2') return response(annualOffer)
+      return response({}, false)
+    })
+    renderPanel()
+    expect(await screen.findByRole('heading', { name: 'Payment already in progress' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /resume/i })).not.toBeInTheDocument()
+  })
+
+  it('takes every resumed card amount from the frozen historical disclosure, never today\'s offer', async () => {
+    const historical = { ...ownedCard, planId: 'standard_annual', amount: '48.00', disclosure: cardDisclosure(4800, 400) }
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: historical })
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      if (path === '/subscription/payment-flows/v2/resume') return response({ contractVersion: 2, kind: 'stripe', authorityId: serverFlowId, clientSecret: 'pi_resumed', disclosure: cardDisclosure(4800, 400) })
+      return response({}, false)
+    })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: /resume card payment/i }))
+    expect(await screen.findByTestId('stripe-payment-form')).toHaveAttribute('data-submit-label', 'Pay €48.00')
+    expect(screen.getByText('Amount due').nextSibling).toHaveTextContent('€48.00')
+    expect(screen.queryByText(/€36\.00/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Early Adopter|Standard Plan|early_annual|standard_annual/)).not.toBeInTheDocument()
+  })
+
+  it('titles a resumed historical Bitcoin invoice from its frozen amount while today\'s offer is Standard and card-only', async () => {
+    const BitcoinPanel = await bitcoinEnabledPanel()
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: ownedBitcoin })
+      if (path === '/subscription/offers/v2') return response(preview ? standardPreview : standardOffer)
+      if (path === '/subscription/payment-flows/v2/resume') return response({ contractVersion: 2, kind: 'btcpay', authorityId: serverFlowId, checkoutUrl: 'https://btcpay.test/i/abc123', invoiceId: 'invoice-1', invoiceLookupToken: 'lookup-token', disclosure: bitcoinDisclosure })
+      return response({}, false)
+    })
+    render(<BitcoinPanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /resume cryptocurrency payment/i }))
+    expect(await screen.findByText(/pay €36\.00\/year annual with bitcoin, lightning and monero/i)).toBeInTheDocument()
+    expect(screen.queryByText(/€48\.00/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Standard Plan|standard_annual/)).not.toBeInTheDocument()
+  })
+
+  it('shows the signed refund window before the choice and on the recovery screen', async () => {
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: null })
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      return response({}, false)
+    })
+    renderPanel()
+    expect(await screen.findByText(/€36\.00 now, then €36\.00 every year until you cancel/)).toHaveTextContent('30-day refund window.')
+    expect(called('/subscription/offers/v2/activate')).toHaveLength(0)
+  })
+
+  it('shows the frozen refund window for an owned flow even without a fresh offer', async () => {
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: ownedCard })
+      if (path === '/subscription/offers/v2') return response({}, false, 503)
+      return response({}, false)
+    })
+    renderPanel()
+    expect(await screen.findByText(/€36\.00 now, then €36\.00 every year until you cancel/)).toHaveTextContent('30-day refund window.')
+  })
+})
+
+// Review correction: the authority returned with a displayed capability is the
+// only one any cancel/back/switch may name, even when /current never showed it.
+describe('PaymentChoicePanel displayed-authority cancellation binding', () => {
+  const newerAuthority = '0b5c6a1e-2f3d-4c8b-9a7e-1d2c3b4a5f60'
+  function cancelBodies() {
+    return called('/subscription/payment-flows/cancel').map(([, init]) => JSON.parse(String(init!.body)))
+  }
+
+  it('binds every card cancel to the freshly created authority while a newer server authority exists, and keeps it on lost, malformed and stale replies', async () => {
+    let currentReads = 0
+    const cancelReplies: Array<() => Response> = [
+      () => { throw new TypeError('network lost') },
+      () => response({}),
+      () => response({ type: 'https://api.silentsuite.io/errors/invalid-cancellation-request' }, false, 400),
+    ]
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      // Another tab has since replaced the authority this tab is displaying.
+      if (path === '/subscription/payment-flows/current') return response({ flow: currentReads++ === 0 ? null : { ...activeFlow, authorityId: newerAuthority, disclosure: cardDisclosure() } })
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      if (path === '/subscription/offers/v2/activate') return activation(cardDisclosure())
+      if (path === '/subscription/payment-flows/v2') return response({ contractVersion: 2, kind: 'stripe', authorityId: serverFlowId, clientSecret: 'pi_secret' })
+      if (path === '/subscription/payment-flows/cancel') return cancelReplies.shift()!()
+      return response({}, false)
+    })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
+    expect(await screen.findByTestId('stripe-payment-form')).toBeInTheDocument()
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      fireEvent.click(screen.getAllByRole('button', { name: 'Cancel card payment' })[0]!)
+      await waitFor(() => expect(called('/subscription/payment-flows/cancel')).toHaveLength(attempt))
+      await waitFor(() => expect(screen.getAllByRole('button', { name: 'Cancel card payment' })[0]).not.toBeDisabled())
+      expect(screen.getByTestId('stripe-payment-form')).toBeInTheDocument()
+    }
+    expect(cancelBodies()).toEqual([{ expectedAuthorityId: serverFlowId }, { expectedAuthorityId: serverFlowId }, { expectedAuthorityId: serverFlowId }])
+  })
+
+  it('binds the Bitcoin back/switch to the freshly created authority and keeps the no-sent acknowledgement per attempt', async () => {
+    const BitcoinPanel = await bitcoinEnabledPanel()
+    let cancelReads = 0
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: null })
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      if (path === '/subscription/offers/v2/activate') return activation(bitcoinDisclosure)
+      if (path === '/subscription/payment-flows/v2') return response({ contractVersion: 2, kind: 'btcpay', authorityId: serverFlowId, checkoutUrl: 'https://btcpay.test/i/abc123', invoiceId: 'invoice-1', invoiceLookupToken: 'lookup-token' })
+      if (path === '/subscription/payment-flows/cancel') return cancelReads++ === 0 ? response({}, false, 502) : response({ cancelled: true, flowKind: 'btcpay_annual' })
+      return response({}, false)
+    })
+    render(<BitcoinPanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /pay .* with bitcoin, lightning and monero/i }))
+    const back = () => screen.getAllByRole('button', { name: /cancel cryptocurrency payment and choose card/i })[0]!
+    await screen.findAllByRole('button', { name: /cancel cryptocurrency payment and choose card/i })
+    expect(back()).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /i have not sent cryptocurrency/i }))
+    fireEvent.click(back())
+    await waitFor(() => expect(called('/subscription/payment-flows/cancel')).toHaveLength(1))
+    // A lost cancellation leaves the invoice displayed and requires a fresh acknowledgement.
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: /i have not sent cryptocurrency/i })).not.toBeChecked())
+    expect(screen.getByText(/pay €36\.00\/year annual with bitcoin/i)).toBeInTheDocument()
+    expect(back()).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /i have not sent cryptocurrency/i }))
+    fireEvent.click(back())
+    expect(await screen.findByRole('button', { name: /continue to card payment/i })).toBeInTheDocument()
+    expect(cancelBodies()).toEqual([
+      { confirmNoBitcoinSent: true, expectedAuthorityId: serverFlowId },
+      { confirmNoBitcoinSent: true, expectedAuthorityId: serverFlowId },
+    ])
   })
 })
 

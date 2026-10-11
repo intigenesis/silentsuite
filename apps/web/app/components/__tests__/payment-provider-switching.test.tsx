@@ -231,7 +231,7 @@ describe('explicit provider-switch consequence labels', () => {
     renderPanel()
 
     expect(await screen.findByText(/€36\.00 now, then €36\.00 every year until you cancel/i)).toBeInTheDocument()
-    expect(screen.getByText(/current access period \(paid or free trial\)/i)).toBeInTheDocument()
+    expect(screen.getByText(/current subscription period is still running/i)).toHaveTextContent('30-day refund window.')
     expect(screen.getByRole('button', { name: /continue to card payment/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /back to payment options/i })).not.toBeInTheDocument()
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith('/offers/v2/activate'))).toBe(false)
