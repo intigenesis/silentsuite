@@ -75,9 +75,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
  * assertion at all, and an unproven flow carries it only if the user
  * acknowledged it anyway.
  */
-function cancellationBody(provider: PaymentFlowCancellationProvider, confirmNoBitcoinSent: boolean): string {
-  if (provider === 'stripe') return '{}'
-  return confirmNoBitcoinSent ? JSON.stringify({ confirmNoBitcoinSent: true }) : '{}'
+function cancellationBody(provider: PaymentFlowCancellationProvider, confirmNoBitcoinSent: boolean, expectedAuthorityId?: string): string {
+  const body: Record<string, unknown> = {}
+  if (provider !== 'stripe' && confirmNoBitcoinSent) body.confirmNoBitcoinSent = true
+  // Present only when Billing's current-flow reply named the authority, so a
+  // cancellation can never release a different flow than the one on screen.
+  if (expectedAuthorityId) body.expectedAuthorityId = expectedAuthorityId
+  return JSON.stringify(body)
 }
 
 export async function cancelPaymentFlow(params: {
@@ -85,6 +89,7 @@ export async function cancelPaymentFlow(params: {
   billingApiUrl: string
   provider: PaymentFlowCancellationProvider
   confirmNoBitcoinSent: boolean
+  expectedAuthorityId?: string
 }): Promise<PaymentFlowCancellationResult> {
   // A Bitcoin flow without a local acknowledgement is refused before any
   // request leaves the browser: the server would reject it anyway, and an
@@ -102,7 +107,7 @@ export async function cancelPaymentFlow(params: {
       method: 'POST',
       credentials: 'include',
       headers: { 'content-type': 'application/json' },
-      body: cancellationBody(params.provider, params.confirmNoBitcoinSent),
+      body: cancellationBody(params.provider, params.confirmNoBitcoinSent, params.expectedAuthorityId),
     })
     body = await response.json()
   } catch {

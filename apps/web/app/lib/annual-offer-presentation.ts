@@ -1,4 +1,4 @@
-import type { AnnualOffer, AnnualProvider } from './billing-v2'
+import type { AnnualDisclosure, AnnualOffer, AnnualProvider } from './billing-v2'
 
 /**
  * Presentation-only helpers for the signed annual offer.  The public client
@@ -37,6 +37,26 @@ export function annualOfferMonthlyLabel(offer: AnnualOffer): string {
 
 export function annualOfferRenewalCopy(offer: AnnualOffer): string {
   return `${annualOfferAnnualLabel(offer)}, billed annually (${annualOfferMonthlyLabel(offer)})`
+}
+
+/**
+ * Customer-facing terms rendered only from a signed disclosure. Amounts are
+ * the signed ones; benefit wording follows the signed rule and never promises
+ * an unconditional bonus for the account profile.
+ */
+export function annualTermsCopy(disclosure: AnnualDisclosure): string {
+  const amount = (minor: number) => formatMinorAmount(minor, disclosure.currency)
+  const terms = disclosure.prepaid
+    ? `${amount(disclosure.annualAmountMinor)} prepaid for one year, no automatic renewal.`
+    : disclosure.renewalAmountMinor === null
+      ? `${amount(disclosure.firstChargeAmountMinor)} now.`
+      : `${amount(disclosure.firstChargeAmountMinor)} now, then ${amount(disclosure.renewalAmountMinor)} every year until you cancel.`
+  if (disclosure.periodEndRule === 'account_confirmation_rules_v1') {
+    return disclosure.prepaid
+      ? `${terms} If your current access period (paid or free trial) is still running when payment is confirmed, your year starts when it ends, without a bonus. Otherwise it starts at confirmation, and accounts from the 7‑day trial get a 14‑day bonus first.`
+      : `${terms} If your account still qualifies when Stripe confirms payment, the 14‑day conversion bonus is applied to your Stripe subscription.`
+  }
+  return disclosure.bonusDays === 14 ? `${terms} 14 bonus days after payment confirms.` : terms
 }
 
 export function isAnnualOfferProviderAvailable(
