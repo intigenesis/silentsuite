@@ -75,7 +75,7 @@ class NoteMetaCodecTest {
     // hand-encoded: {mtime: 1, extra: 'x', name: 'A'}, both keys present with mtime first and a field between
     private val mtimeFirst = "83a56d74696d6501a56578747261a178a46e616d65a141"
 
-    private val allFixtures = listOf(
+    internal val allFixtures = listOf(
         webNote, webNoteExtra, webNoteNested, webLongTitle, webUnicodeTitle, webFloatMtime, webNoMtime, webEmpty,
         webFifteenNoMtime, webSixteen, webNegative, webDateSeconds, webDateMillis, webDateFar, webExt, webWidths,
         webDeepArray, webDeepMap, typedAll, mtimeFirst,
