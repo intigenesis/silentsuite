@@ -62,16 +62,24 @@ const stripeOnlyOffer = {
 // Billing mints the payment flow id server-side; it never equals the offer requestId.
 const serverFlowId = '6d1f0a94-8c52-4b7e-9f31-2a5d6e8b0c47'
 
-const activation = {
-  contractVersion: 2,
-  checkoutIntentToken,
-  expiresAt: '2026-08-10T12:05:00Z',
-  disclosure: {
-    kind: 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: 3600,
-    monthlyEquivalentMinor: 300, currency: 'EUR', trialEndsAt: null, firstChargeAt: null, cancelBy: null,
-    cancelByInclusive: false, autoRenew: true, prepaid: false, refundWindowDays: 30, bonusDays: 14,
-    periodEndRule: 'confirmation_bonus_then_1_utc_calendar_year', renewalAt: null, entitlementEndsAt: null,
-  },
+// The account panel previews the exact signed terms per offered provider before
+// the choice; activation must sign exactly those terms before payment starts.
+const PROFILE = 'account_confirmation_rules_v1'
+function accountTerms(annual: number, monthly: number, provider: string) {
+  const prepaid = provider === 'btcpay'
+  return {
+    kind: prepaid ? 'prepaid' : 'charge_now', annualAmountMinor: annual, firstChargeAmountMinor: annual, renewalAmountMinor: prepaid ? null : annual,
+    monthlyEquivalentMinor: monthly, currency: 'EUR', trialEndsAt: null, firstChargeAt: null, cancelBy: null, cancelByInclusive: false,
+    autoRenew: !prepaid, prepaid, refundWindowDays: 30, bonusDays: 0, periodEndRule: PROFILE, renewalAt: null, entitlementEndsAt: null,
+  }
+}
+function previewOf(body: typeof earlyOffer) {
+  const { annualAmountMinor, monthlyEquivalentMinor, providers } = body.offer
+  return { ...body, accountTermsProfile: PROFILE, accountDisclosures: Object.fromEntries(providers.map(provider => [provider, accountTerms(annualAmountMinor, monthlyEquivalentMinor, provider)])) }
+}
+
+function activation(provider: string) {
+  return { contractVersion: 2, checkoutIntentToken, expiresAt: '2026-08-10T12:05:00Z', disclosure: accountTerms(3600, 300, provider) }
 }
 
 function flow(overrides: Record<string, unknown> = {}) {
@@ -108,11 +116,11 @@ type Routes = {
 }
 
 function mockBilling(routes: Routes) {
-  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
-    const url = String(input)
+  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input)).pathname
     if (url.endsWith('/subscription/payment-flows/current')) return routes.currentFlow?.() ?? response({ flow: null })
-    if (url.endsWith('/subscription/offers/v2')) return routes.offer?.() ?? response(earlyOffer)
-    if (url.endsWith('/subscription/offers/v2/activate')) return response(activation)
+    if (url.endsWith('/subscription/offers/v2')) return routes.offer?.() ?? response(previewOf(earlyOffer))
+    if (url.endsWith('/subscription/offers/v2/activate')) return response(activation(JSON.parse(String(init?.body)).provider))
     if (url.endsWith('/subscription/payment-flows/v2')) return routes.paymentFlow?.() ?? response({}, false)
     if (url.endsWith('/subscription/payment-flows/cancel')) return routes.cancel?.() ?? response({ cancelled: true, flowKind: 'stripe_pay_now' })
     if (url.includes('/subscription/crypto/invoice/')) {
@@ -137,7 +145,6 @@ async function openInlineStripePanel() {
   })
   renderPanel()
   fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
-  fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
   await screen.findByTestId('stripe-payment-form')
 }
 
@@ -154,7 +161,6 @@ async function openInlineBitcoinPanel() {
   })
   renderPanel()
   fireEvent.click(await screen.findByRole('button', { name: /pay .* with bitcoin, lightning and monero for/i }))
-  fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
   await screen.findByRole('heading', { name: /pay .* annual with bitcoin/i })
 }
 
@@ -187,7 +193,7 @@ describe('explicit provider-switch consequence labels', () => {
   })
 
   it('does not promise a provider the current server offer does not expose', async () => {
-    mockBilling({ currentFlow: async () => response({ flow: flow() }), offer: async () => response(stripeOnlyOffer) })
+    mockBilling({ currentFlow: async () => response({ flow: flow() }), offer: async () => response(previewOf(stripeOnlyOffer)) })
     renderPanel()
 
     expect(await screen.findByRole('button', { name: 'Cancel card payment' })).toBeInTheDocument()
@@ -217,14 +223,18 @@ describe('explicit provider-switch consequence labels', () => {
     expect(screen.queryByRole('button', { name: /back to payment options/i })).not.toBeInTheDocument()
   })
 
-  it('keeps the pre-authority terms screen on a plain non-cancelling Back control', async () => {
+  // The owner removed the separate terms screen: the exact terms are shown
+  // before any authority exists, and nothing is activated or cancelled until
+  // a provider is chosen.
+  it('shows the signed terms before any authority exists without activating or cancelling anything', async () => {
     mockBilling({})
     renderPanel()
-    fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
 
-    fireEvent.click(await screen.findByRole('button', { name: /back to payment options/i }))
-
-    expect(await screen.findByRole('button', { name: /continue to card payment/i })).toBeInTheDocument()
+    expect(await screen.findByText(/€36\.00 now, then €36\.00 every year until you cancel/i)).toBeInTheDocument()
+    expect(screen.getByText(/current subscription period is still running/i)).toHaveTextContent('30-day refund window.')
+    expect(screen.getByRole('button', { name: /continue to card payment/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /back to payment options/i })).not.toBeInTheDocument()
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith('/offers/v2/activate'))).toBe(false)
     expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).endsWith('/payment-flows/cancel'))).toBe(false)
   })
 })
@@ -497,7 +507,7 @@ describe('provider switching never creates a second authority', () => {
     expect(creationActions()).toHaveLength(0)
   })
 
-  it('preserves the annual-only offer copy and signed-offer confirmation across a provider switch', async () => {
+  it('preserves the annual-only offer copy and signed-terms consent across a provider switch', async () => {
     let currentFlowReads = 0
     mockBilling({
       currentFlow: async () => {
@@ -505,19 +515,28 @@ describe('provider switching never creates a second authority', () => {
         return response({ flow: currentFlowReads === 1 ? flow() : null })
       },
       cancel: async () => response({ cancelled: true, flowKind: 'stripe_pay_now' }),
+      paymentFlow: async () => response({
+        contractVersion: 2, kind: 'btcpay', authorityId: serverFlowId,
+        checkoutUrl: 'https://btcpay.test/i/abc123', invoiceId: 'invoice-1', invoiceLookupToken: 'B'.repeat(43),
+      }),
     })
     renderPanel()
 
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel card payment and choose cryptocurrency' }))
 
-    expect(await screen.findByText(/pay now \+ 14 bonus days/i)).toBeInTheDocument()
+    // The neutral heading, the signed price and the exact Bitcoin terms are
+    // shown before the new choice; there is no unconditional bonus promise.
+    expect(await screen.findByRole('heading', { name: 'Pay now' })).toBeInTheDocument()
     expect(screen.getByText(/€36\.00\/year/)).toBeInTheDocument()
+    expect(screen.getByText(/€36\.00 prepaid for one year, no automatic renewal/i)).toBeInTheDocument()
+    expect(screen.queryByText(/14 bonus days/i)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: CREATE_BITCOIN }))
 
-    expect(await screen.findByRole('heading', { name: /confirm annual terms/i })).toBeInTheDocument()
-    expect(screen.getByText(/14 bonus days after confirmed payment/i)).toBeInTheDocument()
-    expect(screen.getByText(/30-day refund window/i)).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: /pay .* annual with bitcoin/i })).toBeInTheDocument()
+    const activate = vi.mocked(fetch).mock.calls.find(([input]) => String(input).endsWith('/offers/v2/activate'))
+    expect(JSON.parse(String((activate?.[1] as RequestInit).body))).toMatchObject({ provider: 'btcpay', termsProfile: PROFILE })
+    expect(screen.queryByRole('heading', { name: /confirm annual terms/i })).not.toBeInTheDocument()
   })
 })
 
@@ -542,7 +561,7 @@ describe('post-cancellation provider creation stays closed until the lookup prov
       },
       async () => {
         offerReads += 1
-        return offerReads === 1 ? response(earlyOffer) : offerRefresh.promise
+        return offerReads === 1 ? response(previewOf(earlyOffer)) : offerRefresh.promise
       },
     )
     renderPanel()
@@ -557,7 +576,7 @@ describe('post-cancellation provider creation stays closed until the lookup prov
     expect(screen.getByRole('button', { name: /checking current payment/i })).toBeInTheDocument()
     expect(creationActions()).toHaveLength(0)
 
-    await act(async () => { offerRefresh.resolve(response(earlyOffer)) })
+    await act(async () => { offerRefresh.resolve(response(previewOf(earlyOffer))) })
 
     // The offer is now authoritative again while the current-flow lookup has
     // still not resolved: creation must remain unavailable.
@@ -582,7 +601,7 @@ describe('post-cancellation provider creation stays closed until the lookup prov
       },
       async () => {
         offerReads += 1
-        return offerReads === 1 ? response(earlyOffer) : offerRefresh.promise
+        return offerReads === 1 ? response(previewOf(earlyOffer)) : offerRefresh.promise
       },
     )
     renderPanel()
@@ -590,7 +609,7 @@ describe('post-cancellation provider creation stays closed until the lookup prov
     fireEvent.click(await screen.findByRole('button', { name: 'Cancel card payment and choose cryptocurrency' }))
     await waitFor(() => expect(offerReads).toBe(2))
 
-    await act(async () => { offerRefresh.resolve(response(earlyOffer)) })
+    await act(async () => { offerRefresh.resolve(response(previewOf(earlyOffer))) })
     await act(async () => { secondLookup.resolve(response({ flow: bitcoinFlow })) })
 
     expect(await screen.findByText(/payment already in progress/i)).toBeInTheDocument()

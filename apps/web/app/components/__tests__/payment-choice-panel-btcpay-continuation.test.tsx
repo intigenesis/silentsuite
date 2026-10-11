@@ -62,11 +62,24 @@ function response(body: unknown, ok = true) {
   return { ok, json: async () => body } as Response
 }
 
+// The account panel reads the opt-in preview (`?preview=1`) carrying the exact
+// signed terms per offered provider; the plain offer stays in its old shape.
+const PROFILE = 'account_confirmation_rules_v1'
+const cardTerms = {
+  kind: 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: 3600, monthlyEquivalentMinor: 300,
+  currency: 'EUR', trialEndsAt: null, firstChargeAt: null, cancelBy: null, cancelByInclusive: false, autoRenew: true, prepaid: false,
+  refundWindowDays: 30, bonusDays: 0, periodEndRule: PROFILE, renewalAt: null, entitlementEndsAt: null,
+}
+const previewOffer = {
+  ...annualOffer, accountTermsProfile: PROFILE,
+  accountDisclosures: { stripe: cardTerms, btcpay: { ...cardTerms, kind: 'prepaid', renewalAmountMinor: null, autoRenew: false, prepaid: true } },
+}
+
 function mockPanel(checkoutUrl: unknown) {
   vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
-    const url = String(input)
-    if (url.endsWith('/subscription/payment-flows/current')) return response({ flow: bitcoinFlow(checkoutUrl) })
-    if (url.endsWith('/subscription/offers/v2')) return response(annualOffer)
+    const url = new URL(String(input))
+    if (url.pathname === '/subscription/payment-flows/current') return response({ flow: bitcoinFlow(checkoutUrl) })
+    if (url.pathname === '/subscription/offers/v2') return response(url.searchParams.get('preview') === '1' ? previewOffer : annualOffer)
     return response({}, false)
   })
   render(<PaymentChoicePanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
