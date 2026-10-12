@@ -1572,25 +1572,28 @@ class NotesSyncBoundaryRuntimeTest {
         val note = uploadNote(notebook, "Plan", "First draft", mtime = 1_000L)
         val other = uploadNote(notebook, "Other", "Other text", mtime = 1_500L)
         syncNow(account, "gen-swap")
-        deleteLocally(account, "gen-swap", notebook, note.uid)
-        // Edited elsewhere, so the delete's push gets a 409, and the server copy comes back as another note.
+        editLocally(account, "gen-swap", notebook, note.uid, "Plan", "Edited on the phone", mtime = 2_000L)
+        // Edited elsewhere, so the push gets a 409, and the server copy comes back as another note.
         editOnAnotherDevice(notebook, note.uid, "Edited on the web")
         fake.answerAsFor("GET", "collection/$notebook/item/${note.uid}/", "collection/$notebook/item/${other.uid}/")
 
         syncNow(account, "gen-swap")
         val entry = (pending(account, "gen-swap").read(note.uid) as PendingNotesStore.Read.Present).entry
-        assertEquals("the delete is still waiting", PendingEntry.State.DELETE, entry.state)
+        assertEquals("the edit is still waiting", PendingEntry.State.UPSERT, entry.state)
         assertEquals(1, entry.failureCount)
         assertEquals(NotePushPolicy.FailureKind.TRANSIENT.name, entry.lastFailureCategory)
         assertEquals(setOf(note.uid, other.uid), fake.itemUids(notebook))
-        assertFalse(itemManager(notebook).fetch(note.uid).isDeleted)
+        assertEquals("Edited on the web", itemManager(notebook).fetch(note.uid).contentString)
         assertEquals(SyncStatusStore.FailureCategory.NETWORK, status(account, "gen-swap").lastFailureCategory)
 
-        // With the note's own copy, the edit made elsewhere wins over the delete (design 3.4).
+        // With the note's own copy, the conflict is settled as any edit against an edit made elsewhere (design 3.4).
         syncNow(account, "gen-swap")
         assertTrue("nothing is left waiting", pendingHeaders(account, "gen-swap").isEmpty())
-        assertFalse(itemManager(notebook).fetch(note.uid).isDeleted)
-        assertEquals(setOf("Plan", "Other"), cachedNotes(account, notebook))
+        val onServer = fake.itemUids(notebook)
+        assertEquals("the phone's text has a note of its own", 3, onServer.size)
+        assertEquals("Edited on the web", itemManager(notebook).fetch(note.uid).contentString)
+        assertEquals("Edited on the phone", itemManager(notebook).fetch((onServer - note.uid - other.uid).single()).contentString)
+        assertEquals(setOf("Plan", "Other", "Plan (conflicted copy)"), cachedNotes(account, notebook))
         assertSucceeded(status(account, "gen-swap"))
     }
 

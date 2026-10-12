@@ -1262,19 +1262,18 @@ class NotePushStepTest {
         assertEquals("web-1", server.items.getValue("n1").revision)
     }
 
-    @Test fun `deleting the copy while the original cannot be removed does not bring the text back as a second copy`() {
+    @Test fun `discarding the copy while the original cannot be removed does not bring the text back as a second copy`() {
         editedElsewhere()
         var failing = true
         PendingNotesStore.beforeRemoveForTesting = {
             if (failing && it.name == "n1.note") throw IOException("could not remove n1.note")
         }
         run()
-        // The user deletes the conflicted copy. The delete fails with the removal, and both notes stay.
-        val gone = item(entry("copy-1").blob).copy(revision = revision(), deleted = true)
-        assertThrows(IOException::class.java) { store.markDeleted("copy-1", "b1", gone.revision, gone.blob()) }
+        // The user discards the conflicted copy. The discard fails with the removal, and both notes stay.
+        assertThrows(IOException::class.java) { store.discard("copy-1") }
         run()
         failing = false
-        assertEquals(DeleteOutcome.Removed, store.markDeleted("copy-1", "b1", gone.revision, gone.blob()))
+        store.discard("copy-1")
         assertTrue("the original went with the copy", run().succeeded)
         assertTrue(waiting().isEmpty())
         assertEquals(listOf("copy-1"), built)

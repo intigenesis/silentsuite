@@ -172,11 +172,11 @@ class PendingNotesStoreTest {
         assertEquals("the landed note is not silently forgotten", DeleteOutcome.Queued, store.markDeleted("n1", "b1", "d", blob("x")))
     }
 
-    @Test fun `a delete after a landed save still recognizes the landed revision after the editor clears it`() {
+    @Test fun `a save after a landed save still recognizes the landed revision after the editor clears it`() {
         store.editorOpened("n1")
         store.saveLocal("n1", "b1", "r1", blob("edit"), isCreate = false)
         store.completeSend("n1", store.beginSend("n1")!!.version, "r1", blob("landed"))
-        store.markDeleted("n1", "b1", "d1", blob("deleted"))
+        store.saveLocal("n1", "b1", "r2", blob("edited again"), isCreate = false)
         store.clearLanded("n1")
         val e = entry("n1")
         assertEquals(listOf("r1"), e.sent)
@@ -401,10 +401,10 @@ class PendingNotesStoreTest {
         PendingNotesStore.beforeOriginalRemovedForTesting = { throw IllegalStateException("process died") }
         assertThrows(IllegalStateException::class.java) { store.replaceWithNewNote("orig", entry("orig").version, "srv", copy) }
         PendingNotesStore.beforeOriginalRemovedForTesting = null
-        // The next process finishes the copy, then the user merges by hand and deletes another note.
+        // The next process finishes the copy, then the user merges by hand and edits another note.
         val after = restarted()
         after.saveLocal("orig", "b1", "r2", blob("merged by hand"), isCreate = false)
-        after.markDeleted("other", "b1", "d", blob("x"))
+        after.saveLocal("other", "b1", "r1", blob("another note"), isCreate = false)
         for (i in 1..3) restarted().scan()
         assertArrayEquals(blob("merged by hand"), restarted().entry("orig").blob)
     }
@@ -986,7 +986,7 @@ class PendingNotesStoreTest {
         assertThrows(java.io.IOException::class.java) { next.discard("copy1") }
         assertEquals("orig", next.entry("copy1").origin?.noteUid)
         next.discard("orig")
-        assertEquals(DeleteOutcome.Removed, next.markDeleted("copy1", "b1", "d", blob("x")))
+        next.discard("copy1")
         val scan = next.scan()
         assertTrue(scan.entries.isEmpty())
         assertTrue(scan.unreadable.isEmpty())
@@ -1046,10 +1046,11 @@ class PendingNotesStoreTest {
         assertEquals(listOf("r9"), next.beginSend("orig")!!.sent)
     }
 
-    @Test fun `deleting a linked copy leaves an original that was saved again since`() {
+    @Test fun `discarding a linked copy leaves an original that was saved again since`() {
         val next = linkedCopyWhoseOriginalReadsAgain()
         next.saveLocal("orig", "b1", "r2", blob("typed later"), isCreate = false)
-        assertEquals(DeleteOutcome.Removed, next.markDeleted("copy1", "b1", "d", blob("x")))
+        assertEquals(PendingNotesStore.HoldOutcome.HELD, next.hold("copy1", HeldReason.READ_ONLY, now = 5))
+        next.discard("copy1")
         assertArrayEquals("it is no longer the entry the copy replaced", blob("typed later"), next.entry("orig").blob)
         assertEquals(listOf("orig"), next.scan().entries.map { it.noteUid })
     }
@@ -1060,6 +1061,9 @@ class PendingNotesStoreTest {
         next.discard("copy1")
         assertTrue(next.scan().entries.isEmpty())
         assertEquals(Read.Missing, next.read("orig"))
+        // A later edit of the server's version of that note is not held back.
+        next.saveLocal("orig", "b1", "r9", blob("a new edit"), isCreate = false)
+        assertEquals(listOf("r9"), next.beginSend("orig")!!.sent)
     }
 
     // ---- crash safety and damage ----
@@ -1250,7 +1254,7 @@ class PendingNotesStoreTest {
     @Test fun `removing an entry also removes a stale new file so a later recovery cannot bring it back`() {
         store.saveLocal("n1", "b1", "r1", blob("draft"), isCreate = true)
         File(dir, "n1.note.new").writeBytes(PendingCodec.encodeEntry(entry("n1").copy(revision = "r-old")))
-        assertEquals(DeleteOutcome.Removed, store.markDeleted("n1", "b1", "d", blob("x")))
+        store.discard("n1")
         assertEquals(Read.Missing, restarted().read("n1"))
     }
 
@@ -1267,11 +1271,12 @@ class PendingNotesStoreTest {
     @Test fun `a snapshot keeps only the blobs asked for and reads the sequence with the headers`() {
         val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false))
         store.saveLocal("n2", "b2", "r1", blob("two"), isCreate = true)
-        store.markDeleted("n3", "b1", "d", blob("gone"))
+        store.saveLocal("n3", "b1", "r1", blob("held"), isCreate = false)
+        store.hold("n3", HeldReason.READ_ONLY, now = 1)
         val snapshot = store.snapshot { it.notebookUid == "b1" && it.state == PendingEntry.State.UPSERT }
         assertEquals(listOf("n1", "n2", "n3"), snapshot.headers.map { it.noteUid })
         assertEquals(PendingNotesStore.EntryHeader("n1", "b1", PendingEntry.State.UPSERT, v1), snapshot.headers.first())
-        assertEquals(PendingEntry.State.DELETE, snapshot.headers.last().state)
+        assertEquals(PendingEntry.State.HELD, snapshot.headers.last().state)
         assertEquals(setOf("n1"), snapshot.entries.keys)
         assertArrayEquals(blob("one"), snapshot.entries.getValue("n1").blob)
         assertEquals(3L, snapshot.sequence)

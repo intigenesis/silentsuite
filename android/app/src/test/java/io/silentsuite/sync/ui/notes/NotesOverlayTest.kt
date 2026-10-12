@@ -79,7 +79,7 @@ class NotesOverlayTest {
     @Test fun `a read-only notebook shows only the server version and never decrypts`() {
         val fake = Fake(mapOf("a" to text("Edited", "x", 30), "c" to text("New", "y", 40)))
         val result = notebook(
-            listOf(header("a", State.UPSERT, "ro"), header("b", State.DELETE, "ro"), header("c", State.UPSERT, "ro")),
+            listOf(header("a", State.UPSERT, "ro"), header("b", State.UPSERT, "ro"), header("c", State.UPSERT, "ro")),
             row = readOnly, unreadableCached = setOf("u1"), fake = fake,
         )
         assertEquals(listOf(newer.copy(sync = NoteSync.HELD), older.copy(sync = NoteSync.HELD)), result.notes)
@@ -91,9 +91,8 @@ class NotesOverlayTest {
         val fake = Fake(mapOf("a" to text("Other notebook", "x", 99), "c" to text("Here", "y", 5)))
         val result = notebook(listOf(
             header("a", State.UPSERT, "team"),
-            header("b", State.DELETE, "team"),
+            header("b", State.UPSERT, "team"),
             header("c", State.UPSERT),
-            header("d", State.DELETE),
             header("e", State.HELD),
         ), fake = fake)
         assertEquals(listOf(newer, older, NoteRow("c", "Here", "y", 5, NoteSync.WAITING)), result.notes)
@@ -102,11 +101,11 @@ class NotesOverlayTest {
 
     @Test fun `items that could not be decoded are counted unless a pending change covers them`() {
         val result = notebook(
-            listOf(header("u1", State.UPSERT), header("u2", State.DELETE), header("u3", State.HELD)),
+            listOf(header("u1", State.UPSERT), header("u3", State.HELD)),
             mapOf("u1" to text("Fixed", "", 1)),
-            unreadableCached = setOf("u1", "u2", "u3", "u4"),
+            unreadableCached = setOf("u1", "u3", "u4"),
         )
-        // u1 shows through its edit and u2 is deleted locally; u3 is held, so its server copy is still unreadable, as is u4
+        // u1 shows through its edit; u3 is held, so its server copy is still unreadable, as is u4
         assertEquals(2, result.unreadable)
         assertTrue(result.notes.any { it.uid == "u1" && it.sync == NoteSync.WAITING })
     }
@@ -136,7 +135,7 @@ class NotesOverlayTest {
 
     @Test fun `waiting changes are counted per writable notebook`() {
         val overview = NotesOverlay.notebooks(listOf(own, team, readOnly), access,
-            listOf(header("n1", State.UPSERT), header("n2", State.DELETE), header("n3", State.UPSERT, "team")), emptyMap())
+            listOf(header("n1", State.UPSERT), header("n2", State.UPSERT), header("n3", State.UPSERT, "team")), emptyMap())
         assertEquals(listOf(2, 1, 0), overview.notebooks.map { it.waiting })
         assertEquals(0, overview.unsyncedText)
     }
@@ -148,7 +147,7 @@ class NotesOverlayTest {
                 header("n1", State.HELD),
                 header("n2", State.UPSERT, "ro"),
                 header("n3", State.UPSERT, "gone"),
-                header("n4", State.DELETE, "gone"),
+                header("n4", State.UPSERT, "gone"),
                 header("n5", State.UPSERT),
                 header("n6", State.UPSERT, "team"),
             ), unreadableEntries = mapOf("x" to null, "y" to "own"))
@@ -167,7 +166,7 @@ class NotesOverlayTest {
 
     @Test fun `every change is in exactly one place`() {
         val headers = listOf(header("n1", State.UPSERT), header("n2", State.HELD), header("n3", State.UPSERT, "ro"),
-            header("n4", State.DELETE, "team"), header("n5", State.UPSERT, "hidden"), header("n6", State.UPSERT, "gone"))
+            header("n4", State.UPSERT, "team"), header("n5", State.UPSERT, "hidden"), header("n6", State.UPSERT, "gone"))
         val unreadable = mapOf("x" to null)
         val overview = NotesOverlay.notebooks(listOf(own, team, readOnly), access + NotesOverlay.NotebookAccess("hidden", false, false), headers, unreadable)
         assertEquals(headers.size + unreadable.size, overview.notebooks.sumOf { it.waiting } + overview.unsyncedText)
