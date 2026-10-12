@@ -102,6 +102,8 @@ import kotlin.concurrent.thread
  * that the push leaves a landed record to look at. Some cases also read the pending store's files
  * from disk: none holds a title, a text or a notebook name in plain form, and they are still there,
  * byte for byte, after a cache clear and after a same-name account replaced the one that saved them.
+ * One case sends nothing: it compares the raw metadata codec with the binding's typed encoder and
+ * decoder ([NoteMetaBindingComparison]), on a notebook that is never uploaded.
  */
 @RunWith(AndroidJUnit4::class)
 class NotesSyncBoundaryRuntimeTest {
@@ -1745,6 +1747,25 @@ class NotesSyncBoundaryRuntimeTest {
         assertEquals("the text is kept", "Second phone edit", itemManager(notebook).cacheLoad(held.blob).contentString)
         assertEquals("no failure is counted against it", 0, held.failureCount)
         assertSucceeded(status(account, "gen-readback"))
+    }
+
+    @Test fun theRawMetadataCodecAgreesWithTheBindingsTypedEncoderAndDecoderExceptWhereStated() {
+        // Pure Kotlin first: the screens and the comparison must report hand-made differences before
+        // any call into the binding.
+        NoteMetaBindingComparison.selfCheck()
+        val colMgr = server.collectionManager
+        // Made from raw bytes and never uploaded. Every typed call is the comparison's own, behind its screens.
+        val notebook = colMgr.create_raw(Constants.ETEBASE_TYPE_NOTES,
+            TestMsgPack.encode(linkedMapOf("name" to "Comparison, never uploaded")), ByteArray(0))
+        val sdk = Build.VERSION.SDK_INT
+        val report = NoteMetaBindingComparison.run(colMgr.getItemManager(notebook), sdk)
+        assertEquals(report.text(), 0, report.differences.size)
+        // No difference alone does not show that the rows ran: which calls the screens kept out and how
+        // many rows were compared are pinned too.
+        assertEquals("the typed calls that were not made", NoteMetaBindingComparison.expectedNotSent(sdk), report.notSent)
+        assertEquals("the rows that were compared", NoteMetaBindingComparison.expectedCompared(sdk), report.compared)
+        assertEquals("the notebook never reached the server", emptySet<String>(), fake.collectionUids())
+        assertEquals("no request names the notebook", emptyList<String>(), fake.requests.filter { notebook.uid in it })
     }
 
     // ---- helpers ----

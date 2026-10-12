@@ -8,6 +8,7 @@ import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
+import java.io.File
 
 /**
  * Inputs and expected outputs are the bytes the web's own encoder writes (@msgpack/msgpack 1.12.2,
@@ -434,5 +435,19 @@ class NoteMetaCodecTest {
         assertEquals("82a46e616d65a561efbfbd62a56d74696d6505", hex(fresh.bytes))
         assertEquals("a�b", fresh.name)
         assertEquals(NoteMetaCodec.Peek("a�b", 5), NoteMetaCodec.peek(fresh.bytes))
+    }
+
+    // ---- the same fixtures, compared with the binding's typed decoder on a device ----
+
+    @Test fun `the device comparison with the binding holds the same fixtures`() {
+        // Not there as one literal: the two deep fixtures, which are not sent to the binding, and webWidths,
+        // which is built there from the same pieces and is put together again below.
+        val comparison = File("src/androidTest/java/io/silentsuite/sync/notes/NoteMetaBindingComparison.kt").readText()
+        val shared = allFixtures - setOf(webWidths, webDeepArray, webDeepMap)
+        assertEquals(17, shared.size)
+        for (fixture in shared) assertTrue(fixture, comparison.contains("\"$fixture\""))
+        val widths = comparison.substringAfter("private val WEB_WIDTHS =").lineSequence().takeWhile { '"' in it }.joinToString("")
+        val pieces = Regex("\"([0-9a-f]+)\"(?:\\.repeat\\((\\d+)\\))?")
+        assertEquals(webWidths, pieces.findAll(widths).joinToString("") { it.groupValues[1].repeat(it.groupValues[2].ifEmpty { "1" }.toInt()) })
     }
 }
