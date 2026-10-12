@@ -233,8 +233,8 @@ internal object NotesSyncRunner {
         val store = PendingNotesStore.forIdentity(context, account.type, account.name, creationId)
         val waiting = store.snapshot { false }
         if (waiting.headers.isEmpty() && waiting.unreadable.isEmpty()) {
-            // A copy whose last entry went outside a run (a note never sent and then deleted, held text
-            // discarded), or whose removal failed before, goes here. Nothing is written when there is none.
+            // A copy whose last entry went outside a run (held text discarded), or whose removal failed
+            // before, goes here. Nothing is written when there is none.
             pruneNotebookCopies(store)
             return null
         }
@@ -245,8 +245,7 @@ internal object NotesSyncRunner {
         pruneNotebookCopies(store)
         // Counts only: no title, notebook name or text is ever logged.
         Logger.log.info("Notes push ${result.ended}: pushed ${result.pushed}, held ${result.held}, " +
-            "deletes dropped ${result.droppedDeletes}, conflicts ${result.conflicts.values.sum()}, " +
-            "failure ${result.failure}, carried ${result.carriedFailure}")
+            "conflicts ${result.conflicts.values.sum()}, failure ${result.failure}, carried ${result.carriedFailure}")
         return result
     }
 

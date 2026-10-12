@@ -12,7 +12,6 @@ import io.silentsuite.sync.notes.edit.NotePushPolicy.FailureKind
 import io.silentsuite.sync.notes.edit.NotePushPolicy.NotebookCheck
 import io.silentsuite.sync.notes.edit.NotePushStep.Ended
 import io.silentsuite.sync.notes.edit.NotePushStep.Notebook
-import io.silentsuite.sync.notes.edit.PendingNotesStore.DeleteOutcome
 import io.silentsuite.sync.notes.edit.PendingNotesStore.Read
 import io.silentsuite.sync.notes.edit.PendingNotesStore.SaveOutcome
 import io.silentsuite.sync.syncadapter.StaleSyncRunException
@@ -260,12 +259,6 @@ class NotePushStepTest {
         return saved
     }
 
-    /** A pending delete of a note the server holds at [seen]. */
-    private fun delete(uid: String, seen: String, notebook: String = "b1") {
-        val gone = Item(uid, seen, revision(), true, "")
-        assertEquals(DeleteOutcome.Queued, store.markDeleted(uid, notebook, gone.revision, gone.blob()))
-    }
-
     private fun http(status: Int) = HttpException("HTTP error $status! Code: ''. Detail: ''")
 
     /** n1 was uploaded once, that upload landed and its answer was lost, and the user then saved again. Returns the landed revision. */
@@ -352,14 +345,13 @@ class NotePushStepTest {
 
     // ---- notebooks that take no pushes (3.3 step 1) ----
 
-    @Test fun `changes in a notebook that is read-only, deleted or gone are held without an upload, and a pending delete is dropped`() {
+    @Test fun `changes in a notebook that is read-only, deleted or gone are held without an upload`() {
         notebooks["ro"] = Notebook.READ_ONLY
         notebooks["del"] = Notebook.DELETED
         notebooks["gone"] = Notebook.MISSING
         save("e1", "one", notebook = "ro")
         save("e2", "two", notebook = "del")
         save("e3", "three", notebook = "gone")
-        delete("d1", seen = "srv-0", notebook = "ro")
         save("ok", "fine")
         val result = run()
         assertEquals("only the writable notebook's change is sent", listOf("ok"), uploaded())
@@ -369,8 +361,6 @@ class NotePushStepTest {
         assertEquals(HeldReason.READ_ONLY, entry("e1").held?.reason)
         assertEquals(HeldReason.NOTEBOOK_DELETED, entry("e2").held?.reason)
         assertEquals(HeldReason.LOST_ACCESS, entry("e3").held?.reason)
-        assertEquals("a pending delete has no text to keep", Read.Missing, store.read("d1"))
-        assertEquals("and the run says so", 1, result.droppedDeletes)
         assertEquals("three", item(entry("e3").blob).text)
     }
 
@@ -758,9 +748,8 @@ class NotePushStepTest {
         }
     }
 
-    @Test fun `a 403 confirmed as read-only holds the notebook's other entries without an upload and drops a pending delete`() {
+    @Test fun `a 403 confirmed as read-only holds the notebook's other entries without an upload`() {
         threeInOneNotebook()
-        delete("d", seen = "srv-0")
         save("other", "elsewhere", notebook = "b2")
         server.uploadError = { if (it.uid == "other") null else PermissionDeniedException("no_write_access") }
         server.notebookAnswer = { NotebookCheck.Found(readOnly = true, deleted = false) }
@@ -771,8 +760,6 @@ class NotePushStepTest {
         assertEquals(1, result.pushed)
         assertTrue(result.succeeded)
         for (uid in listOf("a", "b", "c")) assertEquals(HeldReason.READ_ONLY, entry(uid).held?.reason)
-        assertEquals(Read.Missing, store.read("d"))
-        assertEquals(1, result.droppedDeletes)
         assertTrue("the notebook is still there for this account", unset.isEmpty())
     }
 
@@ -1077,40 +1064,6 @@ class NotePushStepTest {
         assertEquals(listOf("copy-1"), built)
     }
 
-    /** The copy of n1 was uploaded and landed, its answer was lost, and the user then deleted it on this device. */
-    private fun markedDeleteMeets(deletedElsewhere: Boolean): NotePushStep.Result {
-        editedElsewhere()
-        loseAnswer = { it.uid == "copy-1" }
-        assertEquals(Ended.STOPPED, run().ended)
-        loseAnswer = { false }
-        val gone = item(entry("copy-1").blob).copy(revision = revision(), deleted = true)
-        assertEquals(DeleteOutcome.Queued, store.markDeleted("copy-1", "b1", gone.revision, gone.blob()))
-        assertTrue("the delete carries the mark", entry("copy-1").fromConflict)
-        server.writeElsewhere("copy-1", "web-2", deleted = deletedElsewhere)
-        cached.clear()
-        entryThereAtCacheWrite.clear()
-        val result = run()
-        assertTrue("nothing is held, and no note is made", waiting().isEmpty())
-        assertEquals(0, result.held)
-        assertEquals(listOf("copy-1"), built)
-        assertEquals("the server's copy went into the cache before the delete was dropped", true, entryThereAtCacheWrite["copy-1"])
-        return result
-    }
-
-    @Test fun `a marked pending delete against an edit made elsewhere gives the note back, through the cache, and nothing is held`() {
-        val result = markedDeleteMeets(deletedElsewhere = false)
-        assertEquals(listOf("copy-1=web-2"), cached)
-        assertEquals("the user is told the delete did not happen", mapOf("b1" to 1), result.conflicts)
-        assertTrue(result.succeeded)
-    }
-
-    @Test fun `a marked pending delete against a delete made elsewhere is already done, quietly`() {
-        val result = markedDeleteMeets(deletedElsewhere = true)
-        assertEquals(listOf("copy-1=web-2 deleted"), cached)
-        assertTrue(result.conflicts.isEmpty())
-        assertTrue(result.succeeded)
-    }
-
     // ---- the mark with a server that behaves ----
 
     @Test fun `a first conflict on an ordinary note still makes its copy, and the copy lands in the same run`() {
@@ -1133,21 +1086,9 @@ class NotePushStepTest {
         assertTrue(result.succeeded)
         assertEquals(false, titledAsCopy["copy-1"])
         assertEquals("n1=web-1 deleted", cached.first())
+        assertEquals("the deletion was cached before the edit was replaced", true, entryThereAtCacheWrite["n1"])
         assertTrue(waiting().isEmpty())
         assertNotNull(server.items["copy-1"])
-    }
-
-    @Test fun `a local delete against an edit made elsewhere gives the note back, and against a delete it is simply done`() {
-        server.writeElsewhere("x", "web-1")
-        server.writeElsewhere("y", "web-2", deleted = true)
-        delete("x", seen = "srv-0")
-        delete("y", seen = "srv-0")
-        val result = run()
-        assertTrue(result.succeeded)
-        assertEquals(mapOf("b1" to 1), result.conflicts)
-        assertTrue(waiting().isEmpty())
-        assertEquals(listOf("x=web-1", "y=web-2 deleted"), cached)
-        assertTrue(built.isEmpty())
     }
 
     @Test fun `a conflict copy saved during its first upload is an ordinary note afterwards`() {
@@ -1313,25 +1254,6 @@ class NotePushStepTest {
         assertEquals("the original was pushed once, before the conflict", 1, uploaded().count { it == "n1" })
         assertEquals(onCopy.revision, server.items.getValue("copy-1").revision)
         assertEquals("web-1", server.items.getValue("n1").revision)
-        assertTrue(waiting().isEmpty())
-    }
-
-    @Test fun `a delete from an editor that has not rebound deletes the copy on the server, not the original`() {
-        server.writeElsewhere("n1", "web-1")
-        val editor = store.editorOpened("n1")
-        val first = Item("n1", "srv-0", revision(), false, "mine")
-        store.saveLocal(editor, "n1", "b1", first.revision, first.blob(), isCreate = false)
-        assertTrue(run().succeeded)
-        val late = Item("n1", "srv-0", revision(), true, "")
-        assertEquals(DeleteOutcome.Moved("copy-1"), store.markDeleted(editor, "n1", "b1", late.revision, late.blob()))
-        assertEquals(Read.Missing, store.read("n1"))
-        val onCopy = Item("copy-1", store.landed("copy-1")!!.revision, revision(), true, "")
-        assertEquals(DeleteOutcome.Queued, store.markDeleted(editor, "copy-1", "b1", onCopy.revision, onCopy.blob()))
-        assertTrue(run().succeeded)
-        assertTrue(server.items.getValue("copy-1").deleted)
-        assertEquals("the other client's version of the original is untouched", "web-1", server.items.getValue("n1").revision)
-        assertFalse(server.items.getValue("n1").deleted)
-        assertEquals(listOf("copy-1"), built)
         assertTrue(waiting().isEmpty())
     }
 
@@ -1581,22 +1503,6 @@ class NotePushStepTest {
         assertTrue(waiting().isEmpty())
     }
 
-    @Test fun `a delete during a successful upload stays a delete, built on the item that landed, and the next run deletes the note`() {
-        val first = save("a", "text")
-        duringUpload = {
-            duringUpload = {}
-            val gone = item(entry("a").blob).copy(revision = revision(), deleted = true)
-            assertEquals(DeleteOutcome.Queued, store.markDeleted("a", "b1", gone.revision, gone.blob()))
-        }
-        assertTrue(run().succeeded)
-        val kept = entry("a")
-        assertEquals(PendingEntry.State.DELETE, kept.state)
-        assertEquals(first.revision, item(kept.blob).base)
-        assertTrue(run().succeeded)
-        assertTrue(server.items.getValue("a").deleted)
-        assertTrue(waiting().isEmpty())
-    }
-
     @Test fun `a failure of the upload is recorded against the text that was sent, not against text saved during it`() {
         save("a", "too odd")
         server.uploadError = { http(400) }
@@ -1639,21 +1545,6 @@ class NotePushStepTest {
         assertTrue(run().succeeded)
         assertTrue(waiting().isEmpty())
         assertEquals("one copy on the server", 1, server.items.keys.count { it.startsWith("copy-") })
-    }
-
-    @Test fun `if the cache cannot take the server's copy a delete that lost to an edit stays pending`() {
-        server.writeElsewhere("x", "web-1")
-        delete("x", seen = "srv-0")
-        cacheError = IOException("disk full")
-        val failed = run()
-        assertEquals(FailureKind.LOCAL, failed.failure)
-        assertTrue(failed.conflicts.isEmpty())
-        assertEquals("dropping it now would show a note that the cache does not hold yet", PendingEntry.State.DELETE, entry("x").state)
-        cacheError = null
-        val result = run()
-        assertTrue(result.succeeded)
-        assertEquals(mapOf("b1" to 1), result.conflicts)
-        assertTrue(waiting().isEmpty())
     }
 
     @Test fun `if the cache cannot take the server's copy an upload that is found to have landed stays pending`() {
@@ -1825,6 +1716,7 @@ class NotePushStepTest {
         assertEquals("the server keeps the upload that landed", "one", server.items.getValue("n1").text)
         assertEquals("and that upload, which the cache never got, is in it before the hold",
             listOf("n1=${server.items.getValue("n1").revision}"), cached)
+        assertEquals("while the text was still waiting, so before the hold", PendingEntry.State.UPSERT, stateAtCacheWrite["n1"])
 
         server.uploads.clear()
         assertTrue(run().succeeded)
@@ -1893,40 +1785,6 @@ class NotePushStepTest {
         assertEquals(PendingEntry.State.UPSERT, entry("n1").state)
         assertEquals(0, entry("n1").failureCount)
         assertEquals("mine", item(entry("n1").blob).text)
-    }
-
-    @Test fun `a pending delete that cannot be rebased is dropped, and the server's copy shows again`() {
-        server.items["n1"] = Item("n1", null, "srv-0", false, "theirs")
-        val first = save("n1", "one", seen = "srv-0")
-        loseAnswer = { true }
-        assertEquals(Ended.STOPPED, run().ended)
-        loseAnswer = { false }
-        delete("n1", seen = "srv-0")
-        rebaseError = IllegalStateException("could not decrypt")
-        val result = run()
-        assertEquals("a delete has no text to hold", 0, result.held)
-        assertEquals(1, result.droppedDeletes)
-        assertNull(result.failure)
-        assertTrue(waiting().isEmpty())
-        assertEquals("the upload that landed is still the server's copy", first.revision, server.items.getValue("n1").revision)
-        assertEquals("and it was written into the cache before the delete went, so the note does not fall back to older text",
-            listOf("n1=${first.revision}"), cached)
-        assertEquals("the delete was still there at that moment", true, entryThereAtCacheWrite["n1"])
-    }
-
-    @Test fun `a pending delete whose server copy cannot be cached first is kept, with a storage failure`() {
-        server.items["n1"] = Item("n1", null, "srv-0", false, "theirs")
-        save("n1", "one", seen = "srv-0")
-        loseAnswer = { true }
-        assertEquals(Ended.STOPPED, run().ended)
-        loseAnswer = { false }
-        delete("n1", seen = "srv-0")
-        rebaseError = IllegalStateException("could not decrypt")
-        cacheError = IllegalStateException("the cache could not be written")
-        val result = run()
-        assertEquals(0, result.droppedDeletes)
-        assertEquals(FailureKind.LOCAL, result.failure)
-        assertEquals(PendingEntry.State.DELETE, entry("n1").state)
     }
 
     @Test fun `text whose server copy cannot be cached first is not held, and waits with a storage failure`() {

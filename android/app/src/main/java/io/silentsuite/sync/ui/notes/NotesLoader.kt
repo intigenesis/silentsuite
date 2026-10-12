@@ -132,7 +132,7 @@ internal object NotesLoader {
         // is damaged is marked here instead of counting by its header alone; only edits are decrypted.
         val readPending = { store: PendingNotesStore ->
             val snapshot = store.snapshot { it.notebookUid == notebookUid && it.state != PendingEntry.State.HELD }
-            val hasEdits = snapshot.entries.values.any { it.state == PendingEntry.State.UPSERT }
+            val hasEdits = snapshot.entries.isNotEmpty()
             PendingRead(snapshot, if (hasEdits) notebookCopy(store, notebookUid) else null)
         }
         return load(context, account, creationId, readPending) { cache, colMgr, pending ->
@@ -321,15 +321,15 @@ internal object NotesLoader {
             // still be shown if they fail, and never while holding the cache monitor or the cache's write
             // fence (the pending lock is never held together with either). This order is safe only
             // because of a rule on the runner: before any store change that lets a note fall back to the
-            // cache (dropping an entry after a push, the conflict drops, removing an original for a
-            // conflict copy, holding text for a repeated conflict or because the note could not be built),
-            // it writes the server item it holds, deleted ones included, into the cache
-            // under the cache monitor and, inside it, through the run's SyncRunGuard.write (which takes
-            // the write fence), without holding the pending lock, and keeps the entry if that write
-            // fails or is refused because the run is no longer current. A load then sees either the
-            // entry or a cache at least as new, so a change that just landed can show as waiting until
-            // the next reload, but older server text, or a note deleted here, never comes back in its
-            // place.
+            // cache (dropping an entry after a push, the drop after a conflict that found the upload had
+            // landed, removing an original for a conflict copy, holding text for a repeated conflict or
+            // because the note could not be built), it writes the server item it holds, deleted ones
+            // included, into the cache under the cache monitor and, inside it, through the run's
+            // SyncRunGuard.write (which takes the write fence), without holding the pending lock, and
+            // keeps the entry if that write fails or is refused because the run is no longer current. A
+            // load then sees either the entry or a cache at least as new, so a change that just landed
+            // can show as waiting until the next reload, but older server text, or a note deleted
+            // elsewhere, never comes back in its place.
             val read = readPending(PendingNotesStore.forIdentity(appContext, account.type, account.name, creationId))
             pending = PendingValue(read)
             if (!exactGenerationStillCurrent()) return NotesLoad.Stale

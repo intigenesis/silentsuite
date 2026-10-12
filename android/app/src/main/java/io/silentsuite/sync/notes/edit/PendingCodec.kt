@@ -208,15 +208,20 @@ internal object PendingCodec {
         input.readLong()
     }
 
+    /**
+     * The state as entry files hold it. Code 2 stood for a pending delete on the unreleased prototype
+     * branch. No state has it now, and it is not given to another state: an upload sends an entry's
+     * blob as it is, whatever its state, and the blob of such a file is a deleted item. This build
+     * neither writes nor reads the code, so a file that carries it is [Decoded.Bad] like one in any
+     * state this build does not know, and is kept.
+     */
     private fun stateCode(state: PendingEntry.State) = when (state) {
         PendingEntry.State.UPSERT -> 1
-        PendingEntry.State.DELETE -> 2
         PendingEntry.State.HELD -> 3
     }
 
     private fun stateOf(code: Int) = when (code) {
         1 -> PendingEntry.State.UPSERT
-        2 -> PendingEntry.State.DELETE
         3 -> PendingEntry.State.HELD
         else -> throw IOException("state $code")
     }

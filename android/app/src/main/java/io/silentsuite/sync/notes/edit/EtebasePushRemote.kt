@@ -70,8 +70,8 @@ internal class EtebasePushRemote(
         val itemMgr = manager(entry.notebookUid)
         guard.check()
         val item = itemMgr.fetch(entry.noteUid)
-        // The conflict step can drop the entry on this copy without decrypting it (our own upload, and
-        // both delete rows), so it has to be this note, and its revision has to name what it holds.
+        // The conflict step can drop the entry on this copy without decrypting it (our own upload),
+        // so it has to be this note, and its revision has to name what it holds.
         // Anything else is the entry's failure, and nothing is resolved without the real copy.
         check(item.uid == entry.noteUid && item.verify()) { "the server answered with another note, or one that does not verify" }
         return serverItem(itemMgr, item)
@@ -101,7 +101,7 @@ internal class EtebasePushRemote(
     }
 
     /**
-     * The server copy with the entry's change on top: its deletion, or its text with its name and mtime
+     * The server copy with the entry's change on top: its text, with its name and mtime
      * merged into the server copy's metadata, so fields another client wrote there are kept. The result
      * keeps the server copy's revision as its base, so its push names the copy it was built on.
      */
@@ -109,7 +109,6 @@ internal class EtebasePushRemote(
         val itemMgr = manager(entry.notebookUid)
         val target = itemMgr.cacheLoad(onto.blob)
         when (entry.state) {
-            PendingEntry.State.DELETE -> target.delete()
             PendingEntry.State.UPSERT -> {
                 val local = itemMgr.cacheLoad(entry.blob)
                 val (name, mtime) = nameAndMtime(local)

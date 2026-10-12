@@ -89,9 +89,9 @@ internal class NotePushStep(
         fun unsetNotebook(notebookUid: String)
 
         /**
-         * The entry's change (its text and title, or its deletion) applied onto [onto]. Throws [NotBuilt]
-         * when the entry's own metadata gives no readable title, when [onto]'s metadata cannot be written
-         * into, or when the result does not read back as written.
+         * The entry's text and title applied onto [onto]. Throws [NotBuilt] when the entry's own
+         * metadata gives no readable title, when [onto]'s metadata cannot be written into, or when the
+         * result does not read back as written.
          */
         fun rebase(entry: PendingEntry, onto: ServerItem): Built
 
@@ -134,8 +134,7 @@ internal class NotePushStep(
      * What the step did in its run.
      * @property pushed notes that landed, or were found to have landed.
      * @property held texts moved to the holding area.
-     * @property droppedDeletes pending deletes that were dropped instead of held, so the server's copy shows again.
-     * @property conflicts per notebook uid, the conflicts settled with a new note or by giving a note back.
+     * @property conflicts per notebook uid, the conflicts settled with a new note.
      * @property failure the run's own failure: the error that ended the step, else the first entry failure.
      * An entry's failure in this run stays the run's failure even when a later notebook answer holds that entry.
      * A 401 is not recorded here; it is [Ended.NEEDS_AUTHENTICATION].
@@ -149,7 +148,6 @@ internal class NotePushStep(
         val conflicts: Map<String, Int>,
         val failure: FailureKind?,
         val carriedFailure: String?,
-        val droppedDeletes: Int = 0,
     ) {
         /** Every entry the run attempted was pushed or resolved, and none was skipped while stuck. */
         val succeeded: Boolean get() = ended == Ended.COMPLETED && failure == null && carriedFailure == null
@@ -171,7 +169,6 @@ internal class NotePushStep(
     private val skipped = HashMap<String, Pair<Long, String>>()
     private var pushed = 0
     private var held = 0
-    private var droppedDeletes = 0
     private var failure: FailureKind? = null
     private var ran = false
 
@@ -194,7 +191,7 @@ internal class NotePushStep(
         } catch (end: EndPass) {
             end.ended
         }
-        return Result(ended, pushed, held, conflicts.toMap(), failure, carriedFailure(), droppedDeletes)
+        return Result(ended, pushed, held, conflicts.toMap(), failure, carriedFailure())
     }
 
     private fun pushWaiting() {
@@ -444,11 +441,6 @@ internal class NotePushStep(
                 if (latest.version != snapshot.version || cacheFirst(latest, server)) {
                     hold(uid, HeldReason.REPEATED_CONFLICT, sentVersion = snapshot.version)
                 }
-            ConflictOutcome.RESTORE_SERVER_NOTE, ConflictOutcome.ALREADY_DELETED -> if (cacheFirst(latest, server)) {
-                store.dropDelete(uid, latest.version)
-                if (decision == ConflictOutcome.RESTORE_SERVER_NOTE) countConflict(latest.notebookUid)
-                settled += uid
-            }
             ConflictOutcome.RETRY_LATER -> error("decided with a server copy")
         }
     }
@@ -525,9 +517,8 @@ internal class NotePushStep(
             fail(entry, FailureKind.LOCAL)
             return
         }
-        // Held text leaves the note's row to the server's version, and a pending delete, which has no
-        // text to hold, is dropped: either way the note falls back to the cache, so the server's copy
-        // goes in there first (design 3.3).
+        // Held text leaves the note's row to the server's version, so the server's copy goes into the
+        // cache first (design 3.3).
         if (!cacheFirst(entry, server)) return
         val reason = (error as? NotBuilt)?.reason ?: HeldReason.NOT_BUILT
         // The reason and the kind of error, never a title, a notebook name or text: a NotBuilt's message
@@ -539,8 +530,8 @@ internal class NotePushStep(
 
     /**
      * Design 3.3: the server item is written into the Etebase cache before any store change that lets
-     * the note fall back to it, or a load in between would show older server text, or bring back a note
-     * deleted here. False when that write failed: the entry stays, with the failure recorded.
+     * the note fall back to it, or a load in between would show older server text, or still list a note
+     * that was deleted elsewhere. False when that write failed: the entry stays, with the failure recorded.
      */
     private fun cacheFirst(entry: PendingEntry, item: ServerItem): Boolean = try {
         remote.cache(entry, item)
@@ -564,7 +555,6 @@ internal class NotePushStep(
         ensureCurrent()
         when (store.hold(uid, reason, now(), sentVersion)) {
             HoldOutcome.HELD -> held++
-            HoldOutcome.DELETE_DROPPED -> droppedDeletes++
             // Its text lives in a conflict copy now, which is held in its own right.
             HoldOutcome.UNFINISHED_ORIGINAL -> {
                 unfinishedOriginal(uid)

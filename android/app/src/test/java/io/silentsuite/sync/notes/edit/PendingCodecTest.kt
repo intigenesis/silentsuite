@@ -83,6 +83,16 @@ class PendingCodecTest {
         assertEquals("state 4", (header(file) as PendingCodec.Decoded.Bad).reason)
     }
 
+    @Test fun `the state code of the prototype's pending delete is not read, by the full read or by the header read`() {
+        // Only tests of the unreleased prototype branch wrote it. The file is whole, so recovery keeps it,
+        // and both reads refuse it as they refuse any state this build does not know. The code is not
+        // given to another state: this test fails if it is.
+        val file = unhex(v2Deleted)
+        assertTrue(PendingCodec.isIntact(file))
+        assertEquals("state 2", bad(file))
+        assertEquals("state 2", (header(file) as PendingCodec.Decoded.Bad).reason)
+    }
+
     @Test fun `a file is intact when its checksum matches, whether or not this build can read it`() {
         val bytes = PendingCodec.encodeEntry(full)
         assertTrue(PendingCodec.isIntact(bytes))
@@ -195,7 +205,9 @@ class PendingCodecTest {
 
     // Format 2 with the conflict mark as its last header field. The mark was added in place, before any
     // build had written format 2 on a user's device (design 3.8); from then on a new field needs format 3.
-    // The upsert carries the mark; the delete and the held entry are unmarked.
+    // The upsert carries the mark; the held entry is unmarked. v2Deleted is an entry in the delete state
+    // the prototype branch once had (state code 2), kept to show that the code is not read. With the
+    // state byte set to 1 its bytes are still read and written, as an edit.
     private val v2Upsert = "53534e50020000003d00066e6f74652d310006626f6f6b2d3101000000000000000300057265762d33010000000100057265762d3200000000ffffffffffffffff00000000014a6a00520000000301020389a5614f"
     private val v2Deleted = "53534e50020000004d00066e6f74652d320006626f6f6b2d3102000000000000000900057265762d64000000000200057265762d6100057265762d62000000020000019980a6340000095452414e5349454e54000000255055b0000000010996f19b9c"
     private val v2Held = "53534e50020000006600066e6f74652d330006626f6f6b2d3203000000000000000c00057265762d68000000000000000000ffffffffffffffff00000100066e6f74652d3000057265762d6f000000000000000500057372762d3701000852454a45435445440000019980a635f4001387e8b800000000748f775f"
@@ -204,18 +216,22 @@ class PendingCodecTest {
     private val v2HeldRepeatedEntry = PendingEntry("note-4", "book-2", PendingEntry.State.HELD, 15, "rev-c", true, listOf("rev-c"),
         held = PendingEntry.Held(HeldReason.REPEATED_CONFLICT, 1_758_800_001_000), fromConflict = true, blob = byteArrayOf(42))
 
-    // The three format 2 layouts as they were before the mark, kept only to show they no longer read.
+    // The upsert and held layouts of format 2 as they were before the mark, kept only to show they no longer read.
     private val v2UpsertBeforeMark = "53534e50020000003c00066e6f74652d310006626f6f6b2d3101000000000000000300057265762d33010000000100057265762d3200000000ffffffffffffffff00000000bacf634300000003010203594d24b4"
-    private val v2DeletedBeforeMark = "53534e50020000004c00066e6f74652d320006626f6f6b2d3102000000000000000900057265762d64000000000200057265762d6100057265762d62000000020000019980a6340000095452414e5349454e54000030ed609400000001099f4f157b"
     private val v2HeldBeforeMark = "53534e50020000006500066e6f74652d330006626f6f6b2d3203000000000000000c00057265762d68000000000000000000ffffffffffffffff00000100066e6f74652d3000057265762d6f000000000000000500057372762d3701000852454a45435445440000019980a635f4e41a9e3e000000005b9e02ad"
 
     @Test fun `format 2 entry files read back exactly and are written byte for byte the same`() {
-        val fixtures = listOf(v2Upsert to upsertEntry.copy(fromConflict = true), v2Deleted to deletedEntry,
-            v2Held to heldEntry, v2HeldRepeated to v2HeldRepeatedEntry)
+        val fixtures = listOf(v2Upsert to upsertEntry.copy(fromConflict = true), v2Held to heldEntry,
+            v2HeldRepeated to v2HeldRepeatedEntry)
         for ((hex, entry) in fixtures) {
             assertEquals(entry, ok(unhex(hex)))
             assertArrayEquals(unhex(hex), PendingCodec.encodeEntry(entry))
         }
+        // The only fixed bytes with a failure on record and two sent revisions: v2Deleted with its state
+        // byte set to 1, an edit. The state code follows the two uids, each written with its two-byte length.
+        val failed = withEntryHeader(unhex(v2Deleted)) { h -> h.copyOf().also { it[16] = 1 } }
+        assertEquals(failedEntry, ok(failed))
+        assertArrayEquals(failed, PendingCodec.encodeEntry(failedEntry))
     }
 
     @Test fun `a format 2 file from before the conflict mark is reported as unreadable, not read as unmarked`() {
@@ -223,7 +239,7 @@ class PendingCodecTest {
         // reported like any file that cannot be read, and the header-only view refuses it the same way.
         // One left as an uncommitted first write (a ".new" with no committed file) is whole, so recovery
         // commits it under its own name, and it is reported the same way.
-        for (hex in listOf(v2UpsertBeforeMark, v2DeletedBeforeMark, v2HeldBeforeMark)) {
+        for (hex in listOf(v2UpsertBeforeMark, v2HeldBeforeMark)) {
             val bytes = unhex(hex)
             assertEquals("truncated", bad(bytes))
             assertEquals("truncated", (PendingCodec.decodeEntryHeader(bytes.copyOf(PendingCodec.entryHeaderEnd(bytes)!!)) as PendingCodec.Decoded.Bad).reason)
@@ -239,7 +255,7 @@ class PendingCodecTest {
     }
 
     private val upsertEntry = PendingEntry("note-1", "book-1", PendingEntry.State.UPSERT, 3, "rev-3", true, listOf("rev-2"), blob = byteArrayOf(1, 2, 3))
-    private val deletedEntry = PendingEntry("note-2", "book-1", PendingEntry.State.DELETE, 9, "rev-d", false, listOf("rev-a", "rev-b"),
+    private val failedEntry = PendingEntry("note-2", "book-1", PendingEntry.State.UPSERT, 9, "rev-d", false, listOf("rev-a", "rev-b"),
         failureCount = 2, lastFailureAt = 1_758_800_000_000, lastFailureCategory = "TRANSIENT", blob = byteArrayOf(9))
     private val heldEntry = PendingEntry("note-3", "book-2", PendingEntry.State.HELD, 12, "rev-h", false,
         origin = PendingEntry.Origin("note-0", "rev-o", 5, "srv-7"), held = PendingEntry.Held(HeldReason.REJECTED, 1_758_800_000_500), blob = byteArrayOf())

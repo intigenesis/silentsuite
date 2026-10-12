@@ -31,8 +31,7 @@ enum class NoteSync {
  *   read-only notebook, leaves the server version in place with a [NoteSync.HELD] marker, and counts
  *   toward the unsynced text the notebook list points to. An entry whose notebook is gone counts there
  *   too, so nothing pending is ever invisible.
- * - A pending edit or create replaces or adds its note's row and is marked. A pending delete hides the
- *   row before the first render (web #746).
+ * - A pending edit or create replaces or adds its note's row and is marked.
  * - A pending edit whose blob cannot be read keeps the server row, or adds a placeholder for a create,
  *   with its own marker. So does a note whose entry file cannot be read at all.
  */
@@ -133,10 +132,6 @@ internal object NotesOverlay {
                 continue
             }
             covered += h.noteUid
-            if (h.state == PendingEntry.State.DELETE) {
-                rows.remove(h.noteUid)
-                continue
-            }
             val content = decrypt(h)
             rows[h.noteUid] = if (content != null) {
                 NoteRow(h.noteUid, content.title, content.preview, content.editedAt, NoteSync.WAITING)
@@ -159,11 +154,11 @@ internal object NotesOverlay {
     }
 
     /**
-     * One note for the viewer, or null when there is nothing to show (a note deleted locally, or neither
-     * a server copy nor any local change). [read] is this note's entry file and [sequence] the store's
-     * sequence read with it; every result carries the sequence, so an editor can drop a load older than
-     * its last save whether or not an entry existed. [cached] is null when the server copy is missing
-     * or cannot be decoded.
+     * One note for the viewer, or null when there is nothing to show (neither a server copy nor any
+     * local change). [read] is this note's entry file and [sequence] the store's sequence read with
+     * it; every result carries the sequence, so an editor can drop a load older than its last save
+     * whether or not an entry existed. [cached] is null when the server copy is missing or cannot be
+     * decoded.
      */
     fun note(
         noteUid: String,
@@ -183,7 +178,6 @@ internal object NotesOverlay {
         }
         if (entry.notebookUid != notebookUid) return cached?.copy(observedSequence = sequence)
         if (!writable || entry.state == PendingEntry.State.HELD) return marked(NoteSync.HELD, entry.version)
-        if (entry.state == PendingEntry.State.DELETE) return null
         val content = decrypt(entry) ?: return marked(NoteSync.LOCAL_UNREADABLE, entry.version)
         return NoteContent(noteUid, content.title, content.body.orEmpty(), content.editedAt, NoteSync.WAITING, entry.version, sequence)
     }

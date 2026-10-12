@@ -36,10 +36,6 @@ internal object NotePushPolicy {
          * The text is held as [HeldReason.REPEATED_CONFLICT], with the sent version, as for a rejection.
          */
         HOLD_REPEATED_CONFLICT,
-        /** A local delete against an edit made elsewhere: the newer edit wins, the note comes back. */
-        RESTORE_SERVER_NOTE,
-        /** Both sides deleted it: done (web issue #745). */
-        ALREADY_DELETED,
         /**
          * The server copy could not be fetched: the entry is never resolved without it. The failed fetch
          * is the entry's failure, recorded as [FailureKind.TRANSIENT] with backoff (design 3.8).
@@ -56,9 +52,7 @@ internal object NotePushPolicy {
      * The mark of a note made from a conflict changes only the two rows that make a note. Without it, a
      * server that answers every push with a 409 and a copy that is not ours would get a new note, a
      * notification and another push in every run; with it, the run that makes the note also holds it
-     * (design 3.8). A copy of ours is handled as for any entry. So is a pending delete, marked or not:
-     * the delete rows make no note, so there is nothing to bound, and they report what happened to the
-     * delete (a note given back counts as a conflict), where the holding area would only drop it.
+     * (design 3.8). A copy of ours is handled as for any entry.
      */
     fun decide(entry: PendingEntry, landedRevision: String?, server: ServerCopy?): ConflictOutcome {
         require(entry.state != PendingEntry.State.HELD) { "held text is never pushed" }
@@ -71,8 +65,6 @@ internal object NotePushPolicy {
                 server.deleted -> ConflictOutcome.RECREATE_AS_NEW_NOTE
                 else -> ConflictOutcome.KEEP_BOTH
             }
-            PendingEntry.State.DELETE ->
-                if (server.deleted) ConflictOutcome.ALREADY_DELETED else ConflictOutcome.RESTORE_SERVER_NOTE
             PendingEntry.State.HELD -> error("unreachable")
         }
     }

@@ -27,9 +27,6 @@ class NotePushPolicyTest {
     private fun upsert(revision: String, sent: List<String> = emptyList(), isCreate: Boolean = false) =
         PendingEntry("n", "b", PendingEntry.State.UPSERT, 1, revision, isCreate, sent, blob = ByteArray(0))
 
-    private fun delete(revision: String, sent: List<String> = emptyList()) =
-        PendingEntry("n", "b", PendingEntry.State.DELETE, 1, revision, false, sent, blob = ByteArray(0))
-
     // ---- the conflict table (design section 3.4) ----
 
     @Test fun `our own landed upload with nothing newer is done`() {
@@ -50,26 +47,12 @@ class NotePushPolicyTest {
         assertEquals(ConflictOutcome.REBASE, NotePushPolicy.decide(upsert("r3", listOf("r3")), "r1", ServerCopy("r1", false)))
     }
 
-    @Test fun `our own landed delete is done and a newer delete onto our own edit is rebased`() {
-        assertEquals(ConflictOutcome.DONE, NotePushPolicy.decide(delete("d1", listOf("d1")), null, ServerCopy("d1", true)))
-        assertEquals(ConflictOutcome.REBASE, NotePushPolicy.decide(delete("d1", listOf("r1", "d1")), null, ServerCopy("r1", false)))
-    }
-
     @Test fun `an edit against an edit made elsewhere keeps both`() {
         assertEquals(ConflictOutcome.KEEP_BOTH, NotePushPolicy.decide(upsert("r2", listOf("r2")), null, ServerCopy("web-1", false)))
     }
 
     @Test fun `an edit against a delete made elsewhere becomes a new note`() {
         assertEquals(ConflictOutcome.RECREATE_AS_NEW_NOTE, NotePushPolicy.decide(upsert("r2", listOf("r2")), null, ServerCopy("web-del", true)))
-    }
-
-    @Test fun `a delete against an edit made elsewhere gives the note back`() {
-        assertEquals(ConflictOutcome.RESTORE_SERVER_NOTE, NotePushPolicy.decide(delete("d1", listOf("d1")), null, ServerCopy("web-1", false)))
-    }
-
-    @Test fun `a delete against a delete made elsewhere is already done`() {
-        // Spike step 5: the server answers this with a conflict too.
-        assertEquals(ConflictOutcome.ALREADY_DELETED, NotePushPolicy.decide(delete("d1", listOf("d1")), null, ServerCopy("web-del", true)))
     }
 
     // ---- a note made from a conflict that conflicts again (design section 3.8) ----
@@ -92,18 +75,10 @@ class NotePushPolicyTest {
         assertEquals(ConflictOutcome.REBASE, NotePushPolicy.decide(upsert("c3", listOf("c3")).copy(fromConflict = true), "c1", ServerCopy("c1", false)))
     }
 
-    @Test fun `a marked pending delete follows the delete rows, never the holding area`() {
-        val marked = delete("d1", listOf("c1", "d1")).copy(fromConflict = true)
-        assertEquals(ConflictOutcome.RESTORE_SERVER_NOTE, NotePushPolicy.decide(marked, null, ServerCopy("srv-1", false)))
-        assertEquals(ConflictOutcome.ALREADY_DELETED, NotePushPolicy.decide(marked, null, ServerCopy("srv-del", true)))
-        assertEquals(ConflictOutcome.REBASE, NotePushPolicy.decide(marked, null, ServerCopy("c1", false)))
-        assertEquals(ConflictOutcome.DONE, NotePushPolicy.decide(marked, null, ServerCopy("d1", true)))
-    }
-
     @Test fun `an unmarked note is never held for a repeated conflict`() {
         // The bound must not fire in an ordinary sequence: every row of the table as it was.
         val servers = listOf(ServerCopy("web-1", false), ServerCopy("web-del", true), ServerCopy("r1", false), ServerCopy("r2", false))
-        for (entry in listOf(upsert("r2", listOf("r1", "r2")), upsert("c1", listOf("c1"), isCreate = true), delete("r2", listOf("r1", "r2")))) {
+        for (entry in listOf(upsert("r2", listOf("r1", "r2")), upsert("c1", listOf("c1"), isCreate = true))) {
             for (server in servers) {
                 assertTrue(NotePushPolicy.decide(entry, null, server) != ConflictOutcome.HOLD_REPEATED_CONFLICT)
             }

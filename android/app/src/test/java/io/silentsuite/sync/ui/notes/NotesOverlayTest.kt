@@ -57,11 +57,6 @@ class NotesOverlayTest {
         assertEquals(NoteSync.WAITING, result.notes.last().sync)
     }
 
-    @Test fun `a pending delete hides the row before the first render`() {
-        assertEquals(listOf("a"), notebook(listOf(header("b", State.DELETE))).notes.map { it.uid })
-        assertEquals(listOf("b", "a"), notebook(listOf(header("z", State.DELETE))).notes.map { it.uid })
-    }
-
     @Test fun `held text leaves the server version in place and says where the text is`() {
         val result = notebook(listOf(header("a", State.HELD), header("x", State.HELD)))
         assertEquals(listOf(newer, older.copy(sync = NoteSync.HELD)), result.notes)
@@ -116,7 +111,7 @@ class NotesOverlayTest {
     }
 
     @Test fun `an entry whose header names this notebook but whose rest is damaged is never out of view`() {
-        // A damaged create gets a placeholder, a damaged edit or delete marks the server row, and one
+        // A damaged create gets a placeholder, a damaged edit marks the server row, and one
         // filed under another notebook, or with no readable header, adds nothing here.
         val result = notebook(emptyList(), unreadableEntries = mapOf("c" to "own", "b" to "own", "d" to "team", "e" to null))
         assertEquals(listOf(newer.copy(sync = NoteSync.LOCAL_UNREADABLE), older, NoteRow("c", "", "", null, NoteSync.LOCAL_UNREADABLE)), result.notes)
@@ -230,10 +225,6 @@ class NotesOverlayTest {
             note(server, Read.Present(entry(State.UPSERT, 5)), writable = false, body = Decrypted("x", "x", "x", 1)))
         // held text of a create that never reached the server
         assertEquals(NoteContent("a", "", "", null, NoteSync.HELD, 6, 12), note(null, Read.Present(entry(State.HELD, 6, held = heldReason))))
-    }
-
-    @Test fun `a note deleted locally is not shown`() {
-        assertNull(note(server, Read.Present(entry(State.DELETE, 5))))
     }
 
     @Test fun `an unreadable edit shows the server version marked, and an unreadable create shows a marked placeholder`() {

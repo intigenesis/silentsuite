@@ -10,13 +10,18 @@ internal data class PendingEntry(
     val notebookUid: String,
     val state: State,
     /**
-     * Moves on every local content change (save, delete, rebase), never on bookkeeping. Drawn from a
+     * Moves on every local content change (save, rebase), never on bookkeeping. Drawn from a
      * store-wide counter, so it only ever grows, even across a drop and a new entry for the same note.
      */
     val version: Long,
     /** The revision uid of [blob], as the item's etag reported when the blob was written. */
     val revision: String,
-    /** True while the note has never been confirmed on the server (a local create). */
+    /**
+     * True for an entry made for a note first written on this device. It is not updated when the note
+     * lands while the entry stays (a newer save during the upload, a rebase), so it can still be true
+     * for a note that is on the server; only a new entry made while a landed record exists clears it.
+     * A reader must look at [sent] as well.
+     */
     val isCreate: Boolean,
     /**
      * Revision uids of ours that the server may hold as its current copy, capped at [MAX_SENT] with the
@@ -40,7 +45,7 @@ internal data class PendingEntry(
     val fromConflict: Boolean = false,
     val blob: ByteArray,
 ) {
-    enum class State { UPSERT, DELETE, HELD }
+    enum class State { UPSERT, HELD }
 
     /** The replaced entry, identified by version and revision (a random uid), so it cannot be confused with a later entry. */
     data class Origin(val noteUid: String, val revision: String, val version: Long, val serverRevision: String)
@@ -104,7 +109,7 @@ internal enum class HeldReason {
 
 /**
  * The saved item after a successful push, kept until the open editor has rebound or closed. While it
- * exists, a later save or delete of the note starts from it: the note is known to exist on the server
+ * exists, a later save of the note starts from it: the note is known to exist on the server
  * at [revision], so it is not a create, and a 409 against [revision] is our own write.
  */
 internal data class LandedRecord(val noteUid: String, val revision: String, val version: Long, val blob: ByteArray) {

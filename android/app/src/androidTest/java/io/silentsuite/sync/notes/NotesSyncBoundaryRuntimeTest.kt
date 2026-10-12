@@ -1290,24 +1290,53 @@ class NotesSyncBoundaryRuntimeTest {
         assertSucceeded(status(account, "gen-lost"))
     }
 
-    @Test fun aPendingDeleteIsPushedAndTheNoteLeavesTheCache() {
-        val account = newAccount("gen-delete")
+    @Test fun anEditOfANoteDeletedElsewhereBecomesANewNoteWithItsOwnTitleAndTheDeletionStays() {
+        val account = newAccount("gen-gone")
         val notebook = uploadNotebook("Work")
-        val note = uploadNote(notebook, STORE_CHECK_TITLE, STORE_CHECK_BODY, mtime = 1_000L)
-        uploadNote(notebook, "Keep", "Stays", mtime = 1_500L)
-        syncNow(account, "gen-delete")
-        deleteLocally(account, "gen-delete", notebook, note.uid)
-        // A pending delete still carries the note's title in its blob, so its file is read from disk as well.
-        val store = pending(account, "gen-delete")
-        val queued = assertNothingPlainOnDisk(store, listOf(STORE_CHECK_TITLE, STORE_CHECK_BODY)).getValue(note.uid)
-        assertEquals(PendingEntry.State.DELETE, queued.state)
-        assertEquals("the title is in the file, and not as plain text", STORE_CHECK_TITLE, decryptThroughStoredCopy(store, queued).meta.name)
+        val note = uploadNote(notebook, "Plan", "First draft", mtime = 1_000L)
+        val keep = uploadNote(notebook, "Keep", "Stays", mtime = 1_500L)
+        syncNow(account, "gen-gone")
+        editLocally(account, "gen-gone", notebook, note.uid, "Plan v2", "Edited on the phone", mtime = 2_000L)
+        // Deleted on another device: the server's copy is a deleted item, and this account's cache does not know it yet.
+        note.delete()
+        itemManager(notebook).batch(arrayOf(note))
+        val deletion = note.etag
+        assertEquals(setOf("Plan", "Keep"), cachedNotes(account, notebook))
 
-        syncNow(account, "gen-delete")
-        assertTrue("deleted on the server", itemManager(notebook).fetch(note.uid).isDeleted)
-        assertEquals(setOf("Keep"), cachedNotes(account, notebook))
-        assertTrue("nothing is left waiting", pendingHeaders(account, "gen-delete").isEmpty())
-        assertSucceeded(status(account, "gen-delete"))
+        val since = fake.requests.size
+        val newUpload = fake.hold("POST", TRANSACTION, skip = 1)
+        startManualRun(account, "gen-gone")
+        newUpload.awaitArrival()
+        // The deleted note has left the cached list already, through the push step's own cache write and
+        // not the fetch, which comes after it. The new note is in the store, made by the app itself,
+        // while its upload is in flight.
+        assertTrue("the fetch has not run yet",
+            fake.requests.drop(since).none { it.substringBefore('?') == "GET collection/$notebook/item/" })
+        assertEquals("the deleted note is no longer listed", setOf("Keep"), cachedNotes(account, notebook))
+        val newOnDisk = assertNothingPlainOnDisk(pending(account, "gen-gone"), listOf("Plan v2", "Edited on the phone")).values.single()
+        assertTrue("it is the new note, marked as made from a conflict: $newOnDisk",
+            newOnDisk.fromConflict && newOnDisk.isCreate && newOnDisk.origin == null && newOnDisk.noteUid != note.uid)
+        val newItem = decryptThroughStoredCopy(pending(account, "gen-gone"), newOnDisk)
+        assertEquals(listOf("Plan v2", "Edited on the phone"), listOf(newItem.meta.name, newItem.contentString))
+        newUpload.release()
+        awaitSettled(ExactAccountIdentity(account.type, account.name, "gen-gone"))
+        // The refused push, the server copy, and the new note, pushed in the run that made it.
+        val serverCopy = "GET collection/$notebook/item/${note.uid}/"
+        assertEquals(listOf(transactionOf(notebook), serverCopy, transactionOf(notebook)),
+            fake.requests.drop(since).filter { it.substringBefore('?') == serverCopy || UPLOAD.matches(it.substringBefore('?')) })
+        val onServer = fake.itemUids(notebook)
+        assertEquals("the deleted note, the other note, and the phone's text as a note of its own", 3, onServer.size)
+        val gone = itemManager(notebook).fetch(note.uid)
+        assertTrue("the note deleted elsewhere stays deleted", gone.isDeleted)
+        assertEquals("at the revision the other device left: nothing was uploaded over it", deletion, gone.etag)
+        val created = itemManager(notebook).fetch((onServer - note.uid - keep.uid).single())
+        assertEquals("its own title, not a conflicted copy's", "Plan v2", created.meta.name)
+        assertEquals("Edited on the phone", created.contentString)
+        @Suppress("UNCHECKED_CAST")
+        assertEquals("fresh metadata, as the web's move writes", setOf("name", "mtime"), (TestMsgPack.decode(created.metaRaw) as Map<String, Any?>).keys)
+        assertTrue("nothing is left waiting", pendingHeaders(account, "gen-gone").isEmpty())
+        assertEquals(setOf("Keep", "Plan v2"), cachedNotes(account, notebook))
+        assertSucceeded(status(account, "gen-gone"))
     }
 
     @Test fun aChangeInANotebookNowReadOnlyIsHeldWithoutAnUpload() {
@@ -2392,15 +2421,6 @@ class NotesSyncBoundaryRuntimeTest {
         val saved = store.saveLocal(note, notebook, item.etag, itemMgr.cacheSaveWithContent(item), isCreate = false,
             notebookCopy = copy.takeIf { withNotebookCopy })
         assertTrue("the edit was saved: $saved", saved is PendingNotesStore.SaveOutcome.Saved)
-    }
-
-    /** A delete by note uid with no editor open: the note with `delete()` applied, queued in the pending store. */
-    private fun deleteLocally(account: Account, generation: String, notebook: String, note: String) {
-        val store = pending(account, generation)
-        val (itemMgr, item, copy) = editable(account, store, notebook, note)
-        item.delete()
-        val queued = store.markDeleted(note, notebook, item.etag, itemMgr.cacheSaveWithContent(item), notebookCopy = copy)
-        assertEquals(PendingNotesStore.DeleteOutcome.Queued, queued)
     }
 
     /** The item a save starts from, with its item manager and a copy of its notebook; the pending lock and the cache monitor are never held together. */
