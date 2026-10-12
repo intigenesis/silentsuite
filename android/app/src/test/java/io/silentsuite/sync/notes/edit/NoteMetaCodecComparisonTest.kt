@@ -21,6 +21,7 @@ import org.msgpack.core.MessageStringCodingException
 import org.msgpack.core.MessageTypeException
 import org.msgpack.core.buffer.MessageBuffer
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.math.BigInteger
 import java.util.EnumSet
 import java.util.Random
@@ -76,7 +77,8 @@ private fun isPlainKey(bytes: ByteArray, from: Int, to: Int): Boolean = PLAIN_KE
 
 /**
  * The same inputs through [NoteMetaCodec] and through a second implementation of merge, fresh and peek
- * on msgpack-core 0.9.12 ([MsgpackCoreNoteMeta]), in its three walk variants.
+ * on msgpack-core 0.9.12 ([MsgpackCoreNoteMeta]), in its three walk variants. The public result calls
+ * LIBRARY_SKIP, LEAF_SKIP and HEADERS_ONLY forms (a), (b) and (c); form (c) is [NoteMetaMsgpack].
  *
  * What is asserted:
  * - LEAF_SKIP and HEADERS_ONLY, the two careful walks, give the same result as the codec on every
@@ -101,8 +103,9 @@ private fun isPlainKey(bytes: ByteArray, from: Int, to: Int): Boolean = PLAIN_KE
  *
  * What a difference of zero can and cannot show: on the library side only the format layer is the
  * library's. The key rules, the count checks, the order of the output and the handling of the name
- * are the codec's own code or a copy of it (see the head of MsgpackCoreNoteMeta.kt), so a mistake in
- * one of them, or any mistake both sides share, gives no difference here.
+ * are the codec's own code or a copy of it (see the heads of NoteMetaMsgpack.kt and
+ * MsgpackCoreNoteMeta.kt), so a mistake in one of them, or any mistake both sides share, gives no
+ * difference here.
  *
  * The counts (comparisons for each corpus, differences for each variant, allocation figures, the
  * reasons on both sides) go to standard output, which Gradle keeps in the XML result of this class.
@@ -1787,6 +1790,52 @@ class NoteMetaCodecComparisonTest {
             }
             fail("a corpus with hand-made defect $i passes")
         }
+    }
+
+    // ---- 15 ----
+
+    /**
+     * HEADERS_ONLY, the form the public result calls (c), is the class NoteMetaMsgpack in a file of its
+     * own, so that what it calls of the library can be checked by reading that one file. This holds the
+     * file to it, and the comparison to the file.
+     *
+     * The file is read as text and its head comment, the first block comment, is set aside; that
+     * comment lists the calls the file never makes and has to name skipValue. What is checked:
+     * - The rest of the file, code and comments alike, contains none of these names anywhere: skipValue;
+     *   unpackValue and packValue, the value model; unpackString; readPayloadAsReference; and the name
+     *   of the class that holds the two forms that do call skipValue, so that the file cannot reach one
+     *   of these calls through that class.
+     * - The rest of the file contains the name readPayload once, in its three-argument form: the read
+     *   into the scratch array.
+     * - The class behind HEADERS_ONLY in this comparison is NoteMetaMsgpack itself, not a subclass.
+     *
+     * What no check of one file's text can see: a declaration in another file of the same package,
+     * which the file could use without an import; and a name put together at run time.
+     */
+    @Test(timeout = 30_000)
+    fun `the file of the form without skipValue names none of the calls it says it never makes`() {
+        val source = File("src/test/java/io/silentsuite/sync/notes/edit/NoteMetaMsgpack.kt").readText()
+        val open = source.indexOf("/*")
+        val close = source.indexOf("*/", open)
+        assertTrue("NoteMetaMsgpack.kt has a head comment", open >= 0 && close > open)
+        val header = source.substring(open, close + 2)
+        val code = source.removeRange(open, close + 2)
+        // The line of the file for a position in the text without the head comment.
+        fun line(at: Int) = source.take(if (at < open) at else at + header.length).count { it == '\n' } + 1
+        // The list of the calls never made is in the part that is set aside, and the file is the one that is meant.
+        assertTrue("the head comment of NoteMetaMsgpack.kt names skipValue", header.contains("skipValue"))
+        assertTrue("the file declares the class", code.contains("internal open class NoteMetaMsgpack"))
+        for (name in listOf("skipValue", "unpackValue", "packValue", "unpackString", "readPayloadAsReference", "MsgpackCoreNoteMeta")) {
+            val at = code.indexOf(name)
+            if (at >= 0) fail("NoteMetaMsgpack.kt names $name outside its head comment, in line ${line(at)}")
+        }
+        val reads = Regex("readPayload").findAll(code).map { line(it.range.first) }.toList()
+        assertEquals("NoteMetaMsgpack.kt names readPayload outside its head comment in lines $reads; the number of them", 1, reads.size)
+        assertTrue(
+            "the one readPayload of NoteMetaMsgpack.kt, in line ${reads[0]}, is the read into the scratch array",
+            code.contains("u.readPayload(scratch, 0, n)"),
+        )
+        assertEquals("HEADERS_ONLY is NoteMetaMsgpack itself, not a subclass", NoteMetaMsgpack::class.java, lib(Walk.HEADERS_ONLY).form.javaClass)
     }
 
     companion object {
