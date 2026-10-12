@@ -99,11 +99,13 @@ import kotlin.concurrent.thread
  * the pending store by note uid, with no editor open, then check what a real run sent, what the
  * server and the cache hold afterwards, and what the run recorded, against a server that behaves
  * and one that misbehaves in a given way. One of them opens an editor handle before its run, so
- * that the push leaves a landed record to look at. Some cases also read the pending store's files
- * from disk: none holds a title, a text or a notebook name in plain form, and they are still there,
- * byte for byte, after a cache clear and after a same-name account replaced the one that saved them.
- * One case sends nothing: it compares the raw metadata codec with the binding's typed encoder and
- * decoder ([NoteMetaBindingComparison]), on a notebook that is never uploaded.
+ * that the push leaves a landed record to look at. Three of them hold the upload in flight and
+ * cancel the run, switch Notes off, sign out or replace the account before its answer arrives.
+ * Some cases also read the pending store's files from disk: none holds a title, a text or a
+ * notebook name in plain form, and they are still there, byte for byte, after a cache clear and
+ * after a same-name account replaced the one that saved them. One case sends nothing: it compares
+ * the raw metadata codec with the binding's typed encoder and decoder
+ * ([NoteMetaBindingComparison]), on a notebook that is never uploaded.
  */
 @RunWith(AndroidJUnit4::class)
 class NotesSyncBoundaryRuntimeTest {
@@ -1749,6 +1751,290 @@ class NotesSyncBoundaryRuntimeTest {
         assertSucceeded(status(account, "gen-readback"))
     }
 
+    @Test fun aCancelledOrSwitchedOffRunWritesNothingAfterItsInFlightPush() {
+        val account = newAccount("gen-push-stop")
+        val identity = ExactAccountIdentity(account.type, account.name, "gen-push-stop")
+        val notebook = uploadNotebook("Work")
+        val note = uploadNote(notebook, "Plan", "First draft", mtime = 1_000L)
+        val list = uploadNote(notebook, "List", "Milk", mtime = 1_500L)
+        syncNow(account, "gen-push-stop")
+        // Every held run below has two changes waiting. The plan's is the older one, so the held
+        // upload is the plan's. What a run that went on would do with the list's differs: in steps 1
+        // and 3, where the server takes the upload, it would be seen sending it; in step 2 the dropped
+        // connection would end the push step with the plan's failure counted; in step 4 it would hold
+        // both. A note is also added on the server before each of those runs, so a run that went on
+        // would fetch it and move the notebook's cursor. A stop by the cancelled schedule alone, with
+        // the interrupt swallowed, is shown on a dropped upload (step 2) and on the notebook fetch
+        // (step 4), not on an upload the server took.
+
+        // 1. The run is cancelled while the upload is in flight, after the server took it. Like a
+        // blocking socket read, the request does not stop for the interrupt; its answer arrives afterwards.
+        editLocally(account, "gen-push-stop", notebook, note.uid, "Plan", "Phone edit one", mtime = 2_000L)
+        editLocally(account, "gen-push-stop", notebook, list.uid, "List", "Milk and eggs", mtime = 2_500L)
+        val webOne = uploadNote(notebook, "From the web one", "Web text one", mtime = 3_000L)
+        val cancelled = holdPush(account, "gen-push-stop", notebook, note.uid, applied = true)
+        NotesSyncCoordinator.cancel(identity)
+        release(cancelled)
+        assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
+        assertNothingWrittenFromPush(cancelled, account, "gen-push-stop", notebook, note.uid)
+        assertEquals("the upload itself landed", "Phone edit one", itemManager(notebook).fetch(note.uid).contentString)
+        assertEquals("the change behind it was not sent", "Milk", itemManager(notebook).fetch(list.uid).contentString)
+
+        // The next run is not affected. It sends the same revision again, which the server takes
+        // without a change, then the list, and it fetches the note from the web: no conflicted copy.
+        var again = fake.requests.size
+        syncNow(account, "gen-push-stop")
+        assertEquals(listOf(transactionOf(notebook), transactionOf(notebook)), uploads(again))
+        assertEquals("the resent revision was taken as it is, with no fetch of the server's copy", 0,
+            fake.requests.drop(again).count { it.substringBefore('?') == "GET collection/$notebook/item/${note.uid}/" })
+        assertEquals("no conflicted copy", setOf(note.uid, list.uid, webOne.uid), fake.itemUids(notebook))
+        assertEquals("Milk and eggs", itemManager(notebook).fetch(list.uid).contentString)
+        assertTrue("nothing is left waiting", pendingHeaders(account, "gen-push-stop").isEmpty())
+        assertEquals("Phone edit one", cachedBody(account, notebook, note.uid))
+        assertEquals("Milk and eggs", cachedBody(account, notebook, list.uid))
+        assertEquals(setOf("Plan", "List", "From the web one"), cachedNotes(account, notebook))
+        assertEquals(fake.itemStoken(notebook), notebookCursor(account, notebook))
+        assertSucceeded(status(account, "gen-push-stop"))
+
+        // 2. Cancelled again, but the server never takes the upload and the network stack swallows
+        // the interrupt. The connection drops, which a run that is still wanted counts as the
+        // change's failure; here only the cancelled schedule, not the thread's interrupt, says stop.
+        editLocally(account, "gen-push-stop", notebook, note.uid, "Plan", "Phone edit two", mtime = 4_000L)
+        editLocally(account, "gen-push-stop", notebook, list.uid, "List", "Milk, eggs and tea", mtime = 4_500L)
+        val webTwo = uploadNote(notebook, "From the web two", "Web text two", mtime = 5_000L)
+        val dropped = holdPush(account, "gen-push-stop", notebook, note.uid, applied = false, swallowInterrupt = true)
+        NotesSyncCoordinator.cancelAccount(account.type, account.name)
+        release(dropped)
+        assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
+        assertNothingWrittenFromPush(dropped, account, "gen-push-stop", notebook, note.uid)
+        assertEquals("the server has the text from before", "Phone edit one", itemManager(notebook).fetch(note.uid).contentString)
+
+        // Unlike after step 1, the held upload never landed: the next run's first upload is not a
+        // resend the server already has, and both of its uploads change the server's notes.
+        again = fake.requests.size
+        syncNow(account, "gen-push-stop")
+        assertEquals(listOf(transactionOf(notebook), transactionOf(notebook)), uploads(again))
+        assertEquals("no conflicted copy", setOf(note.uid, list.uid, webOne.uid, webTwo.uid), fake.itemUids(notebook))
+        assertEquals("Phone edit two", itemManager(notebook).fetch(note.uid).contentString)
+        assertEquals("Milk, eggs and tea", itemManager(notebook).fetch(list.uid).contentString)
+        assertTrue("nothing is left waiting", pendingHeaders(account, "gen-push-stop").isEmpty())
+        assertEquals(setOf("Plan", "List", "From the web one", "From the web two"), cachedNotes(account, notebook))
+        assertEquals(fake.itemStoken(notebook), notebookCursor(account, notebook))
+        assertSucceeded(status(account, "gen-push-stop"))
+
+        // 3. Notes is switched off while the upload is in flight, with no cancellation reaching the
+        // run, and the server took the upload.
+        editLocally(account, "gen-push-stop", notebook, note.uid, "Plan", "Phone edit three", mtime = 6_000L)
+        editLocally(account, "gen-push-stop", notebook, list.uid, "List", "Milk, eggs, tea and jam", mtime = 6_500L)
+        val webThree = uploadNote(notebook, "From the web three", "Web text three", mtime = 7_000L)
+        val switchedOff = holdPush(account, "gen-push-stop", notebook, note.uid, applied = true)
+        assertTrue(AccountSettings.writeNotesEnabled(manager, account, false))
+        release(switchedOff)
+        awaitSettled(identity)
+        assertNothingWrittenFromPush(switchedOff, account, "gen-push-stop", notebook, note.uid)
+        assertEquals("the upload itself landed", "Phone edit three", itemManager(notebook).fetch(note.uid).contentString)
+
+        // Notes is switched on again and the plan is saved once more before the next run. That save
+        // goes onto the change still waiting, so it is still based on the copy from before the upload,
+        // and its push is refused. The server's copy is the revision the switched-off run sent, so
+        // the save is rebased onto it and not copied.
+        assertTrue(AccountSettings.writeNotesEnabled(manager, account, true))
+        editLocally(account, "gen-push-stop", notebook, note.uid, "Plan", "Phone edit four", mtime = 8_000L)
+        again = fake.requests.size
+        syncNow(account, "gen-push-stop")
+        assertEquals("the list, the refused push of the new save, and its rebased push",
+            listOf(transactionOf(notebook), transactionOf(notebook), transactionOf(notebook)), uploads(again))
+        assertEquals("the server copy was fetched once", 1,
+            fake.requests.drop(again).count { it.substringBefore('?') == "GET collection/$notebook/item/${note.uid}/" })
+        assertEquals("no conflicted copy", setOf(note.uid, list.uid, webOne.uid, webTwo.uid, webThree.uid), fake.itemUids(notebook))
+        assertEquals("Phone edit four", itemManager(notebook).fetch(note.uid).contentString)
+        assertEquals("Milk, eggs, tea and jam", itemManager(notebook).fetch(list.uid).contentString)
+        assertTrue("nothing is left waiting", pendingHeaders(account, "gen-push-stop").isEmpty())
+        assertEquals(setOf("Plan", "List", "From the web one", "From the web two", "From the web three"), cachedNotes(account, notebook))
+        assertSucceeded(status(account, "gen-push-stop"))
+
+        // 4. One step further than the fetch cases go: the upload is refused, and the run is
+        // cancelled while the fetch that confirms why is in flight, which is of the notebook itself
+        // and not the upload. The notebook turns read-only after this run's listing, so only the push
+        // and that fetch can see it, and the interrupt is swallowed, so when the answer comes back
+        // only the cancelled schedule says stop. The cancelled run must not hold what waits in the
+        // notebook. This step is the last one, since it leaves the notebook read-only.
+        editLocally(account, "gen-push-stop", notebook, note.uid, "Plan", "Phone edit five", mtime = 9_000L)
+        editLocally(account, "gen-push-stop", notebook, list.uid, "List", "Milk only", mtime = 9_500L)
+        uploadNote(notebook, "From the web four", "Web text four", mtime = 10_000L)
+        val store = pending(account, "gen-push-stop")
+        val waiting = (store.read(note.uid) as PendingNotesStore.Read.Present).entry
+        val stoken = fake.itemStoken(notebook)
+        val cursor = notebookCursor(account, notebook)
+        val cached = cachedNotes(account, notebook)
+        val before = status(account, "gen-push-stop")
+        val since = fake.requests.size
+        val push = fake.hold("POST", TRANSACTION)
+        val confirming = fake.hold("GET", Regex("collection/$notebook/"), swallowInterrupt = true)
+        startManualRun(account, "gen-push-stop")
+        push.awaitArrival()
+        val pushHeldAt = SystemClock.uptimeMillis()
+        assertEquals("the held request is the upload", transactionOf(notebook), push.request)
+        assertEquals("its entry names the revision that was sent", waiting.copy(sent = listOf(waiting.revision)),
+            PendingCodec.decodeEntry(filesOnDisk(store).getValue("${note.uid}.note")).orFail("${note.uid}.note"))
+        fake.setAccessLevel(notebook, 0L)
+        release(push, pushHeldAt)
+        confirming.awaitArrival()
+        val confirmingHeldAt = SystemClock.uptimeMillis()
+        assertEquals("the held request is the fetch of the notebook", "GET collection/$notebook/", confirming.request)
+        val through = fake.requests.size
+        val whileHeld = filesOnDisk(store)
+        NotesSyncCoordinator.cancel(identity)
+        release(confirming, confirmingHeldAt)
+        assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
+        // The first two lines are controls: once a refusal is confirmed as read-only, no run uploads
+        // again or fetches the notebook twice. A run that went on shows in what follows.
+        assertEquals("the refused upload, and none after it", listOf(transactionOf(notebook)), uploads(since))
+        assertEquals("one confirming fetch of the notebook", 1, notebookFetches(since, notebook))
+        assertEquals("no request of any kind followed that fetch", emptyList<String>(), fake.requests.drop(through))
+        assertSameFiles("nothing was held or counted by the cancelled run", whileHeld, filesOnDisk(store))
+        assertEquals("the notebook's cursor did not move", cursor, notebookCursor(account, notebook))
+        assertEquals("the note from the web was not fetched into the cache", cached, cachedNotes(account, notebook))
+        // The stand-in counts an upload before it looks at the access level, so the notes' cursor,
+        // not that count, says the refused upload was not applied.
+        assertEquals("the refused upload was not applied", stoken, fake.itemStoken(notebook))
+        status(account, "gen-push-stop").let {
+            assertEquals("no success was recorded for the cancelled run", before.lastSuccessAt, it.lastSuccessAt)
+            assertEquals("no failure was recorded for it", before.lastFailureAt, it.lastFailureAt)
+            assertNull("no attempt left open: $it", it.activeAttemptId)
+        }
+
+        // The next run's listing shows the notebook as read-only, so both changes are held without an
+        // upload. Reading is still allowed, and the run fetches the note from the web.
+        again = fake.requests.size
+        syncNow(account, "gen-push-stop")
+        assertEquals("nothing was uploaded", emptyList<String>(), uploads(again))
+        assertEquals(cached + "From the web four", cachedNotes(account, notebook))
+        for (uid in listOf(note.uid, list.uid)) {
+            val held = (store.read(uid) as PendingNotesStore.Read.Present).entry
+            assertEquals(PendingEntry.State.HELD, held.state)
+            assertEquals(HeldReason.READ_ONLY, held.held!!.reason)
+        }
+        assertSucceeded(status(account, "gen-push-stop"))
+    }
+
+    @Test fun signOutWhileAPushIsInFlightLetsItsLateAnswerWriteNothing() {
+        // What this case shows about the push is in the request log and in the signed-out account's
+        // store: one upload, no request after it, and the store's files as they were while the upload
+        // was held. The cache and status checks after the release are controls, the ones the fetch
+        // case makes: the status store refuses any late write once sign-out has cleared the record,
+        // whatever the push does.
+        val account = newAccount("gen-push-out")
+        val identity = ExactAccountIdentity(account.type, account.name, "gen-push-out")
+        val notebook = uploadNotebook("Signed out of")
+        val note = uploadNote(notebook, "Plan", "First draft", mtime = 1_000L)
+        val list = uploadNote(notebook, "List", "Milk", mtime = 1_500L)
+        syncNow(account, "gen-push-out")
+        // Two changes wait and a note was added on the server, as in the case above. The server takes
+        // the held upload, so its answer is one that a run that went on would follow directly with a
+        // write into the cache, with no other request in between.
+        editLocally(account, "gen-push-out", notebook, note.uid, "Plan", "Phone edit before sign-out", mtime = 2_000L)
+        editLocally(account, "gen-push-out", notebook, list.uid, "List", "Milk and eggs", mtime = 2_500L)
+        uploadNote(notebook, "From the web", "Web text", mtime = 3_000L)
+        val held = holdPush(account, "gen-push-out", notebook, note.uid, applied = true)
+
+        // The app's own sign-out, from start to finish, while the upload's answer is still held.
+        signOut(account, "gen-push-out")
+        assertFalse(account in manager.getAccountsByType(account.type))
+        assertFalse("sign-out cancelled the Notes run", NotesSyncCoordinator.isActive(identity) || NotesSyncCoordinator.isPending(identity))
+        assertTrue("sign-out cleared the cache: ${cacheFiles(account.name)}", cacheFiles(account.name).isEmpty())
+        assertEquals("sign-out cleared the status", SyncStatusStore.Status(), status(account, "gen-push-out"))
+
+        release(held)
+        assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
+        // Sign-out does not clear the pending store yet. Once it does, no file is left to compare,
+        // and this comparison says nothing until that change brings checks of its own.
+        val after = filesOnDisk(held.store)
+        if (after.isNotEmpty()) assertSameFiles("the signed-out account's store after the late answer", held.files, after)
+        assertEquals("one upload, and none after it", listOf(transactionOf(notebook)), uploads(held.since))
+        assertEquals("no request of any kind followed the held upload", emptyList<String>(), fake.requests.drop(held.through))
+        assertEquals("the server routed that one upload", listOf(1), fake.uploadSizes.drop(held.sizes))
+        assertTrue("the late answer wrote nothing into the cache: ${cacheFiles(account.name)}", cacheFiles(account.name).isEmpty())
+        assertEquals("the late run recorded nothing", SyncStatusStore.Status(), status(account, "gen-push-out"))
+
+        // A same-name account that signs in afterwards starts from nothing, with a store of its own
+        // that is empty. Its run sends nothing and fetches what the server took: the plan's upload,
+        // and not the list's, which never left the device. Both accounts are one Etebase user in this
+        // class, which is why the new one can read it.
+        val next = newAccount("gen-push-in", account.name, discoveryKey = false)
+        assertNull(listCursor(next))
+        assertTrue(cachedNotebooks(next).isEmpty())
+        assertEquals(SyncStatusStore.Status(), status(next, "gen-push-in"))
+        val newStore = pending(next, "gen-push-in")
+        assertFalse("a directory of its own", newStore.dir.canonicalPath == held.store.dir.canonicalPath)
+        assertEquals(PendingNotesStore.Observed(PendingNotesStore.Read.Missing, 0), newStore.observe(note.uid))
+        assertTrue(newStore.snapshot { true }.let { it.headers.isEmpty() && it.entries.isEmpty() && it.unreadable.isEmpty() })
+        val beforeRun = fake.requests.size
+        syncNow(next, "gen-push-in")
+        assertEquals("the new account's run uploads nothing", emptyList<String>(), uploads(beforeRun))
+        assertEquals("the upload the server took is its copy now", "Phone edit before sign-out", cachedBody(next, notebook, note.uid))
+        assertEquals("Milk", cachedBody(next, notebook, list.uid))
+        assertEquals(setOf("Plan", "List", "From the web"), cachedNotes(next, notebook))
+        assertEquals("no unsynced text", 0, (NotesLoader.notebooks(context, next, "gen-push-in") as NotesLoad.Loaded).value.unsyncedText)
+        assertSucceeded(status(next, "gen-push-in"))
+    }
+
+    @Test fun aSameNameAccountThatReplacedTheOldOneGetsNothingFromTheOldRunsInFlightPush() {
+        val name = "notes-boundary-${System.nanoTime()}@example.invalid"
+        val account = newAccount("gen-push-old", name)
+        val oldIdentity = ExactAccountIdentity(account.type, name, "gen-push-old")
+        val notebook = uploadNotebook("Shared before the swap")
+        val note = uploadNote(notebook, "Plan", "First draft", mtime = 1_000L)
+        val list = uploadNote(notebook, "List", "Milk", mtime = 1_500L)
+        syncNow(account, "gen-push-old")
+        // Two changes wait and a note was added on the server, as in the two cases above.
+        editLocally(account, "gen-push-old", notebook, note.uid, "Plan", "Phone edit before the swap", mtime = 2_000L)
+        editLocally(account, "gen-push-old", notebook, list.uid, "List", "Milk and eggs", mtime = 2_500L)
+        uploadNote(notebook, "From the web", "Web text", mtime = 3_000L)
+        val held = holdPush(account, "gen-push-old", notebook, note.uid, applied = true)
+
+        // The account is removed and a same-name one added while the upload's answer is held. Nothing
+        // cancels the old run and Notes is on for the replacement, so only the creation id says the
+        // run is not this account's. The cache, which the two share by name, is not cleared.
+        replaceAccount(account, "gen-push-new")
+        assertStillHeld(held.heldAt)
+        assertTrue("the old run is still waiting for its answer", NotesSyncCoordinator.isActive(oldIdentity))
+        release(held)
+        assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
+        assertNothingWrittenFromPush(held, account, "gen-push-old", notebook, note.uid)
+        // Two controls, as in the fetch case: status is kept per account generation, and the loader
+        // turns the old generation away before it reads anything.
+        assertEquals("the replacement's status is untouched", SyncStatusStore.Status(), status(account, "gen-push-new"))
+        assertEquals(NotesLoad.Stale, NotesLoader.note(context, account, "gen-push-old", notebook, note.uid))
+        // Not inherited: the replacement's store is another directory, with nothing in it, and the
+        // loader the screens use finds no unsynced text.
+        val newStore = pending(account, "gen-push-new")
+        assertFalse("a directory of its own", newStore.dir.canonicalPath == held.store.dir.canonicalPath)
+        assertEquals(PendingNotesStore.Observed(PendingNotesStore.Read.Missing, 0), newStore.observe(note.uid))
+        assertTrue(newStore.snapshot { true }.let { it.headers.isEmpty() && it.entries.isEmpty() && it.unreadable.isEmpty() })
+        assertNull(newStore.notebook(notebook))
+        assertEquals("no unsynced text", 0, (NotesLoader.notebooks(context, account, "gen-push-new") as NotesLoad.Loaded).value.unsyncedText)
+
+        val beforeRun = fake.requests.size
+        syncNow(account, "gen-push-new")
+        assertEquals("the replacement's run uploads nothing", emptyList<String>(), uploads(beforeRun))
+        // Both accounts of this class use one Etebase session, so the text the old account uploaded
+        // reaches the replacement as the server's copy, fetched by the replacement's own run.
+        assertEquals("Phone edit before the swap", cachedBody(account, notebook, note.uid))
+        assertEquals(setOf("Plan", "List", "From the web"), cachedNotes(account, notebook))
+        assertEquals("the change behind the held upload was not sent", "Milk", itemManager(notebook).fetch(list.uid).contentString)
+        assertSameFiles("the old account's store after the replacement's run", held.files, filesOnDisk(held.store))
+
+        // The replacement saves the same note and pushes it, and the old account's files are as they were.
+        editLocally(account, "gen-push-new", notebook, note.uid, "Plan", "Replacement text", mtime = 4_000L)
+        val beforePush = fake.requests.size
+        syncNow(account, "gen-push-new")
+        assertEquals("the replacement's push", listOf(transactionOf(notebook)), uploads(beforePush))
+        assertEquals("Replacement text", itemManager(notebook).fetch(note.uid).contentString)
+        assertSameFiles("the old account's store after the replacement's push", held.files, filesOnDisk(held.store))
+        assertSucceeded(status(account, "gen-push-new"))
+    }
+
     @Test fun theRawMetadataCodecAgreesWithTheBindingsTypedEncoderAndDecoderExceptWhereStated() {
         // Pure Kotlin first: the screens and the comparison must report hand-made differences before
         // any call into the binding.
@@ -2210,6 +2496,119 @@ class NotesSyncBoundaryRuntimeTest {
         assertEquals("the held page's notes were not cached", alreadyCached, cachedNotes(account, notebook))
         assertEquals("the notebook's cursor did not move past the held page", cursorOf(held), notebookCursor(account, notebook))
         assertEquals("no page was requested after the held one", held.request, itemRequests(notebook).last())
+    }
+
+    /** A push held in flight: the hold, and what the test read before the run and while the upload was held. */
+    private class HeldPush(
+        val hold: FakeEtebaseServer.Hold,
+        /** Whether the server took the upload before its answer was held. */
+        val applied: Boolean,
+        /** Where the request log stood before the run, and right after the held upload arrived. */
+        val since: Int,
+        val through: Int,
+        /** How many uploads the stand-in had routed before the run. */
+        val sizes: Int,
+        val store: PendingNotesStore,
+        /** The store's files while the upload was held. */
+        val files: Map<String, ByteArray>,
+        /** Before the run: the account's Notes status, and what the Etebase cache held for the note and its notebook. */
+        val status: SyncStatusStore.Status,
+        val cachedText: String?,
+        val cursor: String?,
+        val cachedNotes: Set<String>,
+        /** When the test saw the held upload arrive. */
+        val heldAt: Long,
+    )
+
+    /**
+     * Starts a manual run and holds the upload of [note], which must be the change the run sends
+     * first (here the oldest one waiting), and checks that the run got that far. With [applied] the
+     * server takes the upload on arrival and only its answer is held; without, the upload is held
+     * before the server looks at it, and on release the connection drops with nothing applied. Read
+     * here for the comparison afterwards: the cache and the status before the run, the pending
+     * store's files while the upload is held, and where the request log and the count of routed
+     * uploads stood.
+     */
+    private fun holdPush(account: Account, generation: String, notebook: String, note: String, applied: Boolean,
+                         swallowInterrupt: Boolean = false): HeldPush {
+        val store = pending(account, generation)
+        val waiting = (store.read(note) as PendingNotesStore.Read.Present).entry
+        assertTrue("the change has not been sent before", waiting.sent.isEmpty())
+        val cachedText = cachedBody(account, notebook, note)
+        val cursor = notebookCursor(account, notebook)
+        val cachedNotes = cachedNotes(account, notebook)
+        val before = status(account, generation)
+        val stoken = fake.itemStoken(notebook)
+        val sizes = fake.uploadSizes.size
+        val since = fake.requests.size
+        if (!applied) fake.answer("POST", TRANSACTION, code = null)
+        val hold = fake.hold("POST", TRANSACTION, swallowInterrupt = swallowInterrupt, answerFirst = applied)
+        startManualRun(account, generation)
+        hold.awaitArrival()
+        val heldAt = SystemClock.uptimeMillis()
+        assertEquals("the held request is the upload", transactionOf(notebook), hold.request)
+        assertEquals("nothing was requested after it", hold.request, fake.requests.last())
+        val through = fake.requests.size
+        assertEquals("the server took the upload, or has not looked at it",
+            if (applied) listOf(1) else emptyList<Int>(), fake.uploadSizes.drop(sizes))
+        assertEquals("its notes changed, or did not", applied, fake.itemStoken(notebook) != stoken)
+        assertNotNull("the run is recorded as in progress", status(account, generation).activeAttemptId)
+        val files = filesOnDisk(store)
+        assertEquals("the sent revision is on disk before the answer, and nothing else changed",
+            waiting.copy(sent = listOf(waiting.revision)), PendingCodec.decodeEntry(files.getValue("$note.note")).orFail("$note.note"))
+        return HeldPush(hold, applied, since, through, sizes, store, files, before, cachedText, cursor, cachedNotes, heldAt)
+    }
+
+    /**
+     * The stand-in lets a parked request go by itself after 60 s and says nothing, and what is
+     * asserted afterwards would then be about a run nothing stopped in flight. So a request that
+     * arrived more than 50 s ago, which leaves room below those 60, fails here by name.
+     */
+    private fun assertStillHeld(heldAt: Long) {
+        val age = SystemClock.uptimeMillis() - heldAt
+        assertTrue("the request arrived $age ms ago, more than 50 s (the stand-in lets a parked request go by itself at 60 s)", age < 50_000)
+    }
+
+    /** Lets a held request go, unless the stand-in may already have let it go. */
+    private fun release(hold: FakeEtebaseServer.Hold, heldAt: Long) {
+        assertStillHeld(heldAt)
+        hold.release()
+    }
+
+    private fun release(held: HeldPush) = release(held.hold, held.heldAt)
+
+    /**
+     * The held upload was answered after its run stopped being allowed to write: no other upload
+     * and no request of any kind followed it, the pending store's files are byte for byte as they
+     * were while it was held, the cache holds the text, the cursor and the notes it held before the
+     * run, and the run recorded neither a success nor a failure. Every difference is reported, not
+     * only the first. It reads the request log to its end, so it goes before any request of the test's own.
+     */
+    private fun assertNothingWrittenFromPush(held: HeldPush, account: Account, generation: String, notebook: String, note: String) {
+        val problems = ArrayList<String>()
+        fun same(what: String, expected: Any?, actual: Any?) {
+            if (expected != actual) problems += "$what: expected <$expected> but was <$actual>"
+        }
+        same("one upload, and none after it", listOf(transactionOf(notebook)), uploads(held.since))
+        same("no request of any kind followed the held upload", emptyList<String>(), fake.requests.drop(held.through))
+        same("the uploads the server routed", if (held.applied) listOf(1) else emptyList<Int>(), fake.uploadSizes.drop(held.sizes))
+        val files = filesOnDisk(held.store)
+        same("the pending store's files", held.files.keys, files.keys)
+        for ((name, bytes) in held.files) {
+            val current = files[name] ?: continue
+            if (current.contentEquals(bytes)) continue
+            // An entry's header is plain, so what changed in it (a failure count, a hold) can be shown.
+            problems += "the pending store's $name changed" +
+                if (name.endsWith(".note")) ": it was ${PendingCodec.decodeEntry(bytes)} and is ${PendingCodec.decodeEntry(current)}" else ""
+        }
+        same("the uploaded note was not cached", held.cachedText, cachedBody(account, notebook, note))
+        same("the notebook's cursor did not move", held.cursor, notebookCursor(account, notebook))
+        same("no other note was fetched into the cache", held.cachedNotes, cachedNotes(account, notebook))
+        val now = status(account, generation)
+        same("no success was recorded", held.status.lastSuccessAt, now.lastSuccessAt)
+        same("no failure was recorded", held.status.lastFailureAt, now.lastFailureAt)
+        same("no attempt left open", null, now.activeAttemptId)
+        assertTrue(problems.joinToString("\n"), problems.isEmpty())
     }
 
     /**
