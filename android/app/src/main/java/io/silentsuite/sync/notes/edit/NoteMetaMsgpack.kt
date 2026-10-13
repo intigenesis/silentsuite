@@ -14,11 +14,15 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 
 /*
- * Test only. This file is form (c) of the comparison of NoteMetaCodec with msgpack-core 0.9.12:
- * merge, fresh and peek of the codec, written on the library's low-level API in the way that never
- * calls skipValue. The public result of the comparison names its three forms (a), (b) and (c), and
- * NoteMetaCodecComparisonTest runs this one under the name HEADERS_ONLY. Nothing here ships: the
- * library is a testImplementation dependency, and the app uses NoteMetaCodec.
+ * Evaluation only, not for merge. This file is form (c) of the comparison of NoteMetaCodec with
+ * msgpack-core 0.9.12: merge, fresh and peek of the codec, written on the library's low-level API in
+ * the way that never calls skipValue. The public result of the comparison names its three forms (a),
+ * (b) and (c), and NoteMetaCodecComparisonTest runs this one under the name HEADERS_ONLY. It is in
+ * main code, and the library is an implementation dependency, only on the branch of the library
+ * evaluation, so that R8 and a device run can say something about it. The app does not use it: the
+ * app reads and writes note metadata through NoteMetaCodec. Its one caller in main code is
+ * NoteMetaLibraryEvaluation, which only tests call, and a unit test fails if any other file of main
+ * code and the debug source set names this class, that caller or the library.
  *
  * The file holds the whole form, so that what it calls can be checked by reading this file alone:
  * the scan, the walk over keys and values, and the rules above the format layer. Those rules are
@@ -26,10 +30,10 @@ import java.nio.charset.CodingErrorAction
  * finiteToLong are the codec's text unchanged; the two slots are the codec's without its comments;
  * the strict decoder for the name differs in one line. The scan loop, the two checks of a count
  * against the bytes left and the key kinds are the same rules written again on the library's reads,
- * and the order of the output on its packer. This is their only copy in the test sources.
+ * and the order of the output on its packer. This is their only copy outside the codec.
  * wellFormed and the result types are the codec's own.
  *
- * Forms (a) and (b) are in another test file. They do call skipValue, and they run the scan and the
+ * Forms (a) and (b) are in a test file. They do call skipValue, and they run the scan and the
  * rules of this file with steps of their own for passing over a key or a value. That is the only
  * reason why the class and its three steps passKey, pass and leaf are open. An object made as
  * NoteMetaMsgpack() runs the steps of this file and no others. The comparison makes its
@@ -60,7 +64,7 @@ import java.nio.charset.CodingErrorAction
  * comment, or if the code below names readPayload more than once.
  */
 
-/** Test only: form (c): merge, fresh and peek of [NoteMetaCodec] on msgpack-core's low-level API. */
+/** Evaluation only: form (c): merge, fresh and peek of [NoteMetaCodec] on msgpack-core's low-level API. */
 internal open class NoteMetaMsgpack {
     private class NotOneMap(message: String) : Exception(message)
 

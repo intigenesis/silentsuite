@@ -1814,7 +1814,7 @@ class NoteMetaCodecComparisonTest {
      */
     @Test(timeout = 30_000)
     fun `the file of the form without skipValue names none of the calls it says it never makes`() {
-        val source = File("src/test/java/io/silentsuite/sync/notes/edit/NoteMetaMsgpack.kt").readText()
+        val source = File("src/main/java/io/silentsuite/sync/notes/edit/NoteMetaMsgpack.kt").readText()
         val open = source.indexOf("/*")
         val close = source.indexOf("*/", open)
         assertTrue("NoteMetaMsgpack.kt has a head comment", open >= 0 && close > open)

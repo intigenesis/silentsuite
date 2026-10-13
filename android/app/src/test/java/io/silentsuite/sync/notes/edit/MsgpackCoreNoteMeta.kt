@@ -11,7 +11,9 @@ import org.msgpack.core.MessageUnpacker
 /*
  * Test only. merge, fresh and peek of NoteMetaCodec written a second time on the low-level API of
  * msgpack-core 0.9.12, so that the two can be compared input by input (NoteMetaCodecComparisonTest).
- * Nothing here ships: the library is a testImplementation dependency.
+ * Nothing in this file ships: forms (a) and (b) are test code. On the branch of the library evaluation
+ * the library is an implementation dependency and form (c) is in main code, where the app does not
+ * use it (see the head of NoteMetaMsgpack.kt).
  *
  * The three forms, which the rest of this file and the comparison test call variants. The public
  * result of the comparison names them (a), (b) and (c), in the order of Walk: (a) is LIBRARY_SKIP,
