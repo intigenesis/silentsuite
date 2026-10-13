@@ -98,4 +98,13 @@ class NoteMetaLibraryEvaluationTest {
         // that setting. On a device nothing sets it; what the library chooses there is for a device run to show.
         assertEquals("org.msgpack.core.buffer.MessageBufferU", NoteMetaLibraryEvaluation.bufferClassName())
     }
+
+    @Test fun `the device measurement builds the five huge maps of comparison test 7 and no other`() {
+        val call = Regex("hugeMap\\(\"([0-9a-f]+)\", \"([0-9a-f]+)\", ([0-9_]+)\\)")
+        fun calls(path: String) = call.findAll(File(path).readText()).map { it.groupValues.drop(1) }.toList()
+        val unit = calls("src/test/java/io/silentsuite/sync/notes/edit/NoteMetaCodecComparisonTest.kt")
+        val device = calls("src/androidTest/java/io/silentsuite/sync/notes/NoteMetaAllocationOnDeviceTest.kt")
+        assertEquals("comparison test 7 has five huge maps", 5, unit.size)
+        assertEquals("the device measurement builds the same five, in the same order", unit, device)
+    }
 }
