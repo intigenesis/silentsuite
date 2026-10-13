@@ -497,7 +497,8 @@ class NoteMetaCodecComparisonTest {
     /**
      * android/app/build.gradle sets msgpack.universal-buffer=true for unit tests, which makes msgpack-core
      * use MessageBufferU, its buffer class on top of ByteBuffer. By the library's source that is the class
-     * it picks on Android; that was not run on a device.
+     * it picks on Android. On the branch of the library evaluation a device case asserts that, with the
+     * property not set: theMetadataFormOnMsgpackCoreRunsInTheMinifiedBuildAndGivesWhatTheCodecGives.
      */
     @Test(timeout = 30_000)
     fun `msgpack-core runs on its ByteBuffer-based buffer class in these tests`() {

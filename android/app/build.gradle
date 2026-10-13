@@ -73,8 +73,8 @@ android {
 
     testOptions {
         unitTests.returnDefaultValues = true
-        // By its source, msgpack-core picks its ByteBuffer-based buffer on Android (not run on a device here);
-        // make the JVM tests run that same class.
+        // msgpack-core picks its ByteBuffer-based buffer on Android by itself (the device case of the
+        // evaluation asserts the class, with this property not set); make the JVM tests run that same class.
         unitTests.all {
             systemProperty 'msgpack.universal-buffer', 'true'
         }

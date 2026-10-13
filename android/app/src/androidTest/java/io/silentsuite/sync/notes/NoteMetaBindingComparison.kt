@@ -1192,6 +1192,21 @@ internal object NoteMetaBindingComparison {
         return Report(compared, notSent, differences)
     }
 
+    // ---- the fixed inputs, for a comparison that makes no call into the binding ----
+
+    /** One merge of the table: its bytes, and the name and mtime the table writes onto them. */
+    class FixedMerge(val id: String, val raw: ByteArray, val name: String, val mtime: Long)
+
+    /**
+     * Every merge of the table in its order, the rows and then the extra merges. A read-only view for
+     * [NoteMetaLibraryComparison], which runs the same inputs through the codec and through the form
+     * of the merge that is written on msgpack-core. Nothing here calls the binding.
+     */
+    fun fixedMerges(): List<FixedMerge> = (ROWS.map { it.mergeCase() } + EXTRA_MERGES).map { FixedMerge(it.id, it.raw, it.name, it.mtime) }
+
+    /** Every pair of name and mtime of the encode direction, in its order. */
+    fun fixedFreshPairs(): List<Pair<String, Long>> = ENCODE_ROWS.filter { it.hex == null }.map { it.fields.name.orEmpty() to (it.fields.mtime ?: 0L) }
+
     // ---- the checks of this file itself, with no call into the binding ----
 
     private fun tableProblems(rows: List<Row>, encode: List<EncodeRow>, extra: List<MergeCase>): List<String> {

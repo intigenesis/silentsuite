@@ -33,6 +33,7 @@ import io.silentsuite.sync.R
 import io.silentsuite.sync.log.Logger
 import io.silentsuite.sync.notes.edit.HeldReason
 import io.silentsuite.sync.notes.edit.NoteMetaCodec
+import io.silentsuite.sync.notes.edit.NoteMetaLibraryEvaluation
 import io.silentsuite.sync.notes.edit.NotePushPolicy
 import io.silentsuite.sync.notes.edit.PendingCodec
 import io.silentsuite.sync.notes.edit.PendingEntry
@@ -111,7 +112,10 @@ import kotlin.concurrent.thread
  * notebook name in plain form, and they are still there, byte for byte, after a cache clear and
  * after a same-name account replaced the one that saved them. One case sends nothing: it compares
  * the raw metadata codec with the binding's typed encoder and decoder
- * ([NoteMetaBindingComparison]), on a notebook that is never uploaded.
+ * ([NoteMetaBindingComparison]), on a notebook that is never uploaded. One more sends nothing and
+ * belongs to the msgpack-core evaluation only: it runs the form of the metadata merge that is
+ * written on that library, in this minified build, over the same table, and holds every result to
+ * the codec's ([NoteMetaLibraryComparison]).
  */
 @RunWith(AndroidJUnit4::class)
 class NotesSyncBoundaryRuntimeTest {
@@ -2305,6 +2309,43 @@ class NotesSyncBoundaryRuntimeTest {
         assertEquals("the rows that were compared", NoteMetaBindingComparison.expectedCompared(sdk), report.compared)
         assertEquals("the notebook never reached the server", emptySet<String>(), fake.collectionUids())
         assertEquals("no request names the notebook", emptyList<String>(), fake.requests.filter { notebook.uid in it })
+    }
+
+    @Test fun theMetadataFormOnMsgpackCoreRunsInTheMinifiedBuildAndGivesWhatTheCodecGives() {
+        // The first call into the library in this process. A class that R8 removed, or a buffer class the
+        // library cannot load on this runtime, ends the case here with an Error, which nothing catches.
+        val first = NoteMetaLibraryEvaluation.fresh("n", 1)
+        assertArrayEquals("the first note the form writes", NoteMetaCodec.fresh("n", 1).bytes, first.bytes)
+        // The library chooses its buffer class by itself: neither the app nor this test sets its property.
+        assertNull("nothing set the library's buffer property", System.getProperty("msgpack.universal-buffer"))
+        val report = NoteMetaLibraryComparison.run()
+        // The simple name: no device test file may hold the library's package name, so that the test APK
+        // gives the debug build no keep rule for the library. The log line of the comparison has the full name.
+        assertEquals("the buffer class msgpack-core chose on this device", "MessageBufferU", report.bufferClass.substringAfterLast('.'))
+        assertEquals(report.differences.joinToString("\n"), 0, report.differences.size)
+        // No difference alone shows neither that the rows ran nor that the form is the library's. The
+        // counts are those of the table, and the last row of the map below is the one that tells the
+        // two sides apart.
+        assertEquals("what the codec makes of the table's merges: merged, refused, not a map",
+            Triple(65, 19, 6), Triple(report.merged, report.refused, report.notAMap))
+        assertEquals("reads of an input, reads of a merged output, fresh pairs",
+            Triple(90, 65, 32), Triple(report.peeks, report.outputPeeks, report.freshes))
+        val trailing = "trailing bytes after the map"
+        val notOneMap = "the top level is not a map"
+        assertEquals(
+            "the inputs both sides refuse as not a map, each with the codec's reason and the form's",
+            mapOf(
+                "trailingByte" to (trailing to trailing),
+                "twoMaps" to (trailing to trailing),
+                "arrayOfFive" to (notOneMap to notOneMap),
+                "notAMap" to (notOneMap to notOneMap),
+                "topLevelNil" to (notOneMap to notOneMap),
+                // The codec's own words, and the name of the exception msgpack-core throws when a read
+                // runs out of input. With the caller pointed at the codec, both would be the codec's words.
+                "cutAtAValueBoundary" to ("a length runs past the end of the input" to "MessageInsufficientBufferException"),
+            ),
+            report.reasons,
+        )
     }
 
     // ---- helpers ----
