@@ -16,20 +16,22 @@ import org.junit.runner.RunWith
 import java.security.MessageDigest
 
 /**
- * Evaluation only, and a measurement, not a regression test. It is not in the runtime ledger, so no
- * lane of CI runs it. Run it by its class name on a test emulator and read its lines under the log
- * tag NoteMetaCompare.
+ * Evaluation only, and a measurement, not a regression test. It is not in the runtime ledger and no
+ * workflow or script names it, so by those files no lane of CI runs it. Run it by its class name on
+ * a test emulator and read its lines under the log tag NoteMetaCompare.
  *
  * What it measures: the bytes allocated by one merge and by one peek of its output, for the codec
- * and for the form on msgpack-core, on the five huge maps of test 7 of NoteMetaCodecComparisonTest
- * and on the two-entry note of the device table. No other input. The counter is the platform's own
- * count for the calling thread (android.os.Debug, deprecated), and from API 23 on also the runtime's
- * count for the whole process, which its documentation calls approximate. A control allocation
- * shows first whether either counts on this device.
+ * and for the form on msgpack-core, on the five huge maps of test 7 of NoteMetaCodecComparisonTest.
+ * For the two-entry note of the device table it measures peeks only: the mean of 1000 peeks of the
+ * note itself. No other input. The counter is the platform's own count for the calling thread
+ * (android.os.Debug, deprecated), and from API 23 on also the runtime's count for the whole process,
+ * which its documentation calls approximate. A control allocation shows first whether either counts
+ * on this device.
  *
  * What the figures are: cumulative counts for single calls, in the debuggable debug build, on an
  * emulator. They are not peak heap, not a release build, not a phone and not a benchmark. The times
- * are of single calls, taken with the counters off.
+ * are of single calls, each a separate call made before the counted one, outside the pair of calls
+ * that start and stop allocation counting.
  *
  * What it prints next to the figures: for both sides and each input, the word "within" or "over"
  * for the two bounds of the codec's own memory test, merge under 3 times the input size and peek
@@ -57,7 +59,8 @@ class NoteMetaAllocationOnDeviceTest {
         )
         say("API ${Build.VERSION.SDK_INT}, heap limit ${Runtime.getRuntime().maxMemory()} bytes, buffer class ${NoteMetaLibraryEvaluation.bufferClassName()}")
         val note = NoteMetaBindingComparison.fixedMerges().first { it.id == "webNote" }.raw
-        // Class loading and first-use work are not what is measured.
+        // A warm-up on the two-entry note, to keep class loading and first use out of the counted calls.
+        // Each counted call also follows a timed call of the same kind on the same input.
         repeat(300) {
             NoteMetaCodec.merge(note, "warm", 1)
             NoteMetaCodec.peek(note)
@@ -91,7 +94,7 @@ class NoteMetaAllocationOnDeviceTest {
         say("one whole peek of the two-entry note, mean of 1000, on this thread: codec ${codecPeek.thread / 1000}, form on msgpack-core ${formPeek.thread / 1000}")
     }
 
-    /** One merge of [input] and one peek of its output, each timed with the counters off and then counted. */
+    /** One merge of [input] and one peek of its output, each run twice: timed outside allocation counting, then counted. */
     private fun measure(input: ByteArray, merge: (ByteArray) -> Merge, peek: (ByteArray) -> Peek?): Figures {
         val mergeMillis = timed { merge(input) }
         val (output, merging) = counted { (merge(input) as Merge.Merged).bytes }

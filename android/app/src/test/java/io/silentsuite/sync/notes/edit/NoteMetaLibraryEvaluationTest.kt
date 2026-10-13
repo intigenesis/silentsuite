@@ -14,6 +14,8 @@ import java.io.File
  * and the debug source set may name the library and the form written on it, that device tests reach
  * the form only through its one caller, which rule keeps both in the minified builds, and that the
  * caller runs the library form and not the codec. The first three are checks of text and say so.
+ * A fifth test, also a check of text, holds the inputs of the device measurement to the five huge
+ * maps of comparison test 7.
  */
 class NoteMetaLibraryEvaluationTest {
     private val form = "NoteMetaMsgpack.kt"
@@ -67,6 +69,8 @@ class NoteMetaLibraryEvaluationTest {
         val build = File("build.gradle").readText()
         assertEquals("debug and release both shrink with proguard-rules.txt", 2,
             build.split("proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.txt'").size - 1)
+        assertEquals("debug and release both have minification on", 2, build.split("minifyEnabled true").size - 1)
+        assertEquals("no build type switches it off", 0, build.split("minifyEnabled false").size - 1)
         assertFalse("the rules only debug has say nothing about the library", File("proguard-debug-test-rules.pro").readText().contains("org.msgpack"))
         assertEquals("the library is declared once", 1, build.split("org.msgpack:msgpack-core").size - 1)
         assertTrue("and as a dependency of the app itself", build.contains("    implementation 'org.msgpack:msgpack-core:0.9.12'"))
