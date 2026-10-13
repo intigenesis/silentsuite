@@ -634,10 +634,39 @@ internal class PendingNotesStore private constructor(
         }
     }
 
+    /**
+     * What removing this identity's account would lose, read from the directory alone; a cleared
+     * store answers nothing without looking. Unlike every other read it runs no recovery and writes
+     * nothing, and a cleared store answers instead of throwing: it is made to be asked on the main
+     * thread, by the sign-out dialog and by the sign-out gate.
+     * Counted: each note with an entry file (waiting, held, or one this build cannot read), and each
+     * first write that never got its name and is intact, which recovery would commit. Not counted:
+     * a first write that is cut short or fails its checksum, and an uncommitted write beside an
+     * entry. Recovery drops both. No entry is decoded while the counter file reads. When the counter
+     * is lost or damaged, [currentSequence] reads every entry and landed record to find the highest
+     * version.
+     * A directory that cannot be listed, or a read in it that fails, answers "could not be counted"
+     * ([UnsyncedNotes.unreadable]) and never "nothing". After a failed read every entry file and every
+     * first write counts by its name, whatever its state.
+     */
+    fun unsynced(): UnsyncedNotes = synchronized(lock) {
+        if (closed || !dir.exists()) return@synchronized UnsyncedNotes.NOTHING
+        val names = dir.list() ?: return@synchronized UnsyncedNotes(0, 0, unreadable = true)
+        try {
+            val committed = names.filter { it.endsWith(NOTE) }.mapTo(HashSet()) { it.removeSuffix(NOTE) }
+            val stranded = names.filter { it.endsWith(NOTE + NEW) }.map { it.removeSuffix(NEW).removeSuffix(NOTE) }
+                .filter { it !in committed && PendingCodec.isIntact(File(dir, it + NOTE + NEW).readBytes()) }
+            val count = committed.size + stranded.size
+            if (count == 0) UnsyncedNotes.NOTHING else UnsyncedNotes(count, currentSequence(), unreadable = false)
+        } catch (e: IOException) {
+            UnsyncedNotes(names.count { it.endsWith(NOTE) || it.endsWith(NOTE + NEW) }, 0, unreadable = true)
+        }
+    }
+
     // ---- internals ----
 
     /**
-     * Every public operation: refuse after [clearAll], and finish any interrupted work first. Recovery
+     * Every public operation except [unsynced]: refuse after [clearAll], and finish any interrupted work first. Recovery
      * runs again before the next operation for as long as anything in it did not work out, including a
      * write or removal inside recovery itself.
      *
