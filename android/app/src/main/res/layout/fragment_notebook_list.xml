@@ -15,6 +15,20 @@
         android:textColor="@color/semantic_on_surface"
         android:visibility="gone" />
 
+    <!-- Says when Notes do not sync by themselves on the network the device reports. It sits above the
+         refresh layout, like the row above it, so it stays when the list is empty. -->
+    <TextView
+        android:id="@+id/notebooks_network_notice"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingStart="@dimen/spacing_16"
+        android:paddingEnd="@dimen/spacing_16"
+        android:paddingTop="@dimen/spacing_8"
+        android:paddingBottom="@dimen/spacing_8"
+        android:textAppearance="@style/TextAppearance.Material3.BodySmall"
+        android:textColor="@color/semantic_on_surface_variant"
+        android:visibility="gone" />
+
     <TextView
         android:id="@+id/notebooks_hint"
         android:layout_width="match_parent"
