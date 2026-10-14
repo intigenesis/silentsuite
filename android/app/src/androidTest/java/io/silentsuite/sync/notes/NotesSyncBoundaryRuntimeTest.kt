@@ -53,8 +53,10 @@ import io.silentsuite.sync.ui.CurrentAccountSignOutState
 import io.silentsuite.sync.ui.ExactAccountIdentity
 import io.silentsuite.sync.ui.notes.NoteContent
 import io.silentsuite.sync.ui.notes.NoteListFragment
+import io.silentsuite.sync.ui.notes.NoteSync
 import io.silentsuite.sync.ui.notes.NoteViewFragment
 import io.silentsuite.sync.ui.notes.NotebookListFragment
+import io.silentsuite.sync.ui.notes.NotebookOverview
 import io.silentsuite.sync.ui.notes.NotesActivity
 import io.silentsuite.sync.ui.notes.NotesLoad
 import io.silentsuite.sync.ui.notes.NotesLoader
@@ -313,6 +315,9 @@ class NotesSyncBoundaryRuntimeTest {
         assertTrue("the run fetched the pages that were left and the new note", "Kept on the server" in cachedNotes(account, notebook))
         editLocally(account, "gen-4", notebook, draft.uid, OLD_DRAFT_TITLE, OLD_DRAFT_BODY, mtime = 10_000L)
         val oldStore = pending(account, "gen-4")
+        val seenByOwner = (NotesLoader.note(context, account, "gen-4", notebook, draft.uid) as NotesLoad.Loaded).value
+        assertEquals("the old account sees its draft", listOf(OLD_DRAFT_TITLE, OLD_DRAFT_BODY, NoteSync.WAITING),
+            listOf(seenByOwner.title, seenByOwner.body, seenByOwner.sync))
         val oldFiles = filesOnDisk(oldStore)
         assertEquals(setOf("${draft.uid}.note", "$notebook.notebook", "sequence"), oldFiles.keys)
 
@@ -325,6 +330,9 @@ class NotesSyncBoundaryRuntimeTest {
         assertTrue(newStore.snapshot { true }.let { it.headers.isEmpty() && it.entries.isEmpty() && it.unreadable.isEmpty() })
         assertNull(newStore.notebook(notebook))
         assertEquals(NotesLoad.Stale, NotesLoader.note(context, account, "gen-4", notebook, draft.uid))
+        val overview = (NotesLoader.notebooks(context, account, "gen-5") as NotesLoad.Loaded).value
+        assertEquals("no unsynced text", 0, overview.unsyncedText)
+        assertTrue("no waiting change on any notebook", overview.notebooks.all { it.waiting == 0 })
         assertEquals("the server's copy, with no local change over it",
             NoteContent(draft.uid, "Kept on the server", "Server text", 9_000L),
             (NotesLoader.note(context, account, "gen-5", notebook, draft.uid) as NotesLoad.Loaded).value)
@@ -535,7 +543,7 @@ class NotesSyncBoundaryRuntimeTest {
                 cursorOf(listing), readWhileHeld("a read of the list cursor") { listCursor(account) })
             assertEquals(setOf(first), readWhileHeld("a read of the cached collections") { cachedNotebooks(account) })
             val shown = readWhileHeld("the Notes screen's load") { NotesLoader.notebooks(context, account, "gen-open") }
-            assertEquals(listOf("Listed first"), (shown as NotesLoad.Loaded).value.map { it.name })
+            assertEquals(listOf("Listed first"), (shown as NotesLoad.Loaded).value.notebooks.map { it.name })
             assertTrue("the refresh is still waiting for its answer", refresh.thread.isAlive)
         } finally {
             listing.release()
@@ -881,6 +889,11 @@ class NotesSyncBoundaryRuntimeTest {
         val agendaBody = "# Monday\n- budget\n- hiring"
         uploadNote(work, "Old plan", "First line of the old plan", mtime = 1_000L)
         val agenda = uploadNote(work, "Agenda", agendaBody, mtime = 2_000L)
+        // A title with a character above U+FFFF, uploaded as the bytes another client writes for it: the
+        // map of name ("Shopping " and U+1F6D2 in its four-byte UTF-8 form) and mtime 500. The list
+        // shows it from the raw metadata, never through a typed string (design decision 5).
+        val cart = "Shopping \uD83D\uDED2"
+        uploadRawNote(work, hex("82 a4 6e616d65 ad 53686f7070696e6720 f09f9b92 a5 6d74696d65 cd01f4"), "eggs")
         // Neither of these is a note to show: an item of another type, and a deleted note.
         uploadNote(work, "Attachment", "not Markdown", mtime = 3_000L, type = "application/octet-stream")
         val deleted = uploadNote(work, "Thrown away", "gone", mtime = 4_000L)
@@ -897,8 +910,8 @@ class NotesSyncBoundaryRuntimeTest {
                 val list = activity.findViewById<ListView>(R.id.notebooks_list)
                 list.performItemClick(list.adapter.getView(1, null, list), 1, 1)
             }
-            waitUntil("the cached notes to show") { noteList(scenario)?.renderedNotes?.map { it.title } == listOf("Agenda", "Old plan") }
-            assertEquals(listOf("Monday", "First line of the old plan"), noteList(scenario)!!.renderedNotes.map { it.preview })
+            waitUntil("the cached notes to show") { noteList(scenario)?.renderedNotes?.map { it.title } == listOf("Agenda", "Old plan", cart) }
+            assertEquals(listOf("Monday", "First line of the old plan", "eggs"), noteList(scenario)!!.renderedNotes.map { it.preview })
             scenario.onActivity { activity ->
                 assertEquals("Work", activity.title.toString())
                 val list = activity.findViewById<ListView>(R.id.notes_list)
@@ -969,7 +982,7 @@ class NotesSyncBoundaryRuntimeTest {
 
         // The replacement's notes were in the cache all along, readable by the same loader.
         val theirNotebooks = NotesLoader.notebooks(context, account, "gen-new")
-        assertEquals(listOf("Replacement notebook"), (theirNotebooks as NotesLoad.Loaded).value.map { it.name })
+        assertEquals(listOf("Replacement notebook"), (theirNotebooks as NotesLoad.Loaded).value.notebooks.map { it.name })
         val theirNote = NotesLoader.note(context, account, "gen-new", notebook, note.uid)
         assertEquals(NoteContent(note.uid, "Replacement note", "Replacement body", 2_000L), (theirNote as NotesLoad.Loaded).value)
     }
@@ -1359,6 +1372,8 @@ class NotesSyncBoundaryRuntimeTest {
         assertSameFiles("the store after the cache clear", before, filesOnDisk(store))
         val kept = (store.read(note.uid) as PendingNotesStore.Read.Present).entry
         assertEquals("Edited before access changed", decryptThroughStoredCopy(store, kept).contentString)
+        assertEquals("the way to the text stays on screen with no notebook cached",
+            NotesLoad.Loaded(NotebookOverview(emptyList(), unsyncedText = 1)), NotesLoader.notebooks(context, account, "gen-readonly"))
 
         // A cache refresh from nothing: the next run fetches the server's copy again and writes nothing over the draft.
         syncNow(account, "gen-readonly")
@@ -1992,6 +2007,7 @@ class NotesSyncBoundaryRuntimeTest {
         assertEquals("the upload the server took is its copy now", "Phone edit before sign-out", cachedBody(next, notebook, note.uid))
         assertEquals("Milk", cachedBody(next, notebook, list.uid))
         assertEquals(setOf("Plan", "List", "From the web"), cachedNotes(next, notebook))
+        assertEquals("no unsynced text", 0, (NotesLoader.notebooks(context, next, "gen-push-in") as NotesLoad.Loaded).value.unsyncedText)
         assertSucceeded(status(next, "gen-push-in"))
     }
 
@@ -2022,12 +2038,14 @@ class NotesSyncBoundaryRuntimeTest {
         // turns the old generation away before it reads anything.
         assertEquals("the replacement's status is untouched", SyncStatusStore.Status(), status(account, "gen-push-new"))
         assertEquals(NotesLoad.Stale, NotesLoader.note(context, account, "gen-push-old", notebook, note.uid))
-        // Not inherited: the replacement's store is another directory, with nothing in it.
+        // Not inherited: the replacement's store is another directory, with nothing in it, and the
+        // loader the screens use finds no unsynced text.
         val newStore = pending(account, "gen-push-new")
         assertFalse("a directory of its own", newStore.dir.canonicalPath == held.store.dir.canonicalPath)
         assertEquals(PendingNotesStore.Observed(PendingNotesStore.Read.Missing, 0), newStore.observe(note.uid))
         assertTrue(newStore.snapshot { true }.let { it.headers.isEmpty() && it.entries.isEmpty() && it.unreadable.isEmpty() })
         assertNull(newStore.notebook(notebook))
+        assertEquals("no unsynced text", 0, (NotesLoader.notebooks(context, account, "gen-push-new") as NotesLoad.Loaded).value.unsyncedText)
 
         val beforeRun = fake.requests.size
         syncNow(account, "gen-push-new")
@@ -2204,6 +2222,16 @@ class NotesSyncBoundaryRuntimeTest {
             this.mtime = mtime
             type?.let { itemType = it }
         }, body)
+        itemMgr.batch(arrayOf(note))
+        return note
+    }
+
+    private fun hex(s: String): ByteArray = s.replace(" ", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+    /** A note with exactly these metadata bytes, as another client could upload it; nothing passes through a typed string. */
+    private fun uploadRawNote(notebook: String, metaRaw: ByteArray, body: String): Item {
+        val itemMgr = itemManager(notebook)
+        val note = itemMgr.create_raw(metaRaw, body.toByteArray(Charsets.UTF_8))
         itemMgr.batch(arrayOf(note))
         return note
     }
