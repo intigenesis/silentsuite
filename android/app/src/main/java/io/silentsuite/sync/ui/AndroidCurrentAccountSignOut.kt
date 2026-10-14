@@ -124,6 +124,11 @@ internal class AndroidCurrentAccountSignOut(
 
     override fun withdrawNotesDiscard(main: ExactAccountIdentity) = PendingNotesDiscardPermit.withdraw(main)
 
+    override fun notesDiscardConfirmed(main: ExactAccountIdentity): Boolean {
+        val now = pendingNotes(main).unsynced()
+        return !now.anything || PendingNotesDiscardPermit.covers(main, now)
+    }
+
     override fun close() {
         runCatching { manager.removeOnAccountsUpdatedListener(accountListener) }
     }
@@ -181,7 +186,9 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
     fun owns(account: Account, creationId: String) =
         exactAccount == ExactAccountIdentity(account.type, account.name, creationId)
 
-    fun hasStarted() = coordinator?.state?.let { it !is CurrentAccountSignOutState.Idle } == true
+    fun hasStarted() = coordinator?.state?.let {
+        it !is CurrentAccountSignOutState.Idle && it !is CurrentAccountSignOutState.Refused
+    } == true
 
     fun ownsCurrentGeneration() = exactAccount?.let { identity ->
         coordinator?.isMainGenerationPresent(identity)
@@ -207,6 +214,8 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
     internal fun confirmNotesDiscard(shown: UnsyncedNotes) {
         exactAccount?.let { coordinator?.confirmNotesDiscard(it, shown) }
     }
+
+    internal fun acknowledgeRefusal() { coordinator?.acknowledgeRefusal() }
 
     override fun onCleared() {
         coordinator?.close()

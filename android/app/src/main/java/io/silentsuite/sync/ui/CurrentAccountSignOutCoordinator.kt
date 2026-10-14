@@ -18,13 +18,21 @@ sealed class CurrentAccountSignOutState {
     object Removing : CurrentAccountSignOutState()
     object CleaningUp : CurrentAccountSignOutState()
     data class RemovalFailed(val errorId: Long) : CurrentAccountSignOutState()
+    /**
+     * The sign-out did not start: the seam's check
+     * ([CurrentAccountSignOutCoordinator.Seams.notesDiscardConfirmed]) answered no, or it threw
+     * ([checkFailed]). This attempt canceled nothing and removed nothing. It is not a failure, and
+     * the view model does not count it as a started sign-out.
+     */
+    data class Refused(val checkFailed: Boolean) : CurrentAccountSignOutState()
     data class CleanupFailed(val errorId: Long) : CurrentAccountSignOutState()
     data class Complete(val replacement: ExactAccountIdentity?) : CurrentAccountSignOutState()
 }
 
 /**
  * Ordered sign-out policy. The snapshot is retained for cleanup-only retry after the main row is
- * absent; a retry can therefore never broaden ownership or issue the main removal twice.
+ * absent; a retry can therefore never broaden ownership or issue the main removal twice. A try
+ * that the Notes gate refuses keeps no snapshot, and the next try has to take a new one.
  */
 class CurrentAccountSignOutCoordinator(
     private val seams: Seams,
@@ -44,12 +52,19 @@ class CurrentAccountSignOutCoordinator(
         /** Called for the user's separate confirmation that the unsynced Notes text of [main] may be discarded. [shown] is the answer it was given for. */
         fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes)
         /**
-         * Ends that confirmation. The coordinator asks for it at each end of an attempt (a failed
-         * removal, a failed cleanup, completion), for the account a confirmation was last given for
-         * and for the snapshot's account. No end follows completion, so a confirmation passed on
-         * after it is not withdrawn.
+         * Ends that confirmation. The coordinator asks for it at each end of an attempt (a refusal,
+         * a failed removal, a failed cleanup, completion), for the account a confirmation was last
+         * given for and for the snapshot's account. No end follows completion, so a confirmation
+         * passed on after it is not withdrawn.
          */
         fun withdrawNotesDiscard(main: ExactAccountIdentity)
+        /**
+         * Whether [main] may be removed as far as its unsynced Notes text goes: there is none, or
+         * the separate discard confirmation still holds for what is there now ([UnsyncedNotes.covers],
+         * with its limits). The coordinator asks it in [begin], after the branches for a cleanup-only
+         * retry and for an account that is already gone, and before it cancels or removes anything.
+         */
+        fun notesDiscardConfirmed(main: ExactAccountIdentity): Boolean
         /** Monotonic platform-listener observation; production defaults to no invalidation. */
         fun hasObservedMainGenerationInvalidation(): Boolean = false
         fun close() = Unit
@@ -87,6 +102,22 @@ class CurrentAccountSignOutCoordinator(
         if (runCatching { seams.mainGenerationAbsent(captured.main) }.getOrDefault(false)) {
             mainRemovalConfirmed = true
             cleanup(captured)
+            return
+        }
+
+        // The gate. The removal starts only when the seam's check answers yes, which by its contract
+        // means that the account's unsynced Notes text is nothing or that a discard confirmation
+        // still holds for it. A check that throws refuses as well, so the gate fails closed. It
+        // stands before anything is canceled, so a refused sign-out stops no sync, and after the two
+        // branches above, which do not remove the main account.
+        val allowed = runCatching { seams.notesDiscardConfirmed(captured.main) }
+        if (!allowed.getOrDefault(false)) {
+            // This try started nothing, so nothing is kept for the next one: the seam is asked to
+            // withdraw the confirmation and the snapshot is dropped, also one kept from an earlier
+            // try whose removal failed. The next try has to take a new one.
+            withdrawNotesDiscard()
+            snapshot = null
+            transition(CurrentAccountSignOutState.Refused(checkFailed = allowed.isFailure))
             return
         }
 
@@ -154,6 +185,14 @@ class CurrentAccountSignOutCoordinator(
     fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) {
         discardConfirmedFor = main
         runCatching { seams.confirmNotesDiscard(main, shown) }
+    }
+
+    /**
+     * Takes a refusal back to idle and reports that. In any other state it does nothing. Made for
+     * the screen to call when it has taken note of a refusal.
+     */
+    fun acknowledgeRefusal() {
+        if (state is CurrentAccountSignOutState.Refused) transition(CurrentAccountSignOutState.Idle)
     }
 
     private fun withdrawNotesDiscard() {

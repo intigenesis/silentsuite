@@ -33,13 +33,23 @@ class CurrentAccountSignOutCoordinatorTest {
         var unsynced = UnsyncedNotes.NOTHING
         var unsyncedFails = false
         var confirmed: UnsyncedNotes? = null
-        var withdrawCalls = 0
+        /** The account of each withdrawal that was asked, in the order asked. */
+        val withdrawnFor = mutableListOf<ExactAccountIdentity>()
         override fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes {
             if (unsyncedFails) throw IllegalStateException("cannot look")
             return unsynced
         }
         override fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) { confirmed = shown }
-        override fun withdrawNotesDiscard(main: ExactAccountIdentity) { withdrawCalls++; confirmed = null }
+        override fun withdrawNotesDiscard(main: ExactAccountIdentity) { withdrawnFor += main; confirmed = null }
+        var discardConfirmed = true
+        var gateThrows = false
+        var gateCalls = 0
+        val gateAskedFor = mutableListOf<ExactAccountIdentity>()
+        override fun notesDiscardConfirmed(main: ExactAccountIdentity): Boolean {
+            gateCalls++; gateAskedFor += main
+            if (gateThrows) throw IllegalStateException("cannot look")
+            return discardConfirmed
+        }
         override fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit) {
             events += "remove"; removeCalls++; removeCallback = callback
         }
@@ -189,6 +199,9 @@ class CurrentAccountSignOutCoordinatorTest {
         assertEquals("kept while the removal is asked", shown, f.confirmed)
         f.removeCallback!!(false)
         assertNull(f.confirmed)
+        assertEquals("the withdrawal was asked once, for the account the confirmation was given for", listOf(target), f.withdrawnFor)
+        f.gateThrows = true; c.begin()
+        assertEquals("a retry after a failed removal comes to the gate again, and a check that cannot run refuses it", CurrentAccountSignOutState.Refused(checkFailed = true), c.state)
         // A removal that fails before it is asked.
         f = Fake().apply { cancelThrows = true }; c = CurrentAccountSignOutCoordinator(f)
         c.confirmNotesDiscard(target, shown); c.begin()
@@ -204,15 +217,84 @@ class CurrentAccountSignOutCoordinatorTest {
         c.confirmNotesDiscard(target, shown); c.begin(); f.absent = true; f.removeCallback!!(true); f.childrenCallback!!(true)
         assertTrue(c.state is CurrentAccountSignOutState.Complete)
         assertNull(f.confirmed)
-        // No snapshot could be taken: a withdrawal is asked for all the same.
+        // No snapshot could be taken: the withdrawal is asked for the account the confirmation was given for.
         f = Fake().apply { captured = null }; c = CurrentAccountSignOutCoordinator(f)
         c.confirmNotesDiscard(target, shown); c.begin()
         assertTrue(c.state is CurrentAccountSignOutState.RemovalFailed)
         assertNull(f.confirmed)
+        assertEquals(listOf(target), f.withdrawnFor)
+        // A confirmation given for another account than the snapshot's: the withdrawal is asked for both.
+        f = Fake(); c = CurrentAccountSignOutCoordinator(f)
+        c.confirmNotesDiscard(sibling, shown); c.begin(); f.removeCallback!!(false)
+        assertEquals(listOf(sibling, target), f.withdrawnFor)
         // The withdrawal is asked before the end is reported.
         val seams = Fake(); var atEnd: UnsyncedNotes? = shown
         c = CurrentAccountSignOutCoordinator(seams) { if (it is CurrentAccountSignOutState.RemovalFailed) atEnd = seams.confirmed }
         c.confirmNotesDiscard(target, shown); c.begin(); seams.removeCallback!!(false)
         assertNull("the confirmation is withdrawn before the end is reported", atEnd)
+    }
+
+    @Test fun `unsynced Notes text without a confirmed discard refuses the sign-out before anything is canceled or removed`() {
+        val f = Fake().apply { discardConfirmed = false; confirmed = UnsyncedNotes(2, 7, false) }
+        val states = mutableListOf<CurrentAccountSignOutState>()
+        val c = CurrentAccountSignOutCoordinator(f) { states += it }
+        c.begin()
+        assertEquals(CurrentAccountSignOutState.Refused(checkFailed = false), c.state)
+        assertEquals("nothing was canceled and nothing removed", listOf("snapshot", "absent:false"), f.events)
+        assertEquals(0, f.removeCalls)
+        assertEquals("the gate was asked once", 1, f.gateCalls)
+        assertEquals("the gate was asked about the snapshot's account", listOf(target), f.gateAskedFor)
+        assertNull("a confirmation that does not cover what is there now is not kept", f.confirmed)
+        assertEquals("the withdrawal was asked for the snapshot's account", listOf(target), f.withdrawnFor)
+        f.discardConfirmed = true
+        c.begin()
+        assertEquals(1, f.removeCalls)
+        assertEquals("a try after a refusal comes to the gate again", 2, f.gateCalls)
+        assertTrue(c.state is CurrentAccountSignOutState.Removing)
+        assertEquals(1, states.count { it is CurrentAccountSignOutState.Refused })
+    }
+
+    @Test fun `a check that cannot run refuses, and the refusal says that it could not run`() {
+        val f = Fake().apply { gateThrows = true }
+        val c = CurrentAccountSignOutCoordinator(f)
+        c.confirmNotesDiscard(target, UnsyncedNotes(2, 7, false))
+        c.begin()
+        assertEquals(CurrentAccountSignOutState.Refused(checkFailed = true), c.state)
+        assertEquals(0, f.removeCalls)
+        assertNull("a refusal ends a confirmation that was given through the coordinator", f.confirmed)
+        c.begin()
+        assertEquals("a second try while the check still cannot run is refused as well", CurrentAccountSignOutState.Refused(checkFailed = true), c.state)
+        assertEquals(0, f.removeCalls)
+    }
+
+    @Test fun `an account that is already gone is cleaned up, not refused`() {
+        val f = Fake().apply { absent = true; children = false; discardConfirmed = false }
+        val c = CurrentAccountSignOutCoordinator(f)
+        c.begin()
+        assertTrue("the row was already gone: cleanup only, nothing to refuse", c.state is CurrentAccountSignOutState.CleaningUp)
+        f.childrenCallback!!(false)
+        assertTrue(c.state is CurrentAccountSignOutState.CleanupFailed)
+        f.childrenCallback = null
+        c.begin(); f.childrenCallback!!(true)
+        assertTrue(c.state is CurrentAccountSignOutState.Complete)
+        assertEquals(0, f.removeCalls)
+    }
+
+    @Test fun `an acknowledged refusal returns to idle and the next try takes a new snapshot`() {
+        val f = Fake().apply { discardConfirmed = false }
+        val states = mutableListOf<CurrentAccountSignOutState>()
+        val c = CurrentAccountSignOutCoordinator(f) { states += it }
+        c.begin(); c.acknowledgeRefusal()
+        assertEquals(CurrentAccountSignOutState.Idle, c.state)
+        assertEquals("the refusal and the return to idle are both reported",
+            listOf(CurrentAccountSignOutState.Idle, CurrentAccountSignOutState.Refused(checkFailed = false), CurrentAccountSignOutState.Idle), states)
+        f.discardConfirmed = true
+        c.begin()
+        assertEquals("a refused try keeps no snapshot", 2, f.events.count { it == "snapshot" })
+        // Acknowledging while a removal is under way changes nothing.
+        c.acknowledgeRefusal()
+        assertTrue(c.state is CurrentAccountSignOutState.Removing)
+        f.removeCallback!!(false); c.acknowledgeRefusal()
+        assertTrue("acknowledging after a failed removal changes nothing", c.state is CurrentAccountSignOutState.RemovalFailed)
     }
 }

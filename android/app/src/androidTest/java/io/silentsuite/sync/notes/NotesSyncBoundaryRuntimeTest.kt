@@ -36,6 +36,7 @@ import io.silentsuite.sync.notes.edit.NoteMetaCodec
 import io.silentsuite.sync.notes.edit.NotePushPolicy
 import io.silentsuite.sync.notes.edit.PendingCodec
 import io.silentsuite.sync.notes.edit.PendingEntry
+import io.silentsuite.sync.notes.edit.PendingNotesDiscardPermit
 import io.silentsuite.sync.notes.edit.PendingNotesStore
 import io.silentsuite.sync.resource.LocalCalendar
 import io.silentsuite.sync.syncadapter.CalendarSyncManager
@@ -2191,6 +2192,20 @@ class NotesSyncBoundaryRuntimeTest {
         uploadNote(notebook, "From the web", "Web text", mtime = 3_000L)
         val held = holdPush(account, "gen-push-out", notebook, note.uid, applied = true)
 
+        // Without the separate discard confirmation the sign-out refuses, and it stops and removes
+        // nothing: the account stays, the run still waits for its answer, the store is untouched.
+        val refused = CurrentAccountSignOutCoordinator(AndroidCurrentAccountSignOut(context, account, "gen-push-out"))
+        try {
+            refused.begin()
+            assertEquals(CurrentAccountSignOutState.Refused(checkFailed = false), refused.state)
+        } finally {
+            refused.close()
+        }
+        assertTrue("the account stays", account in manager.getAccountsByType(account.type))
+        assertTrue("the run was not canceled", NotesSyncCoordinator.isActive(identity))
+        assertSameFiles("a refused sign-out touches nothing", held.files, filesOnDisk(held.store))
+        assertStillHeld(held.heldAt)
+
         // The app's own sign-out, from start to finish, while the upload's answer is still held.
         signOut(account, "gen-push-out")
         assertFalse(account in manager.getAccountsByType(account.type))
@@ -2401,8 +2416,10 @@ class NotesSyncBoundaryRuntimeTest {
     }
 
     /**
-     * The app's own sign-out, as the account drawer runs it: cancel sync, remove the account, clear
-     * its cache and its status.
+     * The app's own sign-out through the coordinator and the real seams, without the screen. When
+     * the store holds anything, the separate discard confirmation is given first for what it holds
+     * now, in place of the answer to the second dialog. Then the coordinator asks its gate, cancels
+     * sync, removes the account, and clears its cache and its status.
      */
     private fun signOut(account: Account, generation: String) {
         awaitSyncManagerQuiet()
@@ -2410,8 +2427,12 @@ class NotesSyncBoundaryRuntimeTest {
         val coordinator = CurrentAccountSignOutCoordinator(AndroidCurrentAccountSignOut(context, account, generation)) { state ->
             if (state is CurrentAccountSignOutState.Complete) completed.countDown()
         }
+        val identity = ExactAccountIdentity(account.type, account.name, generation)
+        val shown = coordinator.unsyncedNotes(identity)
+        if (shown.anything) coordinator.confirmNotesDiscard(identity, shown)
         coordinator.begin()
         assertTrue("sign-out did not complete: ${coordinator.state}", completed.await(15, TimeUnit.SECONDS))
+        assertFalse("the discard confirmation did not outlive the sign-out", PendingNotesDiscardPermit.covers(identity, shown))
         awaitRemovalSeenBySyncManager(account)
     }
 

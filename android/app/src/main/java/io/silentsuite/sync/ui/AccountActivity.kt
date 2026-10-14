@@ -676,7 +676,8 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     private fun confirmLogout() {
         // A sign-out message that is still showing goes while the question is asked. When a dialog
-        // reports that it ended without a sign-out and the last attempt failed, it is shown again.
+        // reports that it ended without a sign-out and the last attempt failed, the failure message
+        // is shown again. The message for a check that could not run is not shown again.
         signOutErrorSnackbar?.dismiss()
         when (val next = UnsyncedNotesSignOutPolicy.start(signOutModel.unsyncedNotes())) {
             is UnsyncedNotesSignOutPolicy.Next.ShowCount -> showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
@@ -686,8 +687,10 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     /**
      * The sign-out question with the words it had before, asked when the store's answer, read right
-     * before, was nothing. Its button starts the sign-out without reading the store again. Its
-     * Cancel and a canceled dialog are reported like the ends of the two unsynced-changes dialogs.
+     * before, was nothing. Its button asks the coordinator for the sign-out. The screen does not read
+     * the store again there. The coordinator's gate asks its seam, and a sign-out it refuses comes
+     * back as [CurrentAccountSignOutState.Refused]. Its Cancel and a canceled dialog are reported
+     * like the ends of the two unsynced-changes dialogs.
      */
     private fun confirmPlainLogout() {
         MaterialAlertDialogBuilder(this)
@@ -785,14 +788,35 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
      * for another account, or a dialog that could not be shown. When the last attempt failed, the
      * failure message with Retry is shown again: a tap on Retry closes it and [confirmLogout]
      * dismisses it. [attachRetainedSignOut] sets the layout and renders the sign-out state and wires
-     * up nothing else, so on the retained sign-out screen that message is the way to try again.
+     * up nothing else, so on the retained sign-out screen that message, or the message for a check
+     * that could not run, is the way to try again. When that screen's state is idle, which it is
+     * only after an acknowledged refusal, there is no failure message to show again, and the
+     * activity is created again.
      */
     internal fun onSignOutDialogClosedWithoutSignOut() {
         val state = signOutModel.currentState() ?: return
         if (state is CurrentAccountSignOutState.RemovalFailed || state is CurrentAccountSignOutState.CleanupFailed) {
             renderedSignOutErrorId = 0
             renderSignOutState(state)
+        } else if (signOutOnly && state is CurrentAccountSignOutState.Idle) {
+            // The retained screen is idle only after a refused sign-out was acknowledged. The
+            // refusal and its acknowledgment took the state to idle, also from a failed removal, so
+            // no failure is left to show and no removal is under way. This screen renders sign-out
+            // states only, so the activity is created again. hasStarted() is false for idle, so
+            // onCreate does not take the retained path.
+            recreate()
         }
+    }
+
+    /**
+     * The message for a sign-out that was refused because the check for unsynced Notes changes could
+     * not run. A message of its own, not the one for a failed sign-out. Its Retry asks the sign-out
+     * question again from the start.
+     */
+    private fun showSignOutCheckFailed() {
+        signOutErrorSnackbar?.dismiss()
+        signOutErrorSnackbar = Snackbar.make(findViewById(R.id.coordinator), R.string.notes_sign_out_check_failed, Snackbar.LENGTH_INDEFINITE)
+            .setAction(R.string.retry) { confirmLogout() }.also { it.show() }
     }
 
     private fun showThemeDialog() {
@@ -834,6 +858,14 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
         invalidateOptionsMenu()
         findViewById<NavigationView>(R.id.nav_view).menu.findItem(R.id.nav_logout)?.isEnabled =
             state !is CurrentAccountSignOutState.Removing && state !is CurrentAccountSignOutState.CleaningUp
+        if (state is CurrentAccountSignOutState.Refused) {
+            // Not a failure. The refusal is acknowledged first. When the check ran and refused, the
+            // sign-out question is asked again from the start: the count while the store holds
+            // anything, else the plain question. When the check could not run, a message says so.
+            signOutModel.acknowledgeRefusal()
+            if (state.checkFailed) showSignOutCheckFailed() else confirmLogout()
+            return
+        }
         val errorId = when (state) {
             is CurrentAccountSignOutState.RemovalFailed -> state.errorId
             is CurrentAccountSignOutState.CleanupFailed -> state.errorId

@@ -71,13 +71,17 @@ class UnsyncedNotesSignOutPolicyTest {
         val branch = activity.substringAfter("is UnsyncedNotesSignOutPolicy.Next.ConfirmAndSignOut -> {").substringBefore("}")
         assertTrue(branch.contains("signOutModel.confirmNotesDiscard(next.shown)"))
         assertTrue(branch.indexOf("confirmNotesDiscard") < branch.indexOf("signOutModel.begin()"))
-        assertEquals("a sign-out starts in three places: the plain question, the accepted discard, Retry", 3,
+        assertEquals("a sign-out is asked for in three places: the plain question, the accepted discard, Retry", 3,
             Regex("signOutModel\\.begin\\(\\)").findAll(activity).count())
         val fragment = source("UnsyncedNotesDialogFragment.kt")
         assertEquals("one button sends the discard answer", 1,
             Regex("send\\(UnsyncedNotesSignOutPolicy\\.Answer\\.DISCARD\\)").findAll(fragment).count())
         assertTrue("and it is the button of step 2", fragment.contains(
             ".setPositiveButton(R.string.notes_discard_and_sign_out) { _, _ ->\n                    send(UnsyncedNotesSignOutPolicy.Answer.DISCARD)\n                }"))
+        // A text check for the gate's rule in the Android seams, which no unit test builds.
+        assertTrue("the gate allows a sign-out with nothing unsynced or with a confirmation that still holds for the store's answer",
+            source("AndroidCurrentAccountSignOut.kt").contains("override fun notesDiscardConfirmed(main: ExactAccountIdentity): Boolean {\n" +
+                "        val now = pendingNotes(main).unsynced()\n        return !now.anything || PendingNotesDiscardPermit.covers(main, now)\n    }"))
     }
 
     @Test fun `every end of a sign-out dialog without a sign-out reaches the one function the screen has for it`() {
@@ -100,17 +104,20 @@ class UnsyncedNotesSignOutPolicyTest {
         assertTrue("the failure message with Retry is shown again",
             closed.contains("renderedSignOutErrorId = 0") && closed.contains("renderSignOutState(state)"))
         assertTrue("Retry asks before it signs out", activity.contains(".setAction(R.string.retry) { retrySignOut(state) }"))
+        assertTrue("when a dialog ends on a retained screen that is idle, the activity is created again",
+            closed.contains("} else if (signOutOnly && state is CurrentAccountSignOutState.Idle) {") &&
+                closed.indexOf("recreate()") > closed.indexOf("signOutOnly && state is CurrentAccountSignOutState.Idle"))
 
         // Text checks for the path a sign-out takes while nothing is unsynced: confirmLogout still leads
         // to the plain question, the plain question keeps the string ids of its title and its text, and
-        // its positive button holds the call that starts the sign-out.
+        // its positive button holds the call that asks the coordinator for the sign-out.
         val confirm = activity.substringAfter("private fun confirmLogout() {", "").substringBefore("\n    }\n")
         assertTrue("with nothing unsynced the plain question is asked", confirm.contains("else -> confirmPlainLogout()"))
         val plain = activity.substringAfter("private fun confirmPlainLogout() {", "").substringBefore("\n    }\n")
         assertTrue("the plain question keeps its title and its text",
             plain.contains(".setTitle(R.string.account_delete_confirmation_title)") &&
                 plain.contains(".setMessage(R.string.account_delete_confirmation_text)"))
-        assertTrue("the plain question's own button starts the sign-out",
+        assertTrue("the plain question's own button asks for the sign-out",
             plain.contains(".setPositiveButton(R.string.navigation_drawer_logout) { _, _ ->\n                signOutModel.begin()\n            }"))
         val answer = activity.substringAfter("internal fun onUnsyncedNotesAnswer(", "").substringBefore("\n    }\n")
         assertTrue("an answer for another account is reported as an end without a sign-out",
@@ -124,5 +131,21 @@ class UnsyncedNotesSignOutPolicyTest {
         assertTrue("after a failed removal Retry reads the store, and it starts at once only when nothing is there",
             retry.contains("if (failed is CurrentAccountSignOutState.RemovalFailed) signOutModel.unsyncedNotes() else UnsyncedNotes.NOTHING") &&
                 retry.contains("if (unsynced.anything) showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, unsynced) else signOutModel.begin()"))
+
+        // Text checks for what the screen does with a refused sign-out.
+        val render = activity.substringAfter("private fun renderSignOutState(state: CurrentAccountSignOutState) {", "").substringBefore("\n    }\n")
+        val refusal = render.substringAfter("if (state is CurrentAccountSignOutState.Refused) {", "").substringBefore("\n        }\n")
+        assertTrue("a refusal is acknowledged, then the check message or the question follows, and nothing more is rendered",
+            refusal.trimEnd().endsWith("signOutModel.acknowledgeRefusal()\n            if (state.checkFailed) showSignOutCheckFailed() else confirmLogout()\n            return"))
+        assertTrue("a refusal is handled before the failure messages",
+            render.indexOf("if (state is CurrentAccountSignOutState.Refused) {") in 0 until render.indexOf("val errorId = when (state) {"))
+        val check = activity.substringAfter("private fun showSignOutCheckFailed() {", "").substringBefore("\n    }\n")
+        assertTrue("a check that could not run has a message of its own, and its Retry asks the question again",
+            check.contains("R.string.notes_sign_out_check_failed") && check.contains(".setAction(R.string.retry) { confirmLogout() }"))
+        val model = source("AndroidCurrentAccountSignOut.kt")
+        assertTrue("a refusal does not count as a started sign-out", model.contains(
+            "fun hasStarted() = coordinator?.state?.let {\n        it !is CurrentAccountSignOutState.Idle && it !is CurrentAccountSignOutState.Refused\n    } == true"))
+        assertTrue("the screen's acknowledgment reaches the coordinator",
+            model.contains("internal fun acknowledgeRefusal() { coordinator?.acknowledgeRefusal() }"))
     }
 }

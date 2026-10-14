@@ -457,6 +457,7 @@ class AccountDrawerSignOutRuntimeTest {
         override fun unsyncedNotes(main: ExactAccountIdentity) = UnsyncedNotes.NOTHING
         override fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) = Unit
         override fun withdrawNotesDiscard(main: ExactAccountIdentity) = Unit
+        override fun notesDiscardConfirmed(main: ExactAccountIdentity) = true
     }
 
     private class DelayedSuccessSeams(
@@ -485,6 +486,7 @@ class AccountDrawerSignOutRuntimeTest {
         override fun unsyncedNotes(main: ExactAccountIdentity) = UnsyncedNotes.NOTHING
         override fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) = Unit
         override fun withdrawNotesDiscard(main: ExactAccountIdentity) = Unit
+        override fun notesDiscardConfirmed(main: ExactAccountIdentity) = true
     }
 
     private fun removeAccountAndWait(manager: AccountManager, account: Account) {
