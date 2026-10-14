@@ -428,7 +428,11 @@ internal class NotePushStep(
             NotePushPolicy.ServerCopy(server.revision, server.deleted))
         when (decision) {
             ConflictOutcome.DONE -> if (cacheFirst(latest, server)) {
-                store.completeSend(uid, latest.version, server.revision, server.blob)
+                when (val outcome = store.completeSend(uid, latest.version, server.revision, server.blob)) {
+                    SendOutcome.Done -> Unit
+                    // Saved since the read above: the newer change is rebased onto our copy, as in [send].
+                    is SendOutcome.NewerLocalChange -> rebaseOntoLanded(outcome.entry, server)
+                }
                 landed(uid)
             }
             ConflictOutcome.REBASE -> rebaseOnce(latest, server)
