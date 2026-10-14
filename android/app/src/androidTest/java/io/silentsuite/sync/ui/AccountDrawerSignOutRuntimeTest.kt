@@ -448,6 +448,7 @@ class AccountDrawerSignOutRuntimeTest {
         override fun mainGenerationAbsent(main: ExactAccountIdentity) = false
         override fun clearCache(main: ExactAccountIdentity) = true.also { destructiveCleanupCalls++ }
         override fun clearStatus(main: ExactAccountIdentity) = true.also { destructiveCleanupCalls++ }
+        override fun clearPendingNotes(main: ExactAccountIdentity) = true.also { destructiveCleanupCalls++ }
         override fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?) =
             ActiveAccountReconciliation(true, replacement).also { destructiveCleanupCalls++ }
         override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) {
@@ -480,6 +481,7 @@ class AccountDrawerSignOutRuntimeTest {
         override fun mainGenerationAbsent(main: ExactAccountIdentity) = absent
         override fun clearCache(main: ExactAccountIdentity) = true
         override fun clearStatus(main: ExactAccountIdentity) = true
+        override fun clearPendingNotes(main: ExactAccountIdentity) = true
         override fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?) =
             ActiveAccountReconciliation(ActiveAccountManager.setActiveAccount(context, siblingAccount), sibling)
         override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) = callback(true)

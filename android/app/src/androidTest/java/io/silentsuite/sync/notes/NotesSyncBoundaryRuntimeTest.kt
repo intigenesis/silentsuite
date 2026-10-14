@@ -178,7 +178,7 @@ class NotesSyncBoundaryRuntimeTest {
         // the other classes that run in the same instrumentation process.
         val problems = mutableListOf<Throwable>()
         try {
-            // Sign-out does not clear the pending store yet (the lifecycle work of slice 2).
+            // Only a sign-out clears the pending store, and most cases end without one.
             for (store in stores) runCatching { store.clearAll() }.exceptionOrNull()?.let(problems::add)
             for (name in names) {
                 runCatching { removeAccount(Account(name, App.accountType)) }.exceptionOrNull()?.let(problems::add)
@@ -2173,11 +2173,12 @@ class NotesSyncBoundaryRuntimeTest {
     }
 
     @Test fun signOutWhileAPushIsInFlightLetsItsLateAnswerWriteNothing() {
-        // What this case shows about the push is in the request log and in the signed-out account's
-        // store: one upload, no request after it, and the store's files as they were while the upload
-        // was held. The cache and status checks after the release are controls, the ones the fetch
-        // case makes: the status store refuses any late write once sign-out has cleared the record,
-        // whatever the push does.
+        // What this case shows about the push is in the request log: one upload, and no request after
+        // it. Sign-out removes the account's pending store with its cache and its status, so the
+        // store's files can no longer be compared: the case checks that the directory is gone, stays
+        // gone after the late answer, and that the cleared store refuses a late save. The cache and
+        // status checks after the release are controls, the ones the fetch case makes: the status
+        // store refuses any late write once sign-out has cleared the record, whatever the push does.
         val account = newAccount("gen-push-out")
         val identity = ExactAccountIdentity(account.type, account.name, "gen-push-out")
         val notebook = uploadNotebook("Signed out of")
@@ -2204,6 +2205,10 @@ class NotesSyncBoundaryRuntimeTest {
         assertTrue("the account stays", account in manager.getAccountsByType(account.type))
         assertTrue("the run was not canceled", NotesSyncCoordinator.isActive(identity))
         assertSameFiles("a refused sign-out touches nothing", held.files, filesOnDisk(held.store))
+        // While the generation still has its row, the cleanup step clears nothing.
+        val seams = AndroidCurrentAccountSignOut(context, account, "gen-push-out")
+        assertFalse("nothing is cleared while the account is there", try { seams.clearPendingNotes(identity) } finally { seams.close() })
+        assertSameFiles("and the store is untouched", held.files, filesOnDisk(held.store))
         assertStillHeld(held.heldAt)
 
         // The app's own sign-out, from start to finish, while the upload's answer is still held.
@@ -2212,13 +2217,19 @@ class NotesSyncBoundaryRuntimeTest {
         assertFalse("sign-out cancelled the Notes run", NotesSyncCoordinator.isActive(identity) || NotesSyncCoordinator.isPending(identity))
         assertTrue("sign-out cleared the cache: ${cacheFiles(account.name)}", cacheFiles(account.name).isEmpty())
         assertEquals("sign-out cleared the status", SyncStatusStore.Status(), status(account, "gen-push-out"))
+        assertFalse("sign-out removed the pending store", held.store.dir.exists())
 
         release(held)
         assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
-        // Sign-out does not clear the pending store yet. Once it does, no file is left to compare,
-        // and this comparison says nothing until that change brings checks of its own.
-        val after = filesOnDisk(held.store)
-        if (after.isNotEmpty()) assertSameFiles("the signed-out account's store after the late answer", held.files, after)
+        // The late answer did not bring the store back. The cleared store stays the one instance for
+        // its directory, closed, so a save that arrives late is refused too.
+        assertFalse("the store stays gone after the late answer", held.store.dir.exists())
+        assertTrue("the cleared store stays the one instance for its directory",
+            held.store === PendingNotesStore.forIdentity(context, account.type, account.name, "gen-push-out"))
+        assertTrue("a save that arrives late is refused", runCatching {
+            held.store.saveLocal(note.uid, notebook, "late", ByteArray(1), isCreate = false)
+        }.exceptionOrNull() is IllegalStateException)
+        assertFalse("and it does not bring the directory back", held.store.dir.exists())
         assertEquals("one upload, and none after it", listOf(transactionOf(notebook)), uploads(held.since))
         assertEquals("no request of any kind followed the held upload", emptyList<String>(), fake.requests.drop(held.through))
         assertEquals("the server routed that one upload", listOf(1), fake.uploadSizes.drop(held.sizes))
@@ -2245,6 +2256,18 @@ class NotesSyncBoundaryRuntimeTest {
         assertEquals(setOf("Plan", "List", "From the web"), cachedNotes(next, notebook))
         assertEquals("no unsynced text", 0, (NotesLoader.notebooks(context, next, "gen-push-in") as NotesLoad.Loaded).value.unsyncedText)
         assertSucceeded(status(next, "gen-push-in"))
+        // One save into the new account's store, then the old generation's store step again through
+        // the real seams, while the row of that name is the new account's: it answers yes, and the new
+        // account's store keeps its files and its count.
+        editLocally(next, "gen-push-in", notebook, list.uid, "List", "Milk and bread", mtime = 4_000L)
+        val newFiles = filesOnDisk(newStore)
+        val newCount = newStore.unsynced()
+        assertTrue("the new account's store holds files", newFiles.isNotEmpty())
+        val oldSeams = AndroidCurrentAccountSignOut(context, account, "gen-push-out")
+        assertTrue("the old generation's store step answers yes next to the new account",
+            try { oldSeams.clearPendingNotes(identity) } finally { oldSeams.close() })
+        assertSameFiles("the new account's store keeps its files", newFiles, filesOnDisk(newStore))
+        assertEquals("and its count", newCount, newStore.unsynced())
     }
 
     @Test fun aSameNameAccountThatReplacedTheOldOneGetsNothingFromTheOldRunsInFlightPush() {
@@ -2419,7 +2442,7 @@ class NotesSyncBoundaryRuntimeTest {
      * The app's own sign-out through the coordinator and the real seams, without the screen. When
      * the store holds anything, the separate discard confirmation is given first for what it holds
      * now, in place of the answer to the second dialog. Then the coordinator asks its gate, cancels
-     * sync, removes the account, and clears its cache and its status.
+     * sync, removes the account, and clears its cache, its status and its pending store.
      */
     private fun signOut(account: Account, generation: String) {
         awaitSyncManagerQuiet()

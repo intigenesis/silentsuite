@@ -29,7 +29,7 @@ class CurrentAccountSignOutCoordinatorTest {
             if (cancelThrows) throw IllegalStateException("cancel failed")
             events += "cancel:${identity.first}:${identity.second}"
         }
-        // The Notes seams record no event, so the event lists of the older tests stand.
+        // These four Notes seams record no event. clearPendingNotes, further down, records one.
         var unsynced = UnsyncedNotes.NOTHING
         var unsyncedFails = false
         var confirmed: UnsyncedNotes? = null
@@ -56,6 +56,15 @@ class CurrentAccountSignOutCoordinatorTest {
         override fun mainGenerationAbsent(main: ExactAccountIdentity) = absent.also { events += "absent:$it" }
         override fun clearCache(main: ExactAccountIdentity) = cache.also { events += "cache" }
         override fun clearStatus(main: ExactAccountIdentity) = status.also { events += "status" }
+        var notes = true
+        /** The account of each request to clear the pending Notes store, in the order asked. */
+        val notesClearedFor = mutableListOf<ExactAccountIdentity>()
+        var notesThrows = false
+        override fun clearPendingNotes(main: ExactAccountIdentity): Boolean {
+            events += "notes"; notesClearedFor += main
+            if (notesThrows) throw IllegalStateException("cannot clear")
+            return notes
+        }
         override fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?) =
             ActiveAccountReconciliation(active, reconciledActive).also { events += "active:${replacement?.name}" }
         override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) {
@@ -70,8 +79,11 @@ class CurrentAccountSignOutCoordinatorTest {
         c.begin()
         assertEquals(listOf("snapshot", "absent:false", "cancel:main:z@example.invalid", "cancel:child:book", "remove"), f.events)
         assertTrue(c.state is CurrentAccountSignOutState.Removing)
-        f.absent = true; f.removeCallback!!(true); f.childrenCallback!!(true)
-        assertEquals(listOf("cache", "status", "active:a@example.invalid", "children"), f.events.takeLast(4))
+        f.absent = true; f.removeCallback!!(true)
+        assertTrue("cleanup went on to the address books", c.state is CurrentAccountSignOutState.CleaningUp)
+        f.childrenCallback!!(true)
+        assertEquals(listOf("cache", "status", "notes", "active:a@example.invalid", "children"), f.events.takeLast(5))
+        assertEquals("the store was asked for once, for the snapshot's account", listOf(target), f.notesClearedFor)
         assertEquals(CurrentAccountSignOutState.Complete(sibling), c.state)
         assertEquals(1, f.closeCalls)
     }
@@ -81,7 +93,7 @@ class CurrentAccountSignOutCoordinatorTest {
         val c = CurrentAccountSignOutCoordinator(f) { states += it }
         c.begin(); f.removeCallback!!(false)
         assertTrue(c.state is CurrentAccountSignOutState.RemovalFailed)
-        assertFalse(f.events.any { it in setOf("cache", "status", "children") || it.startsWith("active:") })
+        assertFalse(f.events.any { it in setOf("cache", "status", "notes", "children") || it.startsWith("active:") })
         assertEquals(1, states.filterIsInstance<CurrentAccountSignOutState.RemovalFailed>().size)
 
         val present = Fake(); val other = CurrentAccountSignOutCoordinator(present)
@@ -141,13 +153,15 @@ class CurrentAccountSignOutCoordinatorTest {
     }
 
     @Test fun `cache status and active failures stop child cleanup and remain cleanup-only retryable`() {
-        listOf("cache", "status", "active").forEach { failed ->
+        listOf("cache", "status", "notes", "active").forEach { failed ->
             val f = Fake().apply {
-                absent = true; cache = failed != "cache"; status = failed != "status"; active = failed != "active"
+                absent = true; cache = failed != "cache"; status = failed != "status"; notes = failed != "notes"; active = failed != "active"
             }
             val c = CurrentAccountSignOutCoordinator(f); c.begin()
             assertTrue(c.state is CurrentAccountSignOutState.CleanupFailed)
             assertFalse(f.events.contains("children")); assertEquals(0, f.removeCalls)
+            assertEquals("no step after the failed one was asked", listOf("cache", "status", "notes", "active").let { it.subList(0, it.indexOf(failed) + 1) },
+                f.events.filter { it in setOf("cache", "status", "notes") || it.startsWith("active:") }.map { it.substringBefore(':') })
         }
     }
 
@@ -296,5 +310,129 @@ class CurrentAccountSignOutCoordinatorTest {
         assertTrue(c.state is CurrentAccountSignOutState.Removing)
         f.removeCallback!!(false); c.acknowledgeRefusal()
         assertTrue("acknowledging after a failed removal changes nothing", c.state is CurrentAccountSignOutState.RemovalFailed)
+    }
+
+    @Test fun `a pending Notes store that cannot be cleared fails cleanup, and the retry clears it without another removal`() {
+        val f = Fake().apply { notes = false }
+        val c = CurrentAccountSignOutCoordinator(f)
+        c.begin()
+        assertTrue("the gate let the removal start", c.state is CurrentAccountSignOutState.Removing)
+        f.absent = true; f.removeCallback!!(true)
+        assertTrue("a store that cannot be cleared fails cleanup", c.state is CurrentAccountSignOutState.CleanupFailed)
+        assertFalse("the address books are not touched while the store could not be cleared", f.events.contains("children"))
+        assertFalse("the active account is not reconciled while the store could not be cleared", f.events.any { it.startsWith("active:") })
+        f.notes = true
+        c.begin()
+        assertTrue("the retry went on to the address books", c.state is CurrentAccountSignOutState.CleaningUp)
+        f.childrenCallback!!(true)
+        assertEquals("the retry asked for no second removal", 1, f.removeCalls)
+        assertEquals("the retry asked for the store again", 2, f.events.count { it == "notes" })
+        assertEquals("both tries asked for the snapshot's account", listOf(target, target), f.notesClearedFor)
+        assertEquals("the cleanup retry did not ask the check again", 1, f.gateCalls)
+        assertTrue(c.state is CurrentAccountSignOutState.Complete)
+        // A store step that throws fails cleanup as well.
+        val thrower = Fake().apply { absent = true; notesThrows = true }
+        val t = CurrentAccountSignOutCoordinator(thrower)
+        t.begin()
+        assertTrue("a store step that throws fails cleanup", t.state is CurrentAccountSignOutState.CleanupFailed)
+        assertFalse("and the address books are not touched", thrower.events.contains("children"))
+
+        // A text check for the Android seam, which no unit test builds: its body holds the line that
+        // answers no while the generation has its row, and it ends with the line that answers
+        // whether the store's clearAll went through. BT runs the seam on a device.
+        val clear = java.io.File("src/main/java/io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt").readText().replace("\r\n", "\n")
+            .substringAfter("override fun clearPendingNotes(main: ExactAccountIdentity): Boolean {", "").substringBefore("\n    }\n")
+        assertTrue("the Android seam clears nothing while the generation has its row",
+            clear.contains("if (row != null && manager.getUserData(row, AccountSettings.KEY_CREATION_ID) == main.creationId) return false"))
+        assertTrue("and it answers whether the store's clearAll went through",
+            clear.trimEnd().endsWith("return runCatching { pendingNotes(main).clearAll() }.isSuccess"))
+    }
+
+    @Test fun `the store of an account that is already gone is cleared only when the check answers yes, and a cleanup retry keeps that answer`() {
+        // The check answers no: cleanup goes on and the store is not cleared.
+        val kept = Fake().apply { absent = true; discardConfirmed = false }
+        val c = CurrentAccountSignOutCoordinator(kept)
+        c.begin()
+        assertTrue("cleanup went on to the address books", c.state is CurrentAccountSignOutState.CleaningUp)
+        kept.childrenCallback!!(true)
+        assertTrue(c.state is CurrentAccountSignOutState.Complete)
+        assertEquals(0, kept.removeCalls)
+        assertFalse("the check said no, so the store is not cleared", kept.events.contains("notes"))
+        assertEquals(listOf("cache", "status", "active:a@example.invalid", "children"), kept.events.takeLast(4))
+        assertEquals("the check was asked once, about the snapshot's account", listOf(target), kept.gateAskedFor)
+        // The check answers yes: the store is cleared after the status.
+        val cleared = Fake().apply { absent = true }
+        val d = CurrentAccountSignOutCoordinator(cleared)
+        d.begin()
+        assertTrue("cleanup went on to the address books", d.state is CurrentAccountSignOutState.CleaningUp)
+        cleared.childrenCallback!!(true)
+        assertTrue(d.state is CurrentAccountSignOutState.Complete)
+        assertEquals(listOf("cache", "status", "notes", "active:a@example.invalid", "children"), cleared.events.takeLast(5))
+        assertEquals(listOf(target), cleared.notesClearedFor)
+        // The check throws: the store is not cleared either.
+        val blind = Fake().apply { absent = true; gateThrows = true }
+        val e = CurrentAccountSignOutCoordinator(blind)
+        e.begin()
+        assertTrue("cleanup went on to the address books", e.state is CurrentAccountSignOutState.CleaningUp)
+        blind.childrenCallback!!(true)
+        assertTrue(e.state is CurrentAccountSignOutState.Complete)
+        assertFalse("the check threw, so the store is not cleared", blind.events.contains("notes"))
+        // The gate let a removal start and the removal failed. By the next try the account is gone
+        // and the check answers no: the yes of the earlier try does not clear the store.
+        val later = Fake()
+        val h = CurrentAccountSignOutCoordinator(later)
+        h.begin()
+        assertTrue("the gate let the removal start", h.state is CurrentAccountSignOutState.Removing)
+        later.removeCallback!!(false)
+        later.absent = true; later.discardConfirmed = false
+        h.begin()
+        assertTrue("cleanup went on to the address books", h.state is CurrentAccountSignOutState.CleaningUp)
+        later.childrenCallback!!(true)
+        assertTrue(h.state is CurrentAccountSignOutState.Complete)
+        assertEquals(1, later.removeCalls)
+        assertFalse("a yes for a try whose removal failed does not clear the store on a later try", later.events.contains("notes"))
+        // The same when the check cannot run on that later try: the earlier yes does not stand in for it.
+        val unsure = Fake()
+        val u = CurrentAccountSignOutCoordinator(unsure)
+        u.begin()
+        assertTrue("the gate let the removal start", u.state is CurrentAccountSignOutState.Removing)
+        unsure.removeCallback!!(false)
+        unsure.absent = true; unsure.gateThrows = true
+        u.begin()
+        assertTrue("cleanup went on to the address books", u.state is CurrentAccountSignOutState.CleaningUp)
+        unsure.childrenCallback!!(true)
+        assertFalse("a yes for a try whose removal failed does not stand in for a check that cannot run on a later try", unsure.events.contains("notes"))
+        // The same with a refused retry in between, which drops the snapshot. This fake still hands
+        // out a snapshot for an account that is gone.
+        val stale = Fake()
+        val g = CurrentAccountSignOutCoordinator(stale)
+        g.begin()
+        assertTrue("the gate let the removal start", g.state is CurrentAccountSignOutState.Removing)
+        stale.removeCallback!!(false)
+        stale.discardConfirmed = false
+        g.begin()
+        assertEquals(CurrentAccountSignOutState.Refused(checkFailed = false), g.state)
+        stale.absent = true
+        g.begin()
+        assertTrue("cleanup went on to the address books", g.state is CurrentAccountSignOutState.CleaningUp)
+        stale.childrenCallback!!(true)
+        assertTrue(g.state is CurrentAccountSignOutState.Complete)
+        assertEquals(1, stale.removeCalls)
+        assertEquals("the check was asked at each of the three tries", 3, stale.gateCalls)
+        assertFalse("a yes from before a refused retry does not clear the store either", stale.events.contains("notes"))
+        // A no is kept for a cleanup retry: the check is not asked again, whatever it would answer.
+        val firm = Fake().apply { absent = true; discardConfirmed = false }
+        val k = CurrentAccountSignOutCoordinator(firm)
+        k.begin()
+        assertTrue("cleanup went on to the address books", k.state is CurrentAccountSignOutState.CleaningUp)
+        firm.childrenCallback!!(false)
+        assertTrue(k.state is CurrentAccountSignOutState.CleanupFailed)
+        firm.discardConfirmed = true
+        k.begin()
+        assertTrue("the cleanup retry went on to the address books", k.state is CurrentAccountSignOutState.CleaningUp)
+        firm.childrenCallback!!(true)
+        assertTrue(k.state is CurrentAccountSignOutState.Complete)
+        assertEquals("the cleanup retry did not ask the check again", 1, firm.gateCalls)
+        assertFalse("the no from the try that entered cleanup holds for the retry", firm.events.contains("notes"))
     }
 }

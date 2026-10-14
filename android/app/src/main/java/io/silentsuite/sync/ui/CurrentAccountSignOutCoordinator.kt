@@ -32,7 +32,9 @@ sealed class CurrentAccountSignOutState {
 /**
  * Ordered sign-out policy. The snapshot is retained for cleanup-only retry after the main row is
  * absent; a retry can therefore never broaden ownership or issue the main removal twice. A try
- * that the Notes gate refuses keeps no snapshot, and the next try has to take a new one.
+ * that the Notes gate refuses keeps no snapshot, and the next try has to take a new one. Cleanup
+ * asks the seam to clear the pending Notes store only when the seam's check answered yes for the
+ * try that entered cleanup.
  */
 class CurrentAccountSignOutCoordinator(
     private val seams: Seams,
@@ -45,6 +47,13 @@ class CurrentAccountSignOutCoordinator(
         fun mainGenerationAbsent(main: ExactAccountIdentity): Boolean
         fun clearCache(main: ExactAccountIdentity): Boolean
         fun clearStatus(main: ExactAccountIdentity): Boolean
+        /**
+         * Removes the pending Notes store of exactly [main], its unsynced text included, and answers
+         * whether that worked. A no or a throw fails cleanup. The coordinator asks for it only in
+         * cleanup, after the status is cleared and before the active account is reconciled, and only
+         * when the check [notesDiscardConfirmed] answered yes for the try that entered cleanup.
+         */
+        fun clearPendingNotes(main: ExactAccountIdentity): Boolean
         fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?): ActiveAccountReconciliation
         fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit)
         /** What the pending Notes store of [main] holds that has not synced, which a removal of the account would lose. */
@@ -59,10 +68,13 @@ class CurrentAccountSignOutCoordinator(
          */
         fun withdrawNotesDiscard(main: ExactAccountIdentity)
         /**
-         * Whether [main] may be removed as far as its unsynced Notes text goes: there is none, or
-         * the separate discard confirmation still holds for what is there now ([UnsyncedNotes.covers],
-         * with its limits). The coordinator asks it in [begin], after the branches for a cleanup-only
-         * retry and for an account that is already gone, and before it cancels or removes anything.
+         * Whether the unsynced Notes text of [main] may go with a sign-out: there is none, or the
+         * separate discard confirmation still holds for what is there now ([UnsyncedNotes.covers],
+         * with its limits). The coordinator asks it in [begin] at two places. As the gate, after the
+         * two branches that do not remove the main account and before it cancels or removes
+         * anything: a no or a throw refuses the sign-out. And in the branch for an account that is
+         * already gone: there the answer only decides whether cleanup asks the seam to clear the
+         * pending Notes store.
          */
         fun notesDiscardConfirmed(main: ExactAccountIdentity): Boolean
         /** Monotonic platform-listener observation; production defaults to no invalidation. */
@@ -83,6 +95,16 @@ class CurrentAccountSignOutCoordinator(
      */
     private var discardConfirmedFor: ExactAccountIdentity? = null
 
+    /**
+     * Whether cleanup may ask the seam to clear the pending Notes store. It is the answer of the
+     * seam's check ([Seams.notesDiscardConfirmed]) for the try that leads into cleanup: set to true
+     * when the gate lets the removal start, and set to the check's answer, false when it throws, in
+     * the branch for an account that is already gone. A cleanup-only retry does not ask again and
+     * uses the value it finds. Once cleanup has been entered, no later try reaches either of the two
+     * places, so the value cleanup reads is the one of the try that entered it.
+     */
+    private var notesMayBeCleared = false
+
     init { onStateChanged(state) }
 
     fun begin() {
@@ -101,6 +123,11 @@ class CurrentAccountSignOutCoordinator(
         }
         if (runCatching { seams.mainGenerationAbsent(captured.main) }.getOrDefault(false)) {
             mainRemovalConfirmed = true
+            // The main account is already gone, so the gate below is not reached and nothing is
+            // refused. The seam's check is asked here for the store alone: on a yes, cleanup asks the
+            // seam to clear the pending Notes store once the cache and the status are cleared, and
+            // on a no or a throw it does not ask, so the store stays on disk.
+            notesMayBeCleared = runCatching { seams.notesDiscardConfirmed(captured.main) }.getOrDefault(false)
             cleanup(captured)
             return
         }
@@ -109,7 +136,8 @@ class CurrentAccountSignOutCoordinator(
         // means that the account's unsynced Notes text is nothing or that a discard confirmation
         // still holds for it. A check that throws refuses as well, so the gate fails closed. It
         // stands before anything is canceled, so a refused sign-out stops no sync, and after the two
-        // branches above, which do not remove the main account.
+        // branches above, which do not remove the main account. The second of them asks the same
+        // check, for the store alone.
         val allowed = runCatching { seams.notesDiscardConfirmed(captured.main) }
         if (!allowed.getOrDefault(false)) {
             // This try started nothing, so nothing is kept for the next one: the seam is asked to
@@ -120,6 +148,9 @@ class CurrentAccountSignOutCoordinator(
             transition(CurrentAccountSignOutState.Refused(checkFailed = allowed.isFailure))
             return
         }
+        // The check answered yes for this try, so cleanup may clear the pending Notes store once
+        // this try's removal went through.
+        notesMayBeCleared = true
 
         transition(CurrentAccountSignOutState.Removing)
         try {
@@ -141,7 +172,8 @@ class CurrentAccountSignOutCoordinator(
         transition(CurrentAccountSignOutState.CleaningUp)
         val replacement = AccountSwitcherPolicy.replacement(captured.main, captured.eligibleSiblings)
         val essentialCleanup = runCatching {
-            if (!seams.clearCache(captured.main) || !seams.clearStatus(captured.main)) null
+            if (!seams.clearCache(captured.main) || !seams.clearStatus(captured.main) ||
+                (notesMayBeCleared && !seams.clearPendingNotes(captured.main))) null
             else seams.reconcileActive(captured.main, replacement)
         }.getOrNull()
         if (essentialCleanup?.succeeded != true) {

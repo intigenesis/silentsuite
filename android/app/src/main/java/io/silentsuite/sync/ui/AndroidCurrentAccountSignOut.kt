@@ -114,6 +114,18 @@ internal class AndroidCurrentAccountSignOut(
 
     override fun clearStatus(main: ExactAccountIdentity) = runCatching { statusCleanup.clear(main) }.getOrDefault(false)
 
+    override fun clearPendingNotes(main: ExactAccountIdentity): Boolean {
+        val row = currentRow(main.type, main.name)
+        // Keyed by the exact generation: while that generation still has its row, nothing is cleared
+        // and the answer is no.
+        if (row != null && manager.getUserData(row, AccountSettings.KEY_CREATION_ID) == main.creationId) return false
+        // clearAll closes the store's one instance for this directory before it deletes, and that
+        // instance stays registered for the rest of the process. A save or a run that reaches the
+        // store later in this process is refused by it and writes nothing into it. Its count
+        // answers nothing from then on, also when the delete failed and files are left.
+        return runCatching { pendingNotes(main).clearAll() }.isSuccess
+    }
+
     private fun pendingNotes(main: ExactAccountIdentity) =
         PendingNotesStore.forIdentity(context, main.type, main.name, main.creationId)
 

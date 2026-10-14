@@ -776,7 +776,8 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
      * Retry from the failure message. After a failed removal the coordinator has asked for the
      * discard confirmation to be withdrawn, so the store is read again and, when it holds anything,
      * the count is shown before a new try. After a failed cleanup the retry starts at once and shows
-     * no dialog.
+     * no dialog; that retry asks for the pending Notes store to be cleared when the try that entered
+     * cleanup was allowed to.
      */
     private fun retrySignOut(failed: CurrentAccountSignOutState) {
         val unsynced = if (failed is CurrentAccountSignOutState.RemovalFailed) signOutModel.unsyncedNotes() else UnsyncedNotes.NOTHING
