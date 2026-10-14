@@ -772,4 +772,13 @@
     <string name="notes_local_change_unreadable">A local change could not be read</string>
     <string name="notes_local_text_held">Your local text is kept in Unsynced text</string>
     <string name="notes_unsynced_text">Unsynced text (%1$d)</string>
+    <!-- The notebook list's network line: one opening sentence, the reasons, one closing sentence, joined by spaces. -->
+    <string name="notes_network_changes_waiting">Changes on this device are waiting to sync.</string>
+    <string name="notes_network_may_be_out_of_date">Notes are not syncing by themselves and may be out of date.</string>
+    <string name="notes_network_notes_setting">Automatic Notes sync is set to Wi-Fi only (Settings, Account).</string>
+    <string name="notes_network_account_wifi_only">Sync over WiFi only is on for this account (Settings, Sync).</string>
+    <string name="notes_network_no_wifi_reported">Android does not report Wi-Fi as the active connection.</string>
+    <string name="notes_network_account_network_name">WiFi SSID restriction (Settings, Sync) names one Wi-Fi network for this account. Android reports another one, or gives this app no name.</string>
+    <string name="notes_network_try_now">Pull down the list to try now.</string>
+    <string name="notes_network_sync_now_needs_wifi">Sync now for Notes is set to Wi-Fi only too (Settings, Account). When Wi-Fi is the active connection, pull down the list to try.</string>
 </resources>

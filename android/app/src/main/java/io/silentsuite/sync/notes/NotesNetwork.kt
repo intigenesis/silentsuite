@@ -32,7 +32,7 @@ internal object NotesNetwork {
      * The connectivity call itself is not guarded. The adapters do not guard it either, but they make
      * it only with the switch on and for a sync that is not manual. Here it is made for every run, also
      * one that no setting can refuse. If it throws, the run ends as an unknown failure, unless it was
-     * cancelled, and nothing is sent.
+     * canceled, and nothing is sent.
      */
     @Suppress("DEPRECATION")
     fun read(context: Context, withWifiName: Boolean): NotesNetworkPolicy.Reading {
