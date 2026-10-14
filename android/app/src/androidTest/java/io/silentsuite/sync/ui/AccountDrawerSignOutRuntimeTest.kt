@@ -19,6 +19,7 @@ import androidx.lifecycle.Lifecycle
 import io.silentsuite.sync.AccountSettings
 import io.silentsuite.sync.App
 import io.silentsuite.sync.R
+import io.silentsuite.sync.notes.NotesSyncCoordinator
 import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.resource.LocalAddressBook
 import io.silentsuite.sync.syncadapter.AccountAuthenticatorService
@@ -434,6 +435,193 @@ class AccountDrawerSignOutRuntimeTest {
         }
     }
 
+    @Test fun signOutWithUnsyncedNotesAsksTwiceBeforeItRemovesAnything() {
+        val fixture = Fixture("unsynced")
+        val fake = UnsyncedNotesSeams(fixture.account, fixture.creationId)
+        CurrentAccountSignOutViewModel.seamsFactory = { _, _, _ -> fake }
+        // With Notes on, Sync now asks the Notes job for a run. The job's work is replaced here, so no
+        // Notes run reaches a server or a network: what is checked is whether a run was asked for,
+        // and which kind. Each run is noted as: did the user start it, and its request id.
+        val runs = java.util.concurrent.CopyOnWriteArrayList<Pair<Boolean, String?>>()
+        NotesSyncCoordinator.runnerOverride = { _, _, _, request -> runs += request.manual to request.requestId }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val count = UnsyncedNotesSignOutPolicy.Step.COUNT
+        val discard = UnsyncedNotesSignOutPolicy.Step.DISCARD
+        val positive = android.content.DialogInterface.BUTTON_POSITIVE
+        val neutral = android.content.DialogInterface.BUTTON_NEUTRAL
+        val negative = android.content.DialogInterface.BUTTON_NEGATIVE
+        val checkFailed = fixture.context.getString(R.string.notes_sign_out_check_failed)
+        fun dialogOf(activity: AccountActivity, step: UnsyncedNotesSignOutPolicy.Step): androidx.appcompat.app.AlertDialog? {
+            activity.supportFragmentManager.executePendingTransactions()
+            val fragment = activity.supportFragmentManager.findFragmentByTag(UnsyncedNotesDialogFragment.tag(step))
+            return (fragment as? androidx.fragment.app.DialogFragment)?.dialog as? androidx.appcompat.app.AlertDialog
+        }
+        fun message(dialog: androidx.appcompat.app.AlertDialog) =
+            dialog.findViewById<android.widget.TextView>(android.R.id.message)!!.text.toString()
+        fun snackbarText(activity: AccountActivity) =
+            activity.findViewById<android.widget.TextView>(com.google.android.material.R.id.snackbar_text)?.text?.toString()
+        fun signOutFromDrawer(scenario: ActivityScenario<AccountActivity>) {
+            scenario.onActivity { activity ->
+                activity.onNavigationItemSelected(requireNotNull(
+                    activity.findViewById<com.google.android.material.navigation.NavigationView>(R.id.nav_view).menu.findItem(R.id.nav_logout)))
+            }
+            instrumentation.waitForIdleSync()
+        }
+        // AlertDialog posts the button's listener and its own dismissal to the main looper, so a tap
+        // waits until the main thread is idle.
+        fun tap(scenario: ActivityScenario<AccountActivity>, step: UnsyncedNotesSignOutPolicy.Step, button: Int) {
+            scenario.onActivity { activity -> dialogOf(activity, step)!!.getButton(button).performClick() }
+            instrumentation.waitForIdleSync()
+        }
+        fun assertNoDialog(scenario: ActivityScenario<AccountActivity>) {
+            scenario.onActivity { activity -> assertNull(dialogOf(activity, count)); assertNull(dialogOf(activity, discard)) }
+        }
+        try {
+            ActivityScenario.launch<AccountActivity>(AccountActivity.newIntent(fixture.context, fixture.account)).use { scenario ->
+                // 1. The count, with Sync now, Cancel, and going on without syncing.
+                signOutFromDrawer(scenario)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, count)) { "the count dialog" }
+                    assertEquals(activity.resources.getQuantityString(R.plurals.notes_sign_out_unsynced, 2, 2), message(shown))
+                    assertEquals(activity.getString(R.string.account_synchronize_now), shown.getButton(positive).text.toString())
+                    assertEquals(activity.getString(R.string.notes_sign_out_without_syncing), shown.getButton(neutral).text.toString())
+                    assertEquals(activity.getString(android.R.string.cancel), shown.getButton(negative).text.toString())
+                }
+
+                // 2. Cancel removes nothing and confirms nothing.
+                tap(scenario, count, negative)
+                assertNoDialog(scenario)
+                assertNull(fake.confirmed); assertEquals(0, fake.removeCalls)
+
+                // 3. Sync now with Notes off (the fixture's state): the dialog closes, no run is asked
+                // for, nothing is confirmed, and the check is not asked.
+                signOutFromDrawer(scenario)
+                tap(scenario, count, positive)
+                assertTrue(NotesSyncCoordinator.drainForTesting(10_000))
+                assertTrue("Notes is off, so no run was asked for: $runs", runs.isEmpty())
+                assertNoDialog(scenario)
+                assertNull(fake.confirmed); assertEquals(0, fake.removeCalls); assertEquals(0, fake.gateCalls)
+
+                // 4. Sync now with Notes on: one run the user started, with the request id that Sync
+                // now recorded for this account generation.
+                check(AccountSettings.writeNotesEnabled(fixture.manager, fixture.account, true))
+                signOutFromDrawer(scenario)
+                tap(scenario, count, positive)
+                waitUntil("the Notes run that Sync now asked for") { runs.any { it.first } }
+                assertTrue(NotesSyncCoordinator.drainForTesting(10_000))
+                val started = runs.filter { it.first }
+                assertEquals("one run the user started: $runs", 1, started.size)
+                val recorded = SyncStatusStore(fixture.context).let {
+                    it.status(it.identity(fixture.account, fixture.creationId), SyncStatusStore.Service.NOTES).activeRequestId
+                }
+                assertNotNull("Sync now recorded a request", recorded)
+                assertEquals("the run has the request id that Sync now recorded", recorded, started.single().second)
+                assertNoDialog(scenario)
+                assertNull(fake.confirmed); assertEquals(0, fake.removeCalls); assertEquals(0, fake.gateCalls)
+
+                // 5. Going on without syncing leads to the separate confirmation. The count step confirmed nothing.
+                signOutFromDrawer(scenario)
+                tap(scenario, count, neutral)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, discard)) { "the discard confirmation" }
+                    assertEquals(activity.resources.getQuantityString(R.plurals.notes_discard_text, 2, 2), message(shown))
+                    assertEquals(activity.getString(R.string.notes_discard_and_sign_out), shown.getButton(positive).text.toString())
+                    assertNull("the count dialog closed", dialogOf(activity, count))
+                }
+                assertNull(fake.confirmed); assertEquals(0, fake.removeCalls); assertEquals(0, fake.gateCalls)
+
+                // 6. What the dialogs read moves on while the confirmation is open: the answer to it is
+                // turned away, the count is shown again, and the check is not asked.
+                fake.unsynced = UnsyncedNotes(2, 8, false)
+                tap(scenario, discard, positive)
+                scenario.onActivity { activity -> assertNotNull("the count is shown again", dialogOf(activity, count)) }
+                assertEquals("the stale answer was turned away before the gate", 0, fake.gateCalls)
+                assertNull(fake.confirmed); assertEquals(0, fake.removeCalls)
+
+                // 7. What the check reads moves on after the answer: the gate refuses, the screen does not
+                // treat that as a failed sign-out, and the count comes back with no tap. On API 21 the
+                // dashboard shows a snackbar of its own from the start (master sync is off there), so the
+                // snackbar text is read before the tap and compared after.
+                tap(scenario, count, neutral)
+                scenario.onActivity { activity -> assertNotNull(dialogOf(activity, discard)) }
+                var before: String? = null
+                scenario.onActivity { activity -> before = snackbarText(activity) }
+                fake.gateSees = UnsyncedNotes(2, 9, false)
+                tap(scenario, discard, positive)
+                waitUntil("the count dialog after the refused sign-out") {
+                    var shown = false
+                    scenario.onActivity { activity -> shown = dialogOf(activity, count) != null }
+                    shown
+                }
+                assertEquals(1, fake.gateCalls); assertEquals(0, fake.removeCalls); assertNull(fake.confirmed)
+                scenario.onActivity { activity ->
+                    val after = snackbarText(activity)
+                    assertFalse("a refusal is not shown as a failed sign-out",
+                        after == activity.getString(R.string.account_sign_out_failed))
+                    assertEquals("the snackbar is the one from before the refused tap", before, after)
+                }
+                fake.gateSees = null
+                // A sign-out that the gate refuses does not count as started. Nothing is confirmed, so
+                // this begin() is refused in the same call.
+                scenario.onActivity { activity ->
+                    val model = androidx.lifecycle.ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java]
+                    model.begin()
+                    assertFalse("a refused sign-out does not count as started", model.hasStarted())
+                }
+                instrumentation.waitForIdleSync()
+                scenario.onActivity { activity ->
+                    assertEquals("the screen acknowledged the refusal", CurrentAccountSignOutState.Idle,
+                        androidx.lifecycle.ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java].currentState())
+                }
+
+                // 8. The check itself cannot run: the sign-out is refused with a message of its own, on
+                // the screen, and the two dialogs do not come back by themselves.
+                fake.gateThrows = true
+                tap(scenario, count, neutral)
+                tap(scenario, discard, positive)
+                waitUntil("the message for a check that could not run, on the screen") {
+                    var shown = false
+                    scenario.onActivity { activity ->
+                        val view = activity.findViewById<android.widget.TextView>(com.google.android.material.R.id.snackbar_text)
+                        shown = view != null && view.isShown && view.text.toString() == checkFailed
+                    }
+                    shown
+                }
+                assertNoDialog(scenario)
+                assertEquals(3, fake.gateCalls); assertEquals(0, fake.removeCalls); assertNull(fake.confirmed)
+                fake.gateThrows = false
+
+                // 9. The confirmation survives a recreation, and its own button confirms and starts the
+                // removal. After the recreation no count dialog is open and the snackbar is not the check
+                // message.
+                signOutFromDrawer(scenario)
+                tap(scenario, count, neutral)
+                scenario.recreate()
+                instrumentation.waitForIdleSync()
+                scenario.onActivity { activity ->
+                    assertNull("no count dialog after the recreation", dialogOf(activity, count))
+                    assertNotEquals("not the check message after the recreation", checkFailed, snackbarText(activity))
+                }
+                tap(scenario, discard, positive)
+                assertEquals(UnsyncedNotes(2, 8, false), fake.confirmed)
+                assertEquals(1, fake.removeCalls)
+                assertEquals(4, fake.gateCalls)
+            }
+        } finally {
+            // Notes goes off first, so a platform sync of this account that ends now asks for no Notes
+            // run. Then what is queued is canceled and waited for, and only then is the stand-in taken
+            // away.
+            AccountSettings.writeNotesEnabled(fixture.manager, fixture.account, false)
+            NotesSyncCoordinator.cancelAccount(fixture.account.type, fixture.account.name)
+            NotesSyncCoordinator.drainForTesting(10_000)
+            NotesSyncCoordinator.runnerOverride = null
+            CurrentAccountSignOutViewModel.seamsFactory = null
+            // The stand-in run never closes the request that Sync now recorded.
+            SyncStatusStore(fixture.context).let { it.clear(it.identity(fixture.account, fixture.creationId)) }
+            fixture.close()
+        }
+    }
+
     private class DelayedFailureSeams(account: Account) : CurrentAccountSignOutCoordinator.Seams {
         private val identity = ExactAccountIdentity(account.type, account.name, "failure-generation")
         var removeCalls = 0
@@ -489,6 +677,42 @@ class AccountDrawerSignOutRuntimeTest {
         override fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) = Unit
         override fun withdrawNotesDiscard(main: ExactAccountIdentity) = Unit
         override fun notesDiscardConfirmed(main: ExactAccountIdentity) = true
+    }
+
+    /**
+     * Seams that report unsynced Notes changes and never answer the removal, so the sign-out stays
+     * in progress and the screen stays. What the check reads can be set apart from what the dialogs
+     * read, the check can be made to throw, and it counts how often it is asked. The cleanup steps,
+     * the pending store's included, answer yes and touch nothing.
+     */
+    private class UnsyncedNotesSeams(account: Account, generation: String) : CurrentAccountSignOutCoordinator.Seams {
+        private val identity = ExactAccountIdentity(account.type, account.name, generation)
+        @Volatile var unsynced = UnsyncedNotes(2, 7, false)
+        /** What the check reads in place of [unsynced], when set. */
+        @Volatile var gateSees: UnsyncedNotes? = null
+        @Volatile var gateThrows = false
+        @Volatile var gateCalls = 0
+        @Volatile var confirmed: UnsyncedNotes? = null
+        @Volatile var removeCalls = 0
+        override fun snapshot() = CurrentAccountSignOutSnapshot(identity, emptyList(), listOf(identity))
+        override fun cancelSync(identity: Pair<String, String>) = Unit
+        override fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit) { removeCalls++ }
+        override fun mainGenerationAbsent(main: ExactAccountIdentity) = false
+        override fun clearCache(main: ExactAccountIdentity) = true
+        override fun clearStatus(main: ExactAccountIdentity) = true
+        override fun clearPendingNotes(main: ExactAccountIdentity) = true
+        override fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?) =
+            ActiveAccountReconciliation(true, replacement)
+        override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) = callback(true)
+        override fun unsyncedNotes(main: ExactAccountIdentity) = unsynced
+        override fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) { confirmed = shown }
+        override fun withdrawNotesDiscard(main: ExactAccountIdentity) { confirmed = null }
+        override fun notesDiscardConfirmed(main: ExactAccountIdentity): Boolean {
+            gateCalls++
+            if (gateThrows) throw IllegalStateException("cannot look")
+            val now = gateSees ?: unsynced
+            return !now.anything || confirmed?.covers(now) == true
+        }
     }
 
     private fun removeAccountAndWait(manager: AccountManager, account: Account) {
