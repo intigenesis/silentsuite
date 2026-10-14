@@ -15,6 +15,9 @@ import androidx.lifecycle.MutableLiveData
 import io.silentsuite.sync.AccountSettings
 import io.silentsuite.sync.App
 import io.silentsuite.sync.EtebaseLocalCache
+import io.silentsuite.sync.notes.edit.PendingNotesDiscardPermit
+import io.silentsuite.sync.notes.edit.PendingNotesStore
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.resource.LocalAddressBook
 import io.silentsuite.sync.syncadapter.SyncStatusStore
 import io.silentsuite.sync.utils.AndroidCompat
@@ -111,6 +114,16 @@ internal class AndroidCurrentAccountSignOut(
 
     override fun clearStatus(main: ExactAccountIdentity) = runCatching { statusCleanup.clear(main) }.getOrDefault(false)
 
+    private fun pendingNotes(main: ExactAccountIdentity) =
+        PendingNotesStore.forIdentity(context, main.type, main.name, main.creationId)
+
+    override fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes = pendingNotes(main).unsynced()
+
+    override fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) =
+        PendingNotesDiscardPermit.grant(main, shown)
+
+    override fun withdrawNotesDiscard(main: ExactAccountIdentity) = PendingNotesDiscardPermit.withdraw(main)
+
     override fun close() {
         runCatching { manager.removeOnAccountsUpdatedListener(accountListener) }
     }
@@ -179,6 +192,21 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
         coordinator?.hasObservedMainGenerationInvalidation() == true
 
     fun begin() = coordinator?.begin()
+
+    /** The exact account this owner was initialized for, or null before that. */
+    internal fun identity(): ExactAccountIdentity? = exactAccount
+
+    /** The coordinator's state right now, or null before [initialize]. [state] is set with postValue, so it can be behind this. */
+    internal fun currentState(): CurrentAccountSignOutState? = coordinator?.state
+
+    /** What this account's pending Notes store holds that has not synced, as the coordinator answers it. Nothing before [initialize]. */
+    internal fun unsyncedNotes(): UnsyncedNotes =
+        exactAccount?.let { coordinator?.unsyncedNotes(it) } ?: UnsyncedNotes.NOTHING
+
+    /** Passes the separate discard confirmation for [shown] on to the coordinator. Does nothing before [initialize]. */
+    internal fun confirmNotesDiscard(shown: UnsyncedNotes) {
+        exactAccount?.let { coordinator?.confirmNotesDiscard(it, shown) }
+    }
 
     override fun onCleared() {
         coordinator?.close()

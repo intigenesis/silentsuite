@@ -1,5 +1,7 @@
 package io.silentsuite.sync.ui
 
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
+
 /** Non-secret identity used to keep account destructive work exact and framework-independent. */
 data class ExactAccountIdentity(val type: String, val name: String, val creationId: String)
 
@@ -37,6 +39,17 @@ class CurrentAccountSignOutCoordinator(
         fun clearStatus(main: ExactAccountIdentity): Boolean
         fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?): ActiveAccountReconciliation
         fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit)
+        /** What the pending Notes store of [main] holds that has not synced, which a removal of the account would lose. */
+        fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes
+        /** Called for the user's separate confirmation that the unsynced Notes text of [main] may be discarded. [shown] is the answer it was given for. */
+        fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes)
+        /**
+         * Ends that confirmation. The coordinator asks for it at each end of an attempt (a failed
+         * removal, a failed cleanup, completion), for the account a confirmation was last given for
+         * and for the snapshot's account. No end follows completion, so a confirmation passed on
+         * after it is not withdrawn.
+         */
+        fun withdrawNotesDiscard(main: ExactAccountIdentity)
         /** Monotonic platform-listener observation; production defaults to no invalidation. */
         fun hasObservedMainGenerationInvalidation(): Boolean = false
         fun close() = Unit
@@ -47,6 +60,13 @@ class CurrentAccountSignOutCoordinator(
     private var snapshot: CurrentAccountSignOutSnapshot? = null
     private var mainRemovalConfirmed = false
     private var nextErrorId = 1L
+
+    /**
+     * Who the separate discard confirmation was last given for since the last withdrawal, if anyone.
+     * Only the last one is kept. Kept apart from the snapshot: an attempt that cannot take its
+     * snapshot fails without one, and the withdrawal is asked for this account as well.
+     */
+    private var discardConfirmedFor: ExactAccountIdentity? = null
 
     init { onStateChanged(state) }
 
@@ -112,11 +132,35 @@ class CurrentAccountSignOutCoordinator(
 
     private fun failRemoval() = transition(CurrentAccountSignOutState.RemovalFailed(nextErrorId++))
     private fun failCleanup() = transition(CurrentAccountSignOutState.CleanupFailed(nextErrorId++))
-    private fun transition(next: CurrentAccountSignOutState) { state = next; onStateChanged(next) }
+    private fun transition(next: CurrentAccountSignOutState) {
+        state = next
+        // At each of these three ends of an attempt, withdrawNotesDiscard() asks the seam to end the
+        // separate discard confirmation of unsynced Notes text, for the account it was given for and
+        // for the snapshot's account, so that none is left standing for a later attempt. That call
+        // comes before the state is reported, so a listener hears of the end after it.
+        if (next is CurrentAccountSignOutState.RemovalFailed || next is CurrentAccountSignOutState.CleanupFailed ||
+            next is CurrentAccountSignOutState.Complete) withdrawNotesDiscard()
+        onStateChanged(next)
+    }
     fun close() { runCatching { seams.close() } }
 
     fun isMainGenerationPresent(main: ExactAccountIdentity) =
         !runCatching { seams.mainGenerationAbsent(main) }.getOrDefault(true)
+
+    /** The seam's answer. When the seam throws, the answer is that the changes could not be counted, never nothing. */
+    fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes =
+        runCatching { seams.unsyncedNotes(main) }.getOrDefault(UnsyncedNotes(0, 0, unreadable = true))
+
+    fun confirmNotesDiscard(main: ExactAccountIdentity, shown: UnsyncedNotes) {
+        discardConfirmedFor = main
+        runCatching { seams.confirmNotesDiscard(main, shown) }
+    }
+
+    private fun withdrawNotesDiscard() {
+        val given = setOfNotNull(discardConfirmedFor, snapshot?.main)
+        discardConfirmedFor = null
+        given.forEach { runCatching { seams.withdrawNotesDiscard(it) } }
+    }
 
     fun hasObservedMainGenerationInvalidation() =
         runCatching { seams.hasObservedMainGenerationInvalidation() }.getOrDefault(true)

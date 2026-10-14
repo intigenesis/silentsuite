@@ -781,4 +781,13 @@
     <string name="notes_network_account_network_name">WiFi SSID restriction (Settings, Sync) names one Wi-Fi network for this account. Android reports another one, or gives this app no name.</string>
     <string name="notes_network_try_now">Pull down the list to try now.</string>
     <string name="notes_network_sync_now_needs_wifi">Sync now for Notes is set to Wi-Fi only too (Settings, Account). When Wi-Fi is the active connection, pull down the list to try.</string>
+    <!-- Sign-out while Notes changes have not synced: the count, the separate discard confirmation, and what Sync now says. -->
+    <string name="notes_sign_out_unsynced_title">Notes changes have not synced</string>
+    <string name="notes_sign_out_unsynced_unreadable">This device may hold Notes changes that have not synced and could not be counted. Sync now tries to send them first. It may not run on this network, and it can fail. If you sign out without syncing, they are removed from this device and cannot be recovered.</string>
+    <string name="notes_sign_out_without_syncing">Sign out without syncing</string>
+    <string name="notes_discard_title">Discard unsynced notes?</string>
+    <string name="notes_discard_unreadable">The unsynced Notes changes on this device will be deleted. This cannot be undone.</string>
+    <string name="notes_discard_and_sign_out">Discard and sign out</string>
+    <string name="notes_sync_now_notes_off">Notes is off for this account. Turn it on in Settings to sync these changes.</string>
+    <string name="notes_sign_out_sync_asked">Asked for a Notes sync. Check the count again before you sign out.</string>
 </resources>
