@@ -646,12 +646,15 @@ internal class PendingNotesStore private constructor(
      * is lost or damaged, [currentSequence] reads every entry and landed record to find the highest
      * version.
      * A directory that cannot be listed, or a read in it that fails, answers "could not be counted"
-     * ([UnsyncedNotes.unreadable]) and never "nothing". After a failed read every entry file and every
-     * first write counts by its name, whatever its state.
+     * ([UnsyncedNotes.unreadable]) and never "nothing", unless the nearest directory above it that can
+     * be listed shows that it is not there ([knownAbsent]). File.exists() is not asked: it answers false
+     * for a check that failed as well as for a directory that is not there. After a failed read every
+     * entry file and every first write counts by its name, whatever its state.
      */
     fun unsynced(): UnsyncedNotes = synchronized(lock) {
-        if (closed || !dir.exists()) return@synchronized UnsyncedNotes.NOTHING
-        val names = dir.list() ?: return@synchronized UnsyncedNotes(0, 0, unreadable = true)
+        if (closed) return@synchronized UnsyncedNotes.NOTHING
+        val names = listNames(dir)
+            ?: return@synchronized if (knownAbsent(dir)) UnsyncedNotes.NOTHING else UnsyncedNotes(0, 0, unreadable = true)
         try {
             val committed = names.filter { it.endsWith(NOTE) }.mapTo(HashSet()) { it.removeSuffix(NOTE) }
             val stranded = names.filter { it.endsWith(NOTE + NEW) }.map { it.removeSuffix(NEW).removeSuffix(NOTE) }
@@ -660,6 +663,27 @@ internal class PendingNotesStore private constructor(
             if (count == 0) UnsyncedNotes.NOTHING else UnsyncedNotes(count, currentSequence(), unreadable = false)
         } catch (e: IOException) {
             UnsyncedNotes(names.count { it.endsWith(NOTE) || it.endsWith(NOTE + NEW) }, 0, unreadable = true)
+        }
+    }
+
+    /** The names in [d], or null when it cannot be listed: not there, not a directory, or a check that failed. */
+    private fun listNames(d: File): Array<String>? {
+        listForTesting?.let { return it(d) }
+        return d.list()
+    }
+
+    /**
+     * Whether [d] is shown not to be there: the nearest directory above it that can be listed does not
+     * hold the next name on the way down to it. When that directory does hold the name, or no directory
+     * above can be listed, it is unknown.
+     */
+    private fun knownAbsent(d: File): Boolean {
+        var below = d
+        while (true) {
+            val above = below.parentFile ?: return false
+            val names = listNames(above)
+            if (names != null) return below.name !in names
+            below = above
         }
     }
 
@@ -906,6 +930,9 @@ internal class PendingNotesStore private constructor(
         @Volatile internal var beforeRenameForTesting: ((File) -> Unit)? = null
         @Volatile internal var beforeRemoveForTesting: ((File) -> Unit)? = null
         @Volatile internal var beforeClearForTesting: (() -> Unit)? = null
+
+        /** Test seam: what a listing in [unsynced] answers in place of File.list(); null is a listing that failed. */
+        @Volatile internal var listForTesting: ((File) -> Array<String>?)? = null
 
         /** rename(2) through File.renameTo: on Android and Linux it replaces the target in one step. */
         private val renameTo: (File, File) -> Unit = { from, to ->

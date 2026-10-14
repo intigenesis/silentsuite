@@ -40,6 +40,7 @@ class PendingNotesStoreTest {
         PendingNotesStore.beforeRenameForTesting = null
         PendingNotesStore.beforeRemoveForTesting = null
         PendingNotesStore.beforeClearForTesting = null
+        PendingNotesStore.listForTesting = null
         PendingNotesStore.resetForTesting()
     }
 
@@ -1405,5 +1406,29 @@ class PendingNotesStoreTest {
         // then is "could not be counted", with every entry file and first write by name, and not "nothing".
         assertTrue(File(dir, "x.note.new").mkdir())
         assertEquals(UnsyncedNotes(3, 0, unreadable = true), restarted().unsynced())
+    }
+
+    @Test fun `a directory that is there but cannot be looked at could not be counted, which is not nothing`() {
+        // File.exists() answers false for a check that fails as well as for a directory that is not there.
+        val root = tmp.newFolder("no_backup")
+        val s = open(PendingNotesStore.identityDir(root, "io.silentsuite", "alice@example.invalid", "gen-1"))
+        val v = saved(s.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
+        val uncounted = UnsyncedNotes(0, 0, unreadable = true)
+        PendingNotesStore.listForTesting = { if (it.name == s.dir.name) null else it.list() }
+        assertEquals("the directory above shows it is there", uncounted, s.unsynced())
+        PendingNotesStore.listForTesting = { if (it.name == s.dir.name || it.name == "notes-pending") null else it.list() }
+        assertEquals("the nearest directory above that can be listed shows the one below it", uncounted, s.unsynced())
+        PendingNotesStore.listForTesting = { null }
+        assertEquals("no directory above can be listed", uncounted, s.unsynced())
+        PendingNotesStore.listForTesting = null
+        assertEquals("the change was there all along", UnsyncedNotes(1, v, false), s.unsynced())
+    }
+
+    @Test fun `a store under directories that were never made holds nothing, and asking makes none of them`() {
+        // As for an account that never saved a note on a device where no account did: no notes-pending either.
+        val root = tmp.newFolder("no_backup")
+        val never = open(PendingNotesStore.identityDir(root, "io.silentsuite", "alice@example.invalid", "gen-1"))
+        assertEquals(UnsyncedNotes.NOTHING, never.unsynced())
+        assertFalse(File(root, "notes-pending").exists())
     }
 }
