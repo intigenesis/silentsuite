@@ -165,6 +165,9 @@ class NotePushStepTest {
     /** Runs while a fetch(uid) is in flight. */
     private var duringFetch: (String) -> Unit = {}
 
+    /** Runs while an item is written into the cache, for a save that lands after the step read the entry. */
+    private var duringCache: (String) -> Unit = {}
+
     /** Failures of the remote's own work on an item (decrypting, building), not of the server. */
     private var rebaseError: Exception? = null
     private var newNoteError: Exception? = null
@@ -200,6 +203,7 @@ class NotePushStepTest {
         override fun fetchNotebook(notebookUid: String) = server.fetchNotebook(notebookUid)
 
         override fun cache(entry: PendingEntry, item: NotePushStep.ServerItem) {
+            duringCache(entry.noteUid)
             cacheError?.let { throw it }
             cached += "${entry.noteUid}=${item.revision}${if (item.deleted) " deleted" else ""}"
             val there = store.read(entry.noteUid) as? Read.Present
@@ -878,6 +882,33 @@ class NotePushStepTest {
         assertTrue(built.isEmpty())
         assertEquals(server.uploads.last().revision, server.items.getValue("n1").revision)
         assertEquals("the server's copy went into the cache before the entry was dropped", true, entryThereAtCacheWrite["n1"])
+    }
+
+    @Test fun `a save while the step settles a 409 that is its own upload is rebased onto that upload`() {
+        val first = save("y", "one")
+        // The upload lands and is answered 409 all the same, so the step fetches the copy and finds its own.
+        server.answerConflictAfterLanding = true
+        // The user saves again after the step read the entry, while the server's copy goes into the cache.
+        duringCache = { uid ->
+            if (uid == "y") {
+                duringCache = {}
+                save("y", "one, two")
+            }
+        }
+        val result = run()
+        assertTrue(result.succeeded)
+        assertEquals(1, result.pushed)
+        val kept = entry("y")
+        assertEquals("one, two", item(kept.blob).text)
+        assertEquals("built on the revision that landed", first.revision, item(kept.blob).base)
+        // The save's own run sends it, and it lands with no conflict.
+        server.answerConflictAfterLanding = false
+        server.uploads.clear()
+        assertTrue(run().succeeded)
+        assertTrue(waiting().isEmpty())
+        assertEquals("one upload, and no 409", 1, server.uploads.size)
+        assertEquals("only the first run's fetch", 1, server.fetches.size)
+        assertEquals("one, two", server.items.getValue("y").text)
     }
 
     @Test fun `with a server that behaves a lost answer and one newer save take one rebase and one more push`() {
