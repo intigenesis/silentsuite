@@ -25,8 +25,8 @@ import java.io.IOException
  * - a note made from a conflict is pushed in the run that makes it, and its mark turns another
  *   conflict into a hold instead of one more note;
  * - a rebase or a new note that cannot be built (a pending change with no readable title, metadata
- *   that cannot be written into, a result that does not read back as written) holds the text with
- *   that reason instead of being tried again;
+ *   that cannot be written into, a result that does not read back as written or is larger than the
+ *   pending store keeps) holds the text with that reason instead of being tried again;
  * - a notebook gets one confirming fetch per run after a 403 or 404, and its result is reused;
  * - a connection error, a temporary server error, or a 403 on the confirming fetch ends the step, so a
  *   run waits out at most one timeout here.
@@ -58,10 +58,10 @@ internal class NotePushStep(
     class Built(val revision: String, val blob: ByteArray)
 
     /**
-     * Thrown by [Remote.rebase] and [Remote.newNote] when the note to upload cannot be built from what is
-     * there, with the reason the text is held for. Nothing about it changes by itself before the next
-     * run, so the entry is held instead of being tried again (design 3.8). The message goes to the log,
-     * so it never holds a title, a notebook name or text.
+     * Thrown by [Remote.rebase] and [Remote.newNote], or by the step for a built note too large to store,
+     * when the note to upload cannot be built from what is there, with the reason the text is held for.
+     * Nothing about it changes by itself before the next run, so the entry is held instead of being tried
+     * again (design 3.8). The message goes to the log, so it never holds a title, a notebook name or text.
      */
     class NotBuilt(val reason: HeldReason, message: String) : Exception(message)
 
@@ -307,7 +307,7 @@ internal class NotePushStep(
     private fun rebaseOntoLanded(newer: PendingEntry, saved: ServerItem) {
         if (newer.state == PendingEntry.State.HELD) return
         val built = try {
-            remote.rebase(newer, saved)
+            remote.rebase(newer, saved).also { requireStorable(it.blob) }
         } catch (e: Exception) {
             if (cancelled(e)) throw e
             // The entry stays on its old base. Its next push gets a 409 whose server copy is ours,
@@ -457,7 +457,7 @@ internal class NotePushStep(
             return
         }
         val built = try {
-            remote.rebase(latest, server)
+            remote.rebase(latest, server).also { requireStorable(it.blob) }
         } catch (e: Exception) {
             notBuilt(latest, server, e)
             return
@@ -479,7 +479,7 @@ internal class NotePushStep(
     private fun replaceWithNewNote(latest: PendingEntry, server: ServerItem, conflictedCopy: Boolean) {
         val uid = latest.noteUid
         val note = try {
-            remote.newNote(latest, conflictedCopy)
+            remote.newNote(latest, conflictedCopy).also { requireStorable(it.blob) }
         } catch (e: Exception) {
             notBuilt(latest, server, e)
             return
@@ -526,6 +526,18 @@ internal class NotePushStep(
         Logger.log.warning("A Notes change could not be built for upload ($reason): " +
             if (error is NotBuilt) error.message else error.javaClass.simpleName)
         hold(entry.noteUid, reason, sentVersion = entry.version)
+    }
+
+    /**
+     * A note built for the upload that the pending store would refuse ([PendingCodec.MAX_BLOB]) is not
+     * built either. Storing it would fail as a storage error in every run, with the same upload and fetch
+     * each time, so the text is held instead.
+     */
+    private fun requireStorable(blob: ByteArray) {
+        if (blob.size > PendingCodec.MAX_BLOB) {
+            throw NotBuilt(HeldReason.NOT_BUILT,
+                "the note built for upload is larger than the pending store keeps (${blob.size} bytes)")
+        }
     }
 
     /**
