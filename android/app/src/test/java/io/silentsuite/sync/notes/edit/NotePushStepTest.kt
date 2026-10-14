@@ -169,6 +169,9 @@ class NotePushStepTest {
     private var rebaseError: Exception? = null
     private var newNoteError: Exception? = null
 
+    /** Makes every rebase and new note come out one byte larger than the pending store keeps. */
+    private var builtTooLarge = false
+
     /** Runs when a rebase or a new note starts, for a save that lands while the note is being built. */
     private var duringBuild: () -> Unit = {}
 
@@ -211,7 +214,9 @@ class NotePushStepTest {
         override fun rebase(entry: PendingEntry, onto: NotePushStep.ServerItem): NotePushStep.Built {
             duringBuild()
             rebaseError?.let { throw it }
-            return item(entry.blob).copy(base = onto.revision, revision = revision()).let { NotePushStep.Built(it.revision, it.blob()) }
+            return item(entry.blob).copy(base = onto.revision, revision = revision()).let {
+                NotePushStep.Built(it.revision, if (builtTooLarge) ByteArray(PendingCodec.MAX_BLOB + 1) else it.blob())
+            }
         }
 
         override fun newNote(entry: PendingEntry, conflictedCopy: Boolean): PendingEntry {
@@ -220,7 +225,8 @@ class NotePushStepTest {
             val note = Item("copy-${built.size + 1}", null, revision(), false, item(entry.blob).text)
             built += note.uid
             titledAsCopy[note.uid] = conflictedCopy
-            return PendingEntry(note.uid, entry.notebookUid, PendingEntry.State.UPSERT, 0, note.revision, true, blob = note.blob())
+            return PendingEntry(note.uid, entry.notebookUid, PendingEntry.State.UPSERT, 0, note.revision, true,
+                blob = if (builtTooLarge) ByteArray(PendingCodec.MAX_BLOB + 1) else note.blob())
         }
     }
 
@@ -1731,6 +1737,70 @@ class NotePushStepTest {
         assertNull(result.failure)
         assertEquals(HeldReason.NOT_BUILT, entry("n1").held!!.reason)
         assertEquals("one, two", item(entry("n1").blob).text)
+    }
+
+    @Test fun `a rebase too large for the store holds the text as not built, and is not tried again`() {
+        landedWithoutAnswerThenSaved()
+        server.uploads.clear()
+        builtTooLarge = true
+        val result = run()
+        assertEquals(1, result.held)
+        assertNull("not a storage failure", result.failure)
+        val held = entry("n1")
+        assertEquals(PendingEntry.State.HELD, held.state)
+        assertEquals(HeldReason.NOT_BUILT, held.held!!.reason)
+        assertEquals("the text survives", "one, two", item(held.blob).text)
+        assertEquals(0, held.failureCount)
+        assertNull(held.lastFailureCategory)
+        assertEquals("only the push that met the conflict", listOf("n1"), uploaded())
+
+        server.uploads.clear()
+        assertTrue(run().succeeded)
+        assertTrue("held text is not sent again", server.uploads.isEmpty())
+    }
+
+    @Test fun `a conflict copy too large for the store holds the text as not built, and no copy is kept`() {
+        editedElsewhere()
+        builtTooLarge = true
+        val result = run()
+        assertEquals("the text is held, and the run has no failure of its own",
+            NotePushStep.Result(Ended.COMPLETED, pushed = 0, held = 1, conflicts = emptyMap(), failure = null, carriedFailure = null), result)
+        val held = entry("n1")
+        assertEquals(HeldReason.NOT_BUILT, held.held!!.reason)
+        assertEquals("mine", item(held.blob).text)
+        assertEquals(0, held.failureCount)
+        assertEquals("no copy was kept", listOf("n1"), waiting())
+        assertEquals("the server's version went into the cache before the hold", listOf("n1=web-1"), cached)
+
+        server.uploads.clear()
+        repeat(2) { assertTrue(run().succeeded) }
+        assertTrue("held text is not sent again", server.uploads.isEmpty())
+
+        // Try again by hand, once the copy fits: the text gets its note.
+        assertTrue(store.release("n1"))
+        builtTooLarge = false
+        assertTrue(run().succeeded)
+        assertTrue(waiting().isEmpty())
+    }
+
+    @Test fun `a newer change too large to rebase onto the item that landed is not a storage failure, and the next run holds it`() {
+        save("a", "text")
+        duringUpload = {
+            duringUpload = {}
+            save("a", "text, and more")
+        }
+        builtTooLarge = true
+        val result = run()
+        assertEquals(1, result.pushed)
+        assertTrue("no storage failure", result.succeeded)
+        assertNull("still on its old base", item(entry("a").blob).base)
+        assertEquals(0, entry("a").failureCount)
+        // Its push gets a 409 whose server copy is ours, and the rebase that does not fit holds the text then.
+        val next = run()
+        assertEquals(1, next.held)
+        assertNull(next.failure)
+        assertEquals(HeldReason.NOT_BUILT, entry("a").held!!.reason)
+        assertEquals("text, and more", item(entry("a").blob).text)
     }
 
     @Test fun `a storage error while a note is being built stays the entry's storage failure, with backoff`() {
