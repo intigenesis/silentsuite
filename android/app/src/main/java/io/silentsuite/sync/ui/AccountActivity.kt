@@ -1577,9 +1577,14 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     private fun requestSync() {
         if (!exactAccountStillCurrent()) return
-        // Only adapter activity blocks a new request: the in-app Notes job coalesces a manual
-        // request into a follow-up run on its own, so it must not turn Sync now into a no-op.
-        if (isAdapterSyncActive()) return        // don't stack a duplicate concurrent sync
+        // Only adapter activity blocks a new adapter request: the in-app Notes job coalesces a manual
+        // request into a follow-up run on its own, so it must not turn Sync now into a no-op. Notes is
+        // still asked for while an adapter sync runs: the run after a sync nobody requested is automatic,
+        // and the automatic Notes setting can refuse it where Sync now for Notes may run.
+        if (isAdapterSyncActive()) {        // don't stack a duplicate concurrent sync
+            requestSync(applicationContext, account, notesOnly = true)
+            return
+        }
         syncRequestOverride?.invoke(applicationContext, account)
             ?: requestSync(applicationContext, account)
         model.loadAccount()
