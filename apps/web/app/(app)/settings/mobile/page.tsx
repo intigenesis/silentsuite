@@ -55,7 +55,7 @@ export default function MobileSettingsPage() {
 
       <div
         data-android-managed-channels
-        className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(15rem,0.9fr)] lg:grid-rows-2 lg:items-stretch"
+        className="grid gap-3 sm:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(15rem,0.9fr)] xl:grid-rows-2 xl:items-stretch"
       >
         {activeChannels.map(({ name, detail, href, logo }) => (
           <a
@@ -87,7 +87,7 @@ export default function MobileSettingsPage() {
 
         <div
           data-android-download-qr
-          className="hidden lg:col-start-3 lg:row-start-1 lg:row-span-2 lg:flex"
+          className="hidden xl:col-start-3 xl:row-start-1 xl:row-span-2 xl:flex"
         >
           <a
             href={INSTALL_DOCS_URL}
@@ -158,7 +158,7 @@ export default function MobileSettingsPage() {
         <Monitor className="inline h-3 w-3 mr-1 -mt-0.5" />
         Looking for desktop integration?{' '}
         <Link href="/settings/desktop" className="text-[rgb(var(--primary))] hover:underline">
-          See Settings → Desktop
+          See Settings → Desktop bridge
         </Link>
         .
       </p>
