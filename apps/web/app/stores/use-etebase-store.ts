@@ -209,6 +209,14 @@ async function ensureCollectionsForAccount(
   return collections
 }
 
+/** destroy() failed after invalidating the account boundary; `epoch` is the token it produced. */
+export class EtebaseTeardownError extends Error {
+  constructor(readonly epoch: number, readonly teardownError: unknown) {
+    super('Etebase teardown failed after account invalidation')
+    this.name = 'EtebaseTeardownError'
+  }
+}
+
 /**
  * Account epoch whose initial collection discovery failed before the
  * SyncEngine was started. A later successful reconcile for the same epoch
@@ -1039,8 +1047,10 @@ interface EtebaseActions {
 
   /**
    * Clean up on logout -- stop sync engine, clear all state.
+   * Returns the account epoch this teardown produced (not one observed after
+   * re-entrant callbacks); throws EtebaseTeardownError carrying it on failure.
    */
-  destroy: () => void
+  destroy: () => number
 
   /**
    * Register a handler for sync change events from the SyncEngine.
@@ -2701,24 +2711,33 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
   },
 
   destroy: () => {
-    bumpAccountEpoch()
-    const { syncEngine } = get()
-    if (syncEngine) {
-      syncEngine.stop()
+    const epoch = bumpAccountEpoch()
+    // Any failure after the bump, including a nested teardown's typed error,
+    // is stamped with this invocation's token so callers never adopt another.
+    try {
+      const { syncEngine } = get()
+      if (syncEngine) {
+        syncEngine.stop()
+      }
+      // A synchronously re-entrant account boundary now owns this store.
+      if (!isCurrentAccountEpoch(epoch)) return epoch
+      set({
+        account: null,
+        accountFingerprint: null,
+        collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] },
+        itemCache: new Map(),
+        itemTypeMap: new Map(),
+        itemCollectionMap: new Map(),
+        isInitialized: false,
+        restoreBlocked: false,
+        domainLoadState: unknownDomainLoadState(),
+        syncEngine: null,
+      })
+      logger.debug('[etebase-store] Destroyed')
+      return epoch
+    } catch (err) {
+      throw new EtebaseTeardownError(epoch, err)
     }
-    set({
-      account: null,
-      accountFingerprint: null,
-      collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] },
-      itemCache: new Map(),
-      itemTypeMap: new Map(),
-      itemCollectionMap: new Map(),
-      isInitialized: false,
-      restoreBlocked: false,
-      domainLoadState: unknownDomainLoadState(),
-      syncEngine: null,
-    })
-    logger.debug('[etebase-store] Destroyed')
   },
 
   onSyncChange: (handler) => {
