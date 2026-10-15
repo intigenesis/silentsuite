@@ -78,13 +78,15 @@ describe('MobileSettingsPage Android download choices', () => {
     expect(qr).toHaveAttribute('data-value', 'https://docs.silentsuite.io/user-guide/apps/android')
     expect(qr).toHaveAttribute('data-size', '144')
     expect(qr.parentElement).toHaveClass('h-40', 'w-40', 'p-[7px]')
+    // The settings rail narrows the pane at lg, so the QR column waits for xl.
     expect(qr.closest('[data-android-download-qr]')).toHaveClass(
       'hidden',
-      'lg:flex',
-      'lg:col-start-3',
-      'lg:row-start-1',
-      'lg:row-span-2',
+      'xl:flex',
+      'xl:col-start-3',
+      'xl:row-start-1',
+      'xl:row-span-2',
     )
+    expect(qr.closest('[data-android-download-qr]')).not.toHaveClass('lg:flex')
     expect(qr.closest('a')).toHaveClass('min-h-28', 'rounded-lg')
     expect(screen.getByRole('link', { name: /Google Play/i })).toHaveClass('min-h-28', 'rounded-lg')
   })
@@ -99,16 +101,17 @@ describe('MobileSettingsPage Android download choices', () => {
     }
   })
 
-  it('uses a responsive two-by-two managed grid beside the spanning desktop QR card', () => {
+  it('uses a responsive two-by-two managed grid beside the spanning wide-desktop QR card', () => {
     render(<MobileSettingsPage />)
 
     const grid = document.querySelector('[data-android-managed-channels]')
     expect(grid).toHaveClass(
       'grid',
       'sm:grid-cols-2',
-      'lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(15rem,0.9fr)]',
-      'lg:grid-rows-2',
+      'xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(15rem,0.9fr)]',
+      'xl:grid-rows-2',
     )
+    expect(grid).not.toHaveClass('lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(15rem,0.9fr)]')
     expect(
       Array.from(grid?.querySelectorAll('[data-android-channel]') ?? []).map((card) =>
         card.getAttribute('data-android-channel'),
@@ -117,6 +120,15 @@ describe('MobileSettingsPage Android download choices', () => {
 
     const directApk = screen.getByRole('link', { name: /Direct APK/i })
     expect(directApk.closest('[data-android-managed-channels]')).toBeNull()
+  })
+
+  it('points the desktop crosslink at the Desktop bridge settings page', () => {
+    render(<MobileSettingsPage />)
+
+    expect(screen.getByRole('link', { name: 'See Settings → Desktop bridge' })).toHaveAttribute(
+      'href',
+      '/settings/desktop',
+    )
   })
 
   it('keeps active channels keyboard-visible and safe when opening external destinations', () => {
