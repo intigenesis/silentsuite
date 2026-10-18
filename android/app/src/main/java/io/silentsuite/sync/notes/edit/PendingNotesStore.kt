@@ -149,7 +149,10 @@ internal class PendingNotesStore private constructor(
 
     fun read(noteUid: String): Read = locked { readEntry(noteUid) }
 
-    /** Lists every entry. A committed file that cannot be read is reported in [Scan.unreadable], never deleted. */
+    /**
+     * Lists every entry. A committed file that cannot be read is reported in [Scan.unreadable], never deleted.
+     * A listing that fails throws IOException: read as an empty store, it would hide every waiting change.
+     */
     fun scan(): Scan = locked { scanOf(files(NOTE)) }
 
     private fun scanOf(noteFiles: List<File>): Scan {
@@ -173,7 +176,7 @@ internal class PendingNotesStore private constructor(
      * header was written counts by its header here, and is found by whatever reads the whole entry (the
      * notebook's own screen, the viewer, a push). A kept entry that fails its full read is reported with
      * the notebook its header names. [keep] runs under the store lock and must not take the Etebase
-     * cache monitor or the cache's write fence.
+     * cache monitor or the cache's write fence. A listing that fails throws IOException, as in [scan].
      */
     fun snapshot(keep: (EntryHeader) -> Boolean): Snapshot = locked {
         val headers = mutableListOf<EntryHeader>()
@@ -616,15 +619,20 @@ internal class PendingNotesStore private constructor(
     }
 
     /**
-     * Removes notebook copies no entry references. Skipped entirely while anything is unreadable,
-     * since its notebook is unknown and its copy may be the only way to decrypt it. A listing that
-     * fails throws and removes nothing: read as an empty store, it would leave every copy unreferenced.
+     * Removes notebook copies no entry references, decided from one listing: a listing that reads as
+     * empty then has no copy to remove either. Skipped entirely while anything is unreadable, since its
+     * notebook is unknown and its copy may be the only way to decrypt it, and while the listing holds a
+     * first write that is not committed yet ("<uid>.note.new"), which may be the only copy of a note
+     * whose notebook no committed entry names. A listing that fails throws, as every listing of the store
+     * does, and nothing is removed.
      */
     fun pruneNotebooks(): List<String> = locked {
-        val scan = scanOf(listedFiles(NOTE))
+        val listed = listing()
+        if (listed.any { it.name.endsWith(NOTE + NEW) }) return@locked emptyList()
+        val scan = scanOf(withSuffix(listed, NOTE))
         if (scan.unreadable.isNotEmpty()) return@locked emptyList()
         val referenced = scan.entries.map { it.notebookUid }.toSet()
-        listedFiles(NOTEBOOK).map { it.name.removeSuffix(NOTEBOOK) }
+        withSuffix(listed, NOTEBOOK).filter { it.isFile }.map { it.name.removeSuffix(NOTEBOOK) }
             .filter { it !in referenced }
             .onEach { remove(notebookFile(it)) }
     }
@@ -646,9 +654,12 @@ internal class PendingNotesStore private constructor(
     // ---- internals ----
 
     /**
-     * Every public operation: refuse after [clearAll], and finish any interrupted work first. Recovery
-     * runs again before the next operation for as long as anything in it did not work out, including a
-     * write or removal inside recovery itself.
+     * Every public operation except [clearAll]: refuse after [clearAll], and finish any interrupted work
+     * first. Recovery runs again before the next operation for as long as anything in it did not work
+     * out, including a write or removal inside recovery itself, or a listing it works from. A recovery
+     * whose listing fails throws, so the operation fails with it and the recovery is not taken for done:
+     * a first write it did not see may be the only copy of a note's text, and an original it did not
+     * see may still wait for its conflict copy.
      *
      * It runs once per operation, at its start. An operation that calls another one under the lock (a
      * save through a handle, anything that goes through [update]) does not recover again in between:
@@ -749,7 +760,7 @@ internal class PendingNotesStore private constructor(
         // and not for long: a landed record goes in step 2 unless an editor is open, a notebook copy
         // lasts until a run prunes or rewrites it, and a counter that cannot be read restarts above
         // every version on disk.
-        for (tmp in listDirectory()?.filter { it.name.endsWith(NEW) }.orEmpty()) {
+        for (tmp in listing().filter { it.name.endsWith(NEW) }) {
             try {
                 val target = File(dir, tmp.name.removeSuffix(NEW))
                 if (target.exists() || !PendingCodec.isIntact(tmp.readBytes())) {
@@ -765,8 +776,9 @@ internal class PendingNotesStore private constructor(
         }
         // 2. A landed record only matters while an editor for its note is open. Any other is left from an
         // editor that closed without clearing it, or from an earlier process (no editor survives one),
-        // and would otherwise keep a full copy of the note on the device.
-        for (file in files(LANDED).filter { !hasEditor(it.name.removeSuffix(LANDED)) }) {
+        // and would otherwise keep a full copy of the note on the device. Only regular files are removed,
+        // as in [pruneNotebooks].
+        for (file in files(LANDED).filter { it.isFile && !hasEditor(it.name.removeSuffix(LANDED)) }) {
             try {
                 remove(file)
             } catch (e: IOException) {
@@ -809,19 +821,48 @@ internal class PendingNotesStore private constructor(
         return problems
     }
 
-    private fun files(suffix: String): List<File> = withSuffix(listDirectory().orEmpty(), suffix)
+    /** The files with [suffix], from [listing]: a listing that fails throws. */
+    private fun files(suffix: String): List<File> = withSuffix(listing(), suffix)
 
-    /** [files], except that a listing that fails throws. Only a directory that was never created lists as empty. */
-    private fun listedFiles(suffix: String): List<File> {
-        val listed = listDirectory() ?: if (dir.exists()) throw IOException("could not list the pending store") else emptyArray()
-        return withSuffix(listed, suffix)
+    /**
+     * The files in [listed] with [suffix], chosen by name alone. File.isFile also answers false when its
+     * check fails, and an entry dropped for that would be neither reported nor pushed, its version would
+     * be passed over, and its notebook copy would look unreferenced. A caller that removes what it lists
+     * keeps only regular files on top, since there a shorter list can only keep more.
+     */
+    private fun withSuffix(listed: Array<out File>, suffix: String): List<File> =
+        listed.filter { it.name.endsWith(suffix) }.sortedBy { it.name }
+
+    /**
+     * Everything in the store's directory. A listing that fails throws IOException, so nothing reads it
+     * as an empty store: only a directory shown not to be there ([knownAbsent]), such as one that was
+     * never created, lists as empty. File.exists() is not asked: it answers false for a check that
+     * failed as well as for a directory that is not there.
+     */
+    private fun listing(): Array<File> =
+        listDirectory() ?: if (knownAbsent(dir)) emptyArray() else throw IOException("could not list the pending store")
+
+    /**
+     * Whether [d] is shown not to be there: the nearest directory above it that can be listed does not
+     * hold the next name on the way down to it. When that directory does hold the name, or no directory
+     * above can be listed, it is unknown. File.exists() is not asked, for the reason [listing] gives.
+     */
+    private fun knownAbsent(d: File): Boolean {
+        var below = d
+        while (true) {
+            val above = below.parentFile ?: return false
+            val names = listDirectory(above)?.map { it.name }
+            if (names != null) return below.name !in names
+            below = above
+        }
     }
 
-    private fun withSuffix(listed: Array<out File>, suffix: String): List<File> =
-        listed.filter { it.isFile && it.name.endsWith(suffix) }.sortedBy { it.name }
-
-    /** The directory's files, or null when the listing fails, as File.listFiles answers. */
-    private fun listDirectory(): Array<File>? = listFilesForTesting.let { if (it != null) it(dir) else dir.listFiles() }
+    /**
+     * The files in [d], or null when the listing fails, as File.listFiles answers: [d] is not there, is
+     * not a directory, or the check failed.
+     */
+    private fun listDirectory(d: File = dir): Array<File>? =
+        listFilesForTesting.let { if (it != null) it(d) else d.listFiles() }
 
     private fun noteFile(uid: String) = File(dir, checkedUid(uid) + NOTE)
     private fun landedFile(uid: String) = File(dir, checkedUid(uid) + LANDED)
@@ -914,11 +955,18 @@ internal class PendingNotesStore private constructor(
         private val UID = Regex("^[A-Za-z0-9_-]{1,128}$")
         private val registry = ConcurrentHashMap<String, PendingNotesStore>()
 
-        /** Test seams: crash points inside the write, conflict, and sign-out sequences, and the directory listing. */
+        /** Test seams: crash points inside the write, conflict, and sign-out sequences. */
         @Volatile internal var beforeOriginalRemovedForTesting: (() -> Unit)? = null
         @Volatile internal var beforeRenameForTesting: ((File) -> Unit)? = null
         @Volatile internal var beforeRemoveForTesting: ((File) -> Unit)? = null
         @Volatile internal var beforeClearForTesting: (() -> Unit)? = null
+
+        /**
+         * Test seam: what a listing of the directory it is given answers in place of File.listFiles();
+         * null is a listing that failed. It answers every listing the store makes itself: of its own
+         * directory, and of the directories above it that [knownAbsent] lists after a listing of it fails.
+         * It does not answer the deletion in [clearAll].
+         */
         @Volatile internal var listFilesForTesting: ((File) -> Array<File>?)? = null
 
         /** rename(2) through File.renameTo: on Android and Linux it replaces the target in one step. */

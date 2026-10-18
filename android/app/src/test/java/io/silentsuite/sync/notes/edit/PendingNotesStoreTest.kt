@@ -1288,7 +1288,7 @@ class PendingNotesStoreTest {
         assertArrayEquals(blob("key"), store.notebook("b9"))
     }
 
-    @Test fun `a failed entry listing prunes nothing, even when the notebook listing after it works`() {
+    @Test fun `a failed listing prunes nothing, even when the listings after it work`() {
         store.putNotebook("b9", blob("key b9"))
         store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false, notebookCopy = blob("key b1"))
         var listings = 0
@@ -1304,6 +1304,192 @@ class PendingNotesStoreTest {
         val never = File(tmp.root, "never")
         assertTrue(open(never).pruneNotebooks().isEmpty())
         assertFalse(never.exists())
+    }
+
+    // ---- a listing that fails is never an empty store ----
+
+    @Test fun `a listing of the store that fails is not read as an empty store`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == store.dir.name) null else d.listFiles() }
+        assertThrows("read as empty, a run would report success while n1 waits", java.io.IOException::class.java) {
+            store.scan()
+        }
+        assertThrows(java.io.IOException::class.java) { store.snapshot { false } }
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals(listOf("n1"), store.scan().entries.map { it.noteUid })
+        assertEquals(listOf("n1"), store.snapshot { false }.headers.map { it.noteUid })
+        // A store whose directory was never made still lists as empty, and asking does not make it.
+        val never = File(tmp.root, "never-listed")
+        assertTrue(open(never).snapshot { false }.headers.isEmpty())
+        assertFalse(never.exists())
+    }
+
+    @Test fun `a recovery that cannot list the store decides nothing, and the next call commits what it missed`() {
+        // The first write of n1 stopped before its rename, in a process that ended: that file is the only
+        // copy of the text, and the notebook copy beside it is the way to decrypt it.
+        val only = PendingEntry("n1", "b1", PendingEntry.State.UPSERT, 4, "r4", false, blob = blob("the only copy"))
+        store.putNotebook("b1", blob("key b1"))
+        File(dir, "n1.note.new").writeBytes(PendingCodec.encodeEntry(only))
+        val s = restarted()
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == s.dir.name) null else d.listFiles() }
+        assertThrows(java.io.IOException::class.java) { s.read("n1") }
+        assertThrows("nothing is pruned while the store cannot be listed", java.io.IOException::class.java) {
+            s.pruneNotebooks()
+        }
+        PendingNotesStore.listFilesForTesting = null
+        // Taken for done, the failed recovery would leave n1 uncommitted, and no scan or snapshot would
+        // show it.
+        assertEquals("the copy the stranded text needs is kept", emptyList<String>(), s.pruneNotebooks())
+        assertEquals(listOf("n1"), s.snapshot { false }.headers.map { it.noteUid })
+        assertEquals(only, s.entry("n1"))
+        assertFalse(File(dir, "n1.note.new").exists())
+        assertArrayEquals(blob("key b1"), s.notebook("b1"))
+    }
+
+    @Test fun `a new process whose recovery cannot list the store does not send an unfinished original`() {
+        store.saveLocal("orig", "b1", "r1", blob("mine"), isCreate = false)
+        PendingNotesStore.beforeRemoveForTesting = {
+            if (it.name == "orig.note") throw java.io.IOException("could not remove orig.note")
+        }
+        assertThrows(java.io.IOException::class.java) {
+            store.replaceWithNewNote("orig", entry("orig").version, "srv", newNote())
+        }
+        val next = restarted()
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == next.dir.name) null else d.listFiles() }
+        // Taken for done, this recovery would know of no unfinished original: orig would go out again,
+        // get the same 409, and become a second copy of the same text.
+        assertThrows(java.io.IOException::class.java) { next.startSend("orig") }
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals(PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.UNFINISHED_ORIGINAL),
+            next.startSend("orig"))
+    }
+
+    @Test fun `a lost version counter is not rebuilt from a listing that fails`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
+        val sequence = File(dir, "sequence")
+        assertTrue(sequence.delete())
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == dir.name) null else d.listFiles() }
+        // Read as an empty store, the rebuild would restart below n1 and hand out a version n1 holds.
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)
+        }
+        assertFalse(sequence.exists())
+        // And a load would carry sequence 0, below the save that n1 holds.
+        assertThrows(java.io.IOException::class.java) { store.observe("n1") }
+        PendingNotesStore.listFilesForTesting = null
+        assertTrue("it restarts above every version on disk",
+            saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
+    }
+
+    @Test fun `a damaged version counter is not rebuilt from a listing that fails, and is left as it is`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
+        val sequence = File(dir, "sequence")
+        val damaged = sequence.readBytes().also { it[6] = (it[6].toInt() xor 0x40).toByte() }
+        sequence.writeBytes(damaged)
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == dir.name) null else d.listFiles() }
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)
+        }
+        assertArrayEquals("nothing was written over it", damaged, sequence.readBytes())
+        assertThrows(java.io.IOException::class.java) { store.observe("n1") }
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals(Read.Missing, store.read("n2"))
+        assertTrue(saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
+    }
+
+    @Test fun `a store directory that is there but cannot be listed is not empty, however far up the walk goes`() {
+        // File.exists() answers false for a check that fails as well as for a directory that is not there.
+        val root = tmp.newFolder("no_backup")
+        val s = open(PendingNotesStore.identityDir(root, "io.silentsuite", "alice@example.invalid", "gen-1"))
+        s.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        // The directories each case lists, so that every case is seen to take its own way up.
+        val asked = ArrayList<String>()
+        fun failing(vararg names: String): (File) -> Array<File>? =
+            { d -> asked += d.name; if (d.name in names) null else d.listFiles() }
+        PendingNotesStore.listFilesForTesting = failing(s.dir.name)
+        assertThrows("the directory above shows it is there", java.io.IOException::class.java) { s.snapshot { false } }
+        assertEquals(listOf(s.dir.name, "notes-pending"), asked)
+        asked.clear()
+        PendingNotesStore.listFilesForTesting = failing(s.dir.name, "notes-pending")
+        assertThrows("the nearest directory above that can be listed shows the one below it",
+            java.io.IOException::class.java) { s.snapshot { false } }
+        assertEquals(listOf(s.dir.name, "notes-pending", "no_backup"), asked)
+        PendingNotesStore.listFilesForTesting = { null }
+        assertThrows("no directory above can be listed", java.io.IOException::class.java) { s.snapshot { false } }
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("the change was there all along", listOf("n1"), s.snapshot { false }.headers.map { it.noteUid })
+    }
+
+    @Test fun `a store under directories that were never made holds nothing, and asking makes none of them`() {
+        // As for an account that never saved a note on a device where no account did: no notes-pending either.
+        val root = tmp.newFolder("no_backup")
+        val never = open(PendingNotesStore.identityDir(root, "io.silentsuite", "alice@example.invalid", "gen-1"))
+        val snapshot = never.snapshot { true }
+        assertTrue(snapshot.headers.isEmpty() && snapshot.entries.isEmpty() && snapshot.unreadable.isEmpty())
+        assertEquals(PendingNotesStore.Scan(emptyList(), emptyList()), never.scan())
+        assertEquals(PendingNotesStore.Observed(Read.Missing, 0), never.observe("n1"))
+        assertTrue(never.pruneNotebooks().isEmpty())
+        assertFalse(File(root, "notes-pending").exists())
+    }
+
+    @Test fun `a listed entry that File isFile does not count as a file is still read, and its notebook copy kept`() {
+        // File.isFile answers false when its check fails, as well as for anything that is not a regular
+        // file. Dropped for that, the entry would be neither reported nor pushed, its version would be
+        // passed over when a lost counter is rebuilt, and the copy of its notebook would look unreferenced.
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false, notebookCopy = blob("key b1")))
+        fun statFails(f: File): File = object : File(f.path) {
+            override fun isFile() = false
+        }
+        PendingNotesStore.listFilesForTesting = { d ->
+            d.listFiles()?.map { if (it.name == "n1.note") statFails(it) else it }?.toTypedArray()
+        }
+        assertEquals(listOf("n1"), store.snapshot { false }.headers.map { it.noteUid })
+        assertEquals(listOf("n1"), store.scan().entries.map { it.noteUid })
+        assertEquals(emptyList<String>(), store.pruneNotebooks())
+        assertTrue(File(dir, "sequence").delete())
+        assertTrue("above the version n1 holds",
+            saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
+        PendingNotesStore.listFilesForTesting = null
+        assertArrayEquals(blob("key b1"), store.notebook("b1"))
+    }
+
+    @Test fun `a prune decides from one listing, so a listing above that wrongly shows nothing removes no copy`() {
+        store.putNotebook("b9", blob("key b9"))
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false, notebookCopy = blob("key b1"))
+        // The store's own listing fails once, and the listing above it then answers with no names, as if
+        // the store were not there. Every listing after those two is real.
+        val asked = ArrayList<String>()
+        PendingNotesStore.listFilesForTesting = { d ->
+            asked += d.name
+            when (asked.size) {
+                1 -> null
+                2 -> emptyArray()
+                else -> d.listFiles()
+            }
+        }
+        assertEquals("read as a store that is not there, which holds no copy to remove",
+            emptyList<String>(), store.pruneNotebooks())
+        assertEquals("one listing of the store, and the one above it",
+            listOf(dir.name, store.dir.parentFile!!.name), asked)
+        PendingNotesStore.listFilesForTesting = null
+        assertArrayEquals(blob("key b1"), store.notebook("b1"))
+        assertArrayEquals(blob("key b9"), store.notebook("b9"))
+        assertEquals(listOf("b9"), store.pruneNotebooks())
+    }
+
+    @Test fun `a prune keeps every copy while its listing holds a first write that is not committed yet`() {
+        store.putNotebook("b1", blob("key b1"))
+        // A first write of n1 that recovery does not know of, as when its check that a problem's file is
+        // still there fails: written in full after recovery ran. No committed entry names b1, and the next
+        // recovery commits this write, which needs that copy.
+        val first = PendingEntry("n1", "b1", PendingEntry.State.UPSERT, 4, "r4", false, blob = blob("first write"))
+        File(dir, "n1.note.new").writeBytes(PendingCodec.encodeEntry(first))
+        assertEquals(emptyList<String>(), store.pruneNotebooks())
+        assertArrayEquals(blob("key b1"), store.notebook("b1"))
+        val next = restarted()
+        assertEquals(first, next.entry("n1"))
+        assertEquals("an entry names it now", emptyList<String>(), next.pruneNotebooks())
+        assertArrayEquals(blob("key b1"), next.notebook("b1"))
     }
 
     @Test fun `uids that could escape the directory are refused for every kind of file`() {
