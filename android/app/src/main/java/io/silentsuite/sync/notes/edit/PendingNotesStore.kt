@@ -200,14 +200,15 @@ internal class PendingNotesStore private constructor(
             }
         }
         unreadable += currentRecoveryProblems(headers.mapTo(HashSet()) { it.noteUid })
-        Snapshot(headers.sortedBy { it.noteUid }, kept, unreadable.sortedBy { it.file }, currentSequence())
+        Snapshot(headers.sortedBy { it.noteUid }, kept, unreadable.sortedBy { it.file },
+            currentSequence(strict = false))
     }
 
     /**
      * One note's entry with the store-wide sequence at the same moment. A load carries the sequence, so
      * an editor can drop any load older than its last save whether or not an entry existed.
      */
-    fun observe(noteUid: String): Observed = locked { Observed(readEntry(noteUid), currentSequence()) }
+    fun observe(noteUid: String): Observed = locked { Observed(readEntry(noteUid), currentSequence(strict = false)) }
 
     // ---- the one primitive every change goes through ----
 
@@ -701,20 +702,75 @@ internal class PendingNotesStore private constructor(
         writeAtomically(notebookFile(notebookUid), PendingCodec.encodeNotebook(notebookUid, blob))
     }
 
-    /** The next value of the store-wide counter, persisted before it is handed out. */
+    /**
+     * The next value of the store-wide counter, persisted before it is handed out. With the counter lost
+     * or damaged it is rebuilt strictly: while a version on disk cannot be read it throws, and nothing is
+     * written. A version that is not above all of them could be one an entry already holds, and a drop
+     * or a rebase that checks the version would then take the newer text for the older.
+     */
     private fun nextVersion(): Long {
-        val next = currentSequence() + 1
+        val next = currentSequence(strict = true) + 1
         writeAtomically(File(dir, SEQUENCE), PendingCodec.encodeSequence(next))
         return next
     }
 
-    /** The last version handed out. A lost or damaged counter restarts above every version still on disk. */
-    private fun currentSequence(): Long {
+    /**
+     * The last version handed out. A counter that is lost or damaged is rebuilt as the highest version
+     * still on disk ([highestVersion]) and is not written back here; [nextVersion] hands out the one above
+     * it. A counter file that cannot be read at all throws. [strict] is for [nextVersion]. The readers
+     * ([snapshot], [observe]) take the highest version they can read instead: the value is only compared,
+     * never written, and a push needs no new version, so one file that cannot be read does not stop a
+     * run from pushing the others.
+     */
+    private fun currentSequence(strict: Boolean): Long {
         val file = File(dir, SEQUENCE)
         val stored = if (file.exists()) (PendingCodec.decodeSequence(file.readBytes()) as? PendingCodec.Decoded.Ok)?.value else null
-        return stored ?: (files(NOTE).mapNotNull { (decodeFile(it) as? Read.Present)?.entry?.version } +
-            files(LANDED).mapNotNull { (PendingCodec.decodeLanded(it.readBytes()) as? PendingCodec.Decoded.Ok)?.value?.version }).maxOrNull() ?: 0L
+        return stored ?: highestVersion(strict)
     }
+
+    /**
+     * The highest version on disk, from one [listing]: each entry's, read from its header alone, which
+     * checks its own CRC and reads no blob, each landed record's, and those of intact writes not
+     * committed yet ("<uid>.note.new", "<uid>.landed.new"), since recovery may still commit one. A write
+     * that was cut short holds none: it was never reported saved, and recovery drops it. A listing that
+     * fails throws. With [strict], so does a version that cannot be read (a damaged header, a newer
+     * format after a downgrade, a landed record that does not decode); otherwise that file is passed over.
+     */
+    private fun highestVersion(strict: Boolean): Long {
+        var highest = 0L
+        for (file in listing()) {
+            val version = try {
+                versionOf(file)
+            } catch (e: IOException) {
+                if (strict) throw e
+                null
+            }
+            if (version != null && version > highest) highest = version
+        }
+        return highest
+    }
+
+    /** The version [file] holds, or null for a file that holds none; throws when it holds one that cannot be read. */
+    private fun versionOf(file: File): Long? {
+        val name = file.name
+        val version = when {
+            name.endsWith(NOTE) -> readHeader(file)?.version
+            name.endsWith(LANDED) -> landedVersion(file.readBytes())
+            name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) -> {
+                val bytes = file.readBytes()
+                if (!PendingCodec.isIntact(bytes)) return null
+                if (name.endsWith(LANDED + NEW)) landedVersion(bytes) else entryVersion(bytes)
+            }
+            else -> return null
+        }
+        return version ?: throw IOException("the version in $name cannot be read")
+    }
+
+    private fun entryVersion(bytes: ByteArray): Long? =
+        (PendingCodec.decodeEntryHeader(bytes) as? PendingCodec.Decoded.Ok)?.value?.version
+
+    private fun landedVersion(bytes: ByteArray): Long? =
+        (PendingCodec.decodeLanded(bytes) as? PendingCodec.Decoded.Ok)?.value?.version
 
     /**
      * Recovery problems that still stand: the file is still there and is not an entry that now reads
@@ -758,8 +814,8 @@ internal class PendingNotesStore private constructor(
         // (design 3.1). An entry file this build cannot read is then reported like every committed entry
         // that cannot be read. The other kinds are kept for a build that can read them but not reported,
         // and not for long: a landed record goes in step 2 unless an editor is open, a notebook copy
-        // lasts until a run prunes or rewrites it, and a counter that cannot be read restarts above
-        // every version on disk.
+        // lasts until a run prunes or rewrites it, and a counter this build cannot read is rebuilt above
+        // every version on disk, or the write that needs it fails.
         for (tmp in listing().filter { it.name.endsWith(NEW) }) {
             try {
                 val target = File(dir, tmp.name.removeSuffix(NEW))

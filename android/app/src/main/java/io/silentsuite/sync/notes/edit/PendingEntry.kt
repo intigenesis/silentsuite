@@ -11,7 +11,10 @@ internal data class PendingEntry(
     val state: State,
     /**
      * Moves on every local content change (save, rebase), never on bookkeeping. Drawn from a
-     * store-wide counter, so it only ever grows, even across a drop and a new entry for the same note.
+     * store-wide counter, so it only ever grows while the counter stands, even across a drop and a new
+     * entry for the same note. A counter that is lost or damaged is rebuilt above every version still on
+     * disk; while one of them cannot be read, that rebuild fails, and so does any change that needs a new
+     * version.
      */
     val version: Long,
     /** The revision uid of [blob], as the item's etag reported when the blob was written. */

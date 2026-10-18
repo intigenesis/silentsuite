@@ -114,6 +114,80 @@ class PendingNotesStoreTest {
         assertTrue(saved(restarted().saveLocal("n2", "b1", "r", blob("c"), isCreate = false)) > high)
     }
 
+    @Test fun `a lost counter is rebuilt above an entry whose blob is damaged behind a header that reads`() {
+        store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false)
+        val high = saved(store.saveLocal("n2", "b1", "r1", blob("two"), isCreate = false))
+        // The header still reads on its own; the whole file does not.
+        val file = File(dir, "n2.note")
+        val bytes = file.readBytes()
+        bytes[bytes.size - 6] = (bytes[bytes.size - 6].toInt() xor 0x40).toByte()
+        file.writeBytes(bytes)
+        assertTrue(File(dir, "sequence").delete())
+        assertTrue("n2 still holds its version",
+            saved(store.saveLocal("n3", "b1", "r1", blob("three"), isCreate = false)) > high)
+    }
+
+    @Test fun `with the counter lost, a write fails while an entry's version cannot be read, and nothing is written`() {
+        // As after a downgrade: an entry a newer build wrote, at a version this build cannot read.
+        val newer = withFormatVersion(PendingCodec.encodeEntry(
+            PendingEntry("n1", "b1", PendingEntry.State.UPSERT, 7, "r7", false, blob = blob("by a newer build"))), 3)
+        dir.mkdirs()
+        File(dir, "n1.note").writeBytes(newer)
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)
+        }
+        assertFalse("no counter is written", File(dir, "sequence").exists() || File(dir, "sequence.new").exists())
+        assertFalse("and no entry", File(dir, "n2.note").exists() || File(dir, "n2.note.new").exists())
+        // Reading still works, and still reports the entry it cannot read.
+        val snapshot = store.snapshot { false }
+        assertTrue(snapshot.headers.isEmpty())
+        assertEquals(listOf(Read.Unreadable("n1.note", "format version 3")), snapshot.unreadable)
+        // Once that file is discarded, no version on disk is unknown, and the save goes through.
+        store.discard("n1")
+        assertTrue(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) is SaveOutcome.Saved)
+    }
+
+    @Test fun `with the counter lost, a write fails while a landed record cannot be read`() {
+        // An open editor keeps the landed record of a push, with the version that was sent.
+        val editor = store.editorOpened("n1")
+        store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false)
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r1", blob("landed")))
+        val landed = File(dir, "n1.landed")
+        landed.writeBytes(landed.readBytes().also { it[8] = (it[8].toInt() xor 0x40).toByte() })
+        assertTrue(File(dir, "sequence").delete())
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)
+        }
+        assertFalse("no counter is written", File(dir, "sequence").exists())
+        // The record goes with its editor, and then the save goes through.
+        store.editorClosed(editor)
+        assertTrue(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) is SaveOutcome.Saved)
+    }
+
+    @Test fun `a lost counter is rebuilt above a first write that recovery cannot commit yet`() {
+        var refuse = true
+        val d = tmp.newFolder("stranded-version")
+        val stranded = PendingEntry("n1", "b1", PendingEntry.State.UPSERT, 9, "r9", false, blob = blob("the only copy"))
+        File(d, "n1.note.new").writeBytes(PendingCodec.encodeEntry(stranded))
+        val s = refusingRenames(d, "n1.note") { refuse }
+        assertTrue("above the version recovery will commit n1 with",
+            saved(s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > 9)
+        assertArrayEquals(PendingCodec.encodeEntry(stranded), File(d, "n1.note.new").readBytes())
+        refuse = false
+        assertEquals(stranded, s.entry("n1"))
+    }
+
+    @Test fun `a lost counter is rebuilt above a landed record that recovery cannot commit yet`() {
+        val d = tmp.newFolder("stranded-landed")
+        val landed = PendingCodec.encodeLanded(LandedRecord("n5", "r12", 12, blob("landed")))
+        File(d, "n5.landed.new").writeBytes(landed)
+        // Committed, the record would go at once, since no editor is open on n5. Refused, it stays.
+        val s = refusingRenames(d, "n5.landed") { true }
+        assertTrue("above the version the record holds",
+            saved(s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > 12)
+        assertArrayEquals(landed, File(d, "n5.landed.new").readBytes())
+    }
+
     // ---- editor saves ----
 
     @Test fun `a later save replaces the content and resets the backoff`() {
