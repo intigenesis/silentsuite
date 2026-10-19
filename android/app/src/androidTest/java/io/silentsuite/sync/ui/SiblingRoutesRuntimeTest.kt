@@ -787,6 +787,253 @@ class SiblingRoutesRuntimeTest {
         try { ActivityScenario.launchActivityForResult<CollectionActivity>(CollectionActivity.newIntent(context,account,"ac41-view-generation",state.uid)).use { s -> waitUntil("view") { var ok=false;s.onActivity { ok=it.findViewById<TextView>(R.id.display_name).text.toString()==state.name && it.findViewById<TextView>(R.id.owner).visibility==View.GONE && it.findViewById<TextView>(R.id.stats).text.toString()==it.resources.getQuantityString(R.plurals.collection_recent_activity_items,2,2) };ok };s.recreate();s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as ViewCollectionFragment;assertEquals(account,f.arguments!!.getParcelable("collection.identity.account"));assertEquals("ac41-view-generation",f.arguments!!.getString("collection.identity.creationId"));assertEquals(state.uid,f.arguments!!.getString("collection.identity.uid"));assertEquals(state.type,f.arguments!!.getString("collection.identity.type"));assertEquals(state.description,it.findViewById<TextView>(R.id.description).text.toString());it.onBackPressedDispatcher.onBackPressed() };waitUntil("collection view return") { s.state == Lifecycle.State.DESTROYED };assertEquals(Lifecycle.State.DESTROYED,s.state);assertEquals(android.app.Activity.RESULT_CANCELED,s.result.resultCode) }} finally { runtimeFixtureOverride=null;removeAccountAndWait(manager,account) }
     }
 
+    /**
+     * Contacts recovery over real Etebase objects in the account's real cache (made against the
+     * in-process stand-in server) and a real local address book in the contacts provider.
+     */
+    @Test
+    fun contactsRecoveryListsOnlyDeletedConfirmsRestoreAndKeepsSiblingHistory() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val generation = "contacts-recovery-generation"
+        val fake = io.silentsuite.sync.notes.FakeEtebaseServer()
+        val client = com.etebase.client.Client.create(okhttp3.OkHttpClient.Builder().addInterceptor(fake).build(), fake.baseUrl)
+        val session = com.etebase.client.Account.signup(client,
+            com.etebase.client.User("contacts-recovery-${System.nanoTime()}", "contacts-recovery@example.invalid"),
+            "stand-in-server-only").save(null)
+        val colMgr = com.etebase.client.Account.restore(client, session, null).collectionManager
+        val account = addAccount(manager, "contacts-recovery", generation)
+        val contacts = android.provider.ContactsContract.AUTHORITY
+        val children = mutableListOf<Account>()
+        try {
+            listOf(App.addressBooksAuthority, android.provider.CalendarContract.AUTHORITY).forEach {
+                android.content.ContentResolver.setIsSyncable(account, it, 0)
+            }
+            AccountSettings.setUserData(manager, account, java.net.URI(fake.baseUrl), account.name)
+            check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
+            AccountSettings(context, account).etebaseSession = session
+            val cache = io.silentsuite.sync.EtebaseLocalCache.getInstance(context, account.name)
+            fun vcard(uid: String, name: String) = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:$uid\r\nFN:$name\r\nEND:VCARD\r\n"
+            /** One live and one deleted entry, uploaded, then cached the way a sync caches them. */
+            fun collection(type: String, name: String, live: String, deleted: String, readOnly: Boolean = false): String {
+                val created = colMgr.create(type, com.etebase.client.ItemMetadata().apply { this.name = name }, "")
+                colMgr.upload(created)
+                val itemMgr = colMgr.getItemManager(created)
+                val kept = itemMgr.create(com.etebase.client.ItemMetadata().apply { this.name = "kept"; mtime = 2_000L }, live)
+                val gone = itemMgr.create(com.etebase.client.ItemMetadata().apply { this.name = "gone"; mtime = 1_000L }, deleted)
+                itemMgr.batch(arrayOf(kept, gone))
+                gone.delete()
+                itemMgr.batch(arrayOf(gone))
+                if (readOnly) fake.setAccessLevel(created.uid, 0L)
+                val current = colMgr.fetch(created.uid)
+                synchronized(cache) {
+                    cache.collectionSet(colMgr, current)
+                    listOf(kept, gone).forEach { cache.itemSet(colMgr.getItemManager(current), current.uid, it) }
+                }
+                return current.uid
+            }
+            val book = collection(Constants.ETEBASE_TYPE_ADDRESS_BOOK, "Recovery contacts",
+                vcard("kept-contact", "Kept Person"), vcard("deleted-contact", "Deleted Person"))
+            val sharedBook = collection(Constants.ETEBASE_TYPE_ADDRESS_BOOK, "Shared contacts",
+                vcard("shared-kept", "Shared Kept"), vcard("shared-deleted", "Shared Deleted"), readOnly = true)
+            val siblings = mapOf(
+                Constants.ETEBASE_TYPE_CALENDAR to collection(Constants.ETEBASE_TYPE_CALENDAR, "Recovery calendar",
+                    "BEGIN:VCALENDAR\r\nSUMMARY:Kept event\r\nEND:VCALENDAR\r\n", "BEGIN:VCALENDAR\r\nSUMMARY:Gone event\r\nEND:VCALENDAR\r\n"),
+                Constants.ETEBASE_TYPE_TASKS to collection(Constants.ETEBASE_TYPE_TASKS, "Recovery tasks",
+                    "BEGIN:VCALENDAR\r\nSUMMARY:Kept task\r\nEND:VCALENDAR\r\n", "BEGIN:VCALENDAR\r\nSUMMARY:Gone task\r\nEND:VCALENDAR\r\n"),
+                Constants.ETEBASE_TYPE_NOTES to collection(Constants.ETEBASE_TYPE_NOTES, "Recovery notes", "Kept note", "Gone note")
+            )
+            val provider = context.contentResolver.acquireContentProviderClient(contacts)!!
+            val childOf = try {
+                listOf(book, sharedBook).associateWith { uid ->
+                    val cached = cache.collectionGet(colMgr, uid)
+                    io.silentsuite.sync.resource.LocalAddressBook.create(context, provider, account, cached)
+                    Account(io.silentsuite.sync.resource.LocalAddressBook.accountName(account, cached), App.addressBookAccountType).also {
+                        children += it
+                        android.content.ContentResolver.setSyncAutomatically(it, contacts, false)
+                        android.content.ContentResolver.setIsSyncable(it, contacts, 0)
+                    }
+                }
+            } finally { provider.release() }
+            fun dirtyFlags(child: Account): List<Int> = context.contentResolver.query(
+                android.provider.ContactsContract.RawContacts.CONTENT_URI,
+                arrayOf(android.provider.ContactsContract.RawContacts.DIRTY),
+                "${android.provider.ContactsContract.RawContacts.ACCOUNT_NAME}=? AND " +
+                    "${android.provider.ContactsContract.RawContacts.ACCOUNT_TYPE}=? AND " +
+                    "${android.provider.ContactsContract.RawContacts.DELETED}=0",
+                arrayOf(child.name, child.type), null)!!.use { cursor ->
+                generateSequence { if (cursor.moveToNext()) cursor.getInt(0) else null }.toList()
+            }
+            fun shownItems(activity: CollectionActivity) =
+                androidx.lifecycle.ViewModelProvider(activity)[ItemsViewModel::class.java].value
+
+            // The ordinary screen leaves the deleted contact out; calendars, tasks and notes keep theirs.
+            (mapOf(Constants.ETEBASE_TYPE_ADDRESS_BOOK to book) + siblings).forEach { (type, uid) ->
+                ActivityScenario.launch<CollectionActivity>(CollectionActivity.newIntent(context, account, generation, uid)).use { s ->
+                    val expected = if (type == Constants.ETEBASE_TYPE_ADDRESS_BOOK) 1 else 2
+                    waitUntil("ordinary list of $type") {
+                        var ok = false
+                        s.onActivity { a ->
+                            ok = shownItems(a)?.size == expected && a.findViewById<TextView>(R.id.stats).text.toString() ==
+                                a.resources.getQuantityString(R.plurals.collection_recent_activity_items, expected, expected)
+                        }
+                        ok
+                    }
+                    s.onActivity { a ->
+                        val items = shownItems(a)!!
+                        assertEquals(type, if (type == Constants.ETEBASE_TYPE_ADDRESS_BOOK) 0 else 1, items.count { it.item.isDeleted })
+                        if (type == Constants.ETEBASE_TYPE_ADDRESS_BOOK) assertTrue(items.single().content.contains("Kept Person"))
+                    }
+                }
+            }
+            // The recovery route is for address books only.
+            ActivityScenario.launch<CollectionActivity>(CollectionActivity.newRecoveryIntent(context, account, generation,
+                siblings.getValue(Constants.ETEBASE_TYPE_CALENDAR))).use { s ->
+                waitUntil("calendar recovery route to close") { s.state == Lifecycle.State.DESTROYED }
+            }
+
+            fun itemScreen(a: CollectionActivity) =
+                a.supportFragmentManager.findFragmentById(R.id.fragment_container) as? CollectionItemFragment
+            fun restoreMenuItem(a: CollectionActivity): android.view.MenuItem {
+                val menu = MenuBuilder(a)
+                itemScreen(a)!!.onCreateOptionsMenu(menu, a.menuInflater)
+                return menu.findItem(R.id.on_restore_item)
+            }
+            /** The Main tab of the current item screen, once it shows [name] in its own attached view. */
+            fun renderedContact(a: CollectionActivity, name: String): PrettyFragment? {
+                val screen = itemScreen(a) ?: return null
+                if (screen.view?.findViewById<androidx.viewpager.widget.ViewPager>(R.id.viewpager)?.adapter?.count != 3) return null
+                val main = screen.childFragmentManager.fragments.filterIsInstance<PrettyFragment>().singleOrNull() ?: return null
+                val shown = main.view?.takeIf { main.isAdded && it.isAttachedToWindow } ?: return null
+                val rendered = shown.findViewById<TextView>(R.id.display_name).text.toString() == name &&
+                    shown.findViewById<View>(R.id.content_container).visibility == View.VISIBLE &&
+                    shown.findViewById<View>(R.id.loading_msg).visibility == View.GONE
+                return main.takeIf { rendered }
+            }
+            fun awaitItemScreen(s: ActivityScenario<CollectionActivity>, name: String) = waitUntil("deleted contact $name shown") {
+                var ok = false
+                s.onActivity { a -> ok = renderedContact(a, name) != null }
+                ok
+            }
+            fun openDeletedContact(uid: String, name: String): ActivityScenario<CollectionActivity> {
+                val s = ActivityScenario.launch<CollectionActivity>(CollectionActivity.newRecoveryIntent(context, account, generation, uid))
+                waitUntil("recovery list of $uid") {
+                    var ok = false
+                    s.onActivity { a ->
+                        val list = a.supportFragmentManager.findFragmentById(R.id.fragment_container) as? ListEntriesFragment
+                        ok = list?.listAdapter?.count == 1
+                    }
+                    ok
+                }
+                s.onActivity { a ->
+                    val list = a.supportFragmentManager.findFragmentById(R.id.fragment_container) as ListEntriesFragment
+                    assertTrue("the recovery list shows only the deleted contact",
+                        (list.listAdapter!!.getItem(0) as io.silentsuite.sync.CachedItem).item.isDeleted)
+                    list.onItemClick(list.listView, list.listView, 0, 0L)
+                }
+                awaitItemScreen(s, name)
+                return s
+            }
+            fun dialogButton(id: Int) = onView(androidx.test.espresso.matcher.ViewMatchers.withId(id)).inRoot(isDialog())
+            val child = childOf.getValue(book)
+
+            openDeletedContact(book, "Deleted Person").use { s ->
+                // A rotation keeps the opened contact shown and usable, with its exact identity and
+                // Restore; the Main tab is rebuilt in a new view rather than reusing the old one.
+                var beforeRotation: PrettyFragment? = null
+                s.onActivity { a -> beforeRotation = renderedContact(a, "Deleted Person") }
+                assertTrue("the deleted contact is shown before rotation", beforeRotation != null)
+                s.recreate()
+                awaitItemScreen(s, "Deleted Person")
+                s.onActivity { a ->
+                    assertTrue(renderedContact(a, "Deleted Person") !== beforeRotation)
+                    assertFalse(beforeRotation!!.isAdded)
+                }
+                s.onActivity { a ->
+                    val identity = CollectionLifecycleIdentity.from(itemScreen(a)!!.arguments)!!
+                    assertEquals(CollectionLifecycleIdentity.existing(account, generation, book, Constants.ETEBASE_TYPE_ADDRESS_BOOK), identity)
+                    assertTrue(restoreMenuItem(a).isVisible)
+                }
+
+                // Cancelling the confirmation writes nothing.
+                s.onActivity { a -> itemScreen(a)!!.onOptionsItemSelected(restoreMenuItem(a)) }
+                onView(withText(R.string.contact_restore_confirm_body)).inRoot(isDialog()).check(matches(isDisplayed()))
+                dialogButton(android.R.id.button2).perform(click())
+                assertEquals(emptyList<Int>(), dirtyFlags(child))
+
+                // A generation replaced while the confirmation is open gets nothing written.
+                s.onActivity { a -> itemScreen(a)!!.onOptionsItemSelected(restoreMenuItem(a)) }
+                onView(withText(R.string.contact_restore_confirm_body)).inRoot(isDialog()).check(matches(isDisplayed()))
+                check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, "contacts-recovery-replaced"))
+                dialogButton(android.R.id.button1).perform(click())
+                assertEquals(emptyList<Int>(), dirtyFlags(child))
+                check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
+
+                // With the parent generation current again, a child address book that records a
+                // previous owner generation, or no owner, is never the destination.
+                val ownerKey = io.silentsuite.sync.resource.LocalAddressBook.USER_DATA_MAIN_ACCOUNT_IDENTITY
+                val statusStore = io.silentsuite.sync.syncadapter.SyncStatusStore(context)
+                val currentOwner = manager.getUserData(child, ownerKey)
+                assertEquals(statusStore.identity(account, generation).storageKey, currentOwner)
+                try {
+                    listOf(statusStore.identity(account, "contacts-recovery-previous").storageKey, null).forEach { staleOwner ->
+                        manager.setUserData(child, ownerKey, staleOwner)
+                        s.onActivity { a -> itemScreen(a)!!.onOptionsItemSelected(restoreMenuItem(a)) }
+                        onView(withText(R.string.contact_restore_confirm_body)).inRoot(isDialog()).check(matches(isDisplayed()))
+                        dialogButton(android.R.id.button1).perform(click())
+                        onView(withText(R.string.journal_item_restore_dialog_body))
+                            .check(androidx.test.espresso.assertion.ViewAssertions.doesNotExist())
+                        assertEquals("owner $staleOwner", emptyList<Int>(), dirtyFlags(child))
+                    }
+                } finally {
+                    manager.setUserData(child, ownerKey, currentOwner)
+                }
+                assertEquals(currentOwner, manager.getUserData(child, ownerKey))
+
+                // Confirming writes the contact into its exact address book, marked for upload.
+                s.onActivity { a -> itemScreen(a)!!.onOptionsItemSelected(restoreMenuItem(a)) }
+                dialogButton(android.R.id.button1).perform(click())
+                onView(withText(R.string.journal_item_restore_dialog_body)).inRoot(isDialog()).check(matches(isDisplayed()))
+                dialogButton(android.R.id.button1).perform(click())
+                assertEquals(listOf(1), dirtyFlags(child))
+                assertEquals(emptyList<Int>(), dirtyFlags(childOf.getValue(sharedBook)))
+                val restoredNames = context.contentResolver.query(
+                    android.provider.ContactsContract.Data.CONTENT_URI,
+                    arrayOf(android.provider.ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME),
+                    "${android.provider.ContactsContract.Data.MIMETYPE}=? AND " +
+                        "${android.provider.ContactsContract.RawContacts.ACCOUNT_NAME}=? AND " +
+                        "${android.provider.ContactsContract.RawContacts.ACCOUNT_TYPE}=?",
+                    arrayOf(android.provider.ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE, child.name, child.type),
+                    null)!!.use { cursor -> generateSequence { if (cursor.moveToNext()) cursor.getString(0) else null }.toList() }
+                assertEquals("the restored contact is the deleted one", listOf("Deleted Person"), restoredNames)
+            }
+
+            // A read-only address book offers no Restore and its operation refuses the write.
+            openDeletedContact(sharedBook, "Shared Deleted").use { s ->
+                s.onActivity { a ->
+                    assertFalse(restoreMenuItem(a).isVisible)
+                    itemScreen(a)!!.restoreItem(androidx.lifecycle.ViewModelProvider(a)[AccountViewModel::class.java].value!!)
+                }
+                onView(withText(R.string.contact_restore_read_only)).inRoot(isDialog()).check(matches(isDisplayed()))
+                dialogButton(android.R.id.button1).perform(click())
+            }
+            val sharedIdentity = CollectionLifecycleIdentity.existing(account, generation, sharedBook, Constants.ETEBASE_TYPE_ADDRESS_BOOK)
+            assertFalse(CollectionItemFragment.restoreContact(context, sharedIdentity,
+                cache.collectionGet(colMgr, sharedBook), vcard("shared-deleted", "Shared Deleted")))
+            assertEquals(emptyList<Int>(), dirtyFlags(childOf.getValue(sharedBook)))
+            // The local address book's own read-only mark is checked at the write as well.
+            val bookIdentity = CollectionLifecycleIdentity.existing(account, generation, book, Constants.ETEBASE_TYPE_ADDRESS_BOOK)
+            io.silentsuite.sync.resource.LocalAddressBook(context, child, null).readOnly = true
+            assertFalse(CollectionItemFragment.restoreContact(context, bookIdentity,
+                cache.collectionGet(colMgr, book), vcard("second-contact", "Second Person")))
+            assertEquals(listOf(1), dirtyFlags(child))
+        } finally {
+            children.forEach { removeAccountAndWait(manager, it) }
+            removeAccountAndWait(manager, account)
+            io.silentsuite.sync.EtebaseLocalCache.clearUserCache(context, account.name)
+        }
+    }
+
     @Test
     fun collectionCreateCompletionRendersCreatedCollectionAndPreservesReturn() {
         val context=InstrumentationRegistry.getInstrumentation().targetContext;val manager=AccountManager.get(context);val account=addAccount(manager,"ac41-create","ac41-create-generation");val state=AtomicReference(fixture("created-uid",""));val calls=AtomicInteger()
