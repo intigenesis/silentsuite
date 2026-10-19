@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
+import androidx.preference.Preference
 import androidx.preference.PreferenceManager
 import androidx.preference.SwitchPreferenceCompat
 import androidx.test.core.app.ActivityScenario
@@ -25,9 +26,13 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+
+/** Preference key of the approved Settings → Recover deleted contacts entry. */
+private const val RECOVER_DELETED_CONTACTS_KEY = "recover_deleted_contacts"
 
 @RunWith(AndroidJUnit4::class)
 class SettingsRuntimeTest {
@@ -202,6 +207,81 @@ class SettingsRuntimeTest {
             }
         } finally {
             removeAccountAndWait(manager, replacement ?: account)
+            ActiveAccountManager.clearActiveAccount(context)
+        }
+    }
+
+    @Test
+    fun recoverDeletedContactsEntryOpensExactAccountDestinationAndRejectsStaleRoute() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val active = Account("settings-recovery-active-${System.nanoTime()}@example.invalid", App.accountType)
+        val selected = Account("settings-recovery-selected-${System.nanoTime()}@example.invalid", App.accountType)
+        val selectedGeneration = "recovery-selected"
+        listOf(active to "recovery-active", selected to selectedGeneration).forEach { (account, generation) ->
+            check(manager.addAccountExplicitly(account, null, null))
+            AccountSettings.setUserData(manager, account, URI("https://example.invalid/"), account.name)
+            check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
+        }
+        // A different active account proves the stale explicit route below does not fall back to it.
+        check(ActiveAccountManager.setActiveAccount(context, active))
+        val exactIntent = AppSettingsActivity.newIntent(context, selected, selectedGeneration)
+        fun shown(activity: AppSettingsActivity) =
+            activity.supportFragmentManager.findFragmentById(android.R.id.content)
+        fun recoveryEntry(activity: AppSettingsActivity): Preference? {
+            activity.supportFragmentManager.executePendingTransactions()
+            val home = shown(activity) as AppSettingsActivity.HomeFragment
+            return home.findPreference(RECOVER_DELETED_CONTACTS_KEY)
+        }
+
+        try {
+            ActivityScenario.launch<AppSettingsActivity>(Intent(exactIntent)).use { scenario ->
+                var destination: Class<*>? = null
+                scenario.onActivity { activity ->
+                    val entry = recoveryEntry(activity)
+                    assertNotNull("Settings home must offer Recover deleted contacts", entry)
+                    assertTrue(entry!!.isEnabled)
+                    entry.performClick()
+                    activity.supportFragmentManager.executePendingTransactions()
+                    val opened = shown(activity)
+                    assertNotNull(opened)
+                    assertFalse(opened is AppSettingsActivity.HomeFragment)
+                    assertFalse(activity.isFinishing)
+                    assertEquals(selected, activity.selectedAccount)
+                    assertEquals(selectedGeneration, activity.selectedCreationId)
+                    destination = opened!!.javaClass
+                }
+                scenario.recreate()
+                scenario.onActivity { activity ->
+                    assertEquals(selected, activity.selectedAccount)
+                    assertEquals(selectedGeneration, activity.selectedCreationId)
+                    assertEquals(destination, shown(activity)?.javaClass)
+                    assertTrue(activity.supportFragmentManager.popBackStackImmediate())
+                    assertTrue(shown(activity) is AppSettingsActivity.HomeFragment)
+                    assertEquals(SettingsCategory.HOME, activity.currentCategory)
+                }
+            }
+
+            removeAccountAndWait(manager, selected)
+            check(manager.addAccountExplicitly(selected, null, Bundle().apply {
+                putString(AccountSettings.KEY_CREATION_ID, "recovery-replacement")
+            }))
+            ActivityScenario.launch<AppSettingsActivity>(Intent(exactIntent)).use { scenario ->
+                scenario.onActivity { activity ->
+                    assertEquals(null, activity.selectedAccount)
+                    val entry = recoveryEntry(activity)
+                    assertNotNull(entry)
+                    assertFalse(entry!!.isEnabled)
+                    entry.performClick()
+                    activity.supportFragmentManager.executePendingTransactions()
+                    assertTrue(shown(activity) is AppSettingsActivity.HomeFragment)
+                }
+            }
+        } finally {
+            listOf(active, selected).forEach { account ->
+                if (manager.getAccountsByType(account.type).any { it == account })
+                    removeAccountAndWait(manager, account)
+            }
             ActiveAccountManager.clearActiveAccount(context)
         }
     }
