@@ -952,6 +952,27 @@ class SiblingRoutesRuntimeTest {
                 assertEquals(emptyList<Int>(), dirtyFlags(child))
                 check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
 
+                // With the parent generation current again, a child address book that records a
+                // previous owner generation, or no owner, is never the destination.
+                val ownerKey = io.silentsuite.sync.resource.LocalAddressBook.USER_DATA_MAIN_ACCOUNT_IDENTITY
+                val statusStore = io.silentsuite.sync.syncadapter.SyncStatusStore(context)
+                val currentOwner = manager.getUserData(child, ownerKey)
+                assertEquals(statusStore.identity(account, generation).storageKey, currentOwner)
+                try {
+                    listOf(statusStore.identity(account, "contacts-recovery-previous").storageKey, null).forEach { staleOwner ->
+                        manager.setUserData(child, ownerKey, staleOwner)
+                        s.onActivity { a -> itemScreen(a)!!.onOptionsItemSelected(restoreMenuItem(a)) }
+                        onView(withText(R.string.contact_restore_confirm_body)).inRoot(isDialog()).check(matches(isDisplayed()))
+                        dialogButton(android.R.id.button1).perform(click())
+                        onView(withText(R.string.journal_item_restore_dialog_body))
+                            .check(androidx.test.espresso.assertion.ViewAssertions.doesNotExist())
+                        assertEquals("owner $staleOwner", emptyList<Int>(), dirtyFlags(child))
+                    }
+                } finally {
+                    manager.setUserData(child, ownerKey, currentOwner)
+                }
+                assertEquals(currentOwner, manager.getUserData(child, ownerKey))
+
                 // Confirming writes the contact into its exact address book, marked for upload.
                 s.onActivity { a -> itemScreen(a)!!.onOptionsItemSelected(restoreMenuItem(a)) }
                 dialogButton(android.R.id.button1).perform(click())
@@ -959,6 +980,15 @@ class SiblingRoutesRuntimeTest {
                 dialogButton(android.R.id.button1).perform(click())
                 assertEquals(listOf(1), dirtyFlags(child))
                 assertEquals(emptyList<Int>(), dirtyFlags(childOf.getValue(sharedBook)))
+                val restoredNames = context.contentResolver.query(
+                    android.provider.ContactsContract.Data.CONTENT_URI,
+                    arrayOf(android.provider.ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME),
+                    "${android.provider.ContactsContract.Data.MIMETYPE}=? AND " +
+                        "${android.provider.ContactsContract.RawContacts.ACCOUNT_NAME}=? AND " +
+                        "${android.provider.ContactsContract.RawContacts.ACCOUNT_TYPE}=?",
+                    arrayOf(android.provider.ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE, child.name, child.type),
+                    null)!!.use { cursor -> generateSequence { if (cursor.moveToNext()) cursor.getString(0) else null }.toList() }
+                assertEquals("the restored contact is the deleted one", listOf("Deleted Person"), restoredNames)
             }
 
             // A read-only address book offers no Restore and its operation refuses the write.

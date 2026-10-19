@@ -252,7 +252,9 @@ class CollectionItemFragment : Fragment() {
          * Writes [vcard] back into the exact local address book of [cachedCollection] as a dirty
          * contact for the next upload. Nothing is written for another collection, a collection the
          * cached access level or the local address book marks read-only, or an account generation
-         * that was replaced, which is checked again right before the write.
+         * that was replaced, which is checked again right before the write. The destination must be
+         * the child address book recorded for this exact parent generation; one a previous
+         * generation left behind, or one without a recorded owner, is never written.
          */
         internal fun restoreContact(
             context: Context,
@@ -267,13 +269,21 @@ class CollectionItemFragment : Fragment() {
             val provider = context.contentResolver.acquireContentProviderClient(ContactsContract.RawContacts.CONTENT_URI)
                     ?: return false
             try {
-                val localAddressBook = LocalAddressBook.findByUid(context, provider, identity.account, addressBookUid)
-                        ?: return false
+                val manager = android.accounts.AccountManager.get(context)
+                val owner = io.silentsuite.sync.syncadapter.SyncStatusStore(context)
+                    .identity(identity.account, identity.creationId).storageKey
+                fun exactChild(book: LocalAddressBook): Boolean = runCatching {
+                    book.url == addressBookUid && book.mainAccountOrNull == identity.account &&
+                        manager.getUserData(book.androidAccount, LocalAddressBook.USER_DATA_MAIN_ACCOUNT_IDENTITY) == owner
+                }.getOrDefault(false)
+                val localAddressBook = manager.getAccountsByType(io.silentsuite.sync.App.addressBookAccountType)
+                    .map { LocalAddressBook(context, it, provider) }
+                    .singleOrNull { exactChild(it) } ?: return false
                 if (localAddressBook.readOnly) return false
                 val contact = Contact.fromReader(StringReader(vcard), null).firstOrNull() ?: return false
                 // FIXME: restoring a contact group is not currently supported
                 if (contact.group) return false
-                if (!identity.validate(context)) return false
+                if (!identity.validate(context) || !exactChild(localAddressBook) || localAddressBook.readOnly) return false
                 var localContact = localAddressBook.findByUid(contact.uid!!) as LocalContact?
                 if (localContact != null) {
                     localContact.updateAsDirty(contact)
