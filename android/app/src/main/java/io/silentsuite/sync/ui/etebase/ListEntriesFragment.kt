@@ -116,7 +116,7 @@ class ListEntriesFragment : ListFragment(), AdapterView.OnItemClickListener {
     private fun onUserRefresh() {
         val refresh = swipeRefreshLayout ?: return
         val account = accountModel.value?.account
-        val identity = CollectionLifecycleIdentity.from(parentFragment?.arguments)
+        val identity = collectionIdentity()
         if (account == null || identity == null || identity.account != account || !identity.validate(requireContext())) {
             refresh.isRefreshing = false
             return
@@ -166,10 +166,14 @@ class ListEntriesFragment : ListFragment(), AdapterView.OnItemClickListener {
     override fun onItemClick(parent: AdapterView<*>, view: View, position: Int, id: Long) {
         val item = listAdapter?.getItem(position) as CachedItem
         activity?.supportFragmentManager?.commit {
-            replace(R.id.fragment_container, CollectionItemFragment.newInstance(item))
+            replace(R.id.fragment_container, CollectionItemFragment.newInstance(item, collectionIdentity()))
             addToBackStack(EditCollectionFragment::class.java.name)
         }
     }
+
+    /** Standalone in the contacts recovery list; otherwise embedded in the collection screen. */
+    private fun collectionIdentity(): CollectionLifecycleIdentity? =
+        CollectionLifecycleIdentity.from(arguments) ?: CollectionLifecycleIdentity.from(parentFragment?.arguments)
 
     internal inner class EntriesListAdapter(context: Context, val cachedCollection: CachedCollection) : ArrayAdapter<CachedItem>(context, R.layout.journal_viewer_list_item) {
 
@@ -209,6 +213,11 @@ class ListEntriesFragment : ListFragment(), AdapterView.OnItemClickListener {
 
     companion object {
         private val dateFormatter = SimpleDateFormat()
+
+        fun newInstance(identity: CollectionLifecycleIdentity) = ListEntriesFragment().apply {
+            arguments = identity.toBundle()
+        }
+
         /** The rest of the line after [prefix]; the last line may have no line break after it. */
         @VisibleForTesting
         internal fun getLine(content: String?, prefix: String): String? {

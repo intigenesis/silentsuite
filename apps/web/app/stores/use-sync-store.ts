@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import type { SyncStatus } from '@silentsuite/core'
-import { replay, getPendingCount, getFailedCount, onCountChange, type ConfirmedRemoteMutation, type QueueEntry, type OfflineQueueAccountGuard, type ReplayCheckpoint } from '@/app/lib/offline-queue'
+import { replay, getHeldCount, getPendingCount, getFailedCount, onCountChange, type ConfirmedRemoteMutation, type QueueEntry, type OfflineQueueAccountGuard, type ReplayCheckpoint } from '@/app/lib/offline-queue'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
 import { showErrorToast } from '@/app/stores/use-toast-store'
 import { logger } from '@/app/lib/logger'
@@ -18,11 +18,11 @@ async function captureQueueGuard(): Promise<OfflineQueueAccountGuard> {
 }
 
 async function readQueueCounts(guard: OfflineQueueAccountGuard) {
-  const [pendingQueueCount, failedQueueCount] = await Promise.all([
-    getPendingCount(guard), getFailedCount(guard),
+  const [pendingQueueCount, failedQueueCount, heldQueueCount] = await Promise.all([
+    getPendingCount(guard), getFailedCount(guard), getHeldCount(guard),
   ])
   assertCurrentAccountEpoch(guard.accountEpoch)
-  return { pendingQueueCount, failedQueueCount }
+  return { pendingQueueCount, failedQueueCount, heldQueueCount }
 }
 
 interface SyncState {
@@ -32,6 +32,8 @@ interface SyncState {
   error: string | null
   pendingQueueCount: number
   failedQueueCount: number
+  /** Held and legacy records (#744): never sent until the user acts, so never "synced". */
+  heldQueueCount: number
   partialLoad: boolean
   partialLoadDomainCount: number
 }
@@ -59,6 +61,7 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
   error: null,
   pendingQueueCount: 0,
   failedQueueCount: 0,
+  heldQueueCount: 0,
   partialLoad: false,
   partialLoadDomainCount: 0,
 
@@ -83,12 +86,15 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
     window.addEventListener('online', handleOnline)
     window.addEventListener('offline', handleOffline)
 
+    let disposed = false
+
     // Subscribe to queue changes and refresh counts for the active account only.
     const refreshCounts = async () => {
       try {
         const guard = await captureQueueGuard()
         const counts = await readQueueCounts(guard)
         assertCurrentAccountEpoch(guard.accountEpoch)
+        if (disposed) return
         set(counts)
       } catch (err) {
         if (!(err instanceof AccountBoundaryChangedError)) logger.warn('[sync-store] Failed to refresh queue counts', getSafeErrorDetails(err))
@@ -97,6 +103,19 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
     const unsubQueue = onCountChange(() => { void refreshCounts() })
 
     void refreshCounts()
+
+    // The restored account does not exist yet when this runs, so the read above
+    // cannot see its queue: read the counts again once an account is published.
+    let unsubAccount: (() => void) | null = null
+    void import('@/app/stores/use-etebase-store').then(({ useEtebaseStore }) => {
+      if (disposed) return
+      unsubAccount = useEtebaseStore.subscribe((state, prev) => {
+        if (state.account && state.accountFingerprint && (state.accountFingerprint !== prev.accountFingerprint || !prev.account)) {
+          void refreshCounts()
+        }
+      })
+      void refreshCounts()
+    }).catch((err) => logger.warn('[sync-store] Failed to watch the account for queue counts', getSafeErrorDetails(err)))
 
     // Set initial state. Mutations queued by a previous session are replayed
     // by SyncProvider once the Etebase session has been restored.
@@ -107,9 +126,11 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
     }
 
     return () => {
+      disposed = true
       window.removeEventListener('online', handleOnline)
       window.removeEventListener('offline', handleOffline)
       unsubQueue()
+      unsubAccount?.()
     }
   },
 
@@ -202,10 +223,25 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
 
       // First reconcile collection membership so manual sync notices calendars,
       // task lists, or address books deleted or created on another device.
+      const syncEngineBeforeReconcile = etebase.syncEngine
       await etebase.reconcileCollections()
       assertCurrentAccountEpoch(accountEpoch)
       const reconciledEtebase = useEtebaseStore.getState()
       if (reconciledEtebase.accountFingerprint !== accountFingerprint) throw new AccountBoundaryChangedError()
+
+      // Reconcile started the SyncEngine, so initial collection discovery had
+      // failed and earlier replays could not reach their collections (#748).
+      // Replay once now, before the refresh, so the stores show the result.
+      if (!syncEngineBeforeReconcile && reconciledEtebase.syncEngine) {
+        try {
+          await get().replayOfflineQueue()
+        } catch (err) {
+          assertCurrentAccountEpoch(accountEpoch)
+          logger.warn('[sync-store] Offline queue replay after collection recovery failed', getSafeErrorDetails(err))
+        }
+        assertCurrentAccountEpoch(accountEpoch)
+        if (useEtebaseStore.getState().accountFingerprint !== accountFingerprint) throw new AccountBoundaryChangedError()
+      }
 
       // Then run the SyncEngine poll to advance stokens for active collections.
       if (reconciledEtebase.syncEngine) {
@@ -251,7 +287,8 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
 
       const contacts = contactItems.map((item) => {
         const contact = core.deserializeContact(item.content)
-        return { ...contact, id: item.uid, listId: item.collectionUid }
+        // Content and revision are paired from the same SDK item (#744).
+        return { ...contact, id: item.uid, listId: item.collectionUid, revision: item.revision }
       })
       if (domainLoadState.contacts === 'loaded') {
         assertCurrentAccountEpoch(accountEpoch)
@@ -271,7 +308,7 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
         partialDomainCount += 1
       }
 
-      const notes = noteItems.map((item) => core.noteFromEtebaseItem(item.uid, item.content, item.meta, item.collectionUid))
+      const notes = noteItems.map((item) => ({ ...core.noteFromEtebaseItem(item.uid, item.content, item.meta, item.collectionUid), revision: item.revision }))
       if (domainLoadState.notes === 'loaded') {
         assertCurrentAccountEpoch(accountEpoch)
         useNoteStore.getState().syncFromRemote(notes)
@@ -288,7 +325,7 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
       }
 
       // Refresh counts to ensure UI is accurate after sync
-      const { pendingQueueCount: pc, failedQueueCount: fc } = await readQueueCounts(guard)
+      const { pendingQueueCount: pc, failedQueueCount: fc, heldQueueCount: hc } = await readQueueCounts(guard)
       assertCurrentAccountEpoch(guard.accountEpoch)
       set({
         syncStatus: 'synced',
@@ -296,6 +333,7 @@ export const useSyncStore = create<SyncState & SyncActions>((set, get) => ({
         error: null,
         pendingQueueCount: pc,
         failedQueueCount: fc,
+        heldQueueCount: hc,
         partialLoad: partialDomainCount > 0,
         partialLoadDomainCount: partialDomainCount,
       })
