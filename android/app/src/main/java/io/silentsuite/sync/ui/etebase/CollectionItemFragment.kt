@@ -359,8 +359,8 @@ class PrettyFragment : Fragment() {
 
         when (cachedCollection.collectionType) {
             Constants.ETEBASE_TYPE_ADDRESS_BOOK -> {
+                // Filled in onViewCreated, once this view is the fragment's view.
                 v = inflater.inflate(R.layout.contact_info, container, false)
-                asyncTask = loadContactTask(v)
             }
             Constants.ETEBASE_TYPE_CALENDAR -> {
                 v = inflater.inflate(R.layout.event_info, container, false)
@@ -378,6 +378,12 @@ class PrettyFragment : Fragment() {
         }
 
         return v
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        if (cachedCollection.collectionType == Constants.ETEBASE_TYPE_ADDRESS_BOOK)
+            asyncTask = loadContactTask(view)
     }
 
     override fun onDestroyView() {
@@ -504,8 +510,12 @@ class PrettyFragment : Fragment() {
         }
     }
 
+    /**
+     * Renders the contact into [view] only. The parse can finish before the coroutine first
+     * suspends, so it may render right away; the view lifecycle scope cancels it with that view.
+     */
     private fun loadContactTask(view: View): Job {
-        return lifecycleScope.launch {
+        return viewLifecycleOwner.lifecycleScope.launch {
             val contact = withContext(Dispatchers.IO) {
                 var result: Contact? = null
                 val reader = StringReader(content)
@@ -528,18 +538,16 @@ class PrettyFragment : Fragment() {
                     tv.text = contact.displayName
 
                     if (contact.group) {
-                        showGroup(contact)
+                        showGroup(view, contact)
                     } else {
-                        showContact(contact)
+                        showContact(view, contact)
                     }
             }
         }
     }
 
 
-    private fun showGroup(contact: Contact) {
-        val view = requireView()
-
+    private fun showGroup(view: View, contact: Contact) {
         val mainCard = view.findViewById<View>(R.id.main_card) as ViewGroup
 
         addInfoItem(view.context, mainCard, getString(R.string.journal_item_member_count), null, contact.members.size.toString())
@@ -550,8 +558,7 @@ class PrettyFragment : Fragment() {
     }
 
 
-    private fun showContact(contact: Contact) {
-        val view = requireView()
+    private fun showContact(view: View, contact: Contact) {
         val mainCard = view.findViewById<View>(R.id.main_card) as ViewGroup
         val aboutCard = view.findViewById<View>(R.id.about_card) as ViewGroup
         aboutCard.findViewById<View>(R.id.title_container).visibility = View.VISIBLE

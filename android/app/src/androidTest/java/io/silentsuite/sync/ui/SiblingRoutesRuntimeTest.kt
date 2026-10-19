@@ -899,14 +899,23 @@ class SiblingRoutesRuntimeTest {
                 itemScreen(a)!!.onCreateOptionsMenu(menu, a.menuInflater)
                 return menu.findItem(R.id.on_restore_item)
             }
-            fun awaitItemScreen(s: ActivityScenario<CollectionActivity>) = waitUntil("deleted contact screen") {
+            /** The Main tab of the current item screen, once it shows [name] in its own attached view. */
+            fun renderedContact(a: CollectionActivity, name: String): PrettyFragment? {
+                val screen = itemScreen(a) ?: return null
+                if (screen.view?.findViewById<androidx.viewpager.widget.ViewPager>(R.id.viewpager)?.adapter?.count != 3) return null
+                val main = screen.childFragmentManager.fragments.filterIsInstance<PrettyFragment>().singleOrNull() ?: return null
+                val shown = main.view?.takeIf { main.isAdded && it.isAttachedToWindow } ?: return null
+                val rendered = shown.findViewById<TextView>(R.id.display_name).text.toString() == name &&
+                    shown.findViewById<View>(R.id.content_container).visibility == View.VISIBLE &&
+                    shown.findViewById<View>(R.id.loading_msg).visibility == View.GONE
+                return main.takeIf { rendered }
+            }
+            fun awaitItemScreen(s: ActivityScenario<CollectionActivity>, name: String) = waitUntil("deleted contact $name shown") {
                 var ok = false
-                s.onActivity { a ->
-                    ok = itemScreen(a)?.view?.findViewById<androidx.viewpager.widget.ViewPager>(R.id.viewpager)?.adapter?.count == 3
-                }
+                s.onActivity { a -> ok = renderedContact(a, name) != null }
                 ok
             }
-            fun openDeletedContact(uid: String): ActivityScenario<CollectionActivity> {
+            fun openDeletedContact(uid: String, name: String): ActivityScenario<CollectionActivity> {
                 val s = ActivityScenario.launch<CollectionActivity>(CollectionActivity.newRecoveryIntent(context, account, generation, uid))
                 waitUntil("recovery list of $uid") {
                     var ok = false
@@ -922,16 +931,24 @@ class SiblingRoutesRuntimeTest {
                         (list.listAdapter!!.getItem(0) as io.silentsuite.sync.CachedItem).item.isDeleted)
                     list.onItemClick(list.listView, list.listView, 0, 0L)
                 }
-                awaitItemScreen(s)
+                awaitItemScreen(s, name)
                 return s
             }
             fun dialogButton(id: Int) = onView(androidx.test.espresso.matcher.ViewMatchers.withId(id)).inRoot(isDialog())
             val child = childOf.getValue(book)
 
-            openDeletedContact(book).use { s ->
-                // A rotation keeps the opened contact usable, with its exact identity and Restore.
+            openDeletedContact(book, "Deleted Person").use { s ->
+                // A rotation keeps the opened contact shown and usable, with its exact identity and
+                // Restore; the Main tab is rebuilt in a new view rather than reusing the old one.
+                var beforeRotation: PrettyFragment? = null
+                s.onActivity { a -> beforeRotation = renderedContact(a, "Deleted Person") }
+                assertTrue("the deleted contact is shown before rotation", beforeRotation != null)
                 s.recreate()
-                awaitItemScreen(s)
+                awaitItemScreen(s, "Deleted Person")
+                s.onActivity { a ->
+                    assertTrue(renderedContact(a, "Deleted Person") !== beforeRotation)
+                    assertFalse(beforeRotation!!.isAdded)
+                }
                 s.onActivity { a ->
                     val identity = CollectionLifecycleIdentity.from(itemScreen(a)!!.arguments)!!
                     assertEquals(CollectionLifecycleIdentity.existing(account, generation, book, Constants.ETEBASE_TYPE_ADDRESS_BOOK), identity)
@@ -992,7 +1009,7 @@ class SiblingRoutesRuntimeTest {
             }
 
             // A read-only address book offers no Restore and its operation refuses the write.
-            openDeletedContact(sharedBook).use { s ->
+            openDeletedContact(sharedBook, "Shared Deleted").use { s ->
                 s.onActivity { a ->
                     assertFalse(restoreMenuItem(a).isVisible)
                     itemScreen(a)!!.restoreItem(androidx.lifecycle.ViewModelProvider(a)[AccountViewModel::class.java].value!!)
