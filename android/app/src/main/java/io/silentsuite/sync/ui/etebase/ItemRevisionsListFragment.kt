@@ -88,7 +88,10 @@ class ItemRevisionsListFragment : ListFragment(), AdapterView.OnItemClickListene
     override fun onItemClick(parent: AdapterView<*>, view: View, position: Int, id: Long) {
         val item = listAdapter?.getItem(position) as CachedItem
         activity?.supportFragmentManager?.commit {
-            replace(R.id.fragment_container, CollectionItemFragment.newInstance(item))
+            // The revision opens in the same item screen, so restoring it keeps the exact identity
+            // and the contacts confirmation and read-only checks.
+            replace(R.id.fragment_container, CollectionItemFragment.newInstance(item,
+                CollectionLifecycleIdentity.from(parentFragment?.arguments)))
             addToBackStack(null)
         }
     }

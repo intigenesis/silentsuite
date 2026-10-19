@@ -233,8 +233,42 @@ class SettingsRuntimeTest {
             val home = shown(activity) as AppSettingsActivity.HomeFragment
             return home.findPreference(RECOVER_DELETED_CONTACTS_KEY)
         }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val listed = java.util.Collections.synchronizedList(mutableListOf<Pair<Account, String>>())
+        AppSettingsActivity.recoveryAddressBooksOverride = { _, account, creationId ->
+            listed += account to creationId
+            listOf(RecoveryAddressBook("recovery-book-a", "Recovery book A"),
+                RecoveryAddressBook("recovery-book-b", "Recovery book B"))
+        }
+        val collectionClass = io.silentsuite.sync.ui.etebase.CollectionActivity::class.java.name
+        var started: Intent? = null
+        // Inspecting a started intent needs API 26; older lanes can only count the blocked launch.
+        val launches = if (android.os.Build.VERSION.SDK_INT >= 26)
+            object : android.app.Instrumentation.ActivityMonitor() {
+                override fun onStartActivity(intent: Intent): android.app.Instrumentation.ActivityResult? {
+                    if (intent.component?.className != collectionClass) return null
+                    started = intent
+                    return android.app.Instrumentation.ActivityResult(0, null)
+                }
+            }
+        else android.app.Instrumentation.ActivityMonitor(collectionClass, null, true)
+        fun awaitBook(scenario: ActivityScenario<AppSettingsActivity>, uid: String, owner: Account = selected): Preference {
+            var found: Preference? = null
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (found == null && System.nanoTime() < deadline) {
+                scenario.onActivity { activity ->
+                    activity.supportFragmentManager.executePendingTransactions()
+                    found = (shown(activity) as? androidx.preference.PreferenceFragmentCompat)
+                        ?.findPreference(recoveryAddressBookKey(owner, uid))
+                }
+                if (found == null) Thread.sleep(50)
+            }
+            assertNotNull("Recovery picker must list address book $uid of ${owner.name}", found)
+            return found!!
+        }
 
         try {
+            instrumentation.addMonitor(launches)
             ActivityScenario.launch<AppSettingsActivity>(Intent(exactIntent)).use { scenario ->
                 var destination: Class<*>? = null
                 scenario.onActivity { activity ->
@@ -251,7 +285,38 @@ class SettingsRuntimeTest {
                     assertEquals(selectedGeneration, activity.selectedCreationId)
                     destination = opened!!.javaClass
                 }
+                // The picker lists the routed account's address books only, never the active account's.
+                awaitBook(scenario, "recovery-book-a")
+                val book = awaitBook(scenario, "recovery-book-b")
+                assertEquals(setOf(selected to selectedGeneration), listed.toSet())
+                scenario.onActivity { activity ->
+                    val picker = shown(activity) as androidx.preference.PreferenceFragmentCompat
+                    assertEquals(null, picker.findPreference<Preference>(recoveryAddressBookKey(active, "recovery-book-a")))
+                    assertEquals(null, picker.findPreference<Preference>(RECOVERY_NONE_KEY))
+                    book.performClick()
+                }
+                instrumentation.waitForIdleSync()
+                assertEquals(1, launches.hits)
+                if (android.os.Build.VERSION.SDK_INT >= 26) {
+                    val intent = started!!
+                    // Only identifiers are routed: no address-book name or contact content.
+                    assertEquals(setOf(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_ACCOUNT,
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_CREATION_ID,
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_COLLECTION_UID,
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_RECOVER_DELETED_CONTACTS
+                    ), intent.extras!!.keySet())
+                    assertEquals(selected, intent.getParcelableExtra<Account>(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_ACCOUNT))
+                    assertEquals(selectedGeneration, intent.getStringExtra(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_CREATION_ID))
+                    assertEquals("recovery-book-b", intent.getStringExtra(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_COLLECTION_UID))
+                    assertTrue(intent.getBooleanExtra(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_RECOVER_DELETED_CONTACTS, false))
+                }
                 scenario.recreate()
+                awaitBook(scenario, "recovery-book-b")
                 scenario.onActivity { activity ->
                     assertEquals(selected, activity.selectedAccount)
                     assertEquals(selectedGeneration, activity.selectedCreationId)
@@ -260,12 +325,22 @@ class SettingsRuntimeTest {
                     assertTrue(shown(activity) is AppSettingsActivity.HomeFragment)
                     assertEquals(SettingsCategory.HOME, activity.currentCategory)
                 }
+
+                // A picker left open across a same-name replacement opens nothing for the new generation.
+                scenario.onActivity { activity -> recoveryEntry(activity)!!.performClick() }
+                val stalePick = awaitBook(scenario, "recovery-book-a")
+                removeAccountAndWait(manager, selected)
+                check(manager.addAccountExplicitly(selected, null, Bundle().apply {
+                    putString(AccountSettings.KEY_CREATION_ID, "recovery-replacement")
+                }))
+                scenario.onActivity { activity ->
+                    stalePick.performClick()
+                    assertTrue(activity.isFinishing)
+                }
+                instrumentation.waitForIdleSync()
+                assertEquals(1, launches.hits)
             }
 
-            removeAccountAndWait(manager, selected)
-            check(manager.addAccountExplicitly(selected, null, Bundle().apply {
-                putString(AccountSettings.KEY_CREATION_ID, "recovery-replacement")
-            }))
             ActivityScenario.launch<AppSettingsActivity>(Intent(exactIntent)).use { scenario ->
                 scenario.onActivity { activity ->
                     assertEquals(null, activity.selectedAccount)
@@ -277,7 +352,34 @@ class SettingsRuntimeTest {
                     assertTrue(shown(activity) is AppSettingsActivity.HomeFragment)
                 }
             }
+
+            // Global Settings offers every current account, each under its own heading and with its
+            // current generation, and lists them again after recreation.
+            listed.clear()
+            ActivityScenario.launch<AppSettingsActivity>(AppSettingsActivity.newIntent(context)).use { scenario ->
+                scenario.onActivity { activity ->
+                    val entry = recoveryEntry(activity)
+                    assertTrue(entry!!.isEnabled)
+                    entry.performClick()
+                }
+                repeat(2) { pass ->
+                    if (pass == 1) scenario.recreate()
+                    listOf(active, selected).forEach { owner -> awaitBook(scenario, "recovery-book-a", owner) }
+                    scenario.onActivity { activity ->
+                        val picker = shown(activity) as androidx.preference.PreferenceFragmentCompat
+                        listOf(active, selected).forEach { owner ->
+                            val heading = picker.findPreference<Preference>(recoveryAddressBookKey(owner, "recovery-book-b"))!!.parent
+                            assertTrue(heading is androidx.preference.PreferenceCategory)
+                            assertEquals(owner.name, heading!!.title.toString())
+                        }
+                    }
+                }
+                assertTrue(listed.containsAll(listOf(active to "recovery-active", selected to "recovery-replacement")))
+                assertFalse(listed.any { it == selected to selectedGeneration })
+            }
         } finally {
+            instrumentation.removeMonitor(launches)
+            AppSettingsActivity.recoveryAddressBooksOverride = null
             listOf(active, selected).forEach { account ->
                 if (manager.getAccountsByType(account.type).any { it == account })
                     removeAccountAndWait(manager, account)
