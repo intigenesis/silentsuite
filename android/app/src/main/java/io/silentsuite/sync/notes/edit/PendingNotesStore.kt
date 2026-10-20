@@ -808,6 +808,14 @@ internal class PendingNotesStore private constructor(
         (PendingCodec.decodeLanded(bytes) as? PendingCodec.Decoded.Ok)?.value?.version
 
     /**
+     * A write this build makes, which recovery may finish or drop: the "<name>.new" of an entry, a landed record, a
+     * notebook copy or the counter.
+     */
+    private fun isKnownWrite(name: String): Boolean =
+        name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) || name.endsWith(NOTEBOOK + NEW) ||
+            name == SEQUENCE + NEW
+
+    /**
      * Recovery problems that still stand: the file is still there and is not an entry that now reads
      * fine (a failed step of a conflict copy is recorded under the copy's own name). Without this a
      * problem would outlive its file until the process restarts, and a readable entry would count twice.
@@ -840,18 +848,21 @@ internal class PendingNotesStore private constructor(
     private fun recoverLocked(): List<Read.Unreadable> {
         val problems = mutableListOf<Read.Unreadable>()
         val unfinished = HashSet<String>()
-        // 1. A leftover "<name>.new" was never committed. While "<name>" exists that write never reported
-        // success, so it goes, unread. Without a committed file it is the first write of that file,
-        // stopped before its rename. One that is cut short or fails its checksum goes as well. Any other
-        // is committed under its own name, in the order a write commits (content synced, renamed in one
-        // step, the rename synced), whether or not this build can read its layout (a newer format
-        // after a downgrade, a held reason added later), so nothing a build wrote in full is thrown away
-        // (design 3.1). An entry file this build cannot read is then reported like every committed entry
-        // that cannot be read. The other kinds are kept for a build that can read them but not reported.
-        // A landed record goes in step 2 unless an editor is open, and a notebook copy lasts until a run
-        // prunes or rewrites it. A counter this build cannot read stays as it is, and every write that
+        // 1. A leftover "<name>.new" of a kind this build writes was never committed. While "<name>" exists
+        // that write never reported success, so it goes, unread. Without a committed file it is the first
+        // write of that file, stopped before its rename. One that is cut short or fails its checksum goes as
+        // well. Any other is committed under its own name, in the order a write commits (content synced,
+        // renamed in one step, the rename synced), whether or not this build can read its layout (a newer
+        // format after a downgrade, a held reason added later), so nothing a build wrote in full is thrown
+        // away (design 3.1). An entry file this build cannot read is then reported like every committed
+        // entry that cannot be read. The other kinds are kept for a build that can read them but not
+        // reported. A landed record goes in step 2 unless an editor is open, and a notebook copy lasts until
+        // a run prunes or rewrites it. A counter this build cannot read stays as it is, and every write that
         // needs a new version fails while it does: the build that wrote it may have handed out higher ones.
-        for (tmp in listing().filter { it.name.endsWith(NEW) }) {
+        // A ".new" of any other kind is left as it is: not deleted, not committed and not reported, since
+        // this build cannot judge it and a newer build may keep versions in it. With the counter lost, the
+        // version rebuild ([versionOf]) then takes it for a file of a kind this build does not know.
+        for (tmp in listing().filter { isKnownWrite(it.name) }) {
             try {
                 val target = File(dir, tmp.name.removeSuffix(NEW))
                 if (target.exists() || !PendingCodec.isIntact(tmp.readBytes())) {

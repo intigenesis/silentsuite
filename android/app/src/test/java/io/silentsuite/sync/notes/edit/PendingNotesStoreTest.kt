@@ -250,6 +250,49 @@ class PendingNotesStoreTest {
             v1 + 2, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
     }
 
+    @Test fun `a leftover new file of a kind this build does not know is left as it is, and stops new versions`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false))
+        store.putNotebook("b9", blob("key b9"))
+        // As after a downgrade: one fails this build's check, one sits beside a committed file of its name, and one is
+        // intact with nothing of its name.
+        val cut = PendingCodec.encodeSequence(7).copyOf(5)
+        val beside = PendingCodec.encodeSequence(9)
+        val whole = PendingCodec.encodeSequence(11)
+        File(dir, "x.draft.new").writeBytes(cut)
+        File(dir, "y.draft").writeBytes(blob("a newer build's"))
+        File(dir, "y.draft.new").writeBytes(beside)
+        File(dir, "z.draft.new").writeBytes(whole)
+        // A known kind beside them: an intact landed record with no editor open is committed and then dropped.
+        File(dir, "n5.landed.new").writeBytes(PendingCodec.encodeLanded(LandedRecord("n5", "r5", v1, blob("landed"))))
+        val s = restarted()
+        val scan = s.scan()
+        assertEquals(listOf("n1"), scan.entries.map { it.noteUid })
+        assertTrue("nothing is reported", scan.unreadable.isEmpty())
+        assertArrayEquals("not deleted", cut, File(dir, "x.draft.new").readBytes())
+        assertArrayEquals("not deleted beside its committed file", beside, File(dir, "y.draft.new").readBytes())
+        assertArrayEquals("not committed", whole, File(dir, "z.draft.new").readBytes())
+        assertFalse(File(dir, "z.draft").exists())
+        assertFalse("a known kind is finished as before",
+            File(dir, "n5.landed.new").exists() || File(dir, "n5.landed").exists())
+        assertEquals("the recovery finished, so the prune runs", listOf("b9"), s.pruneNotebooks())
+        // With the counter lost, each of them is a file of a kind this build does not know, alone as well.
+        assertTrue(File(dir, "sequence").delete())
+        assertTrue(File(dir, "y.draft").delete())
+        val save = { s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        assertThrows(java.io.IOException::class.java) { save() }
+        assertFalse("no counter is written", File(dir, "sequence").exists() || File(dir, "sequence.new").exists())
+        assertFalse("no entry is written", File(dir, "n2.note").exists() || File(dir, "n2.note.new").exists())
+        assertEquals("reads still work", "r1", (s.read("n1") as Read.Present).entry.revision)
+        assertEquals(v1, s.snapshot { false }.sequence)
+        assertTrue(File(dir, "y.draft.new").delete() && File(dir, "z.draft.new").delete())
+        assertThrows("the one that fails the check, alone", java.io.IOException::class.java) { save() }
+        assertTrue(File(dir, "x.draft.new").delete())
+        File(dir, "z.draft.new").writeBytes(whole)
+        assertThrows("an intact one, alone", java.io.IOException::class.java) { save() }
+        assertTrue(File(dir, "z.draft.new").delete())
+        assertEquals("then above every version on disk", v1 + 1, saved(save()))
+    }
+
     @Test fun `an uncommitted counter write in a layout this build cannot read stops new versions`() {
         var refuse = true
         val d = tmp.newFolder("stranded-counter")
