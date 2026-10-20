@@ -1191,6 +1191,14 @@ class SiblingRoutesRuntimeTest {
         fun serverContent(uid: String): String = items().fetch(itemUids.getValue(uid)).contentString
         fun serverDeleted(uid: String): Boolean = items().fetch(itemUids.getValue(uid)).isDeleted
 
+        /** Deletes an entry on the server, as another device would. */
+        fun deleteRemote(uid: String) {
+            val itemMgr = items()
+            val item = itemMgr.fetch(itemUids.getValue(uid))
+            item.delete()
+            itemMgr.batch(arrayOf(item))
+        }
+
         fun recache() = synchronized(cache) { cache.collectionSet(colMgr, colMgr.fetch(colUid)) }
         fun cursor(): String? = synchronized(cache) { cache.collectionLoadStoken(colUid) }
 
@@ -1480,6 +1488,8 @@ class SiblingRoutesRuntimeTest {
         run.first.interrupt()
         hold.release()
         val outcome = f.join(run)
+        assertTrue("the interrupted run ended with a provider outcome, not a crash: $outcome",
+            outcome is SyncManager.ProviderOutcome)
         assertTrue("the interrupted run did not complete: $outcome", outcome != success)
         assertTrue(f.slot(native)?.isNotEmpty() != true)
         assertEquals(success, f.sync(native))
@@ -1487,6 +1497,64 @@ class SiblingRoutesRuntimeTest {
             listOf("a", "b", "c", "d", "e"), f.liveUids(native))
         assertTrue(f.phones(f.rawId(native, "c")).contains("5550103"))
         assertTrue(f.serverContent("c").contains("5550103"))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsALateEditOfARowDeletedOnTheServer() = withNativeStore("native-late-tombstone") { f ->
+        val native = f.populated("Tombstone contacts", people("a", "b", "c", "d", "e"))
+        f.clearSlot(native)
+        f.deleteRemote("e")
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        f.addPhone(f.rawId(native, "e"), "5550107")
+        hold.release()
+        assertEquals(success, f.join(run))
+        assertTrue("a native edit made during the listing outlives the server's deletion",
+            f.liveUids(native).contains("e"))
+        assertTrue(f.phones(f.rawId(native, "e")).contains("5550107"))
+        assertTrue(f.dirty(f.rawId(native, "e")))
+        // Local wins: the next run uploads the edited row again.
+        assertEquals(success, f.sync(native))
+        assertTrue(f.liveUids(native).contains("e"))
+        assertFalse(f.serverDeleted("e"))
+        assertTrue(f.serverContent("e").contains("5550107"))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsALateMembershipEditOfAContactSharedWithAnotherGroup() = withNativeStore("native-shared-member") { f ->
+        val native = f.populated("Shared member contacts", people("a", "b", "c", "d") +
+            ("g" to nativeGroupVcard("g", "Group G", listOf("a", "c"))) +
+            ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+        f.clearSlot(native)
+        // Another device renames G, so G's members are applied again while C's new H membership is pending.
+        f.changeRemote("g", nativeGroupVcard("g", "Group G renamed", listOf("a", "c")))
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        val h = f.groupId(native, "h")
+        assertTrue(f.members(native, f.groupId(native, "g")).contains("c"))
+        assertFalse(f.members(native, h).contains("c"))
+        f.addToGroup(f.rawId(native, "c"), h)
+        hold.release()
+        assertEquals(success, f.join(run))
+        assertTrue("applying another group keeps a membership edit made during the listing",
+            f.members(native, f.groupId(native, "h")).contains("c"))
+        assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "g")))
+        // Next run: the cursor equals the cached collection token, so the fetch is skipped.
+        assertEquals(success, f.sync(native))
+        assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "h")))
+        assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "g")))
+        assertTrue(f.serverContent("h").contains("urn:uuid:c"))
+        assertTrue(f.serverContent("h").contains("urn:uuid:a"))
+        assertTrue(f.serverContent("g").contains("urn:uuid:c"))
+        // A refreshed collection makes the fetch return the uploaded revisions.
+        f.recache()
+        assertEquals(success, f.sync(native))
+        assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "h")))
+        assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "g")))
     }
 
     @Test
