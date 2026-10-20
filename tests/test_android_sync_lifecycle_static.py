@@ -661,9 +661,11 @@ def test_dashboard_install_task_app_routes_to_android_apps_docs():
 
 def test_api21_lifecycle_observer_avoids_blocking_activity_polling():
     runtime = (ROOT / "android/app/src/androidTest/java/io/silentsuite/sync/ui/AccountDashboardRuntimeTest.kt").read_text(encoding="utf-8")
+    # The slice ends at the next test method, so it covers exactly this lifecycle method's body
+    # whatever method follows it in the file.
     lifecycle = runtime.split(
         "@Test fun requestedQueuedRunningSettlingAndTerminalStatesNeverFlashGenericAttention()", 1
-    )[1].split("@Test fun freshContactsGenerationFinishesBeforeChildDispatchOrCompletion()", 1)[0]
+    )[1].split("@Test fun ", 1)[0]
 
     assert lifecycle.count("scenario.onActivity") == 6
     assert lifecycle.count("addTextChangedListener") == 1
