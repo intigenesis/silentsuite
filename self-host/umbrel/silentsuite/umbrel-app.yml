@@ -2,7 +2,7 @@ manifestVersion: 2.0
 id: silentsuite
 category: files
 name: SilentSuite
-version: "0.5.11-dev"
+version: "0.5.14-dev.1"
 tagline: End-to-end encrypted calendar, contacts, tasks and notes
 description: >-
   SilentSuite keeps your calendar, contacts, tasks and notes end-to-end encrypted.

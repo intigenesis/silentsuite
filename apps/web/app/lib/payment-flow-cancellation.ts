@@ -36,7 +36,7 @@ export const BITCOIN_CANCELLATION_WARNING =
 export const PAYMENT_FLOW_CANCELLATION_MESSAGES: Record<PaymentFlowCancellationFailure, string> = {
   'bitcoin-acknowledgement-required': 'Confirm that you have not sent cryptocurrency before cancelling this cryptocurrency payment.',
   'invalid-cancellation-request': 'This payment could not be cancelled. Reload the page and try again.',
-  'payment-reconciliation-required': 'This payment is still being reconciled and cannot be cancelled yet. Wait for the provider update or contact support.',
+  'payment-reconciliation-required': 'This payment could not be cancelled. Contact support if cancellation remains blocked.',
   'provider-cancellation-failed': 'The payment provider would not cancel this payment. It may already have been paid. Wait for the provider update or contact support.',
   unavailable: 'Could not cancel the pending payment flow.',
 }
@@ -46,6 +46,11 @@ const KNOWN_FAILURES: ReadonlyArray<readonly [number, string, PaymentFlowCancell
   [400, 'bitcoin-cancellation-acknowledgement-required', 'bitcoin-acknowledgement-required'],
   [400, 'invalid-cancellation-request', 'invalid-cancellation-request'],
   [409, 'payment-reconciliation-required', 'payment-reconciliation-required'],
+  // Deliberate refusals that keep the flow: held/not cancellable, a different
+  // flow than the one displayed, and a flow still being finalized.
+  [409, 'flow-not-cancellable', 'payment-reconciliation-required'],
+  [409, 'payment-flow-changed', 'invalid-cancellation-request'],
+  [409, 'flow-finalization-pending', 'invalid-cancellation-request'],
   [502, 'provider-cancellation-failed', 'provider-cancellation-failed'],
 ]
 
@@ -75,9 +80,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
  * assertion at all, and an unproven flow carries it only if the user
  * acknowledged it anyway.
  */
-function cancellationBody(provider: PaymentFlowCancellationProvider, confirmNoBitcoinSent: boolean): string {
-  if (provider === 'stripe') return '{}'
-  return confirmNoBitcoinSent ? JSON.stringify({ confirmNoBitcoinSent: true }) : '{}'
+function cancellationBody(provider: PaymentFlowCancellationProvider, confirmNoBitcoinSent: boolean, expectedAuthorityId?: string): string {
+  const body: Record<string, unknown> = {}
+  if (provider !== 'stripe' && confirmNoBitcoinSent) body.confirmNoBitcoinSent = true
+  // Present only when Billing's current-flow reply named the authority, so a
+  // cancellation can never release a different flow than the one on screen.
+  if (expectedAuthorityId) body.expectedAuthorityId = expectedAuthorityId
+  return JSON.stringify(body)
 }
 
 export async function cancelPaymentFlow(params: {
@@ -85,6 +94,7 @@ export async function cancelPaymentFlow(params: {
   billingApiUrl: string
   provider: PaymentFlowCancellationProvider
   confirmNoBitcoinSent: boolean
+  expectedAuthorityId?: string
 }): Promise<PaymentFlowCancellationResult> {
   // A Bitcoin flow without a local acknowledgement is refused before any
   // request leaves the browser: the server would reject it anyway, and an
@@ -102,7 +112,7 @@ export async function cancelPaymentFlow(params: {
       method: 'POST',
       credentials: 'include',
       headers: { 'content-type': 'application/json' },
-      body: cancellationBody(params.provider, params.confirmNoBitcoinSent),
+      body: cancellationBody(params.provider, params.confirmNoBitcoinSent, params.expectedAuthorityId),
     })
     body = await response.json()
   } catch {

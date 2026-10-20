@@ -316,6 +316,8 @@
     <string name="journal_item_member_count">Member Count</string>
     <string name="journal_item_restore_action">Restore state</string>
     <string name="journal_item_restore_dialog_body">Successfully restored the entry to previous state.</string>
+    <string name="contact_restore_confirm_body">Restore this contact to the address book? It will sync to your other devices.</string>
+    <string name="contact_restore_read_only">This address book is read-only, so contacts cannot be restored into it.</string>
 
 
     <!-- PermissionsActivity -->
@@ -719,6 +721,9 @@
     <string name="settings_category_privacy_security_summary">Encryption and local privacy protections</string>
     <string name="settings_category_help">Help and troubleshooting</string>
     <string name="settings_category_help_summary">Advanced connection, certificate, language, and diagnostic options</string>
+    <string name="settings_recover_deleted_contacts">Recover deleted contacts</string>
+    <string name="settings_recover_deleted_contacts_summary">Choose an address book to view and restore deleted contacts</string>
+    <string name="settings_recover_deleted_contacts_none">No address books available</string>
     <string name="settings_category_advanced">Advanced</string>
     <string name="settings_category_advanced_summary">Proxy, certificates, language, logging, and debug information</string>
     <string name="settings_account_current">Current account</string>
