@@ -2,6 +2,7 @@ package io.silentsuite.sync.notes.edit
 
 import io.silentsuite.sync.notes.edit.PendingNotesStore.DiscardOutcome
 import io.silentsuite.sync.notes.edit.PendingNotesStore.Read
+import io.silentsuite.sync.notes.edit.PendingNotesStore.RemovalCheck
 import io.silentsuite.sync.notes.edit.PendingNotesStore.SaveOutcome
 import io.silentsuite.sync.notes.edit.PendingNotesStore.SendOutcome
 import org.junit.After
@@ -2090,16 +2091,18 @@ class PendingNotesStoreTest {
         assertEquals(1, Regex("""\bisDirectory\b""").findAll(code).count())
         assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(code).count())
         // The presence check is asked only where a check that failed cannot pass for an absence: isPresent and
-        // syncRemoval, which throw on UNKNOWN, four decisions that need ABSENT (a recovery problem stays; shownGone,
+        // syncRemoval, which throw on UNKNOWN, five decisions that need ABSENT (a recovery problem stays; shownGone,
         // for a clear and for a count of nothing; a file a discard permit names holds back; storeDirectories, for a
-        // notes-pending that holds no store), and createDirectory, which makes a level not shown PRESENT and lets
-        // mkdir decide.
+        // notes-pending that holds no store; a removal check's store folder that cannot be listed, which it never
+        // takes for gone), and createDirectory, which makes a level not shown PRESENT and lets mkdir decide.
         assertFalse(Regex("""==\s*Presence\.PRESENT\b|\bPresence\.PRESENT\s*==""").containsMatchIn(code))
-        assertEquals(8, Regex("""\bpresenceOf\(""").findAll(code).count())
+        assertEquals(9, Regex("""\bpresenceOf\(""").findAll(code).count())
         assertEquals(2, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
         assertEquals(3, Regex("""\) != Presence\.ABSENT\b""").findAll(code).count())
         assertEquals(1, Regex("""\?: presence\(root\)\) == Presence\.ABSENT\b""").findAll(code).count())
-        assertEquals("no other test for ABSENT", 4, Regex("""[=!]=\s*Presence\.ABSENT\b""").findAll(code).count())
+        assertEquals(1, Regex("""presenceOf\(dir\) == Presence\.ABSENT -> RemovalCheck\.UnlistedAbsent""")
+            .findAll(code).count())
+        assertEquals("no other test for ABSENT", 5, Regex("""[=!]=\s*Presence\.ABSENT\b""").findAll(code).count())
         assertEquals(2, Regex("""\) != Presence\.PRESENT\b""").findAll(code).count())
         // A clear returns only on its own check that the directory is gone, never on what the deletion answered.
         assertEquals(listOf("dir.deleteRecursively()"),
@@ -4238,6 +4241,437 @@ class PendingNotesStoreTest {
         assertThrows("a clear refused still closes the instance", IllegalStateException::class.java) { fresh.scan() }
         assertEquals(before, filesOf(s.dir))
         assertEquals("only the store's own folder was asked about", setOf(s.dir.path), asked)
+    }
+
+    // ---- what a removal of the account would lose, in one step, for a removal guard ----
+
+    @Test fun `a removal check of a store that lists is clean, covered by its permit, or blocked by what it holds`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup)
+        val reads = ArrayList<String>()
+        PendingNotesDiscardPermits.onReadForTesting = { reads += it.name }
+        assertEquals("a store never made", RemovalCheck.Clean, s.removalCheck())
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false, notebookCopy = blob("key b1"))
+        assertEquals(SendOutcome.Done, s.completeSend("n1", s.beginSend("n1")!!.version, "r1", blob("landed")))
+        assertEquals("the save showed the permit gone, so the send read none", emptyList<String>(), reads)
+        reads.clear()
+        assertEquals("the counter and a notebook copy hold no text", RemovalCheck.Clean, s.removalCheck())
+        assertEquals("and no permit is read for a store that holds nothing", emptyList<String>(), reads)
+
+        val v = saved(s.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false))
+        val held = UnsyncedNotes(1, v, false, names = notes("n2"))
+        assertEquals(RemovalCheck.Blocks(held), s.removalCheck())
+        assertEquals("its permit, by path", listOf("${s.dir.name}.permit"), reads)
+        // The permit a confirmed discard records for exactly that covers it, and the answer is the count's.
+        permitsOf(s).record(s.dir.name, held)
+        assertEquals(RemovalCheck.Covered, s.removalCheck())
+        assertEquals(held, s.unsynced())
+        // A store that cannot be counted is blocked too, unless a permit for that answer covers it.
+        File(s.dir, "n3.draft").writeBytes(blob("kept by a newer build"))
+        val uncounted = s.unsynced()
+        assertTrue(uncounted.unreadable)
+        assertEquals(RemovalCheck.Blocks(uncounted), s.removalCheck())
+        permitsOf(s).record(s.dir.name, uncounted)
+        assertEquals(RemovalCheck.Covered, s.removalCheck())
+        // A permit that cannot be read is none.
+        val permit = File(noBackup, "notes-discard/${s.dir.name}.permit")
+        assertTrue(permit.delete() && permit.mkdir())
+        assertEquals(RemovalCheck.Blocks(uncounted), s.removalCheck())
+    }
+
+    @Test fun `a permit recorded for less than the store holds now covers no removal`() {
+        val s = identityStore()
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val older = s.unsynced()
+        s.saveLocal("n1", "b1", "r2", blob("typed after"), isCreate = false)
+        // Recorded directly: a save removes the permit before it hands out a version, so after one there is none.
+        permitsOf(s).record(s.dir.name, older)
+        assertEquals(RemovalCheck.Blocks(s.unsynced()), s.removalCheck())
+        // Nor one at the same sequence that names a note less.
+        s.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        val now = s.unsynced()
+        permitsOf(s).record(s.dir.name, now.copy(count = 1, names = notes("n1")))
+        assertEquals(RemovalCheck.Blocks(now), s.removalCheck())
+    }
+
+    @Test fun `a store that cannot be listed is acknowledged, unlisted, or absent by its own check alone`() {
+        identifyDirectories()
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup)
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        unlisted(s)
+        val reads = ArrayList<String>()
+        PendingNotesDiscardPermits.onReadForTesting = { reads += it.name }
+        assertEquals(RemovalCheck.Unlisted, s.removalCheck())
+        assertEquals("no permit is read, and no acknowledgement by an instance that wrote since", emptyList<String>(),
+            reads)
+        assertEquals(DiscardOutcome.Acknowledged, s.discardStore(s.unsynced()))
+        assertEquals(RemovalCheck.Acknowledged, s.removalCheck())
+        assertTrue("never a permit", reads.none { it.endsWith(".permit") })
+        // A fresh instance, as after a restart, has listed nothing, so the acknowledgement holds for it as well.
+        PendingNotesStore.resetForTesting()
+        assertEquals(RemovalCheck.Acknowledged, identityStore(noBackup).removalCheck())
+        // Not for a directory that took its place, nor while the identity cannot be read.
+        val files = filesOf(s.dir)
+        replace(s.dir)
+        assertEquals(RemovalCheck.Unlisted, identityStore(noBackup).removalCheck())
+        PendingNotesStore.identityForTesting = { null }
+        assertEquals(RemovalCheck.Unlisted, identityStore(noBackup).removalCheck())
+        assertEquals("nothing in it changed", files, filesOf(s.dir))
+
+        // While notes-pending cannot be listed, a store folder that was never made is absent by its own check alone,
+        // which shows no directory gone, and one whose check fails is no absence.
+        val never = identityStore(noBackup, creationId = "gen-2")
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-pending") null else d.listFiles() }
+        assertEquals(RemovalCheck.UnlistedAbsent, never.removalCheck())
+        checksFailFor(never.dir.name)
+        assertEquals(RemovalCheck.Unlisted, never.removalCheck())
+        PendingNotesStore.presenceForTesting = null
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("shown gone once notes-pending lists", RemovalCheck.Clean, never.removalCheck())
+    }
+
+    @Test fun `an absent answer is ENOENT for the store's own path, asked under its lock, and writes nothing`() {
+        identifyDirectories()
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup)
+        // notes-pending is there but cannot be listed, and the store's own folder was never made.
+        assertTrue(File(noBackup, "notes-pending").mkdir())
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-pending") null else d.listFiles() }
+        PendingNotesDiscardPermits.beforeRecordForTesting = { throw AssertionError("a record of ${it.name}") }
+        PendingNotesDiscardPermits.beforeDeleteForTesting = { throw AssertionError("a withdrawal of ${it.name}") }
+        val reads = java.util.Collections.synchronizedList(ArrayList<String>())
+        PendingNotesDiscardPermits.onReadForTesting = { reads += it.name }
+        fun snapshot() = noBackup.walk().associate { f ->
+            f.relativeTo(noBackup).path to (if (f.isFile) f.readBytes().toList() else null)
+        }
+        val before = snapshot()
+        val path = PendingNotesStore.identityDir(noBackup, "io.silentsuite", "alice@example.invalid", "gen-1")
+            .canonicalPath
+        val caller = Thread.currentThread()
+        val asked = ArrayList<String>()
+        var other: Thread? = null
+        var blocked = false
+        PendingNotesStore.presenceForTesting = { f ->
+            if (Thread.currentThread() === caller) asked += f.canonicalPath
+            if (other == null) {
+                // Another caller of the same store while the presence check runs waits for the store lock.
+                val thread = kotlin.concurrent.thread { s.unsynced() }
+                other = thread
+                val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
+                while (thread.state != Thread.State.BLOCKED && thread.state != Thread.State.TERMINATED &&
+                        System.nanoTime() < deadline) Thread.sleep(1)
+                blocked = thread.state == Thread.State.BLOCKED
+            }
+            null
+        }
+        val answer = try {
+            s.removalCheck()
+        } finally {
+            other?.join(10_000)
+        }
+        assertEquals(RemovalCheck.UnlistedAbsent, answer)
+        assertTrue("the presence check ran under the store lock", blocked)
+        assertEquals("one check, of the store's own path", listOf(path), asked)
+        assertEquals("only its acknowledgement is read, by path, and no permit",
+            listOf("${s.dir.name}.acknowledgement"), reads)
+        assertEquals("nothing was written, made or withdrawn", before, snapshot())
+
+        // Any other answer for that path is no absence, and a check that throws is no answer.
+        for (presence in listOf(PendingNotesStore.Presence.PRESENT, PendingNotesStore.Presence.UNKNOWN)) {
+            PendingNotesStore.presenceForTesting = { f -> if (f.canonicalPath == path) presence else null }
+            assertEquals("$presence", RemovalCheck.Unlisted, s.removalCheck())
+        }
+        PendingNotesStore.presenceForTesting = { f ->
+            if (f.canonicalPath == path) throw SecurityException("denied") else null
+        }
+        assertThrows(SecurityException::class.java) { s.removalCheck() }
+        PendingNotesStore.presenceForTesting = null
+
+        // A discard in the same state, as sign-out's clear: no identity to bind an acknowledgement to, so nothing is
+        // recorded or deleted, and nothing is taken for gone.
+        val shown = s.unsynced()
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true, listed = false), shown)
+        assertEquals(DiscardOutcome.AcknowledgementNotRecorded, s.discardStore(shown))
+        assertEquals(DiscardOutcome.Changed(shown), s.discardStore(null))
+        assertEquals(before, snapshot())
+
+        // A regular file at the store's path is there, by the platform's own check.
+        File(path).writeBytes(blob("not a folder"))
+        assertEquals(RemovalCheck.Unlisted, s.removalCheck())
+    }
+
+    @Test fun `a removal check withdraws the acknowledgement of a store that lists, and writes and recovers nothing`() {
+        identifyDirectories()
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup)
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false, notebookCopy = blob("key b1"))
+        unlisted(s)
+        assertEquals(DiscardOutcome.Acknowledged, s.discardStore(s.unsynced()))
+        PendingNotesStore.listFilesForTesting = null
+        // Behind the store's back: an intact first write that recovery would commit.
+        val stranded = PendingEntry("n9", "b1", PendingEntry.State.UPSERT, 9, "r9", false, blob = blob("c"))
+        File(s.dir, "n9.note.new").writeBytes(PendingCodec.encodeEntry(stranded))
+        val before = filesOf(s.dir)
+        PendingNotesStore.resetForTesting()
+        val fresh = identityStore(noBackup)
+        assertEquals(RemovalCheck.Blocks(UnsyncedNotes(2, 1, false, names = notes("n1", "n9"))), fresh.removalCheck())
+        assertNull("withdrawn, as a count withdraws it", permitsOf(s).acknowledgement(s.dir.name))
+        assertFalse(fresh.acknowledged())
+        assertEquals("no recovery ran and nothing was written in the store", before, filesOf(s.dir))
+    }
+
+    @Test fun `while the acknowledgement cannot be shown gone, an empty store says so, and text is still counted`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val v = saved(identityStore(noBackup).saveLocal("n1", "b1", "r1", blob("a"), isCreate = false))
+        val covered = identityStore(noBackup, creationId = "gen-3")
+        covered.saveLocal("n1", "b1", "r1", blob("b"), isCreate = false)
+        // The permit is there, so notes-discard is too.
+        covered.coverForTesting()
+        PendingNotesStore.resetForTesting()
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-discard") null else d.listFiles() }
+        assertEquals("a store never made", RemovalCheck.NothingUnwithdrawn,
+            identityStore(noBackup, creationId = "gen-2").removalCheck())
+        val s = identityStore(noBackup)
+        assertEquals(RemovalCheck.Blocks(UnsyncedNotes(1, v, false, names = notes("n1"))), s.removalCheck())
+        assertEquals("its permit is read by path", RemovalCheck.Covered,
+            identityStore(noBackup, creationId = "gen-3").removalCheck())
+        assertFalse("and the acknowledgement is taken for valid no more", s.acknowledged())
+        // Once notes-discard lists, the same instances withdraw it and answer as before.
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals(RemovalCheck.Clean, identityStore(noBackup, creationId = "gen-2").removalCheck())
+    }
+
+    @Test fun `a folder that lists and holds no text is NothingUnwithdrawn while notes-discard cannot be listed`() {
+        val noBackup = tmp.newFolder("no_backup")
+        // A store whose last change was pushed, which keeps only its counter and a notebook copy, and an empty folder.
+        val pushed = identityStore(noBackup)
+        pushed.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false, notebookCopy = blob("key b1"))
+        assertEquals(SendOutcome.Done,
+            pushed.completeSend("n1", pushed.beginSend("n1")!!.version, "r1", blob("landed")))
+        assertEquals(setOf("sequence", "b1.notebook"), filesOf(pushed.dir).keys)
+        assertTrue(PendingNotesStore.identityDir(noBackup, "io.silentsuite", "alice@example.invalid", "gen-2").mkdir())
+        // notes-discard is there, as after a permit that came and went, and cannot be listed.
+        assertTrue(File(noBackup, PendingNotesDiscardPermits.ROOT).mkdir())
+        PendingNotesStore.resetForTesting()
+        val listed = ArrayList<String>()
+        PendingNotesStore.listFilesForTesting = { d ->
+            listed += d.name
+            if (d.name == PendingNotesDiscardPermits.ROOT) null else d.listFiles()
+        }
+        val reads = ArrayList<String>()
+        PendingNotesDiscardPermits.onReadForTesting = { reads += it.name }
+        val before = treeOf(noBackup)
+        val stores = listOf("gen-1", "gen-2").map { identityStore(noBackup, creationId = it) }
+        for (s in stores) {
+            listed.clear()
+            assertEquals(RemovalCheck.NothingUnwithdrawn, s.removalCheck())
+            assertEquals("counted from its own listing, which worked", s.dir.name, listed.first())
+        }
+        assertEquals("no permit is read", emptyList<String>(), reads)
+        assertEquals("nothing changes", before, treeOf(noBackup))
+        // A count of the same stores, as the Unsynced Notes screen asks, could not be counted, and names nothing.
+        for (s in stores) {
+            val shown = s.unsynced()
+            assertTrue(shown.unreadable && shown.listed && shown.count == 0 && shown.names.isEmpty())
+        }
+    }
+
+    @Test fun `a dropped store refuses a removal check, and a cleared one still answers from what is on disk`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        PendingNotesStore.beforeClearForTesting = { throw java.io.IOException("could not clear the pending store") }
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        PendingNotesStore.beforeClearForTesting = null
+        assertEquals("what the failed clear left", RemovalCheck.Blocks(store.unsynced()), store.removalCheck())
+        store.clearAll()
+        assertEquals(RemovalCheck.Clean, store.removalCheck())
+
+        val other = open(tmp.newFolder("other"))
+        other.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        assertEquals(DiscardOutcome.Done, other.discardStore(other.unsynced()))
+        other.unregister()
+        assertThrows(IllegalStateException::class.java) { other.removalCheck() }
+    }
+
+    /**
+     * Store A's folder made a link to [target], given store B beside it, which holds a saved note. A's removal check
+     * lists nothing, reads no permit, records and withdraws nothing, and changes nothing on disk, B and the target
+     * included: it is Unlisted, never Clean, Blocks or UnlistedAbsent, and Acknowledged once A is acknowledged, for the
+     * link's own identity, in a new instance as well.
+     */
+    private fun assertRemovalCheckNeverFollowsLink(target: (PendingNotesStore) -> File) {
+        identifyWithoutFollowing()
+        val noBackup = tmp.newFolder("no_backup")
+        val b = identityStore(noBackup, creationId = "gen-2")
+        b.saveLocal("n1", "b1", "r1", blob("B's own note"), isCreate = false, notebookCopy = blob("key b1"))
+        val to = target(b)
+        val folder = PendingNotesStore.identityDir(noBackup, "io.silentsuite", "alice@example.invalid", "gen-1")
+        linked(folder, to)
+        fun check(expected: RemovalCheck) {
+            val listed = ArrayList<String>()
+            val read = ArrayList<String>()
+            PendingNotesStore.listFilesForTesting = { d -> listed += d.path; d.listFiles() }
+            PendingNotesDiscardPermits.onReadForTesting = { read += it.name }
+            PendingNotesDiscardPermits.beforeRecordForTesting = { throw AssertionError("a record of ${it.name}") }
+            PendingNotesDiscardPermits.beforeDeleteForTesting = { throw AssertionError("a withdrawal of ${it.name}") }
+            val before = treeOf(noBackup) + treeOf(to)
+            assertEquals(expected, identityStore(noBackup).removalCheck())
+            assertEquals("nothing is listed", emptyList<String>(), listed)
+            assertEquals("no permit is read, only the link's own acknowledgement",
+                listOf(folder.name + ".acknowledgement"), read)
+            assertEquals("nothing changes on disk", before, treeOf(noBackup) + treeOf(to))
+            PendingNotesStore.listFilesForTesting = null
+            PendingNotesDiscardPermits.onReadForTesting = null
+            PendingNotesDiscardPermits.beforeRecordForTesting = null
+            PendingNotesDiscardPermits.beforeDeleteForTesting = null
+        }
+        check(RemovalCheck.Unlisted)
+        val a = identityStore(noBackup)
+        assertEquals(DiscardOutcome.Acknowledged, a.discardStore(a.unsynced()))
+        check(RemovalCheck.Acknowledged)
+        PendingNotesStore.resetForTesting()
+        check(RemovalCheck.Acknowledged)
+        assertTrue("the link is still a link", Files.isSymbolicLink(folder.toPath()))
+    }
+
+    @Test fun `a removal check of a store folder that is a link to another store is unlisted until acknowledged`() =
+        assertRemovalCheckNeverFollowsLink { b -> b.dir }
+
+    @Test fun `a removal check of a store folder that is a link to a file is unlisted until acknowledged`() =
+        assertRemovalCheckNeverFollowsLink { tmp.newFile("plain").also { it.writeBytes(blob("not a store")) } }
+
+    @Test fun `a removal check of a store folder that is a link to nothing is unlisted until acknowledged`() =
+        assertRemovalCheckNeverFollowsLink { File(tmp.root, "missing") }
+
+    @Test fun `a removal check of a store folder whose lstat cannot tell lists, reads and withdraws nothing`() {
+        identifyDirectories()
+        val noBackup = tmp.newFolder("no_backup")
+        // Followed, these would be Blocks, Clean, and absent by lstat under a notes-pending that cannot be listed.
+        identityStore(noBackup).saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val clean = identityStore(noBackup, creationId = "gen-2")
+        clean.saveLocal("n1", "b1", "r1", blob("b"), isCreate = false, notebookCopy = blob("key b1"))
+        assertEquals(SendOutcome.Done, clean.completeSend("n1", clean.beginSend("n1")!!.version, "r1", blob("landed")))
+        PendingNotesStore.resetForTesting()
+        val stores = listOf("gen-1", "gen-2", "gen-3").map { identityStore(noBackup, creationId = it) }
+        val listed = ArrayList<String>()
+        PendingNotesStore.listFilesForTesting = { d ->
+            listed += d.path
+            if (d.name == "notes-pending") null else d.listFiles()
+        }
+        val read = ArrayList<String>()
+        PendingNotesDiscardPermits.onReadForTesting = { read += it.name }
+        val asked = HashSet<String>()
+        PendingNotesStore.linkForTesting = { d -> asked += d.path; null }
+        fun check(s: PendingNotesStore, expected: RemovalCheck) {
+            listed.clear()
+            read.clear()
+            PendingNotesDiscardPermits.beforeRecordForTesting = { throw AssertionError("a record of ${it.name}") }
+            PendingNotesDiscardPermits.beforeDeleteForTesting = { throw AssertionError("a withdrawal of ${it.name}") }
+            val before = treeOf(noBackup)
+            assertEquals(s.dir.name, expected, s.removalCheck())
+            assertEquals("nothing is listed", emptyList<String>(), listed)
+            assertEquals("no permit is read", listOf(s.dir.name + ".acknowledgement"), read)
+            assertEquals("nothing changes on disk", before, treeOf(noBackup))
+            PendingNotesDiscardPermits.beforeRecordForTesting = null
+            PendingNotesDiscardPermits.beforeDeleteForTesting = null
+        }
+        for (s in stores) check(s, RemovalCheck.Unlisted)
+        // The acknowledgement holds for each folder that is there; the one never made has no identity to bind it to.
+        val outcomes = stores.map { it.discardStore(it.unsynced()) }
+        assertEquals(listOf(DiscardOutcome.Acknowledged, DiscardOutcome.Acknowledged,
+            DiscardOutcome.AcknowledgementNotRecorded), outcomes)
+        check(stores[0], RemovalCheck.Acknowledged)
+        check(stores[1], RemovalCheck.Acknowledged)
+        check(stores[2], RemovalCheck.Unlisted)
+        assertEquals("only the stores' own folders were asked about", stores.map { it.dir.path }.toSet(), asked)
+
+        // Once lstat tells, each folder is followed again.
+        PendingNotesStore.linkForTesting = null
+        assertTrue(stores[0].removalCheck() is RemovalCheck.Blocks)
+        assertEquals(RemovalCheck.Clean, stores[1].removalCheck())
+        assertEquals(RemovalCheck.UnlistedAbsent, stores[2].removalCheck())
+    }
+
+    @Test fun `coverForTesting covers what the store holds without closing it, and the next version withdraws it`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup)
+        assertEquals("nothing to cover", UnsyncedNotes.NOTHING, s.coverForTesting())
+        assertFalse("and no permit", File(noBackup, "notes-discard").exists())
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val before = filesOf(s.dir)
+        val now = s.coverForTesting()
+        assertEquals(s.unsynced(), now)
+        assertEquals(now, permitsOf(s).read(s.dir.name))
+        assertEquals(RemovalCheck.Covered, s.removalCheck())
+        assertEquals("nothing was deleted", before, filesOf(s.dir))
+        // This instance withdrew its permit once, at its first save; covering makes it withdraw again.
+        assertTrue("open", s.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false) is SaveOutcome.Saved)
+        assertNull(permitsOf(s).read(s.dir.name))
+        assertEquals(RemovalCheck.Blocks(s.unsynced()), s.removalCheck())
+    }
+
+    @Test fun `no main code covers a store with no confirmation`() {
+        val main = File("src/main/java")
+        val naming = main.walk().filter { it.isFile && it.extension in setOf("kt", "java") }.flatMap { file ->
+            file.readLines().map { it.trim() }.filter { line ->
+                "coverForTesting" in line && !line.startsWith("*") && !line.startsWith("/*") && !line.startsWith("//")
+            }.map { file.name to it }
+        }.toList()
+        val definition = "internal fun coverForTesting(): UnsyncedNotes = synchronized(lock) {"
+        assertEquals("only its definition", listOf("PendingNotesStore.kt" to definition), naming)
+    }
+
+    @Test fun `a folder counter moves on a listing of its folder that works or when shown gone, and on nothing else`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val pending = File(noBackup, "notes-pending")
+        val discard = File(noBackup, PendingNotesDiscardPermits.ROOT)
+        fun counts() = NotesFolderListings.Folder.entries.map { NotesFolderListings.count(it) }
+        var last = counts()
+        /** How far each counter moved since the last call: notes-pending's, then notes-discard's. */
+        fun moved(): List<Long> = counts().let { now -> now.zip(last) { a, b -> a - b }.also { last = now } }
+
+        // Shown not to be there, each moves its own, and a store folder shown gone with notes-pending moves that one.
+        assertTrue(PendingNotesStore.knownAbsent(pending))
+        assertEquals(listOf(1L, 0L), moved())
+        assertTrue(PendingNotesStore.knownAbsent(discard))
+        assertEquals(listOf(0L, 1L), moved())
+        val folder = File(pending, "0".repeat(64))
+        assertTrue(PendingNotesStore.knownAbsent(folder))
+        assertEquals(listOf(1L, 0L), moved())
+
+        // There: a check that shows it there moves nothing, and each listing that works moves its folder's once.
+        assertTrue(folder.mkdirs() && discard.mkdir())
+        assertFalse(PendingNotesStore.knownAbsent(pending))
+        assertEquals(listOf(0L, 0L), moved())
+        assertNotNull(PendingNotesStore.listDirectory(pending))
+        assertEquals(listOf(1L, 0L), moved())
+        assertNotNull(PendingNotesStore.listDirectory(discard))
+        assertEquals(listOf(0L, 1L), moved())
+        assertEquals(listOf(folder.name), PendingNotesStore.storeDirectories(noBackup).stores)
+        assertEquals(listOf(1L, 0L), moved())
+        val permits = PendingNotesDiscardPermits(discard, {}, atomicMove, PendingNotesStore.nioPresence)
+        assertEquals(emptySet<String>(), permits.listNames())
+        assertEquals(listOf(0L, 1L), moved())
+        // A store folder's own listing, and a store folder shown gone while notes-pending lists, move nothing else.
+        assertNotNull(PendingNotesStore.listDirectory(folder))
+        assertEquals(listOf(0L, 0L), moved())
+        assertTrue(PendingNotesStore.knownAbsent(File(pending, "1".repeat(64))))
+        assertEquals("the listing of notes-pending only", listOf(1L, 0L), moved())
+
+        // A listing that fails moves nothing; one the seam answers is a listing that worked.
+        PendingNotesStore.listFilesForTesting = { null }
+        assertNull(PendingNotesStore.listDirectory(pending))
+        assertNull(PendingNotesStore.listDirectory(discard))
+        assertFalse(PendingNotesStore.knownAbsent(folder))
+        assertEquals(listOf(0L, 0L), moved())
+        PendingNotesStore.listFilesForTesting = { d -> d.listFiles() }
+        assertNotNull(PendingNotesStore.listDirectory(pending))
+        assertEquals(listOf(1L, 0L), moved())
+    }
+
+    @Test fun `presenceOnDevice answers what the presence seam says first`() {
+        PendingNotesStore.presenceForTesting = { f -> if (f == tmp.root) PendingNotesStore.Presence.UNKNOWN else null }
+        assertEquals(PendingNotesStore.Presence.UNKNOWN, PendingNotesStore.presenceOnDevice(tmp.root))
     }
 
     @Test fun `a dropped store refuses everything, and the next open starts empty and takes a save`() {

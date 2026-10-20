@@ -156,6 +156,31 @@ internal class PendingNotesDiscardPermits(
      */
     fun withdrawAcknowledgement(store: String) = delete(acknowledgementFile(store), "the acknowledgement of $store")
 
+    /**
+     * The store folders the root holds a record of, each once, by its folder's name (the names
+     * [PendingNotesStore.storeDirectories] keeps): from every "<store>.permit" and "<store>.acknowledgement", and from
+     * a write of either that was never committed ("<name>.new"). Any other name is left out. Decided from one listing
+     * of the root, by name alone, so no record is read. A root shown not to be there by two checks that agree, as a
+     * store's own folder is ([PendingNotesStore.knownAbsent], and its presence check answers absent), holds none; a
+     * listing that fails otherwise answers null, never none.
+     */
+    fun listNames(): Set<String>? {
+        val listed = PendingNotesStore.listDirectory(root)
+        if (listed == null) {
+            val gone = PendingNotesStore.knownAbsent(root) && presenceOf(root) == PendingNotesStore.Presence.ABSENT
+            return if (gone) emptySet() else null
+        }
+        return listed.mapNotNullTo(sortedSetOf()) { storeOf(it.name) }
+    }
+
+    /** The store folder that a record named [name] is for, or null when it is no record of a store folder. */
+    private fun storeOf(name: String): String? {
+        val committed = name.removeSuffix(NEW)
+        val store = listOf(PERMIT, ACKNOWLEDGEMENT).firstOrNull { committed.endsWith(it) }
+            ?.let { committed.removeSuffix(it) }
+        return store?.takeIf { PendingNotesStore.STORE_DIRECTORY.matches(it) }
+    }
+
     private fun write(target: File, bytes: ByteArray) {
         val tmp = File(root, target.name + NEW)
         try {
