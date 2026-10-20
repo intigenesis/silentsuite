@@ -742,10 +742,10 @@ internal class PendingNotesStore private constructor(
     // ---- the whole store ----
 
     /**
-     * Sign-out: everything for this identity goes. The closed instance stays registered for the rest of
-     * the process, so a late save that opens the store again gets this instance and is refused instead
-     * of recreating the directory. The identity (account generation) never comes back after sign-out. A
-     * call after a failed one tries the deletion again, so a sign-out cleanup retry does real work.
+     * Test teardown only: everything for this identity goes, with no count, confirmation or permit, so no
+     * production code calls it. Sign-out clears through [discardStore]. The closed instance stays registered
+     * for the rest of the process, so a late save that opens the store again gets this instance and is
+     * refused instead of recreating the directory. A call after a failed one tries the deletion again.
      *
      * It returns only once the directory is shown gone by two checks that agree ([shownGone]). Otherwise it
      * throws IOException, whatever the deletion answered, since the deletion counts a file it could not

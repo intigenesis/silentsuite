@@ -118,6 +118,17 @@ internal class AndroidCurrentAccountSignOut(
 
     override fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes = pendingNotes(main).unsynced()
 
+    /**
+     * Keyed by the exact generation, so a same-name account that replaced this one has a store of its own,
+     * which this never touches. A cleared instance stays registered for the rest of the process, unless the
+     * removal then fails and [reopenPendingNotes] drops it, so a save or a run that reaches the store of a
+     * removed account later is refused and does not bring the directory back.
+     */
+    override fun discardPendingNotes(main: ExactAccountIdentity, confirmed: UnsyncedNotes?) =
+        pendingNotes(main).discardStore(confirmed)
+
+    override fun reopenPendingNotes(main: ExactAccountIdentity) = pendingNotes(main).unregister()
+
     override fun close() {
         runCatching { manager.removeOnAccountsUpdatedListener(accountListener) }
     }
@@ -175,7 +186,9 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
     fun owns(account: Account, creationId: String) =
         exactAccount == ExactAccountIdentity(account.type, account.name, creationId)
 
-    fun hasStarted() = coordinator?.state?.let { it !is CurrentAccountSignOutState.Idle } == true
+    fun hasStarted() = coordinator?.state?.let {
+        it !is CurrentAccountSignOutState.Idle && it !is CurrentAccountSignOutState.Refused
+    } == true
 
     fun ownsCurrentGeneration() = exactAccount?.let { identity ->
         coordinator?.isMainGenerationPresent(identity)
@@ -202,6 +215,13 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
      */
     internal fun unsyncedNotes(): UnsyncedNotes =
         exactAccount?.let { coordinator?.unsyncedNotes(it) } ?: UnsyncedNotes.NOTHING
+
+    /** Passes the separate discard confirmation for [shown] on to the coordinator. Does nothing before [initialize]. */
+    internal fun confirmNotesDiscard(shown: UnsyncedNotes) {
+        exactAccount?.let { coordinator?.confirmNotesDiscard(it, shown) }
+    }
+
+    internal fun acknowledgeRefusal() { coordinator?.acknowledgeRefusal() }
 
     override fun onCleared() {
         coordinator?.close()

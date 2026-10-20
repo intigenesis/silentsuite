@@ -701,8 +701,11 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     /**
      * The sign-out question with the words it had before, asked when the store's answer, read right
-     * before, was nothing. Its button starts the sign-out without reading the store again. Its
-     * Cancel and a canceled dialog are reported like the ends of the two unsynced-changes dialogs.
+     * before, was nothing. Its button asks the coordinator for the sign-out. The screen does not read
+     * the store again there: the coordinator counts it before anything is canceled and again under
+     * the store's lock before it clears it, and a sign-out it refuses comes back as
+     * [CurrentAccountSignOutState.Refused]. Its Cancel and a canceled dialog are reported like the
+     * ends of the two unsynced-changes dialogs.
      */
     private fun confirmPlainLogout() {
         MaterialAlertDialogBuilder(this)
@@ -750,7 +753,10 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
             is UnsyncedNotesSignOutPolicy.Next.ShowDiscard ->
                 showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.DISCARD, next.unsynced)
             UnsyncedNotesSignOutPolicy.Next.SyncNotes -> syncNotesBeforeSignOut(identity)
-            is UnsyncedNotesSignOutPolicy.Next.ConfirmAndSignOut -> signOutModel.begin()
+            is UnsyncedNotesSignOutPolicy.Next.ConfirmAndSignOut -> {
+                signOutModel.confirmNotesDiscard(next.shown)
+                signOutModel.begin()
+            }
         }
     }
 
@@ -789,13 +795,14 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
     }
 
     /**
-     * Retry from the failure message. After a failed removal the store is read again and, when it
-     * holds anything, the count is shown before a new try. After a failed cleanup the retry starts
-     * at once and shows no dialog.
+     * Retry from the failure message. After a failed removal or a clear of the Notes store that
+     * stopped, the coordinator has withdrawn the discard confirmation, so the store is read again
+     * and, when it holds anything, the count is shown before a new try. After a failed cleanup the
+     * retry starts at once and shows no dialog.
      */
     private fun retrySignOut(failed: CurrentAccountSignOutState) {
-        val unsynced = if (failed is CurrentAccountSignOutState.RemovalFailed) signOutModel.unsyncedNotes()
-            else UnsyncedNotes.NOTHING
+        val unsynced = if (failed is CurrentAccountSignOutState.CleanupFailed) UnsyncedNotes.NOTHING
+            else signOutModel.unsyncedNotes()
         if (unsynced.anything) showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, unsynced)
         else signOutModel.begin()
     }
@@ -805,13 +812,22 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
      * for another account, or a dialog that could not be shown. When the last attempt failed, the
      * failure message with Retry is shown again: a tap on Retry closes it and [confirmLogout]
      * dismisses it. [attachRetainedSignOut] sets the layout and renders the sign-out state and wires
-     * up nothing else, so on the retained sign-out screen that message is the way to try again.
+     * up nothing else, so on the retained sign-out screen that message is the way to try again. When
+     * that screen's state is idle, which it is only after an acknowledged refusal, there is no
+     * failure message to show again, and the activity is created again.
      */
     internal fun onSignOutDialogClosedWithoutSignOut() {
         val state = signOutModel.currentState() ?: return
-        if (state is CurrentAccountSignOutState.RemovalFailed || state is CurrentAccountSignOutState.CleanupFailed) {
+        if (state is CurrentAccountSignOutState.RemovalFailed || state is CurrentAccountSignOutState.NotesClearFailed ||
+            state is CurrentAccountSignOutState.CleanupFailed) {
             renderedSignOutErrorId = 0
             renderSignOutState(state)
+        } else if (signOutOnly && state is CurrentAccountSignOutState.Idle) {
+            // The retained screen is idle only after a refused sign-out was acknowledged, so no
+            // failure is left to show and no removal is under way. This screen renders sign-out
+            // states only, so the activity is created again. hasStarted() is false for idle, so
+            // onCreate does not take the retained path.
+            recreate()
         }
     }
 
@@ -854,16 +870,25 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
         invalidateOptionsMenu()
         findViewById<NavigationView>(R.id.nav_view).menu.findItem(R.id.nav_logout)?.isEnabled =
             state !is CurrentAccountSignOutState.Removing && state !is CurrentAccountSignOutState.CleaningUp
+        if (state is CurrentAccountSignOutState.Refused) {
+            // Not a failure: the Notes store holds what no confirmation covers, and nothing was
+            // removed or cleared. The refusal is acknowledged first, then the sign-out question is
+            // asked again from the start: the count while the store holds anything, else the plain
+            // question.
+            signOutModel.acknowledgeRefusal()
+            confirmLogout()
+            return
+        }
         val errorId = when (state) {
             is CurrentAccountSignOutState.RemovalFailed -> state.errorId
+            is CurrentAccountSignOutState.NotesClearFailed -> state.errorId
             is CurrentAccountSignOutState.CleanupFailed -> state.errorId
             else -> null
         }
         if (errorId != null && errorId > renderedSignOutErrorId) {
             renderedSignOutErrorId = errorId
             signOutErrorSnackbar?.dismiss()
-            val message = if (state is CurrentAccountSignOutState.CleanupFailed)
-                R.string.account_sign_out_cleanup_failed else R.string.account_sign_out_failed
+            val message = UnsyncedNotesSignOutPolicy.failureMessage(state)
             signOutErrorSnackbar = Snackbar.make(findViewById(R.id.coordinator), message, Snackbar.LENGTH_INDEFINITE)
                 .setAction(R.string.retry) { retrySignOut(state) }.also { it.show() }
         }

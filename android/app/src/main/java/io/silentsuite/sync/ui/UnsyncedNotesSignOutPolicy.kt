@@ -1,12 +1,14 @@
 package io.silentsuite.sync.ui
 
+import androidx.annotation.StringRes
+import io.silentsuite.sync.R
 import io.silentsuite.sync.notes.edit.UnsyncedNotes
 
 /**
  * What the sign-out screen does next, decided from the answer to a dialog and from what the caller
- * passes as the store's answer at that moment. Pure, so the rule can be tested without a screen: of
- * the three answers only DISCARD, the answer to the separate discard confirmation, gives
- * [Next.ConfirmAndSignOut].
+ * passes as the store's answer at that moment, and what it says when a sign-out stops. Pure, so the
+ * rules can be tested without a screen: of the three answers only DISCARD, the answer to the separate
+ * discard confirmation, gives [Next.ConfirmAndSignOut].
  */
 internal object UnsyncedNotesSignOutPolicy {
     enum class Step { COUNT, DISCARD }
@@ -20,7 +22,7 @@ internal object UnsyncedNotesSignOutPolicy {
         /** Step 2: the separate discard confirmation, shown for [unsynced]. */
         data class ShowDiscard(val unsynced: UnsyncedNotes) : Next()
         object SyncNotes : Next()
-        /** The DISCARD answer was accepted. [shown] is what its dialog showed. */
+        /** The DISCARD answer was accepted. [shown] is what its dialog showed: confirm that, then sign out. */
         data class ConfirmAndSignOut(val shown: UnsyncedNotes) : Next()
     }
 
@@ -30,6 +32,14 @@ internal object UnsyncedNotesSignOutPolicy {
         data class Counted(val count: Int) : Text()
         /** That the changes could not be counted. */
         object Uncounted : Text()
+        /**
+         * That the store could not be listed ([UnsyncedNotes.listed] false). A confirmation given for it deletes
+         * nothing and is only an acknowledgement (the store's DiscardOutcome.Acknowledged), so its words never call
+         * it a discard, never say that anything will be deleted or removed, and name no sign-out on a button. They
+         * say that nothing will be deleted, that the account stays signed in, and that unsynced Notes text may
+         * remain on this device and may no longer sync.
+         */
+        object Unlisted : Text()
     }
 
     /** The user asked to sign out: the count when [now] holds anything, else the plain question. */
@@ -49,10 +59,40 @@ internal object UnsyncedNotesSignOutPolicy {
     }
 
     /**
-     * What the dialogs say for [shown]: the number of changes while they were counted, else that they could
-     * not be counted. A count of zero is never shown: the dialogs are asked only for an answer that holds
+     * What the dialogs say for [shown]: that the store could not be listed, whatever else the answer holds, since a
+     * confirmation given for it deletes nothing; else the number of changes while they were counted, else that they
+     * could not be counted. A count of zero is never shown: the dialogs are asked only for an answer that holds
      * anything, and one that holds no counted change could not be counted.
      */
-    fun text(shown: UnsyncedNotes): Text =
-        if (shown.unreadable || shown.count <= 0) Text.Uncounted else Text.Counted(shown.count)
+    fun text(shown: UnsyncedNotes): Text = when {
+        !shown.listed -> Text.Unlisted
+        shown.unreadable || shown.count <= 0 -> Text.Uncounted
+        else -> Text.Counted(shown.count)
+    }
+
+    /**
+     * The words of the failure message with Retry for a sign-out that ended in [failed]: a removal that failed,
+     * a clear of the Notes store that did not finish, or a cleanup that failed. When the store held changes the
+     * user confirmed for discard and was cleared, or its clear stopped partway, the usual words, that the local
+     * data were preserved, would be false. A clear that stopped with no confirmed changes, and a removal that
+     * failed after a clear of none, say only that the account was kept: the store, or part of it, may be gone, and
+     * a clear an earlier confirmed attempt stopped may have deleted changes the count no longer shows. Only a
+     * removal that failed before any clear keeps the usual words. A store that could not be listed had nothing
+     * deleted, and the confirmation was only an acknowledgement: the words say that, and that unsynced text may
+     * remain on this device and may no longer sync, and never call it a discard or say that changes may already
+     * be deleted.
+     */
+    @StringRes
+    fun failureMessage(failed: CurrentAccountSignOutState): Int = when {
+        failed is CurrentAccountSignOutState.CleanupFailed -> R.string.account_sign_out_cleanup_failed
+        failed is CurrentAccountSignOutState.NotesClearFailed && failed.acknowledgement != null ->
+            R.string.notes_sign_out_stopped_nothing_deleted
+        failed is CurrentAccountSignOutState.NotesClearFailed && failed.notesDiscarded ->
+            R.string.notes_sign_out_stopped
+        failed is CurrentAccountSignOutState.NotesClearFailed -> R.string.notes_sign_out_stopped_kept
+        failed is CurrentAccountSignOutState.RemovalFailed && failed.notesDiscarded -> R.string.notes_sign_out_stopped
+        failed is CurrentAccountSignOutState.RemovalFailed && failed.notesCleared ->
+            R.string.notes_sign_out_stopped_kept
+        else -> R.string.account_sign_out_failed
+    }
 }

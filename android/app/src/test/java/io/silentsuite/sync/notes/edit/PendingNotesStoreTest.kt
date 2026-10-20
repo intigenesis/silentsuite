@@ -3608,12 +3608,28 @@ class PendingNotesStoreTest {
         assertEquals(1, next.unsynced().count)
     }
 
-    @Test fun `nothing outside the pending store's package calls discardStore yet`() {
-        // A discard deletes unsynced text, so each caller comes with a change and a review of its own.
+    @Test fun `outside the pending store's package only the sign-out seam calls discardStore`() {
+        // A discard deletes unsynced text, so each caller comes with a change and a review of its own. Any code
+        // line that names the function counts, so a call inside a scope function or a reference is found too;
+        // comment and KDoc lines, which only link to it, do not.
         val main = File("src/main/java")
-        val mentions = main.walk().filter { it.isFile && it.extension in setOf("kt", "java") }
-            .filter { "discardStore" in it.readText() }.map { it.relativeTo(main).invariantSeparatorsPath }.toList()
-        assertTrue("the store defines it", "io/silentsuite/sync/notes/edit/PendingNotesStore.kt" in mentions)
-        assertEquals(emptyList<String>(), mentions.filterNot { it.startsWith("io/silentsuite/sync/notes/edit/") })
+        fun callersOf(name: String): List<String> {
+            val word = Regex("\\b$name\\b")
+            return main.walk().filter { it.isFile && it.extension in setOf("kt", "java") }
+                .filter { file ->
+                    file.readLines().any { line ->
+                        val code = line.trim()
+                        !code.startsWith("*") && !code.startsWith("/*") && !code.startsWith("//") &&
+                            word.containsMatchIn(line)
+                    }
+                }
+                .map { it.relativeTo(main).invariantSeparatorsPath }
+                .filterNot { it.startsWith("io/silentsuite/sync/notes/edit/") }.toList()
+        }
+        assertTrue("the store defines it",
+            File(main, "io/silentsuite/sync/notes/edit/PendingNotesStore.kt").readText().contains("fun discardStore("))
+        assertEquals(listOf("io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt"), callersOf("discardStore"))
+        assertEquals(listOf("io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt"), callersOf("unregister"))
+        assertEquals("clearAll is for test teardown only", emptyList<String>(), callersOf("clearAll"))
     }
 }

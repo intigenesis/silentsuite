@@ -12,7 +12,10 @@ import io.silentsuite.sync.notes.edit.UnsyncedNotes
  * The two dialogs the account screen shows before a sign-out while Notes changes have not synced.
  * Step 1 shows how many changes have not synced, or that they could not be counted, with Sync now,
  * Cancel and a third action to go on without syncing. Step 2 asks for the separate confirmation of
- * the discard. The dialog keeps the exact account generation and all of the answer it showed, the
+ * the discard. For a store that could not be listed, where a confirmation deletes nothing and is only
+ * an acknowledgement, both steps have words of their own ([UnsyncedNotesSignOutPolicy.Text.Unlisted]):
+ * none of them calls it a discard or says that anything will be deleted, and no button names a sign-out.
+ * The dialog keeps the exact account generation and all of the answer it showed, the
  * names that answer was counted from included, in its arguments, and sends both with every answer,
  * so the screen can turn away an answer for another account. It
  * decides nothing itself: an answer goes to the account screen that hosts it, and so do Cancel and
@@ -33,6 +36,11 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
             (activity as? AccountActivity)?.onSignOutDialogClosedWithoutSignOut()
         }
         val text = UnsyncedNotesSignOutPolicy.text(shown)
+        // A store that could not be listed: a confirmation deletes nothing, so no word of a discard is used for it.
+        val unlisted = text == UnsyncedNotesSignOutPolicy.Text.Unlisted
+        val goOn = if (unlisted) R.string.notes_continue_without_syncing else R.string.notes_sign_out_without_syncing
+        val confirmTitle = if (unlisted) R.string.notes_acknowledge_title else R.string.notes_discard_title
+        val confirm = if (unlisted) R.string.notes_acknowledge_continue else R.string.notes_discard_and_sign_out
         val builder = MaterialAlertDialogBuilder(requireContext())
         return when (UnsyncedNotesSignOutPolicy.Step.valueOf(args.getString(ARG_STEP)!!)) {
             UnsyncedNotesSignOutPolicy.Step.COUNT -> builder
@@ -41,9 +49,10 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
                     is UnsyncedNotesSignOutPolicy.Text.Counted ->
                         resources.getQuantityString(R.plurals.notes_sign_out_unsynced, text.count, text.count)
                     UnsyncedNotesSignOutPolicy.Text.Uncounted -> getString(R.string.notes_sign_out_unsynced_unreadable)
+                    UnsyncedNotesSignOutPolicy.Text.Unlisted -> getString(R.string.notes_sign_out_unsynced_unlisted)
                 })
                 .setNegativeButton(android.R.string.cancel) { _, _ -> closedWithoutSignOut() }
-                .setNeutralButton(R.string.notes_sign_out_without_syncing) { _, _ ->
+                .setNeutralButton(goOn) { _, _ ->
                     send(UnsyncedNotesSignOutPolicy.Answer.GO_ON_WITHOUT_SYNCING)
                 }
                 .setPositiveButton(R.string.account_synchronize_now) { _, _ ->
@@ -51,14 +60,15 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
                 }
                 .create()
             UnsyncedNotesSignOutPolicy.Step.DISCARD -> builder
-                .setTitle(R.string.notes_discard_title)
+                .setTitle(confirmTitle)
                 .setMessage(when (text) {
                     is UnsyncedNotesSignOutPolicy.Text.Counted ->
                         resources.getQuantityString(R.plurals.notes_discard_text, text.count, text.count)
                     UnsyncedNotesSignOutPolicy.Text.Uncounted -> getString(R.string.notes_discard_unreadable)
+                    UnsyncedNotesSignOutPolicy.Text.Unlisted -> getString(R.string.notes_acknowledge_text)
                 })
                 .setNegativeButton(android.R.string.cancel) { _, _ -> closedWithoutSignOut() }
-                .setPositiveButton(R.string.notes_discard_and_sign_out) { _, _ ->
+                .setPositiveButton(confirm) { _, _ ->
                     send(UnsyncedNotesSignOutPolicy.Answer.DISCARD)
                 }
                 .create()
