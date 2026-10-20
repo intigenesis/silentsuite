@@ -2114,11 +2114,16 @@ internal class PendingNotesStore private constructor(
         }
 
         /**
-         * The store folders in notes-pending, by name in sorted order ([stores]), and whether notes-pending holds a
-         * name of any other kind ([unknown]). Only store folders are ever made there, so another name is of a kind
-         * this build does not know, which may hold unsynced text a newer build wrote: it is never read as nothing.
+         * The store folders in notes-pending, by name in sorted order ([stores]), and every other name it holds, in
+         * sorted order too ([others]). A store folder is a name of exactly 64 lowercase hex characters, whatever the
+         * entry is; any other name, of a file, a folder or a link, is of a kind this build does not know ([unknown]).
+         * Only store folders are ever made there, so another name may hold unsynced text a newer build wrote: it is
+         * never read as nothing.
          */
-        internal class StoreFolders(val stores: List<String>, val unknown: Boolean)
+        internal class StoreFolders(val stores: List<String>, val others: List<String>) {
+            /** Whether notes-pending holds a name of a kind this build does not know. */
+            val unknown: Boolean get() = others.isNotEmpty()
+        }
 
         /**
          * The folders of notes-pending in [noBackup], chosen by name alone from one listing: nothing is asked of each
@@ -2134,11 +2139,11 @@ internal class PendingNotesStore private constructor(
             val listed = listDirectory(root)
             if (listed == null) {
                 val gone = knownAbsent(root) && (presenceForTesting?.invoke(root) ?: presence(root)) == Presence.ABSENT
-                if (gone) return StoreFolders(emptyList(), unknown = false)
+                if (gone) return StoreFolders(emptyList(), emptyList())
                 throw IOException("could not list the pending stores")
             }
             val (stores, others) = listed.map { it.name }.partition { STORE_DIRECTORY.matches(it) }
-            return StoreFolders(stores.sorted(), unknown = others.isNotEmpty())
+            return StoreFolders(stores.sorted(), others.sorted())
         }
 
         /** [storeDirectories] in noBackupFilesDir, with the presence check [forDirectory] gives a store on a device. */

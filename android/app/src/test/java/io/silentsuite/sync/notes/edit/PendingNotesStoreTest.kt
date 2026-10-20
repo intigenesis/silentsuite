@@ -4765,6 +4765,42 @@ class PendingNotesStoreTest {
         assertEquals(UnsyncedNotes(0, 0, unreadable = true, listed = false), opened.unsynced())
     }
 
+    @Test fun `storeDirectories names every entry of another kind, sorted, whatever the entry is`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val pending = File(noBackup, "notes-pending")
+        val store = storeName("a")
+        assertTrue(File(pending, store).mkdirs())
+        // A plain file and a hidden one, and folders named with uppercase hex, one character short, or a suffix, one
+        // of them holding a file.
+        File(pending, "future.dat").writeBytes(ByteArray(4))
+        File(pending, ".nomedia").writeBytes(ByteArray(0))
+        val folders = listOf("0123456789ABCDEF".repeat(4), store.drop(1), "$store.new", "FUTURE")
+        for (folder in folders) assertTrue(folder, File(pending, folder).mkdir())
+        File(pending, "FUTURE/inside.dat").writeBytes(ByteArray(1))
+        // A plain file with a store folder's name is a store: nothing is asked of a name.
+        val plain = storeName("plain")
+        assertTrue(File(pending, plain).createNewFile())
+        // A link of another name, dangling, where this JVM may make one (Windows needs a privilege for it).
+        val link = try {
+            java.nio.file.Files.createSymbolicLink(File(pending, "link").toPath(), File(noBackup, "gone").toPath())
+            listOf("link")
+        } catch (e: java.io.IOException) {
+            emptyList()
+        } catch (e: UnsupportedOperationException) {
+            emptyList()
+        }
+        // Listed in reverse order, so the order given is the sort's, whatever order a file system lists in.
+        PendingNotesStore.listFilesForTesting = { d -> d.listFiles()?.sortedByDescending { it.name }?.toTypedArray() }
+        val found = PendingNotesStore.storeDirectories(noBackup)
+        assertEquals(listOf(store, plain).sorted(), found.stores)
+        assertEquals((listOf("future.dat", ".nomedia") + folders + link).sorted(), found.others)
+        assertTrue(found.unknown)
+        // Shown gone, notes-pending holds none.
+        assertTrue(pending.deleteRecursively())
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals(emptyList<String>(), PendingNotesStore.storeDirectories(noBackup).others)
+    }
+
     @Test fun `storeDirectories throws while notes-pending cannot be listed and is not shown gone`() {
         val noBackup = tmp.newFolder("no_backup")
         val pending = File(noBackup, "notes-pending")

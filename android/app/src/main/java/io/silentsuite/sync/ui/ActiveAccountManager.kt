@@ -30,6 +30,17 @@ object ActiveAccountManager {
         return account
     }
 
+    /**
+     * The name and creation id the active-account preference holds, read from the preference alone, with no
+     * AccountManager call, or null when either is missing or blank. Nothing says that row is still there.
+     */
+    internal fun savedIdentity(context: Context): Pair<String, String>? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val name = prefs.getString(KEY_NAME, null)?.takeIf(String::isNotBlank) ?: return null
+        val creationId = prefs.getString(KEY_CREATION_ID, null)?.takeIf(String::isNotBlank) ?: return null
+        return name to creationId
+    }
+
     fun setActiveAccount(context: Context, account: Account): Boolean {
         val manager = AccountManager.get(context)
         if (account.type != App.accountType || account !in manager.getAccountsByType(App.accountType)) return false
