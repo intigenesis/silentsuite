@@ -188,6 +188,85 @@ class PendingNotesStoreTest {
         assertArrayEquals(landed, File(d, "n5.landed.new").readBytes())
     }
 
+    @Test fun `a counter in a layout this build cannot read stops every new version, while reads and sends go on`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false))
+        val v2 = saved(store.saveLocal("n2", "b1", "r1", blob("two"), isCreate = false))
+        store.hold("n2", HeldReason.READ_ONLY, now = 1)
+        // As after a downgrade: a newer build wrote the counter, and may have handed out versions above
+        // every file this build can read. Rebuilt from those files, it could restart below them.
+        val counter = withFormatVersion(PendingCodec.encodeSequence(41), 2)
+        File(dir, "sequence").writeBytes(counter)
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n3", "b1", "r1", blob("new"), isCreate = true)
+        }
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n1", "b1", "r2", blob("edit"), isCreate = false)
+        }
+        assertThrows(java.io.IOException::class.java) { store.rebase("n1", v1, "r1", "r3", blob("rebased")) }
+        assertThrows(java.io.IOException::class.java) { store.replaceWithNewNote("n1", v1, "srv", newNote()) }
+        assertThrows(java.io.IOException::class.java) { store.release("n2") }
+        assertArrayEquals("left as that build wrote it", counter, File(dir, "sequence").readBytes())
+        assertEquals(Read.Missing, store.read("n3"))
+        assertEquals(Read.Missing, store.read("copy1"))
+        assertEquals("r1", entry("n1").revision)
+        assertEquals(PendingEntry.State.HELD, entry("n2").state)
+        // Reads take the highest version they can read, and a push needs no new version.
+        assertEquals(v2, store.snapshot { false }.sequence)
+        assertEquals(v2, store.observe("n1").sequence)
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r1", blob("landed")))
+        assertEquals(Read.Missing, store.read("n1"))
+        assertArrayEquals(counter, File(dir, "sequence").readBytes())
+    }
+
+    @Test fun `a counter that fails its checksum, with nothing else on disk, restarts at 1`() {
+        store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false)
+        store.saveLocal("n1", "b1", "r2", blob("two"), isCreate = false)
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r2", blob("landed")))
+        assertEquals("only the counter is left", listOf("sequence"), dir.list()!!.toList())
+        val sequence = File(dir, "sequence")
+        assertArrayEquals(PendingCodec.encodeSequence(2), sequence.readBytes())
+        sequence.writeBytes(sequence.readBytes().also { it[6] = (it[6].toInt() xor 0x40).toByte() })
+        // Damaged, not written in another layout: no version is left on disk to stay above.
+        assertEquals(1L, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
+        assertArrayEquals("written anew", PendingCodec.encodeSequence(1), sequence.readBytes())
+    }
+
+    @Test fun `with the counter lost, a file of a kind this build does not know stops every new version`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false))
+        // As after a downgrade: a newer build may keep versions in a file or directory this build has no name for.
+        File(dir, "n1.draft").writeBytes(blob("a newer build's"))
+        assertTrue(File(dir, "versions").mkdir())
+        assertEquals("while the counter reads, nothing else is looked at",
+            v1 + 1, saved(store.saveLocal("n1", "b1", "r2", blob("two"), isCreate = false)))
+        assertTrue(File(dir, "sequence").delete())
+        assertThrows(java.io.IOException::class.java) { store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        assertFalse("no counter is written", File(dir, "sequence").exists() || File(dir, "sequence.new").exists())
+        assertEquals(Read.Missing, store.read("n2"))
+        assertEquals("reads pass over them", v1 + 1, store.snapshot { false }.sequence)
+        assertTrue(File(dir, "n1.draft").delete())
+        assertThrows(java.io.IOException::class.java) { store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        assertTrue(File(dir, "versions").delete())
+        assertEquals("then above every version on disk",
+            v1 + 2, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
+    }
+
+    @Test fun `an uncommitted counter write in a layout this build cannot read stops new versions`() {
+        var refuse = true
+        val d = tmp.newFolder("stranded-counter")
+        // A newer build wrote its counter in full, and the rename never happened.
+        val counter = withFormatVersion(PendingCodec.encodeSequence(41), 2)
+        File(d, "sequence.new").writeBytes(counter)
+        val s = refusingRenames(d, "sequence") { refuse }
+        assertThrows(java.io.IOException::class.java) { s.saveLocal("n1", "b1", "r1", blob("u"), isCreate = true) }
+        assertArrayEquals("not written over", counter, File(d, "sequence.new").readBytes())
+        assertEquals(Read.Missing, s.read("n1"))
+        refuse = false
+        // Committed by the next recovery, it is a counter this build cannot read, and still stops them.
+        assertThrows(java.io.IOException::class.java) { s.saveLocal("n1", "b1", "r1", blob("u"), isCreate = true) }
+        assertArrayEquals(counter, File(d, "sequence").readBytes())
+        assertFalse(File(d, "sequence.new").exists())
+    }
+
     // ---- editor saves ----
 
     @Test fun `a later save replaces the content and resets the backoff`() {
@@ -1246,9 +1325,14 @@ class PendingNotesStoreTest {
         assertNull("this build cannot use it", store.notebook("b1"))
         assertFalse(File(dir, "b1.notebook.new").exists())
         assertFalse("one that was cut short goes, as before", File(dir, "cut.notebook.new").exists() || File(dir, "cut.notebook").exists())
-        // A counter this build cannot read restarts above every version on disk, and is written anew.
+        // A counter written in full in a layout this build cannot read, here a newer build's: no version
+        // is handed out over it, and it stays as that build wrote it.
         assertArrayEquals(counter, File(dir, "sequence").readBytes())
-        assertEquals(1L, saved(store.saveLocal("n1", "b1", "r1", blob("first"), isCreate = true)))
+        assertThrows(java.io.IOException::class.java) {
+            store.saveLocal("n1", "b1", "r1", blob("first"), isCreate = true)
+        }
+        assertArrayEquals(counter, File(dir, "sequence").readBytes())
+        assertEquals(Read.Missing, store.read("n1"))
     }
 
     @Test fun `removing an entry also removes a stale new file so a later recovery cannot bring it back`() {

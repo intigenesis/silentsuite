@@ -703,10 +703,12 @@ internal class PendingNotesStore private constructor(
     }
 
     /**
-     * The next value of the store-wide counter, persisted before it is handed out. With the counter lost
-     * or damaged it is rebuilt strictly: while a version on disk cannot be read it throws, and nothing is
-     * written. A version that is not above all of them could be one an entry already holds, and a drop
-     * or a rebase that checks the version would then take the newer text for the older.
+     * The next value of the store-wide counter, persisted before it is handed out. A counter that does not
+     * read is rebuilt strictly ([highestVersion]): while a version on disk cannot be read, or a file there
+     * may hold one this build cannot read (a counter written in full in a layout it does not know, a file
+     * of a kind it does not know), it throws, and nothing is written, the counter included. A version that
+     * is not above all of them could be one an entry already holds, and a drop or a rebase that checks the
+     * version would then take the newer text for the older.
      */
     private fun nextVersion(): Long {
         val next = currentSequence(strict = true) + 1
@@ -715,12 +717,21 @@ internal class PendingNotesStore private constructor(
     }
 
     /**
-     * The last version handed out. A counter that is lost or damaged is rebuilt as the highest version
-     * still on disk ([highestVersion]) and is not written back here; [nextVersion] hands out the one above
-     * it. A counter file that cannot be read at all throws. [strict] is for [nextVersion]. The readers
-     * ([snapshot], [observe]) take the highest version they can read instead: the value is only compared,
-     * never written, and a push needs no new version, so one file that cannot be read does not stop a
-     * run from pushing the others.
+     * The last version handed out. A counter that is lost, cut short or fails its checksum is rebuilt as
+     * the highest version still on disk ([highestVersion]) and is not written back here; [nextVersion]
+     * hands out the one above it. A counter written in full in a layout this build does not know (a newer
+     * build's after a downgrade, or an older one this build no longer reads) comes from a build that may
+     * have handed out versions above every file here, so nothing is rebuilt over it: with [strict], which
+     * is for [nextVersion], it throws, as a version on disk that cannot be read does. A counter file that
+     * cannot be read at all throws. The readers ([snapshot], [observe]) take the highest version they can
+     * read instead: the value is only compared, never written, and a push needs no new version, so one
+     * file that cannot be read does not stop a run from pushing the others.
+     *
+     * The counter shares [PendingCodec.RECORD_FORMAT_VERSION] with landed records and notebook copies, and
+     * the codec reads no other format version, an earlier one included. A build that raises it must keep
+     * decoding every earlier counter layout: otherwise, after the upgrade, every write that needs a new
+     * version fails here, since [versionOf] takes an intact counter it cannot decode for one that may hold
+     * versions it cannot read.
      */
     private fun currentSequence(strict: Boolean): Long {
         val file = File(dir, SEQUENCE)
@@ -730,11 +741,15 @@ internal class PendingNotesStore private constructor(
 
     /**
      * The highest version on disk, from one [listing]: each entry's, read from its header alone, which
-     * checks its own CRC and reads no blob, each landed record's, and those of intact writes not
-     * committed yet ("<uid>.note.new", "<uid>.landed.new"), since recovery may still commit one. A write
-     * that was cut short holds none: it was never reported saved, and recovery drops it. A listing that
-     * fails throws. With [strict], so does a version that cannot be read (a damaged header, a newer
-     * format after a downgrade, a landed record that does not decode); otherwise that file is passed over.
+     * checks its own CRC and reads no blob, each landed record's, the counter's when the listing shows
+     * one that reads, and those of intact writes not committed yet ("<uid>.note.new", "<uid>.landed.new",
+     * "sequence.new"), since recovery may still commit one. A write that was cut short holds none: it was
+     * never reported saved, and recovery drops it. Neither does a counter that is cut short or fails its
+     * checksum, which is what is rebuilt here, nor a notebook copy. A listing that fails throws. With
+     * [strict], so does a version that cannot be read (a damaged header, a newer format after a
+     * downgrade, a landed record that does not decode, a counter written in full in a layout this build
+     * does not know), and so does a file of a kind this build does not know, which may hold one;
+     * otherwise that file is passed over.
      */
     private fun highestVersion(strict: Boolean): Long {
         var highest = 0L
@@ -750,18 +765,27 @@ internal class PendingNotesStore private constructor(
         return highest
     }
 
-    /** The version [file] holds, or null for a file that holds none; throws when it holds one that cannot be read. */
+    /**
+     * The version [file] holds, or null for a file that holds none (a notebook copy, a write or a counter
+     * that was cut short or fails its checksum). Throws when it holds one that cannot be read, and for a
+     * file of a kind this build does not know, which may hold one.
+     */
     private fun versionOf(file: File): Long? {
         val name = file.name
         val version = when {
             name.endsWith(NOTE) -> readHeader(file)?.version
             name.endsWith(LANDED) -> landedVersion(file.readBytes())
-            name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) -> {
+            name.endsWith(NOTEBOOK) || name.endsWith(NOTEBOOK + NEW) -> return null
+            name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) || name == SEQUENCE || name == SEQUENCE + NEW -> {
                 val bytes = file.readBytes()
                 if (!PendingCodec.isIntact(bytes)) return null
-                if (name.endsWith(LANDED + NEW)) landedVersion(bytes) else entryVersion(bytes)
+                when {
+                    name.endsWith(LANDED + NEW) -> landedVersion(bytes)
+                    name.endsWith(NOTE + NEW) -> entryVersion(bytes)
+                    else -> (PendingCodec.decodeSequence(bytes) as? PendingCodec.Decoded.Ok)?.value
+                }
             }
-            else -> return null
+            else -> throw IOException("$name is of a kind this build does not know")
         }
         return version ?: throw IOException("the version in $name cannot be read")
     }
@@ -812,10 +836,10 @@ internal class PendingNotesStore private constructor(
         // step, the rename synced), whether or not this build can read its layout (a newer format
         // after a downgrade, a held reason added later), so nothing a build wrote in full is thrown away
         // (design 3.1). An entry file this build cannot read is then reported like every committed entry
-        // that cannot be read. The other kinds are kept for a build that can read them but not reported,
-        // and not for long: a landed record goes in step 2 unless an editor is open, a notebook copy
-        // lasts until a run prunes or rewrites it, and a counter this build cannot read is rebuilt above
-        // every version on disk, or the write that needs it fails.
+        // that cannot be read. The other kinds are kept for a build that can read them but not reported.
+        // A landed record goes in step 2 unless an editor is open, and a notebook copy lasts until a run
+        // prunes or rewrites it. A counter this build cannot read stays as it is, and every write that
+        // needs a new version fails while it does: the build that wrote it may have handed out higher ones.
         for (tmp in listing().filter { it.name.endsWith(NEW) }) {
             try {
                 val target = File(dir, tmp.name.removeSuffix(NEW))
