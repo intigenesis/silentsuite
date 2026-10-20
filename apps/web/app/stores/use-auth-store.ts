@@ -6,7 +6,7 @@ import { isSelfHosted, isCustomServer } from '@/app/lib/self-hosted'
 import { logger } from '@/app/lib/logger'
 import { BILLING_API_URL, ETEBASE_SERVER_URL } from '@/app/lib/config'
 import { COOKIE_MAX_AGE_SELF_HOSTED, COOKIE_MAX_AGE_HOSTED } from '@/app/lib/constants'
-import { secureGet, secureSet, secureRemove, secureClear, migrateFromLocalStorage } from '@/app/lib/secure-storage'
+import { secureGet, secureSet, secureRemove, secureRemoveIfEqual, secureClear, migrateFromLocalStorage } from '@/app/lib/secure-storage'
 import { clearAll as clearLocalDataCache } from '@/app/lib/data-cache'
 import { clearAll as clearOfflineQueue } from '@/app/lib/offline-queue'
 import { createLoginSessionPersistenceDiagnostics } from '@/app/lib/sync-restore-diagnostics'
@@ -1189,6 +1189,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       if (get().pendingSignup !== existing) throw new Error('Signup was superseded.')
       if (!isSelfHosted && !isCustomServer(serverUrl)) clearHostedValidationMarkers()
       await secureSet('etebase_session', savedSession)
+      if (owner?.signal.aborted) {
+        // Undo only this operation's own write; a session saved by a newer operation stays.
+        await secureRemoveIfEqual('etebase_session', savedSession)
+        throw new DOMException('Signup was cancelled.', 'AbortError')
+      }
       if (get().pendingSignup !== existing) throw new Error('Signup was superseded.')
       if (isCustomServer(serverUrl) && serverUrl) {
         localStorage.setItem('silentsuite-server-url', serverUrl)
