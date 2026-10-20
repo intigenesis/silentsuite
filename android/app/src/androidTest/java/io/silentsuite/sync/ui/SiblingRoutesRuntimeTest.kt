@@ -45,7 +45,7 @@ import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.SyncResult
-import android.content.SyncStateContract
+import android.provider.SyncStateContract
 import android.provider.ContactsContract
 import io.silentsuite.sync.EtebaseLocalCache
 import io.silentsuite.sync.HttpClient
