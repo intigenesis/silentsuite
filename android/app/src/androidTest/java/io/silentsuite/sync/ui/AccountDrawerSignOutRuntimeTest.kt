@@ -4,13 +4,18 @@ import android.Manifest
 import android.accounts.Account
 import android.accounts.AccountManager
 import android.content.Context
+import android.content.DialogInterface
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.View
+import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.core.view.ViewCompat
 import androidx.core.view.GravityCompat
 import androidx.drawerlayout.widget.DrawerLayout
+import androidx.fragment.app.DialogFragment
+import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -19,6 +24,7 @@ import androidx.lifecycle.Lifecycle
 import io.silentsuite.sync.AccountSettings
 import io.silentsuite.sync.App
 import io.silentsuite.sync.R
+import io.silentsuite.sync.notes.NotesSyncCoordinator
 import io.silentsuite.sync.notes.edit.PendingNotesStore
 import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.resource.LocalAddressBook
@@ -27,6 +33,7 @@ import io.silentsuite.sync.syncadapter.SyncStatusStore
 import io.silentsuite.sync.ui.setup.PostLoginSetupState
 import io.silentsuite.sync.utils.AndroidCompat
 import java.net.URI
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.*
@@ -435,6 +442,244 @@ class AccountDrawerSignOutRuntimeTest {
         }
     }
 
+    @Test fun signOutWithUnsyncedNotesAsksTwiceBeforeItRemovesAnything() {
+        val fixture = Fixture("unsynced")
+        val fake = UnsyncedNotesSeams(fixture.account, fixture.creationId)
+        CurrentAccountSignOutViewModel.seamsFactory = { _, _, _ -> fake }
+        // With Notes on, Sync now asks the Notes job for a run. The job's work is replaced here, so no
+        // Notes run reaches a server or a network: what is checked is whether a run was asked for, and
+        // which kind. Each run is noted as: did the user start it, and its request id.
+        val runs = CopyOnWriteArrayList<Pair<Boolean, String?>>()
+        NotesSyncCoordinator.runnerOverride = { _, _, _, request -> runs += request.manual to request.requestId }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val count = UnsyncedNotesSignOutPolicy.Step.COUNT
+        val discard = UnsyncedNotesSignOutPolicy.Step.DISCARD
+        val positive = DialogInterface.BUTTON_POSITIVE
+        val neutral = DialogInterface.BUTTON_NEUTRAL
+        val negative = DialogInterface.BUTTON_NEGATIVE
+        val cancel = "cancel:${fixture.account.name}"
+        fun dialogOf(activity: AccountActivity, step: UnsyncedNotesSignOutPolicy.Step): AlertDialog? {
+            activity.supportFragmentManager.executePendingTransactions()
+            val fragment = activity.supportFragmentManager.findFragmentByTag(UnsyncedNotesDialogFragment.tag(step))
+            return (fragment as? DialogFragment)?.dialog as? AlertDialog
+        }
+        fun message(dialog: AlertDialog) = dialog.findViewById<TextView>(android.R.id.message)!!.text.toString()
+        fun snackbarText(activity: AccountActivity) =
+            activity.findViewById<TextView>(com.google.android.material.R.id.snackbar_text)?.text?.toString()
+        fun model(activity: AccountActivity) = ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java]
+        fun signOutFromDrawer(scenario: ActivityScenario<AccountActivity>) {
+            scenario.onActivity { activity ->
+                activity.onNavigationItemSelected(requireNotNull(
+                    activity.findViewById<com.google.android.material.navigation.NavigationView>(R.id.nav_view)
+                        .menu.findItem(R.id.nav_logout)))
+            }
+            instrumentation.waitForIdleSync()
+        }
+        // AlertDialog posts the button's listener and its own dismissal to the main looper, so a tap
+        // waits until the main thread is idle.
+        fun tap(scenario: ActivityScenario<AccountActivity>, step: UnsyncedNotesSignOutPolicy.Step, button: Int) {
+            scenario.onActivity { activity -> dialogOf(activity, step)!!.getButton(button).performClick() }
+            instrumentation.waitForIdleSync()
+        }
+        fun assertNoDialog(scenario: ActivityScenario<AccountActivity>) {
+            scenario.onActivity { activity ->
+                assertNull(dialogOf(activity, count))
+                assertNull(dialogOf(activity, discard))
+            }
+        }
+        /** What the screen and the coordinator asked of the seams since [since] calls, in order. */
+        fun callsSince(since: Int) = fake.calls.drop(since)
+        try {
+            val intent = AccountActivity.newIntent(fixture.context, fixture.account)
+            ActivityScenario.launch<AccountActivity>(intent).use { scenario ->
+                // 1. The count, with Sync now, Cancel, and going on without syncing.
+                signOutFromDrawer(scenario)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, count)) { "the count dialog" }
+                    assertEquals(activity.resources.getQuantityString(R.plurals.notes_sign_out_unsynced, 2, 2),
+                        message(shown))
+                    assertEquals(activity.getString(R.string.account_synchronize_now),
+                        shown.getButton(positive).text.toString())
+                    assertEquals(activity.getString(R.string.notes_sign_out_without_syncing),
+                        shown.getButton(neutral).text.toString())
+                    assertEquals(activity.getString(android.R.string.cancel), shown.getButton(negative).text.toString())
+                }
+                assertEquals("the screen only counted", listOf("count"), fake.calls)
+
+                // 2. Cancel cancels, clears and removes nothing.
+                var since = fake.calls.size
+                tap(scenario, count, negative)
+                assertNoDialog(scenario)
+                assertEquals(emptyList<String>(), callsSince(since))
+
+                // 3. Sync now with Notes off (the fixture's state): the dialog closes, no run is asked for, and
+                // the answer is only counted again.
+                signOutFromDrawer(scenario)
+                since = fake.calls.size
+                tap(scenario, count, positive)
+                assertTrue(NotesSyncCoordinator.drainForTesting(10_000))
+                assertTrue("Notes is off, so no run was asked for: $runs", runs.isEmpty())
+                assertNoDialog(scenario)
+                assertEquals(listOf("count"), callsSince(since))
+
+                // 4. Sync now with Notes on: one run the user started, with the request id that Sync now
+                // recorded for this account generation.
+                check(AccountSettings.writeNotesEnabled(fixture.manager, fixture.account, true))
+                signOutFromDrawer(scenario)
+                since = fake.calls.size
+                tap(scenario, count, positive)
+                waitUntil("the Notes run that Sync now asked for") { runs.any { it.first } }
+                assertTrue(NotesSyncCoordinator.drainForTesting(10_000))
+                val started = runs.filter { it.first }
+                assertEquals("one run the user started: $runs", 1, started.size)
+                val recorded = SyncStatusStore(fixture.context).let {
+                    it.status(it.identity(fixture.account, fixture.creationId), SyncStatusStore.Service.NOTES)
+                        .activeRequestId
+                }
+                assertNotNull("Sync now recorded a request", recorded)
+                assertEquals("the run has the request id that Sync now recorded", recorded, started.single().second)
+                assertNoDialog(scenario)
+                assertEquals(listOf("count"), callsSince(since))
+
+                // 5. Going on without syncing leads to the separate confirmation, and asks for no sign-out.
+                signOutFromDrawer(scenario)
+                since = fake.calls.size
+                tap(scenario, count, neutral)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, discard)) { "the discard confirmation" }
+                    assertEquals(activity.resources.getQuantityString(R.plurals.notes_discard_text, 2, 2),
+                        message(shown))
+                    assertEquals(activity.getString(R.string.notes_discard_and_sign_out),
+                        shown.getButton(positive).text.toString())
+                    assertNull("the count dialog closed", dialogOf(activity, count))
+                }
+                assertEquals(listOf("count"), callsSince(since))
+
+                // 6. What the store holds moves on while the confirmation is open: the answer to it is turned
+                // away before any sign-out is asked for, and the count is shown again.
+                fake.unsynced = UnsyncedNotes(2, 8, false)
+                since = fake.calls.size
+                tap(scenario, discard, positive)
+                scenario.onActivity { activity -> assertNotNull("the count is shown again", dialogOf(activity, count)) }
+                assertEquals("the stale answer was turned away", listOf("count"), callsSince(since))
+
+                // 7. The store changes after the answer was accepted: its clear finds more than was confirmed,
+                // so the sign-out is refused with nothing cleared or removed, it is not shown as a failed
+                // sign-out, and the count comes back with no tap. While master sync is off, the dashboard
+                // shows a snackbar of its own from the start, so the snackbar text is read before the tap
+                // and compared after.
+                tap(scenario, count, neutral)
+                scenario.onActivity { activity -> assertNotNull(dialogOf(activity, discard)) }
+                var before: String? = null
+                scenario.onActivity { activity -> before = snackbarText(activity) }
+                fake.clear = PendingNotesStore.DiscardOutcome.Changed(UnsyncedNotes(2, 9, false))
+                since = fake.calls.size
+                tap(scenario, discard, positive)
+                waitUntil("the count dialog after the refused sign-out") {
+                    var shown = false
+                    scenario.onActivity { activity -> shown = dialogOf(activity, count) != null }
+                    shown
+                }
+                assertEquals("counted at the answer and before anything was canceled, canceled, asked to clear what " +
+                    "the dialog showed, and counted again for the count dialog; nothing removed",
+                    listOf("count", "count", cancel, "clear:${UnsyncedNotes(2, 8, false)}", "count"), callsSince(since))
+                assertEquals(0, fake.removeCalls)
+                scenario.onActivity { activity ->
+                    val after = snackbarText(activity)
+                    assertFalse("a refusal is not shown as a failed sign-out",
+                        after == activity.getString(R.string.account_sign_out_failed))
+                    assertEquals("the snackbar is the one from before the refused tap", before, after)
+                }
+                fake.clear = PendingNotesStore.DiscardOutcome.Done
+                // A sign-out that is refused does not count as started. Nothing is confirmed now, so this
+                // begin() is refused in the same call, before anything is canceled.
+                since = fake.calls.size
+                scenario.onActivity { activity ->
+                    model(activity).begin()
+                    assertFalse("a refused sign-out does not count as started", model(activity).hasStarted())
+                }
+                instrumentation.waitForIdleSync()
+                scenario.onActivity { activity ->
+                    assertEquals("the screen acknowledged the refusal", CurrentAccountSignOutState.Idle,
+                        model(activity).currentState())
+                }
+                assertFalse("nothing was canceled", callsSince(since).contains(cancel))
+
+                // 8. A count that throws: both dialogs say the changes could not be counted, never nothing and
+                // never a number. Cancel on the confirmation asks for no sign-out.
+                tap(scenario, count, negative)
+                fake.countThrows = true
+                signOutFromDrawer(scenario)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, count)) { "the count dialog" }
+                    assertEquals(activity.getString(R.string.notes_sign_out_unsynced_unreadable), message(shown))
+                }
+                tap(scenario, count, neutral)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, discard)) { "the discard confirmation" }
+                    assertEquals(activity.getString(R.string.notes_discard_unreadable), message(shown))
+                }
+                since = fake.calls.size
+                tap(scenario, discard, negative)
+                assertNoDialog(scenario)
+                assertEquals(emptyList<String>(), callsSince(since))
+                fake.countThrows = false
+
+                // 9. A store that could not be listed: a confirmation of it deletes nothing, so both dialogs have
+                // words of their own, never those of a discard, and no button says sign out. Cancel on the
+                // confirmation asks for no sign-out.
+                fake.unsynced = UnsyncedNotes(0, 7, true, listed = false)
+                signOutFromDrawer(scenario)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, count)) { "the count dialog" }
+                    assertEquals(activity.getString(R.string.notes_sign_out_unsynced_unlisted), message(shown))
+                    assertEquals(activity.getString(R.string.notes_continue_without_syncing),
+                        shown.getButton(neutral).text.toString())
+                }
+                tap(scenario, count, neutral)
+                scenario.onActivity { activity ->
+                    val shown = requireNotNull(dialogOf(activity, discard)) { "the confirmation" }
+                    assertEquals(activity.getString(R.string.notes_acknowledge_text), message(shown))
+                    assertEquals(activity.getString(R.string.notes_acknowledge_continue),
+                        shown.getButton(positive).text.toString())
+                }
+                since = fake.calls.size
+                tap(scenario, discard, negative)
+                assertNoDialog(scenario)
+                assertEquals(emptyList<String>(), callsSince(since))
+                fake.unsynced = UnsyncedNotes(2, 8, false)
+
+                // 10. The confirmation survives a recreation, and its own button confirms and starts the
+                // sign-out, in this order: counted at the answer and before anything is canceled, the sync
+                // canceled, the store asked to clear what the dialog showed, and only then the removal.
+                signOutFromDrawer(scenario)
+                tap(scenario, count, neutral)
+                scenario.recreate()
+                instrumentation.waitForIdleSync()
+                scenario.onActivity { activity ->
+                    assertNull("no count dialog after the recreation", dialogOf(activity, count))
+                }
+                since = fake.calls.size
+                tap(scenario, discard, positive)
+                assertEquals(listOf("count", "count", cancel, "clear:${UnsyncedNotes(2, 8, false)}", "remove"),
+                    callsSince(since))
+                assertEquals(1, fake.removeCalls)
+            }
+        } finally {
+            // Notes goes off first, so a platform sync of this account that ends now asks for no Notes
+            // run. Then what is queued is canceled and waited for, and only then is the stand-in taken
+            // away.
+            AccountSettings.writeNotesEnabled(fixture.manager, fixture.account, false)
+            NotesSyncCoordinator.cancelAccount(fixture.account.type, fixture.account.name)
+            NotesSyncCoordinator.drainForTesting(10_000)
+            NotesSyncCoordinator.runnerOverride = null
+            CurrentAccountSignOutViewModel.seamsFactory = null
+            // The stand-in run never closes the request that Sync now recorded.
+            SyncStatusStore(fixture.context).let { it.clear(it.identity(fixture.account, fixture.creationId)) }
+            fixture.close()
+        }
+    }
+
     private class DelayedFailureSeams(account: Account) : CurrentAccountSignOutCoordinator.Seams {
         private val identity = ExactAccountIdentity(account.type, account.name, "failure-generation")
         var removeCalls = 0
@@ -488,6 +733,43 @@ class AccountDrawerSignOutRuntimeTest {
         override fun discardPendingNotes(main: ExactAccountIdentity, confirmed: UnsyncedNotes?) =
             PendingNotesStore.DiscardOutcome.Done
         override fun reopenPendingNotes(main: ExactAccountIdentity) = Unit
+    }
+
+    /**
+     * Seams that report unsynced Notes changes and never answer the removal, so the sign-out stays in
+     * progress and the screen stays. Every count, cancel, clear of the store, removal and reopening is
+     * logged in order ([calls]); what the clear answers can be set, and the count can be made to throw.
+     * They touch no store, sync or account, and every cleanup step answers yes.
+     */
+    private class UnsyncedNotesSeams(account: Account, generation: String) : CurrentAccountSignOutCoordinator.Seams {
+        private val identity = ExactAccountIdentity(account.type, account.name, generation)
+        @Volatile var unsynced = UnsyncedNotes(2, 7, false)
+        @Volatile var countThrows = false
+        @Volatile var clear: PendingNotesStore.DiscardOutcome = PendingNotesStore.DiscardOutcome.Done
+        /** "count", "cancel:<name>", "clear:<the confirmed answer>", "remove" and "reopen", in the order asked. */
+        val calls = CopyOnWriteArrayList<String>()
+        @Volatile var removeCalls = 0
+        override fun snapshot() = CurrentAccountSignOutSnapshot(identity, emptyList(), listOf(identity))
+        override fun cancelSync(identity: Pair<String, String>) { calls += "cancel:${identity.second}" }
+        override fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit) {
+            calls += "remove"
+            removeCalls++
+        }
+        override fun mainGenerationAbsent(main: ExactAccountIdentity) = false
+        override fun clearCache(main: ExactAccountIdentity) = true
+        override fun clearStatus(main: ExactAccountIdentity) = true
+        override fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?) =
+            ActiveAccountReconciliation(true, replacement)
+        override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) =
+            callback(true)
+        override fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes {
+            calls += "count"
+            if (countThrows) throw IllegalStateException("cannot look")
+            return unsynced
+        }
+        override fun discardPendingNotes(main: ExactAccountIdentity, confirmed: UnsyncedNotes?) =
+            clear.also { calls += "clear:$confirmed" }
+        override fun reopenPendingNotes(main: ExactAccountIdentity) { calls += "reopen" }
     }
 
     private fun removeAccountAndWait(manager: AccountManager, account: Account) {
