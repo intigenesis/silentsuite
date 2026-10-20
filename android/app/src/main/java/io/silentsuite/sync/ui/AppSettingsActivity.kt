@@ -88,6 +88,17 @@ class AppSettingsActivity : BaseActivity() {
         /** Global settings have no account identity and intentionally carry no account extra. */
         fun newIntent(context: Context): Intent = Intent(context, AppSettingsActivity::class.java)
 
+        /** Opens Unsynced Notes as the root of Settings, with no hub ([newUnsyncedNotesIntent]). */
+        internal const val EXTRA_UNSYNCED_NOTES = "unsynced_notes"
+
+        /**
+         * Settings, Unsynced Notes, for the sign-in and setup screens: no account extra, as global Settings, and the
+         * screen itself as the root, so neither Recover deleted contacts nor any account's categories are one tap away,
+         * and Back returns to the screen that opened it.
+         */
+        internal fun newUnsyncedNotesIntent(context: Context): Intent =
+            newIntent(context).putExtra(EXTRA_UNSYNCED_NOTES, true)
+
         internal fun newIntent(context: Context, category: SettingsCategory): Intent =
             newIntent(context).putExtra(EXTRA_CATEGORY, category.route)
 
@@ -126,10 +137,20 @@ class AppSettingsActivity : BaseActivity() {
             }
             updateTitle()
         }
-        if (savedInstanceState == null)
-            showCategory(currentCategory, addToBackStack = false)
-        else
+        if (savedInstanceState == null) {
+            if (intent.getBooleanExtra(EXTRA_UNSYNCED_NOTES, false)) showUnsyncedNotesAsRoot()
+            else showCategory(currentCategory, addToBackStack = false)
+        } else
             updateTitle()
+    }
+
+    /**
+     * The menu route of the sign-in and setup screens: Unsynced Notes in place of the hub, with an empty back stack.
+     * Committed at once, since the back-stack listener that sets the title runs only on a change of the back stack.
+     */
+    private fun showUnsyncedNotesAsRoot() {
+        supportFragmentManager.beginTransaction().replace(android.R.id.content, UnsyncedNotesFragment()).commitNow()
+        updateTitle()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {

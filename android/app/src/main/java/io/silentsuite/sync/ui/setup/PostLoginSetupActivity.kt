@@ -9,6 +9,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Gravity
+import android.view.Menu
+import android.view.MenuItem
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -27,6 +29,7 @@ import io.silentsuite.sync.resource.LocalTaskList
 import io.silentsuite.sync.syncadapter.requestSync
 import io.silentsuite.sync.ui.AccountActivity
 import io.silentsuite.sync.ui.BaseActivity
+import io.silentsuite.sync.ui.UnsyncedNotesEntry
 import io.silentsuite.sync.ui.WebViewActivity
 import io.silentsuite.sync.ui.applySystemBarInsetsAsPadding
 import java.util.UUID
@@ -222,6 +225,15 @@ class PostLoginSetupActivity : BaseActivity() {
         render()
         resumeSetupWork()
     }
+
+    /** Unsynced Notes in the overflow, as on the sign-in screen, for an account whose setup cannot finish too. */
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        UnsyncedNotesEntry.addTo(menu)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean =
+        UnsyncedNotesEntry.opens(this, item) || super.onOptionsItemSelected(item)
 
     private fun submit(decision: PostLoginSetupOrchestrator.UserDecision) {
         model.submitUserDecision(decision)
