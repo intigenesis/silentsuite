@@ -44,11 +44,16 @@ internal class PendingNotesStore private constructor(
     private val rename: (File, File) -> Unit,
     /** Whether a path is there, without following a link; [Presence.UNKNOWN] when the check fails. */
     private val presence: (File) -> Presence,
+    /** Where this store's discard permit is kept, under its directory's name. */
+    private val permits: PendingNotesDiscardPermits,
 ) {
     private val lock = Any()
     private var closed = false
     private var recovered = false
     private var recoveryProblems: List<Read.Unreadable> = emptyList()
+
+    /** Whether this instance has shown its store's discard permit gone; see [withdrawPermit]. */
+    private var permitWithdrawn = false
 
     /**
      * New directory levels whose entry in their parent is not synced yet. A level stays here until that
@@ -815,9 +820,24 @@ internal class PendingNotesStore private constructor(
      * version would then take the newer text for the older.
      */
     private fun nextVersion(): Long {
+        withdrawPermit()
         val next = currentSequence(strict = true) + 1
         writeAtomically(File(dir, SEQUENCE), PendingCodec.encodeSequence(next))
         return next
+    }
+
+    /**
+     * A discard permit never covers text saved after it, so before the first new version this instance
+     * hands out, the store's permit is removed ([PendingNotesDiscardPermits.remove]). Comparing answers
+     * is not enough: with the counter gone and nothing versioned left on disk, versions start at 1 again,
+     * and an answer that could not be counted and carries sequence 0 compares only a number of files. A
+     * removal that cannot be shown throws before the counter or the entry is written. Once shown, it is
+     * not asked again by this instance.
+     */
+    private fun withdrawPermit() {
+        if (permitWithdrawn) return
+        permits.remove(dir.name)
+        permitWithdrawn = true
     }
 
     /**
@@ -1098,23 +1118,8 @@ internal class PendingNotesStore private constructor(
      * never created, lists as empty. File.exists() is not asked: it answers false for a check that
      * failed as well as for a directory that is not there.
      */
-    private fun listing(): Array<File> =
-        listDirectory() ?: if (knownAbsent(dir)) emptyArray() else throw IOException("could not list the pending store")
-
-    /**
-     * Whether [d] is shown not to be there: the nearest directory above it that can be listed does not
-     * hold the next name on the way down to it. When that directory does hold the name, or no directory
-     * above can be listed, it is unknown. File.exists() is not asked, for the reason [listing] gives.
-     */
-    private fun knownAbsent(d: File): Boolean {
-        var below = d
-        while (true) {
-            val above = below.parentFile ?: return false
-            val names = listDirectory(above)?.map { it.name }
-            if (names != null) return below.name !in names
-            below = above
-        }
-    }
+    private fun listing(): Array<File> = listDirectory(dir)
+        ?: if (knownAbsent(dir)) emptyArray() else throw IOException("could not list the pending store")
 
     /**
      * Whether [d] is shown gone by two checks that agree: the nearest directory above it that can be listed
@@ -1127,13 +1132,6 @@ internal class PendingNotesStore private constructor(
         if (presenceOf(d) != Presence.ABSENT) return false
         return true
     }
-
-    /**
-     * The files in [d], or null when the listing fails, as File.listFiles answers: [d] is not there, is
-     * not a directory, or the check failed.
-     */
-    private fun listDirectory(d: File = dir): Array<File>? =
-        listFilesForTesting.let { if (it != null) it(d) else d.listFiles() }
 
     private fun noteFile(uid: String) = File(dir, checkedUid(uid) + NOTE)
     private fun landedFile(uid: String) = File(dir, checkedUid(uid) + LANDED)
@@ -1247,12 +1245,36 @@ internal class PendingNotesStore private constructor(
          * null is a listing that failed. It answers every listing the store makes itself: of its own
          * directory, and of the directories above it that [knownAbsent] lists after a listing of it fails.
          * It answers the listing in the check of [clearAll] that the directory is gone, but not the deletion.
+         * It answers the listings of the discard permits' root too ([PendingNotesDiscardPermits.remove]).
          */
         @Volatile internal var listFilesForTesting: ((File) -> Array<File>?)? = null
 
         /**
+         * The files in [d], or null when the listing fails, as File.listFiles answers: [d] is not there, is
+         * not a directory, or the check failed.
+         */
+        internal fun listDirectory(d: File): Array<File>? =
+            listFilesForTesting.let { if (it != null) it(d) else d.listFiles() }
+
+        /**
+         * Whether [d] is shown not to be there: the nearest directory above it that can be listed does not
+         * hold the next name on the way down to it. When that directory does hold the name, or no directory
+         * above can be listed, it is unknown. File.exists() is not asked, for the reason [listing] gives.
+         */
+        internal fun knownAbsent(d: File): Boolean {
+            var below = d
+            while (true) {
+                val above = below.parentFile ?: return false
+                val names = listDirectory(above)?.map { it.name }
+                if (names != null) return below.name !in names
+                below = above
+            }
+        }
+
+        /**
          * Test seam: what a check of whether the path it is given is there answers in place of the store's
          * own [Presence] check; null leaves the answer to that check. [Presence.UNKNOWN] is a check that failed.
+         * It answers the checks of the discard permits too ([PendingNotesDiscardPermits]).
          */
         @Volatile internal var presenceForTesting: ((File) -> Presence?)? = null
 
@@ -1262,7 +1284,7 @@ internal class PendingNotesStore private constructor(
          * gets [lstatPresence] through [forIdentity].
          */
         @SuppressLint("NewApi")
-        private val nioPresence: (File) -> Presence = { path ->
+        internal val nioPresence: (File) -> Presence = { path ->
             try {
                 Files.readAttributes(path.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
                 Presence.PRESENT
@@ -1303,15 +1325,20 @@ internal class PendingNotesStore private constructor(
         /**
          * The single instance for [dir] in this process, so every caller shares its lock. [rename] must
          * replace an existing target in one step; JVM tests on Windows pass a java.nio atomic move. The
-         * default [presence] is for the JVM tests; a store on a device is opened through [forIdentity].
+         * default [presence] is for the JVM tests; a store on a device is opened through [forIdentity]. So is
+         * the default [permits], in a root beside [dir]: [forIdentity] keeps every permit in
+         * noBackupFilesDir/notes-discard. The first opener's functions and permits are the ones kept.
          */
         fun open(
             dir: File,
             syncDirectory: (File) -> Unit = {},
             rename: (File, File) -> Unit = renameTo,
             presence: (File) -> Presence = nioPresence,
-        ): PendingNotesStore =
-            registry.computeIfAbsent(dir.canonicalPath) { PendingNotesStore(File(it), syncDirectory, rename, presence) }
+            permits: PendingNotesDiscardPermits = PendingNotesDiscardPermits(
+                File(dir.parentFile, PendingNotesDiscardPermits.ROOT), syncDirectory, rename, presence),
+        ): PendingNotesStore = registry.computeIfAbsent(dir.canonicalPath) {
+            PendingNotesStore(File(it), syncDirectory, rename, presence, permits)
+        }
 
         /** Test seam: forget every instance, as a process restart would. */
         internal fun resetForTesting() = registry.clear()
@@ -1362,9 +1389,25 @@ internal class PendingNotesStore private constructor(
         private val androidDirectorySync = directorySync(fsyncDirectory) { it == OsConstants.EINVAL || it == OsConstants.ENOTSUP }
 
         /** Outside backup and device transfer, and outside the Etebase cache's per-username directories. */
-        fun forIdentity(context: Context, accountType: String, accountName: String, creationId: String) = open(
-            identityDir(context.noBackupFilesDir, accountType, accountName, creationId),
-            androidDirectorySync, androidRename, lstatPresence,
-        )
+        fun forIdentity(context: Context, accountType: String, accountName: String, creationId: String) =
+            forNoBackup(context.noBackupFilesDir, accountType, accountName, creationId, androidDirectorySync,
+                androidRename, lstatPresence)
+
+        /**
+         * [forIdentity] in [noBackup]: the store in notes-pending, and its discard permit in a root of its own
+         * beside notes-pending, so the permit stays readable when notes-pending cannot be listed. JVM tests pass
+         * their own [syncDirectory] and [rename], and keep the default [presence], which is for them.
+         */
+        internal fun forNoBackup(
+            noBackup: File,
+            accountType: String,
+            accountName: String,
+            creationId: String,
+            syncDirectory: (File) -> Unit,
+            rename: (File, File) -> Unit,
+            presence: (File) -> Presence = nioPresence,
+        ) = open(identityDir(noBackup, accountType, accountName, creationId), syncDirectory, rename, presence,
+            PendingNotesDiscardPermits(File(noBackup, PendingNotesDiscardPermits.ROOT), syncDirectory, rename,
+                presence))
     }
 }

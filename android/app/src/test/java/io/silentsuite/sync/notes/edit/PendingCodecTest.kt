@@ -289,4 +289,31 @@ class PendingCodecTest {
         assertEquals(42L, (PendingCodec.decodeSequence(unhex(v1Sequence)) as PendingCodec.Decoded.Ok).value)
         assertArrayEquals(unhex(v1Sequence), PendingCodec.encodeSequence(42))
     }
+
+    // A discard permit for the store in directory "store-1" with two changes at sequence 41, and one for
+    // "store-2" given for an answer that could not be counted, with three files.
+    private val v1Permit = "53534e520104000773746f72652d31000000020000000000000029009f6afa68"
+    private val v1PermitUncounted = "53534e520104000773746f72652d32000000030000000000000000013f881bf0"
+
+    @Test fun `version 1 permit records read back exactly, are written the same, and are no other kind`() {
+        val fixtures = listOf(v1Permit to ("store-1" to UnsyncedNotes(2, 41, false)),
+            v1PermitUncounted to ("store-2" to UnsyncedNotes(3, 0, unreadable = true)))
+        for ((hex, permit) in fixtures) {
+            val (store, shown) = permit
+            assertEquals(permit, (PendingCodec.decodePermit(unhex(hex)) as PendingCodec.Decoded.Ok).value)
+            assertArrayEquals(unhex(hex), PendingCodec.encodePermit(store, shown))
+        }
+        val bytes = unhex(v1Permit)
+        assertTrue("a permit is not a counter", PendingCodec.decodeSequence(bytes) is PendingCodec.Decoded.Bad)
+        assertTrue(PendingCodec.decodeLanded(bytes) is PendingCodec.Decoded.Bad)
+        assertTrue(PendingCodec.decodeNotebook(bytes) is PendingCodec.Decoded.Bad)
+        assertTrue(PendingCodec.decodeEntry(bytes) is PendingCodec.Decoded.Bad)
+        assertEquals("not a permit record",
+            (PendingCodec.decodePermit(unhex(v1Sequence)) as PendingCodec.Decoded.Bad).reason)
+        assertEquals("format version 2",
+            (PendingCodec.decodePermit(withFormatVersion(bytes, 2)) as PendingCodec.Decoded.Bad).reason)
+        for (length in 0 until bytes.size) {
+            assertTrue("cut to $length", PendingCodec.decodePermit(bytes.copyOf(length)) is PendingCodec.Decoded.Bad)
+        }
+    }
 }

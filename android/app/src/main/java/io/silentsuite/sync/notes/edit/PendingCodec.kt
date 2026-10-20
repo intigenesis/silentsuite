@@ -9,10 +9,10 @@ import java.io.IOException
 import java.util.zip.CRC32
 
 /**
- * On-disk format of the pending store: a magic number, a format version, the fields, and a CRC32
- * over everything before it. A file that fails any check decodes to [Decoded.Bad] and is kept,
- * never guessed at. Any other format version is also [Decoded.Bad], so neither a downgrade nor an
- * old file can be misread.
+ * On-disk format of the pending store and of its discard permits ([PendingNotesDiscardPermits]): a
+ * magic number, a format version, the fields, and a CRC32 over everything before it. A file that
+ * fails any check decodes to [Decoded.Bad] and is kept, never guessed at. Any other format version
+ * is also [Decoded.Bad], so neither a downgrade nor an old file can be misread.
  *
  * Entry files (format 2) put every field except the blob in a header with its own length and CRC32
  * ahead of the blob, so a screen that only counts entries reads a few hundred bytes per file instead
@@ -33,6 +33,7 @@ internal object PendingCodec {
     private const val KIND_LANDED = 1
     private const val KIND_NOTEBOOK = 2
     private const val KIND_SEQUENCE = 3
+    private const val KIND_PERMIT = 4
     /** The largest blob the store keeps; a larger save is refused before anything is written. */
     const val MAX_BLOB = 64 * 1024 * 1024
     /** Bytes before a format 2 entry header: magic, format version, header length. */
@@ -206,6 +207,26 @@ internal object PendingCodec {
     fun decodeSequence(bytes: ByteArray): Decoded<Long> = open(bytes, RECORD_MAGIC) { input ->
         if (input.readUnsignedByte() != KIND_SEQUENCE) throw IOException("not a sequence record")
         input.readLong()
+    }
+
+    /** A discard permit ([PendingNotesDiscardPermits]): the store directory it is for, and the answer it covers. */
+    fun encodePermit(store: String, shown: UnsyncedNotes): ByteArray = withChecksum { out ->
+        out.writeInt(RECORD_MAGIC)
+        out.writeByte(RECORD_FORMAT_VERSION)
+        out.writeByte(KIND_PERMIT)
+        out.writeUTF(store)
+        out.writeInt(shown.count)
+        out.writeLong(shown.sequence)
+        out.writeBoolean(shown.unreadable)
+    }
+
+    fun decodePermit(bytes: ByteArray): Decoded<Pair<String, UnsyncedNotes>> = open(bytes, RECORD_MAGIC) { input ->
+        if (input.readUnsignedByte() != KIND_PERMIT) throw IOException("not a permit record")
+        val store = input.readUTF()
+        val count = input.readInt()
+        val sequence = input.readLong()
+        if (count < 0 || sequence < 0) throw IOException("count $count, sequence $sequence")
+        store to UnsyncedNotes(count, sequence, input.readBoolean())
     }
 
     /**

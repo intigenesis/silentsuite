@@ -24,7 +24,8 @@ internal data class UnsyncedNotes(val count: Int, val sequence: Long, val unread
      * no higher number of files than was shown. Its sequence moves on with every save, as a counted
      * one does. Between two that carry 0 only the number of files is compared, which cannot tell
      * whether text changed or one note took the place of another; while the sequence cannot be read,
-     * though, no new version can be handed out.
+     * though, no new version can be handed out. A recorded permit does not rest on this comparison
+     * alone: a store removes its permit before it hands out a new version ([PendingNotesDiscardPermits]).
      */
     fun covers(now: UnsyncedNotes): Boolean =
         sequence == now.sequence && unreadable == now.unreadable && now.count <= count

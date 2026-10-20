@@ -1950,6 +1950,14 @@ class PendingNotesStoreTest {
         // A clear returns only on its own check that the directory is gone, never on what the deletion answered.
         assertEquals(listOf("dir.deleteRecursively()"),
             code.lines().filter { "deleteRecursively" in it }.map { it.trim() })
+
+        // The discard permits decide the same way: no File.exists(), and mkdir answers first.
+        val permits = File("src/main/java/io/silentsuite/sync/notes/edit/PendingNotesDiscardPermits.kt").readText()
+            .replace(Regex("(?s)/\\*.*?\\*/"), "").replace(Regex("//[^\n]*"), "")
+        assertFalse(Regex("""\b(exists|notExists|isFile)\b""").containsMatchIn(permits))
+        assertEquals(1, Regex("""\bisDirectory\b""").findAll(permits).count())
+        assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(permits).count())
+        assertFalse(Regex("""==\s*(PendingNotesStore\.)?Presence\.PRESENT\b""").containsMatchIn(permits))
     }
 
     @Test fun `uids that could escape the directory are refused for every kind of file`() {
