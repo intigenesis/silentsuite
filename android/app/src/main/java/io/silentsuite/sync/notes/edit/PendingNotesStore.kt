@@ -36,6 +36,11 @@ import java.util.concurrent.ConcurrentHashMap
  * decides nothing here: it answers false for a check that failed as well, and a file taken for absent
  * that way could be written over, skipped by a removal that then reports success, or left out of what a
  * run reports.
+ *
+ * A confirmed discard of the whole store ([discardStore]) runs under the same lock and, when the store holds
+ * anything a removal would lose ([UnsyncedNotes.anything]), records a permit outside the store before any
+ * file goes ([PendingNotesDiscardPermits]). An instance dropped after it ([unregister]) refuses everything,
+ * so only the new instance acts on the directory.
  */
 internal class PendingNotesStore private constructor(
     val dir: File,
@@ -54,6 +59,12 @@ internal class PendingNotesStore private constructor(
 
     /** Whether this instance has shown its store's discard permit gone; see [withdrawPermit]. */
     private var permitWithdrawn = false
+
+    /** Set once [discardStore] has shown the directory gone. */
+    private var discarded = false
+
+    /** Set by [unregister]: another instance may own the directory now. */
+    private var dropped = false
 
     /**
      * New directory levels whose entry in their parent is not synced yet. A level stays here until that
@@ -690,6 +701,7 @@ internal class PendingNotesStore private constructor(
      */
     fun clearAll() {
         synchronized(lock) {
+            checkNotDropped()
             closed = true
             beforeClearForTesting?.invoke()
             dir.deleteRecursively()
@@ -699,8 +711,8 @@ internal class PendingNotesStore private constructor(
 
     /**
      * What removing this identity's account would lose, read from the directory alone. Unlike every other
-     * read it runs no recovery and writes nothing, and a cleared store answers too, from what is still on
-     * disk: a clear that failed may have left text there.
+     * read it runs no recovery and writes nothing, and a cleared store answers too, until it is dropped
+     * ([unregister]), from what is still on disk: a clear that failed may have left text there.
      *
      * Counted: each note with an entry file (waiting, held, or one this build cannot read), and each first
      * write that never got its name and is intact, which recovery would commit. Not counted: a first write
@@ -723,7 +735,10 @@ internal class PendingNotesStore private constructor(
      * still carries the sequence when [nextVersion] could read it, so a save since moves it, and 0 only when
      * it cannot ([uncountedSequence]).
      */
-    fun unsynced(): UnsyncedNotes = synchronized(lock) { countUnsynced() }
+    fun unsynced(): UnsyncedNotes = synchronized(lock) {
+        checkNotDropped()
+        countUnsynced()
+    }
 
     /** [unsynced], under the store lock. */
     private fun countUnsynced(): UnsyncedNotes {
@@ -757,10 +772,129 @@ internal class PendingNotesStore private constructor(
         0L
     }
 
+    sealed class DiscardOutcome {
+        /** The directory is shown gone. Its permit was removed, or is left for a new version to withdraw. */
+        object Done : DiscardOutcome()
+
+        /** The store holds what the confirmation does not cover, [now]; nothing was written or deleted. */
+        data class Changed(val now: UnsyncedNotes) : DiscardOutcome()
+
+        /**
+         * The permit could not be recorded, and nothing was deleted. A permit may still be on disk: one from
+         * before this call, which stays, or this call's own, when the record failed after its rename and was
+         * not taken back. Either covers only what the user confirmed, until the next new version withdraws it.
+         */
+        object PermitNotRecorded : DiscardOutcome()
+
+        /**
+         * The deletion stopped, or the directory is not shown gone. A permit recorded for it stays. While it
+         * still covers what is left (step 4 of [discardStore]), a later call can finish; otherwise that call
+         * gives [Changed], and the user is asked again.
+         */
+        object NotFinished : DiscardOutcome()
+    }
+
+    /**
+     * The user's confirmed discard of everything in this store. [confirmed] is the answer of [unsynced] the
+     * user was shown, or null when nothing was shown. It all happens in one hold of the store lock, the lock
+     * every write takes, so a save either comes first and is counted, or comes once the store is closed and
+     * is refused. It runs no recovery, and it runs on a cleared instance too, so a discard that stopped can
+     * be finished.
+     *
+     * 1. The store is counted again from disk. When anything is there that [confirmed] does not cover,
+     *    nothing is written or deleted ([DiscardOutcome.Changed]).
+     * 2. When anything is there, a permit for it is recorded ([PendingNotesDiscardPermits.record]) before any
+     *    file goes. When that fails, nothing is deleted ([DiscardOutcome.PermitNotRecorded]), though a permit
+     *    may be left for the next new version to withdraw.
+     * 3. The instance is closed for the rest of the process, as by [clearAll]: every operation but [unsynced],
+     *    [discardStore], [unregister] and [clearAll] is refused.
+     * 4. The files go through [remove], in this order: entries and first writes, landed records, notebook
+     *    copies and anything else, the counter, then the directory. With the counter last, while the counter
+     *    file reads, what a discard that stopped leaves keeps its sequence and the count only falls, so its
+     *    permit still covers it. With the counter lost, cut short or failing its checksum, the sequence is
+     *    rebuilt from what is left and can fall, and an answer that could not be counted can become a counted
+     *    one once the file that stopped the count is gone. The permit then no longer covers the store: the
+     *    next call gives [DiscardOutcome.Changed], and the user is asked again.
+     * 5. [DiscardOutcome.Done] only once the directory is shown gone by two checks that agree ([shownGone]),
+     *    and then the permit is removed; a removal that fails then is logged, and the permit is left for the
+     *    next new version to withdraw. Otherwise, a failed removal or listing included, the permit stays
+     *    ([DiscardOutcome.NotFinished]). A store that cannot be listed is not deleted.
+     */
+    fun discardStore(confirmed: UnsyncedNotes?): DiscardOutcome = synchronized(lock) {
+        checkNotDropped()
+        // Whatever happens below may leave a permit on disk, so the next new version withdraws it again.
+        permitWithdrawn = false
+        val now = countUnsynced()
+        if (now.anything) {
+            if (confirmed == null || !confirmed.covers(now)) return@synchronized DiscardOutcome.Changed(now)
+            val earlier = permits.read(dir.name)
+            try {
+                permits.record(dir.name, now)
+            } catch (e: IOException) {
+                // A permit from before, such as the one a discard that stopped keeps, covers what is left, so it
+                // stays, and so does one this call put in its place. Otherwise one that reached the disk before a
+                // later step failed goes, when it can.
+                if (earlier == null) {
+                    try {
+                        permits.remove(dir.name)
+                    } catch (left: IOException) {
+                        // Then it covers only what the user confirmed, until the next new version withdraws it.
+                    }
+                }
+                return@synchronized DiscardOutcome.PermitNotRecorded
+            }
+        }
+        closed = true
+        try {
+            beforeClearForTesting?.invoke()
+            deleteAll()
+        } catch (e: IOException) {
+            return@synchronized DiscardOutcome.NotFinished
+        }
+        if (!shownGone(dir)) return@synchronized DiscardOutcome.NotFinished
+        discarded = true
+        try {
+            permits.remove(dir.name)
+        } catch (e: IOException) {
+            // Harmless: it is for a directory that is gone, and the next new version withdraws it.
+            Logger.log.warning("Pending notes discard permit could not be removed")
+        }
+        DiscardOutcome.Done
+    }
+
+    /** Removes every file of the store in the order [discardStore] gives, from one listing, then the directory. */
+    private fun deleteAll() {
+        val names = listing().map { it.name.removeSuffix(NEW) }.distinct().sorted()
+        val (entries, rest) = names.partition { it.endsWith(NOTE) }
+        val (landed, others) = rest.partition { it.endsWith(LANDED) }
+        for (name in entries + landed + others.filter { it != SEQUENCE } + others.filter { it == SEQUENCE }) {
+            remove(File(dir, name))
+        }
+        if (dir.delete()) dir.parentFile?.let(syncDirectory)
+    }
+
+    /**
+     * Drops this instance from the registry once [discardStore] has finished, so the next [open] of the
+     * directory gets a new instance, over a directory that is not there, which takes saves again. This one
+     * refuses every operation from then on, [unsynced], [discardStore] and [clearAll] included, since the new
+     * instance may own the directory by then. A second call does nothing.
+     */
+    fun unregister() {
+        synchronized(lock) {
+            if (dropped) return
+            check(discarded) { "only a discarded store is dropped" }
+            dropped = true
+            registry.remove(dir.path, this)
+        }
+    }
+
+    private fun checkNotDropped() = check(!dropped) { "the pending store was dropped" }
+
     // ---- internals ----
 
     /**
-     * Every public operation except [unsynced], [clearAll] and [pruneNotebooks]: refuse after [clearAll], and
+     * Every public operation except [unsynced], [discardStore], [unregister], [clearAll] and [pruneNotebooks]:
+     * refuse once [clearAll], or a [discardStore] that got as far as deleting, has closed the store, and
      * finish any interrupted work first. Recovery runs again before the next operation for as long as
      * anything in it did not work out, including a write or removal inside recovery itself, or a listing it
      * works from. A recovery whose listing fails throws, so the operation fails with it and the recovery is
@@ -832,7 +966,7 @@ internal class PendingNotesStore private constructor(
      * is not enough: with the counter gone and nothing versioned left on disk, versions start at 1 again,
      * and an answer that could not be counted and carries sequence 0 compares only a number of files. A
      * removal that cannot be shown throws before the counter or the entry is written. Once shown, it is
-     * not asked again by this instance.
+     * not asked again by this instance until a [discardStore], which may leave a permit behind.
      */
     private fun withdrawPermit() {
         if (permitWithdrawn) return
@@ -1243,9 +1377,9 @@ internal class PendingNotesStore private constructor(
         /**
          * Test seam: what a listing of the directory it is given answers in place of File.listFiles();
          * null is a listing that failed. It answers every listing the store makes itself: of its own
-         * directory, and of the directories above it that [knownAbsent] lists after a listing of it fails.
-         * It answers the listing in the check of [clearAll] that the directory is gone, but not the deletion.
-         * It answers the listings of the discard permits' root too ([PendingNotesDiscardPermits.remove]).
+         * directory, and of the directories above it that [knownAbsent] lists, after a listing of it fails or
+         * when [clearAll] or [discardStore] checks that the directory is gone, but not the deletion in
+         * [clearAll]. It answers the listings of the discard permits' root too ([PendingNotesDiscardPermits.remove]).
          */
         @Volatile internal var listFilesForTesting: ((File) -> Array<File>?)? = null
 

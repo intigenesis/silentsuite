@@ -1,5 +1,6 @@
 package io.silentsuite.sync.notes.edit
 
+import io.silentsuite.sync.notes.edit.PendingNotesStore.DiscardOutcome
 import io.silentsuite.sync.notes.edit.PendingNotesStore.Read
 import io.silentsuite.sync.notes.edit.PendingNotesStore.SaveOutcome
 import io.silentsuite.sync.notes.edit.PendingNotesStore.SendOutcome
@@ -42,6 +43,7 @@ class PendingNotesStoreTest {
         PendingNotesStore.beforeClearForTesting = null
         PendingNotesStore.listFilesForTesting = null
         PendingNotesStore.presenceForTesting = null
+        PendingNotesDiscardPermits.beforeRecordForTesting = null
         PendingNotesStore.resetForTesting()
     }
 
@@ -2270,5 +2272,336 @@ class PendingNotesStoreTest {
         assertFalse("a higher number of files than was shown", uncounted.covers(UnsyncedNotes(3, 0, unreadable = true)))
         assertFalse("a store that is counted now", uncounted.covers(UnsyncedNotes(1, 1, false)))
         assertFalse("not even a counted answer that carries sequence 0", uncounted.covers(UnsyncedNotes(1, 0, false)))
+    }
+
+    // ---- discarding the whole store ----
+
+    /**
+     * A reader of [s]'s permits of its own, as after a restart, where [s] keeps them: beside notes-pending for
+     * a store in the app's layout ([identityStore]), otherwise in the default root beside its directory.
+     */
+    private fun permitsOf(s: PendingNotesStore): PendingNotesDiscardPermits {
+        val parent = s.dir.parentFile!!
+        val root = if (parent.name == "notes-pending") parent.parentFile!! else parent
+        return PendingNotesDiscardPermits(File(root, PendingNotesDiscardPermits.ROOT), {}, atomicMove,
+            PendingNotesStore.nioPresence)
+    }
+
+    /**
+     * A store in the app's layout, opened as forIdentity opens one: notes-pending/<digest> in a no-backup
+     * directory of its own, with its permits in notes-discard beside notes-pending.
+     */
+    private fun identityStore() = PendingNotesStore.forNoBackup(tmp.newFolder("no_backup"), "io.silentsuite",
+        "alice@example.invalid", "gen-1", {}, atomicMove)
+
+    @Test fun `a discard whose permit cannot be recorded deletes nothing`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false, notebookCopy = blob("key b1"))
+        val shown = store.unsynced()
+        val before = filesOf(dir)
+        PendingNotesDiscardPermits.beforeRecordForTesting = { throw java.io.IOException("could not record the permit") }
+        assertEquals(DiscardOutcome.PermitNotRecorded, store.discardStore(shown))
+        PendingNotesDiscardPermits.beforeRecordForTesting = null
+        assertEquals("byte for byte", before, filesOf(dir))
+        assertNull(permitsOf(store).read(dir.name))
+        assertTrue("and no file of one", permitsOf(store).root.list()!!.isEmpty())
+        // Stands in for a permit a failed record left on disk, as when taking it back fails as well. This
+        // instance withdrew once already, at its first save; the discard attempt makes it withdraw again.
+        permitsOf(store).record(dir.name, store.unsynced())
+        assertTrue("the store stays open",
+            store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) is SaveOutcome.Saved)
+        assertNull("and its next save on the same instance withdraws the permit", permitsOf(store).read(dir.name))
+
+        // A permit that reached the disk before the sync after its rename failed is removed again.
+        PendingNotesStore.resetForTesting()
+        val root = permitsOf(store).root
+        val failing = PendingNotesDiscardPermits(root, syncDirectory = {
+            if (it.name == root.name) throw java.io.IOException("sync failed")
+        }, rename = atomicMove, presence = PendingNotesStore.nioPresence)
+        val s = PendingNotesStore.open(dir, rename = atomicMove, permits = failing)
+        val again = filesOf(dir)
+        assertEquals(DiscardOutcome.PermitNotRecorded, s.discardStore(s.unsynced()))
+        assertEquals(again, filesOf(dir))
+        assertNull(permitsOf(s).read(dir.name))
+    }
+
+    @Test fun `the permit is on disk before the first file goes, the files go in order, and then the directory`() {
+        store.editorOpened("pushed")
+        store.saveLocal("pushed", "b1", "r1", blob("p"), isCreate = false, notebookCopy = blob("key b1"))
+        val sent = store.beginSend("pushed")!!
+        assertEquals(SendOutcome.Done, store.completeSend("pushed", sent.version, "r1", blob("landed")))
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        store.saveLocal("n2", "b2", "r1", blob("b"), isCreate = false, notebookCopy = blob("key b2"))
+        // A first write that never got its name, behind the store's back.
+        val first = PendingEntry("n3", "b1", PendingEntry.State.UPSERT, 1, "r1", false, blob = blob("c"))
+        File(dir, "n3.note.new").writeBytes(PendingCodec.encodeEntry(first))
+        val shown = store.unsynced()
+        assertEquals(3, shown.count)
+
+        PendingNotesStore.beforeClearForTesting = {
+            assertThrows("closed before any file goes", IllegalStateException::class.java) { store.read("n1") }
+        }
+        val removed = ArrayList<String>()
+        PendingNotesStore.beforeRemoveForTesting = { file ->
+            if (removed.isEmpty() || file.name == "sequence") {
+                assertEquals("read back from disk, by a reader of its own", shown, permitsOf(store).read(dir.name))
+            }
+            removed += file.name
+        }
+        assertEquals(DiscardOutcome.Done, store.discardStore(shown))
+        assertEquals("entries and first writes, landed records, notebook copies, then the counter",
+            listOf("n1.note", "n2.note", "n3.note", "pushed.landed", "b1.notebook", "b2.notebook", "sequence"), removed)
+        assertFalse(dir.exists())
+        assertNull("the permit went once the directory had", permitsOf(store).read(dir.name))
+        assertTrue(permitsOf(store).root.list()!!.isEmpty())
+        assertEquals(UnsyncedNotes.NOTHING, store.unsynced())
+    }
+
+    @Test fun `a discard that stops is finished later under the same permit, also after a restart`() {
+        // n1 holds the highest version and goes first. With the counter gone before it, what is left would
+        // read at a lower sequence, which the permit no longer covers.
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false, notebookCopy = blob("key b1"))
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val shown = store.unsynced()
+        var removals = 0
+        PendingNotesStore.beforeRemoveForTesting = {
+            removals++
+            if (it.name == "n2.note") throw java.io.IOException("stopped")
+        }
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(shown))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertEquals("it stopped at the second file", 2, removals)
+        assertFalse("the first entry went", File(dir, "n1.note").exists())
+        assertTrue("the second did not, nor the counter",
+            File(dir, "n2.note").exists() && File(dir, "sequence").exists())
+        assertEquals("the permit stays", shown, permitsOf(store).read(dir.name))
+        assertThrows("closed to every other operation", IllegalStateException::class.java) {
+            store.saveLocal("n3", "b1", "r1", blob("late"), isCreate = false)
+        }
+        // A retry whose record fails keeps the permit that covers what is left, and deletes nothing.
+        val remaining = filesOf(dir)
+        PendingNotesDiscardPermits.beforeRecordForTesting = { throw java.io.IOException("could not record the permit") }
+        assertEquals(DiscardOutcome.PermitNotRecorded, store.discardStore(shown))
+        PendingNotesDiscardPermits.beforeRecordForTesting = null
+        assertEquals("the earlier permit stays", shown, permitsOf(store).read(dir.name))
+        assertEquals(remaining, filesOf(dir))
+
+        val next = restarted()
+        val left = next.unsynced()
+        assertEquals(UnsyncedNotes(1, shown.sequence, false), left)
+        val permit = permitsOf(next).read(next.dir.name)!!
+        assertTrue("what is left is still covered", permit.covers(left))
+        assertEquals(DiscardOutcome.Done, next.discardStore(permit))
+        assertFalse(dir.exists())
+        assertNull(permitsOf(next).read(next.dir.name))
+    }
+
+    @Test fun `with a damaged counter, a discard that stops is asked about again and deletes no more`() {
+        // A counter that fails its checksum is rebuilt from what is left, which falls as entries go. n1 holds
+        // the highest version and goes first. (One in a layout this build does not know is not damage: it
+        // stops the rebuild, and the count could not be made.)
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val sequence = File(dir, "sequence")
+        sequence.writeBytes(sequence.readBytes().also { it[6] = (it[6].toInt() xor 0x40).toByte() })
+        val shown = store.unsynced()
+        assertEquals(UnsyncedNotes(2, 2, false), shown)
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw java.io.IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(shown))
+        PendingNotesStore.beforeRemoveForTesting = null
+
+        val next = restarted()
+        val left = next.unsynced()
+        assertEquals("rebuilt from what is left", UnsyncedNotes(1, 1, false), left)
+        val permit = permitsOf(next).read(next.dir.name)!!
+        assertEquals(shown, permit)
+        val before = filesOf(dir)
+        assertEquals("the permit no longer covers it", DiscardOutcome.Changed(left), next.discardStore(permit))
+        assertEquals("and nothing more was deleted", before, filesOf(dir))
+        assertEquals("confirmed again, it finishes", DiscardOutcome.Done, next.discardStore(left))
+        assertFalse(dir.exists())
+        assertNull(permitsOf(next).read(next.dir.name))
+    }
+
+    @Test fun `a discard that meets more than was shown gives Changed, and writes and deletes nothing`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val shown = store.unsynced()
+        store.saveLocal("n1", "b1", "r2", blob("typed after the answer was shown"), isCreate = false)
+        val now = store.unsynced()
+        val before = filesOf(dir)
+        assertEquals(DiscardOutcome.Changed(now), store.discardStore(shown))
+        assertEquals("nothing was shown", DiscardOutcome.Changed(now), store.discardStore(null))
+        assertEquals(before, filesOf(dir))
+        assertNull("no permit", permitsOf(store).read(dir.name))
+        assertTrue("the store stays open",
+            store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) is SaveOutcome.Saved)
+
+        // A permit a save withdrew covers nothing, so its answer gives Changed too.
+        val s = restarted()
+        permitsOf(s).record(dir.name, s.unsynced())
+        val permit = permitsOf(s).read(dir.name)!!
+        s.saveLocal("n2", "b1", "r2", blob("typed later"), isCreate = false)
+        assertNull(permitsOf(s).read(dir.name))
+        assertEquals(DiscardOutcome.Changed(s.unsynced()), s.discardStore(permit))
+
+        // A store that holds nothing unsynced needs no confirmation, and records no permit, so a permit root
+        // that fails does not hold it up.
+        val clean = open(tmp.newFolder("clean"))
+        clean.putNotebook("b1", blob("key b1"))
+        var records = 0
+        PendingNotesDiscardPermits.beforeRecordForTesting = { records++; throw java.io.IOException("the root fails") }
+        assertEquals(DiscardOutcome.Done, clean.discardStore(null))
+        PendingNotesDiscardPermits.beforeRecordForTesting = null
+        assertEquals("no permit was recorded", 0, records)
+        assertFalse(clean.dir.exists())
+    }
+
+    @Test fun `a discard confirmed for a store that could not be counted still sees a save since`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        // A first write that cannot be read: a directory under its name.
+        val stranded = File(dir, "n9.note.new").also { assertTrue(it.mkdir()) }
+        fun files() = dir.listFiles()!!.filter { it.isFile }.associate { it.name to it.readBytes().toList() }
+        val shown = store.unsynced()
+        assertTrue(shown.unreadable)
+        store.saveLocal("n1", "b1", "r2", blob("typed after the answer was shown"), isCreate = false)
+        val before = files()
+        assertEquals(DiscardOutcome.Changed(store.unsynced()), store.discardStore(shown))
+        assertEquals("byte for byte", before, files())
+        assertTrue(stranded.isDirectory)
+        assertNull("no permit", permitsOf(store).read(dir.name))
+
+        // The same with one note pushed and a new one saved, which leaves the number of files as it was.
+        val again = store.unsynced()
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r2", blob("landed")))
+        store.saveLocal("n3", "b1", "r1", blob("a new note"), isCreate = false)
+        assertEquals(again.count, store.unsynced().count)
+        val after = files()
+        assertEquals(DiscardOutcome.Changed(store.unsynced()), store.discardStore(again))
+        assertEquals(after, files())
+        assertTrue(stranded.isDirectory)
+        assertNull(permitsOf(store).read(dir.name))
+    }
+
+    @Test fun `a save that holds the lock first is seen as Changed, and a save after the discard is refused`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val shown = store.unsynced()
+        val inSave = java.util.concurrent.CountDownLatch(1)
+        val finishSave = java.util.concurrent.CountDownLatch(1)
+        // The save stops at its first rename, the counter's, while it holds the lock: nothing it writes is
+        // counted on disk yet, so only a count taken under the lock sees it.
+        PendingNotesStore.beforeRenameForTesting = { target ->
+            if (target.name == "sequence" && inSave.count > 0) {
+                inSave.countDown()
+                finishSave.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }
+        var saved: SaveOutcome? = null
+        val saving = kotlin.concurrent.thread {
+            saved = store.saveLocal("n2", "b1", "r1", blob("typed while the question was open"), isCreate = false)
+        }
+        var outcome: DiscardOutcome? = null
+        var discarding: Thread? = null
+        try {
+            assertTrue(inSave.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            val thread = kotlin.concurrent.thread { outcome = store.discardStore(shown) }
+            discarding = thread
+            val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
+            while (thread.state != Thread.State.BLOCKED) {
+                assertTrue("the discard waits for the lock the save holds", System.nanoTime() < deadline)
+                Thread.sleep(1)
+            }
+        } finally {
+            // On every path, so that neither thread outlives this test and meets the next one's seams.
+            finishSave.countDown()
+            saving.join(10_000)
+            discarding?.join(10_000)
+            PendingNotesStore.beforeRenameForTesting = null
+        }
+        assertTrue(saved is SaveOutcome.Saved)
+        assertEquals(DiscardOutcome.Changed(store.unsynced()), outcome)
+        assertEquals(2, store.unsynced().count)
+        assertNull(permitsOf(store).read(dir.name))
+
+        // Confirmed again, it goes through, and a save after it is refused.
+        assertEquals(DiscardOutcome.Done, store.discardStore(store.unsynced()))
+        assertThrows(IllegalStateException::class.java) {
+            store.saveLocal("n3", "b1", "r1", blob("late"), isCreate = false)
+        }
+        assertFalse("nothing was written back", dir.exists())
+    }
+
+    @Test fun `a discard that cannot show the directory gone is not finished, and keeps its permit`() {
+        val s = identityStore()
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val shown = s.unsynced()
+        // Every file goes, but notes-pending cannot be listed, so the directory's going cannot be shown.
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-pending") null else d.listFiles() }
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        PendingNotesStore.listFilesForTesting = null
+        assertFalse("the files and the directory went", s.dir.exists())
+        assertEquals("the permit stays", shown, permitsOf(s).read(s.dir.name))
+        assertEquals("a later call finishes", DiscardOutcome.Done, s.discardStore(null))
+        assertNull(permitsOf(s).read(s.dir.name))
+
+        // Nor while the directory's own check fails, though the listing above no longer shows it.
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val counted = store.unsynced()
+        checksFailFor(dir.name)
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(counted))
+        PendingNotesStore.presenceForTesting = null
+        assertFalse(dir.exists())
+        assertEquals("the permit stays", counted, permitsOf(store).read(dir.name))
+        assertEquals(DiscardOutcome.Done, store.discardStore(null))
+        assertNull(permitsOf(store).read(dir.name))
+    }
+
+    @Test fun `a store that cannot be listed is not deleted, though confirmed as uncountable, and keeps its permit`() {
+        val s = identityStore()
+        val v = saved(s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false))
+        val before = filesOf(s.dir)
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == s.dir.name) null else d.listFiles() }
+        val shown = s.unsynced()
+        assertEquals(UnsyncedNotes(0, v, unreadable = true), shown)
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("nothing was deleted", before, filesOf(s.dir))
+        assertEquals("the permit stays", shown, permitsOf(s).read(s.dir.name))
+        // Listed again, the store is counted, which a permit for a store that could not be counted does not cover.
+        assertFalse(shown.covers(s.unsynced()))
+        assertEquals(DiscardOutcome.Changed(s.unsynced()), s.discardStore(shown))
+        assertEquals(before, filesOf(s.dir))
+    }
+
+    @Test fun `a dropped store refuses everything, and the next open starts empty and takes a save`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        assertThrows("only a store discarded in full is dropped", IllegalStateException::class.java) {
+            store.unregister()
+        }
+        assertEquals(DiscardOutcome.Done, store.discardStore(store.unsynced()))
+        assertSame("a discarded store stays registered until it is dropped", store, open(dir))
+        store.unregister()
+        val next = open(dir)
+        assertNotSame(store, next)
+        assertEquals(UnsyncedNotes.NOTHING, next.unsynced())
+        assertTrue(next.saveLocal("n1", "b1", "r1", blob("new"), isCreate = false) is SaveOutcome.Saved)
+        // The dropped one refuses everything, so it can never act on the directory the new one owns.
+        assertThrows(IllegalStateException::class.java) { store.unsynced() }
+        assertThrows(IllegalStateException::class.java) { store.discardStore(null) }
+        assertThrows(IllegalStateException::class.java) { store.clearAll() }
+        assertThrows(IllegalStateException::class.java) { store.read("n1") }
+        assertThrows(IllegalStateException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("late"), isCreate = false)
+        }
+        store.unregister()
+        assertSame("a second call does nothing", next, open(dir))
+        assertEquals(1, next.unsynced().count)
+    }
+
+    @Test fun `nothing outside the pending store's package calls discardStore yet`() {
+        // A discard deletes unsynced text, so each caller comes with a change and a review of its own.
+        val main = File("src/main/java")
+        val mentions = main.walk().filter { it.isFile && it.extension in setOf("kt", "java") }
+            .filter { "discardStore" in it.readText() }.map { it.relativeTo(main).invariantSeparatorsPath }.toList()
+        assertTrue("the store defines it", "io/silentsuite/sync/notes/edit/PendingNotesStore.kt" in mentions)
+        assertEquals(emptyList<String>(), mentions.filterNot { it.startsWith("io/silentsuite/sync/notes/edit/") })
     }
 }
