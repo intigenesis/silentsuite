@@ -60,13 +60,14 @@ class PendingNotesDiscardPermitsTest {
 
     @After fun reset() {
         PendingNotesDiscardPermits.beforeRecordForTesting = null
+        PendingNotesDiscardPermits.beforeDeleteForTesting = null
         PendingNotesStore.listFilesForTesting = null
         PendingNotesStore.presenceForTesting = null
         PendingNotesStore.resetForTesting()
     }
 
     @Test fun `a permit reads back as it was recorded, under its own store's name alone`() {
-        val shown = UnsyncedNotes(2, 7, false)
+        val shown = UnsyncedNotes(2, 7, false, names = setOf("n1.note", "n2.note"))
         assertNull("none before one is recorded", permits.read("store-a"))
         permits.record("store-a", shown)
         assertEquals(shown, permits.read("store-a"))
@@ -75,9 +76,13 @@ class PendingNotesDiscardPermitsTest {
         assertArrayEquals(PendingCodec.encodePermit("store-a", shown), File(permits.root, "store-a.permit").readBytes())
         assertNull("another store has none", permits.read("store-b"))
 
-        val uncounted = UnsyncedNotes(3, 0, unreadable = true)
+        val uncounted = UnsyncedNotes(3, 0, unreadable = true, names = setOf("n1.note", "n2.draft"))
         permits.record("store-a", uncounted)
         assertEquals("a second record takes the place of the first", uncounted, permits.read("store-a"))
+        assertThrows("never one for a store that could not be listed", IllegalArgumentException::class.java) {
+            permits.record("store-a", UnsyncedNotes(0, 7, unreadable = true, listed = false))
+        }
+        assertEquals(uncounted, permits.read("store-a"))
         permits.remove("store-a")
         assertNull(permits.read("store-a"))
         permits.remove("store-a")
@@ -121,7 +126,7 @@ class PendingNotesDiscardPermitsTest {
         // A push hands out no new version, so the permit stays, and what is left is still covered.
         val sent = again.beginSend("n1")!!
         assertEquals(SendOutcome.Done, again.completeSend("n1", sent.version, "r1", blob("landed")))
-        assertEquals(UnsyncedNotes(1, shown.sequence, false), again.unsynced())
+        assertEquals(UnsyncedNotes(1, shown.sequence, false, names = setOf("n2.note")), again.unsynced())
         assertEquals(shown, freshPermits().read(again.dir.name))
         assertTrue(permit.covers(again.unsynced()))
     }
@@ -184,16 +189,17 @@ class PendingNotesDiscardPermitsTest {
     @Test fun `a permit left in a store emptied down to its directory does not cover a new save at version 1`() {
         assertEquals(1L, saved(store.saveLocal("n1", "b1", "r1", blob("discarded"), isCreate = false)))
         val shown = store.unsynced()
-        assertEquals(UnsyncedNotes(1, 1, false), shown)
+        assertEquals(UnsyncedNotes(1, 1, false, names = setOf("n1.note")), shown)
         permits.record(store.dir.name, shown)
         // What a discard leaves when it stops after the counter, before the directory: the empty
         // directory and the permit.
         assertTrue(File(store.dir, "n1.note").delete() && File(store.dir, "sequence").delete())
         assertTrue(store.dir.list()!!.isEmpty())
 
+        // The same note typed again, so that even its name is the one the permit holds.
         val next = restarted()
         assertEquals("with nothing versioned left, versions start at 1 again",
-            1L, saved(next.saveLocal("n2", "b1", "r1", blob("typed later"), isCreate = false)))
+            1L, saved(next.saveLocal("n1", "b1", "r1", blob("typed later"), isCreate = false)))
         assertEquals("so the store now reads as the answer the permit was recorded for", shown, next.unsynced())
         assertNull("but the save withdrew the permit first", permits.read(next.dir.name))
     }
@@ -219,17 +225,69 @@ class PendingNotesDiscardPermitsTest {
         assertEquals(before, filesOf(s.dir))
         PendingNotesStore.presenceForTesting = null
 
-        // A root that cannot be listed, while the directory above it shows that it is there.
+        // A root that cannot be listed, while the directory above it shows that it is there. The instance lists
+        // the store first, while the root still lists, so its acknowledgement is shown gone and only the
+        // permit's removal is left to fail.
         s = restarted()
-        PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-discard") null else d.listFiles() }
+        assertTrue(s.scan().entries.isNotEmpty())
+        val unlistedRoot: (File) -> Array<File>? = { d -> if (d.name == "notes-discard") null else d.listFiles() }
+        PendingNotesStore.listFilesForTesting = unlistedRoot
         assertThrows(IOException::class.java) { s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
         assertEquals(before, filesOf(s.dir))
         PendingNotesStore.listFilesForTesting = null
         assertTrue(s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) is SaveOutcome.Saved)
 
         // Once shown gone, the instance does not ask again.
-        PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-discard") null else d.listFiles() }
+        PendingNotesStore.listFilesForTesting = unlistedRoot
         assertTrue(s.saveLocal("n3", "b1", "r1", blob("v"), isCreate = false) is SaveOutcome.Saved)
+
+        // A new instance's first listing, in its recovery, shows the acknowledgement gone first, so with that
+        // root it fails before anything is read or written, whether or not one was ever recorded.
+        val written = filesOf(s.dir)
+        s = restarted()
+        assertThrows(IOException::class.java) { s.saveLocal("n4", "b1", "r1", blob("w"), isCreate = false) }
+        assertThrows(IOException::class.java) { s.scan() }
+        assertEquals(written, filesOf(s.dir))
+    }
+
+    @Test fun `an acknowledgement is a record of its own, which is never read as a permit, nor a permit as one`() {
+        val identity = PendingNotesStore.DirectoryIdentity(device = 7, inode = 42)
+        assertNull(permits.acknowledgement("store-a"))
+        permits.acknowledge("store-a", identity)
+        assertEquals(identity, permits.acknowledgement("store-a"))
+        assertEquals("read by a reader of its own, as after a restart",
+            identity, freshPermits().acknowledgement("store-a"))
+        assertEquals("a file of its own", listOf("store-a.acknowledgement"), permits.root.list()!!.toList())
+        assertNull("it is no permit", permits.read("store-a"))
+        val acknowledgement = File(permits.root, "store-a.acknowledgement")
+        val bytes = acknowledgement.readBytes()
+        File(permits.root, "store-a.permit").writeBytes(bytes)
+        assertNull("not even under a permit's name", permits.read("store-a"))
+        permits.record("store-a", UnsyncedNotes(1, 1, false))
+        acknowledgement.writeBytes(File(permits.root, "store-a.permit").readBytes())
+        assertNull("and a permit under its name is no acknowledgement", permits.acknowledgement("store-a"))
+
+        for (length in 0 until bytes.size) {
+            acknowledgement.writeBytes(bytes.copyOf(length))
+            assertNull("cut to $length", permits.acknowledgement("store-a"))
+        }
+        for (i in bytes.indices) {
+            acknowledgement.writeBytes(bytes.copyOf().also { it[i] = (it[i].toInt() xor 0x40).toByte() })
+            assertNull("byte $i", permits.acknowledgement("store-a"))
+        }
+        acknowledgement.writeBytes(withFormatVersion(bytes, 2))
+        assertNull("a newer format", permits.acknowledgement("store-a"))
+        acknowledgement.writeBytes(PendingCodec.encodeAcknowledgement("store-b", identity))
+        assertNull("another store's acknowledgement under this store's name", permits.acknowledgement("store-a"))
+
+        // Withdrawn on its own: the permit beside it stays.
+        permits.acknowledge("store-a", identity)
+        permits.withdrawAcknowledgement("store-a")
+        assertNull(permits.acknowledgement("store-a"))
+        permits.withdrawAcknowledgement("store-a")
+        assertEquals(UnsyncedNotes(1, 1, false), permits.read("store-a"))
+        assertEquals(listOf("store-a.permit"), permits.root.list()!!.toList())
+        assertThrows(IllegalArgumentException::class.java) { permits.acknowledge("../x", identity) }
     }
 
     @Test fun `a permit is written in full and synced into place, or not at all, and its removal is synced`() {

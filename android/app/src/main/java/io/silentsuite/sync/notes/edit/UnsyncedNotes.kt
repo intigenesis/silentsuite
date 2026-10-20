@@ -9,8 +9,25 @@ package io.silentsuite.sync.notes.edit
  * version reads it, so a save moves it on there as well. It carries 0 only while the sequence cannot
  * be read, and then no new version can be handed out. An answer of nothing carries sequence 0, which
  * says nothing about the text.
+ *
+ * [listed] is false only when the store's directory could not be listed and is not shown gone: nothing was
+ * counted, and a confirmation of such an answer is only an acknowledgement, which deletes nothing
+ * ([PendingNotesStore.DiscardOutcome.Acknowledged]). A caller chooses from it, before it asks, between the
+ * wording of a discard and that of an acknowledgement.
+ *
+ * [names] are what the answer was counted from that may hold unsynced text: each note it counted by its entry
+ * file's name ("<uid>.note", which a first write takes when recovery commits it), and in an answer that could
+ * not be counted, each entry file and first write by that name and each file of a kind this build does not
+ * know by its own. A listing can come back short, so a count can be low (see [PendingNotesStore.unsynced]);
+ * a confirmation covers only what it names all the same.
  */
-internal data class UnsyncedNotes(val count: Int, val sequence: Long, val unreadable: Boolean) {
+internal data class UnsyncedNotes(
+    val count: Int,
+    val sequence: Long,
+    val unreadable: Boolean,
+    val listed: Boolean = true,
+    val names: Set<String> = emptySet(),
+) {
     /** Something would be lost, or that cannot be ruled out. */
     val anything: Boolean get() = count > 0 || unreadable
 
@@ -26,9 +43,14 @@ internal data class UnsyncedNotes(val count: Int, val sequence: Long, val unread
      * whether text changed or one note took the place of another; while the sequence cannot be read,
      * though, no new version can be handed out. A recorded permit does not rest on this comparison
      * alone: a store removes its permit before it hands out a new version ([PendingNotesDiscardPermits]).
+     *
+     * Either way, [now] must name nothing that this does not ([names]), so what a short listing missed is not
+     * covered once a later listing shows it. And an answer from a store that could not be listed covers only
+     * another such answer, while no answer from a listed store covers one ([listed]): a confirmation given as
+     * an acknowledgement never becomes one for a discard, nor the other way round.
      */
-    fun covers(now: UnsyncedNotes): Boolean =
-        sequence == now.sequence && unreadable == now.unreadable && now.count <= count
+    fun covers(now: UnsyncedNotes): Boolean = sequence == now.sequence && unreadable == now.unreadable &&
+        listed == now.listed && now.count <= count && names.containsAll(now.names)
 
     companion object {
         val NOTHING = UnsyncedNotes(0, 0, false)
