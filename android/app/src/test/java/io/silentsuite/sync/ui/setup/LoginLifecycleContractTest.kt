@@ -288,9 +288,10 @@ class LoginLifecycleContractTest {
     @Test
     fun dashboardLifecycleObservationAvoidsRepeatedActivityScenarioPolling() {
         val source = File("src/androidTest/java/io/silentsuite/sync/ui/AccountDashboardRuntimeTest.kt").readText()
+        // Ends at the next test method, so this is exactly the lifecycle method's body.
         val lifecycle = source.substringAfter(
             "@Test fun requestedQueuedRunningSettlingAndTerminalStatesNeverFlashGenericAttention()"
-        ).substringBefore("@Test fun freshContactsGenerationFinishesBeforeChildDispatchOrCompletion()")
+        ).substringBefore("@Test fun ")
         val observerPoll = source.substringAfter("private fun waitForObservedText(")
             .substringBefore("private fun waitForText(")
 
