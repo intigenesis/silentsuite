@@ -19,6 +19,7 @@ import androidx.lifecycle.Lifecycle
 import io.silentsuite.sync.AccountSettings
 import io.silentsuite.sync.App
 import io.silentsuite.sync.R
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.resource.LocalAddressBook
 import io.silentsuite.sync.syncadapter.AccountAuthenticatorService
 import io.silentsuite.sync.syncadapter.SyncStatusStore
@@ -453,6 +454,7 @@ class AccountDrawerSignOutRuntimeTest {
             destructiveCleanupCalls++
             callback(true)
         }
+        override fun unsyncedNotes(main: ExactAccountIdentity) = UnsyncedNotes.NOTHING
     }
 
     private class DelayedSuccessSeams(
@@ -478,6 +480,7 @@ class AccountDrawerSignOutRuntimeTest {
         override fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?) =
             ActiveAccountReconciliation(ActiveAccountManager.setActiveAccount(context, siblingAccount), sibling)
         override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) = callback(true)
+        override fun unsyncedNotes(main: ExactAccountIdentity) = UnsyncedNotes.NOTHING
     }
 
     private fun removeAccountAndWait(manager: AccountManager, account: Account) {

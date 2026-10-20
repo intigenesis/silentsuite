@@ -1,5 +1,6 @@
 package io.silentsuite.sync.ui
 
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -34,6 +35,13 @@ class CurrentAccountSignOutCoordinatorTest {
             ActiveAccountReconciliation(active, reconciledActive).also { events += "active:${replacement?.name}" }
         override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) {
             events += "children"; childrenCallback = callback
+        }
+        // The count records no event, so the event lists of the other tests stand.
+        var unsynced = UnsyncedNotes.NOTHING
+        var unsyncedFails = false
+        override fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes {
+            if (unsyncedFails) throw IllegalStateException("cannot look")
+            return unsynced
         }
         override fun hasObservedMainGenerationInvalidation() = listenerInvalidated
         override fun close() { closeCalls++ }
@@ -152,5 +160,16 @@ class CurrentAccountSignOutCoordinatorTest {
         // routing read look present again.
         f.absent = false
         assertTrue(c.hasObservedMainGenerationInvalidation())
+    }
+
+    @Test fun `the count comes through the seam, and a seam that cannot look says something may be there`() {
+        val f = Fake().apply { unsynced = UnsyncedNotes(2, 7, false) }
+        val c = CurrentAccountSignOutCoordinator(f)
+        assertEquals(UnsyncedNotes(2, 7, false), c.unsyncedNotes(target))
+        f.unsyncedFails = true
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true), c.unsyncedNotes(target))
+        assertTrue(c.unsyncedNotes(target).anything)
+        assertEquals("asking starts nothing", emptyList<String>(), f.events)
+        assertEquals(CurrentAccountSignOutState.Idle, c.state)
     }
 }

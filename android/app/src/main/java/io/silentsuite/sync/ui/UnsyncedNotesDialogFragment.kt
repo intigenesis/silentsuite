@@ -1,0 +1,109 @@
+package io.silentsuite.sync.ui
+
+import android.app.Dialog
+import android.content.DialogInterface
+import android.os.Bundle
+import androidx.fragment.app.DialogFragment
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import io.silentsuite.sync.R
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
+
+/**
+ * The two dialogs the account screen shows before a sign-out while Notes changes have not synced.
+ * Step 1 shows how many changes have not synced, or that they could not be counted, with Sync now,
+ * Cancel and a third action to go on without syncing. Step 2 asks for the separate confirmation of
+ * the discard. The dialog keeps the exact account generation and all of the answer it showed, the
+ * names that answer was counted from included, in its arguments, and sends both with every answer,
+ * so the screen can turn away an answer for another account. It
+ * decides nothing itself: an answer goes to the account screen that hosts it, and so do Cancel and
+ * a canceled dialog ([onCancel]).
+ */
+class UnsyncedNotesDialogFragment : DialogFragment() {
+    override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+        val args = requireArguments()
+        val identity = ExactAccountIdentity(args.getString(ARG_TYPE)!!, args.getString(ARG_NAME)!!,
+            args.getString(ARG_CREATION_ID)!!)
+        // All of the answer, the names it was counted from included: a confirmation covers only what it names.
+        val shown = UnsyncedNotes(args.getInt(ARG_COUNT), args.getLong(ARG_SEQUENCE), args.getBoolean(ARG_UNREADABLE),
+            args.getBoolean(ARG_LISTED), args.getStringArrayList(ARG_NAMES)!!.toSet())
+        fun send(answer: UnsyncedNotesSignOutPolicy.Answer) {
+            (activity as? AccountActivity)?.onUnsyncedNotesAnswer(identity, answer, shown)
+        }
+        fun closedWithoutSignOut() {
+            (activity as? AccountActivity)?.onSignOutDialogClosedWithoutSignOut()
+        }
+        val text = UnsyncedNotesSignOutPolicy.text(shown)
+        val builder = MaterialAlertDialogBuilder(requireContext())
+        return when (UnsyncedNotesSignOutPolicy.Step.valueOf(args.getString(ARG_STEP)!!)) {
+            UnsyncedNotesSignOutPolicy.Step.COUNT -> builder
+                .setTitle(R.string.notes_sign_out_unsynced_title)
+                .setMessage(when (text) {
+                    is UnsyncedNotesSignOutPolicy.Text.Counted ->
+                        resources.getQuantityString(R.plurals.notes_sign_out_unsynced, text.count, text.count)
+                    UnsyncedNotesSignOutPolicy.Text.Uncounted -> getString(R.string.notes_sign_out_unsynced_unreadable)
+                })
+                .setNegativeButton(android.R.string.cancel) { _, _ -> closedWithoutSignOut() }
+                .setNeutralButton(R.string.notes_sign_out_without_syncing) { _, _ ->
+                    send(UnsyncedNotesSignOutPolicy.Answer.GO_ON_WITHOUT_SYNCING)
+                }
+                .setPositiveButton(R.string.account_synchronize_now) { _, _ ->
+                    send(UnsyncedNotesSignOutPolicy.Answer.SYNC_NOW)
+                }
+                .create()
+            UnsyncedNotesSignOutPolicy.Step.DISCARD -> builder
+                .setTitle(R.string.notes_discard_title)
+                .setMessage(when (text) {
+                    is UnsyncedNotesSignOutPolicy.Text.Counted ->
+                        resources.getQuantityString(R.plurals.notes_discard_text, text.count, text.count)
+                    UnsyncedNotesSignOutPolicy.Text.Uncounted -> getString(R.string.notes_discard_unreadable)
+                })
+                .setNegativeButton(android.R.string.cancel) { _, _ -> closedWithoutSignOut() }
+                .setPositiveButton(R.string.notes_discard_and_sign_out) { _, _ ->
+                    send(UnsyncedNotesSignOutPolicy.Answer.DISCARD)
+                }
+                .create()
+        }
+    }
+
+    /**
+     * The dialog was canceled: it ends without an answer, and the account screen that hosts it is told. The
+     * platform cancels a dialog for Back and for a tap outside it.
+     */
+    override fun onCancel(dialog: DialogInterface) {
+        super.onCancel(dialog)
+        (activity as? AccountActivity)?.onSignOutDialogClosedWithoutSignOut()
+    }
+
+    companion object {
+        private const val ARG_TYPE = "unsyncedNotes.type"
+        private const val ARG_NAME = "unsyncedNotes.name"
+        private const val ARG_CREATION_ID = "unsyncedNotes.creationId"
+        private const val ARG_COUNT = "unsyncedNotes.count"
+        private const val ARG_SEQUENCE = "unsyncedNotes.sequence"
+        private const val ARG_UNREADABLE = "unsyncedNotes.unreadable"
+        private const val ARG_LISTED = "unsyncedNotes.listed"
+        private const val ARG_NAMES = "unsyncedNotes.names"
+        private const val ARG_STEP = "unsyncedNotes.step"
+
+        /** One tag per step. The screen looks the tag up before it shows a step and shows none while it finds one. */
+        internal fun tag(step: UnsyncedNotesSignOutPolicy.Step) = "unsynced-notes-" + step.name
+
+        internal fun newInstance(
+            identity: ExactAccountIdentity,
+            step: UnsyncedNotesSignOutPolicy.Step,
+            shown: UnsyncedNotes,
+        ) = UnsyncedNotesDialogFragment().apply {
+            arguments = Bundle(9).apply {
+                putString(ARG_TYPE, identity.type)
+                putString(ARG_NAME, identity.name)
+                putString(ARG_CREATION_ID, identity.creationId)
+                putInt(ARG_COUNT, shown.count)
+                putLong(ARG_SEQUENCE, shown.sequence)
+                putBoolean(ARG_UNREADABLE, shown.unreadable)
+                putBoolean(ARG_LISTED, shown.listed)
+                putStringArrayList(ARG_NAMES, ArrayList(shown.names.sorted()))
+                putString(ARG_STEP, step.name)
+            }
+        }
+    }
+}

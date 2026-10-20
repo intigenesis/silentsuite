@@ -58,6 +58,8 @@ import io.silentsuite.sync.dataexport.AndroidExportKind
 import io.silentsuite.sync.log.Logger
 import io.silentsuite.sync.model.CollectionInfo
 import io.silentsuite.sync.notes.NotesSyncCoordinator
+import io.silentsuite.sync.notes.NotesSyncPolicy
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.ui.notes.NotesActivity
 import io.silentsuite.sync.resource.LocalAddressBook
 import io.silentsuite.sync.resource.LocalCalendar
@@ -687,14 +689,130 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
     }
 
     private fun confirmLogout() {
+        // A sign-out message that is still showing goes while the question is asked. When a dialog
+        // reports that it ended without a sign-out and the last attempt failed, it is shown again.
+        signOutErrorSnackbar?.dismiss()
+        when (val next = UnsyncedNotesSignOutPolicy.start(signOutModel.unsyncedNotes())) {
+            is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
+                showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
+            else -> confirmPlainLogout()
+        }
+    }
+
+    /**
+     * The sign-out question with the words it had before, asked when the store's answer, read right
+     * before, was nothing. Its button starts the sign-out without reading the store again. Its
+     * Cancel and a canceled dialog are reported like the ends of the two unsynced-changes dialogs.
+     */
+    private fun confirmPlainLogout() {
         MaterialAlertDialogBuilder(this)
             .setTitle(R.string.account_delete_confirmation_title)
             .setMessage(R.string.account_delete_confirmation_text)
             .setPositiveButton(R.string.navigation_drawer_logout) { _, _ ->
                 signOutModel.begin()
             }
-            .setNegativeButton(android.R.string.cancel, null)
+            .setNegativeButton(android.R.string.cancel) { _, _ -> onSignOutDialogClosedWithoutSignOut() }
+            .setOnCancelListener { onSignOutDialogClosedWithoutSignOut() }
             .show()
+    }
+
+    private fun showUnsyncedNotes(step: UnsyncedNotesSignOutPolicy.Step, unsynced: UnsyncedNotes) {
+        val tag = UnsyncedNotesDialogFragment.tag(step)
+        // A dialog of this step is open already. It reports its own end.
+        if (supportFragmentManager.findFragmentByTag(tag) != null) return
+        val identity = signOutModel.identity()
+        if (identity == null || supportFragmentManager.isStateSaved) {
+            onSignOutDialogClosedWithoutSignOut()
+            return
+        }
+        UnsyncedNotesDialogFragment.newInstance(identity, step, unsynced).show(supportFragmentManager, tag)
+    }
+
+    /**
+     * Every answer of the two unsynced-changes dialogs arrives here. For the account this screen
+     * signs out, what follows is decided by [UnsyncedNotesSignOutPolicy].
+     */
+    internal fun onUnsyncedNotesAnswer(
+        identity: ExactAccountIdentity,
+        answer: UnsyncedNotesSignOutPolicy.Answer,
+        shown: UnsyncedNotes,
+    ) {
+        // An answer for another account than the one this screen signs out starts nothing. Its
+        // dialog still ended without a sign-out.
+        if (signOutModel.identity() != identity) {
+            onSignOutDialogClosedWithoutSignOut()
+            return
+        }
+        when (val next = UnsyncedNotesSignOutPolicy.answered(answer, shown, signOutModel.unsyncedNotes())) {
+            UnsyncedNotesSignOutPolicy.Next.AskPlain -> confirmPlainLogout()
+            is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
+                showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
+            is UnsyncedNotesSignOutPolicy.Next.ShowDiscard ->
+                showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.DISCARD, next.unsynced)
+            UnsyncedNotesSignOutPolicy.Next.SyncNotes -> syncNotesBeforeSignOut(identity)
+            is UnsyncedNotesSignOutPolicy.Next.ConfirmAndSignOut -> signOutModel.begin()
+        }
+    }
+
+    /**
+     * Sync now from the count dialog. While this screen's generation still has its account and Notes
+     * is on for it, a request is recorded under the exact generation and the Notes job is asked for
+     * a run the user started, as turning the Notes switch on does. The dashboard's own Sync now is
+     * not used: it also asks for the calendar, contact and task syncs, asks for nothing while one of
+     * them runs, and needs the screen's account, which the retained sign-out screen never sets. With
+     * Notes off only a message is shown. When the generation no longer has its account, nothing is
+     * asked and no message is shown. The run is an attempt that can be skipped or fail, and neither
+     * message says that anything was sent. However this ends, the dialog is reported as ended without
+     * a sign-out.
+     */
+    private fun syncNotesBeforeSignOut(identity: ExactAccountIdentity) {
+        try {
+            if (!signOutModel.ownsCurrentGeneration()) return
+            val exact = Account(identity.name, identity.type)
+            if (!AccountSettings.notesEnabled(AccountManager.get(this), exact)) {
+                // A run does nothing while Notes is off, and turning Notes off keeps the changes.
+                Toast.makeText(this, R.string.notes_sync_now_notes_off, Toast.LENGTH_LONG).show()
+                return
+            }
+            val requestId = java.util.UUID.randomUUID().toString()
+            val statusStore = SyncStatusStore(applicationContext)
+            // Recorded for the exact generation, the one the run reports under.
+            statusStore.recordRequested(statusStore.identity(exact, identity.creationId),
+                setOf(SyncStatusStore.Service.NOTES), requestId, System.currentTimeMillis())
+            NotesSyncCoordinator.request(applicationContext, exact, identity.creationId,
+                NotesSyncPolicy.Trigger.MANUAL, requestId)
+            if (!signOutOnly) model.loadAccount()
+            Toast.makeText(this, R.string.notes_sign_out_sync_asked, Toast.LENGTH_LONG).show()
+        } finally {
+            onSignOutDialogClosedWithoutSignOut()
+        }
+    }
+
+    /**
+     * Retry from the failure message. After a failed removal the store is read again and, when it
+     * holds anything, the count is shown before a new try. After a failed cleanup the retry starts
+     * at once and shows no dialog.
+     */
+    private fun retrySignOut(failed: CurrentAccountSignOutState) {
+        val unsynced = if (failed is CurrentAccountSignOutState.RemovalFailed) signOutModel.unsyncedNotes()
+            else UnsyncedNotes.NOTHING
+        if (unsynced.anything) showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, unsynced)
+        else signOutModel.begin()
+    }
+
+    /**
+     * A sign-out dialog ended and no sign-out started: Cancel, a canceled dialog, Sync now, an answer
+     * for another account, or a dialog that could not be shown. When the last attempt failed, the
+     * failure message with Retry is shown again: a tap on Retry closes it and [confirmLogout]
+     * dismisses it. [attachRetainedSignOut] sets the layout and renders the sign-out state and wires
+     * up nothing else, so on the retained sign-out screen that message is the way to try again.
+     */
+    internal fun onSignOutDialogClosedWithoutSignOut() {
+        val state = signOutModel.currentState() ?: return
+        if (state is CurrentAccountSignOutState.RemovalFailed || state is CurrentAccountSignOutState.CleanupFailed) {
+            renderedSignOutErrorId = 0
+            renderSignOutState(state)
+        }
     }
 
     private fun showThemeDialog() {
@@ -747,7 +865,7 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
             val message = if (state is CurrentAccountSignOutState.CleanupFailed)
                 R.string.account_sign_out_cleanup_failed else R.string.account_sign_out_failed
             signOutErrorSnackbar = Snackbar.make(findViewById(R.id.coordinator), message, Snackbar.LENGTH_INDEFINITE)
-                .setAction(R.string.retry) { signOutModel.begin() }.also { it.show() }
+                .setAction(R.string.retry) { retrySignOut(state) }.also { it.show() }
         }
         if (state is CurrentAccountSignOutState.Complete && !signOutCompletionHandled) {
             signOutCompletionHandled = true

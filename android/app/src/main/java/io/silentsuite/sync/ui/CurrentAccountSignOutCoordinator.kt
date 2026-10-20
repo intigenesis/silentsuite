@@ -1,5 +1,7 @@
 package io.silentsuite.sync.ui
 
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
+
 /** Non-secret identity used to keep account destructive work exact and framework-independent. */
 data class ExactAccountIdentity(val type: String, val name: String, val creationId: String)
 
@@ -22,9 +24,10 @@ sealed class CurrentAccountSignOutState {
 
 /**
  * Ordered sign-out policy. The snapshot is retained for cleanup-only retry after the main row is
- * absent; a retry can therefore never broaden ownership or issue the main removal twice.
+ * absent; a retry can therefore never broaden ownership or issue the main removal twice. Internal,
+ * since its seams speak of the pending Notes store's own types.
  */
-class CurrentAccountSignOutCoordinator(
+internal class CurrentAccountSignOutCoordinator(
     private val seams: Seams,
     private val onStateChanged: (CurrentAccountSignOutState) -> Unit = {}
 ) {
@@ -37,6 +40,8 @@ class CurrentAccountSignOutCoordinator(
         fun clearStatus(main: ExactAccountIdentity): Boolean
         fun reconcileActive(main: ExactAccountIdentity, replacement: ExactAccountIdentity?): ActiveAccountReconciliation
         fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit)
+        /** What the pending Notes store of [main] holds that has not synced: what removing the account would lose. */
+        fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes
         /** Monotonic platform-listener observation; production defaults to no invalidation. */
         fun hasObservedMainGenerationInvalidation(): Boolean = false
         fun close() = Unit
@@ -117,6 +122,10 @@ class CurrentAccountSignOutCoordinator(
 
     fun isMainGenerationPresent(main: ExactAccountIdentity) =
         !runCatching { seams.mainGenerationAbsent(main) }.getOrDefault(true)
+
+    /** The seam's answer. When the seam throws, the answer is that the changes could not be counted, never nothing. */
+    fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes =
+        runCatching { seams.unsyncedNotes(main) }.getOrDefault(UnsyncedNotes(0, 0, unreadable = true))
 
     fun hasObservedMainGenerationInvalidation() =
         runCatching { seams.hasObservedMainGenerationInvalidation() }.getOrDefault(true)
