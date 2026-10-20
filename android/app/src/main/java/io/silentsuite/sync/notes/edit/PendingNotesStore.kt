@@ -30,6 +30,12 @@ import java.util.concurrent.ConcurrentHashMap
  * identity. Every operation runs under it. Callers must never hold the Etebase cache monitor or the
  * cache's write fence (EtebaseLocalCache.writeIfCurrent) while calling in, and transforms passed to
  * [update] must not take either.
+ *
+ * Whether a file is there is decided by a read that worked, a listing that worked, or a presence check
+ * ([Presence]) that answers absent only when the system says the path does not exist. File.exists()
+ * decides nothing here: it answers false for a check that failed as well, and a file taken for absent
+ * that way could be written over, skipped by a removal that then reports success, or left out of what a
+ * run reports.
  */
 internal class PendingNotesStore private constructor(
     val dir: File,
@@ -669,12 +675,23 @@ internal class PendingNotesStore private constructor(
      * the process, so a late save that opens the store again gets this instance and is refused instead
      * of recreating the directory. The identity (account generation) never comes back after sign-out. A
      * call after a failed one tries the deletion again, so a sign-out cleanup retry does real work.
+     *
+     * It returns only once the directory is shown gone by two checks that agree: its presence check answers
+     * [Presence.ABSENT], and the nearest directory above it that can be listed does not hold the next name
+     * on the way down to it ([knownAbsent]). A listing alone is no proof, since File.listFiles can return
+     * what it read so far when reading a directory fails partway. Otherwise it throws IOException, whatever
+     * the deletion answered, since the deletion counts a file it could not remove as gone when File.exists()
+     * says so, and that answers false for a check that failed as well. A caller may rely on a clear only
+     * when it returned.
      */
     fun clearAll() {
         synchronized(lock) {
             closed = true
             beforeClearForTesting?.invoke()
-            if (dir.exists() && !dir.deleteRecursively()) throw IOException("could not clear the pending store")
+            dir.deleteRecursively()
+            if (presenceOf(dir) != Presence.ABSENT || !knownAbsent(dir)) {
+                throw IOException("could not clear the pending store")
+            }
         }
     }
 
@@ -1149,7 +1166,7 @@ internal class PendingNotesStore private constructor(
          * Test seam: what a listing of the directory it is given answers in place of File.listFiles();
          * null is a listing that failed. It answers every listing the store makes itself: of its own
          * directory, and of the directories above it that [knownAbsent] lists after a listing of it fails.
-         * It does not answer the deletion in [clearAll].
+         * It answers the listing in the check of [clearAll] that the directory is gone, but not the deletion.
          */
         @Volatile internal var listFilesForTesting: ((File) -> Array<File>?)? = null
 

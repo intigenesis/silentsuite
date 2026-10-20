@@ -1853,6 +1853,52 @@ class PendingNotesStoreTest {
         assertNull("shown gone, the link is cleared", restarted().beginSend("copy1")!!.origin)
     }
 
+    @Test fun `a sign-out clear returns only once the store directory is shown gone`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        // The deletion works, but no directory above the store can be listed, so it cannot be shown gone.
+        PendingNotesStore.listFilesForTesting = { null }
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        // A listing above that still shows the directory is no proof either.
+        val above = store.dir.parentFile!!
+        PendingNotesStore.listFilesForTesting = { d -> if (d.path == above.path) arrayOf(store.dir) else d.listFiles() }
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        // Nor is a listing that no longer shows it while its own check fails, since a listing can come back short.
+        PendingNotesStore.listFilesForTesting = null
+        checksFailFor(store.dir.name)
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        PendingNotesStore.presenceForTesting = null
+        store.clearAll()
+        assertFalse(dir.exists())
+        assertThrows(IllegalStateException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("late"), isCreate = false)
+        }
+    }
+
+    @Test fun `the store asks File exists nothing, and keeps only checks that cannot make a file absent`() {
+        // File.exists() answers false for a check that failed as well as for a file that is not there.
+        val code = File("src/main/java/io/silentsuite/sync/notes/edit/PendingNotesStore.kt").readText()
+            .replace(Regex("(?s)/\\*.*?\\*/"), "").replace(Regex("//[^\n]*"), "")
+        // Words, not calls, so that a reference such as File::exists is caught as well.
+        assertFalse(Regex("""\b(exists|notExists)\b""").containsMatchIn(code))
+        // A true answer from these needs a check that worked. Each removal keeps only regular files on top
+        // of a listing, so a false answer keeps a file; mkdir answered first, so a false answer fails a write.
+        assertEquals(2, Regex("""\bisFile\b""").findAll(code).count())
+        assertEquals(2, Regex("""\.filter \{ it\.isFile\b""").findAll(code).count())
+        assertEquals(1, Regex("""\bisDirectory\b""").findAll(code).count())
+        assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(code).count())
+        // The presence check is asked only where a check that failed cannot pass for an absence: isPresent,
+        // which throws on UNKNOWN, two decisions that need ABSENT (a recovery problem stays, a clear throws),
+        // and createDirectory, which makes a level not shown PRESENT and lets mkdir decide.
+        assertFalse(Regex("""==\s*Presence\.PRESENT\b|\bPresence\.PRESENT\s*==""").containsMatchIn(code))
+        assertEquals(6, Regex("""\bpresenceOf\(""").findAll(code).count())
+        assertEquals(1, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
+        assertEquals(2, Regex("""\) != Presence\.ABSENT\b""").findAll(code).count())
+        assertEquals(2, Regex("""\) != Presence\.PRESENT\b""").findAll(code).count())
+        // A clear returns only on its own check that the directory is gone, never on what the deletion answered.
+        assertEquals(listOf("dir.deleteRecursively()"),
+            code.lines().filter { "deleteRecursively" in it }.map { it.trim() })
+    }
+
     @Test fun `uids that could escape the directory are refused for every kind of file`() {
         for (uid in listOf("../x", "a/b", "", ".", "a b", "x".repeat(129))) {
             assertThrows(uid, IllegalArgumentException::class.java) { store.read(uid) }
