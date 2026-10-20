@@ -9,14 +9,17 @@
 package io.silentsuite.sync.syncadapter
 
 import android.accounts.Account
+import android.accounts.AccountManager
 import android.content.*
 import android.os.Bundle
+import android.os.RemoteException
 import android.provider.ContactsContract
 import androidx.annotation.VisibleForTesting
 import at.bitfire.ical4android.CalendarStorageException
 import at.bitfire.vcard4android.BatchOperation
 import at.bitfire.vcard4android.Contact
 import at.bitfire.vcard4android.ContactsStorageException
+import com.etebase.client.CollectionAccessLevel
 import com.etebase.client.Item
 import io.silentsuite.sync.AccountSettings
 import io.silentsuite.sync.BuildConfig
@@ -57,7 +60,45 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
         resourceDownloader = ResourceDownloader(context)
     }
 
+    /**
+     * The native address book and owner generation this run was admitted for, read once here and
+     * never read again to adopt a later generation. Null when any part is missing or inconsistent:
+     * such a destination is listed from the start and never marked complete.
+     */
+    private class Destination(
+        val native: Account,
+        val creationId: String,
+        val ownerIdentity: String,
+        val url: String,
+        val main: Account,
+        val mainCreationId: String,
+    )
+
+    private val destination: Destination? = captureDestination(context, localAddressBook)
+
     companion object {
+        /** Marks a native address book that one complete listing has filled, for one exact destination. */
+        private const val POPULATED_MARKER = "silentsuite.contacts.populated.v1"
+
+        private fun captureDestination(context: Context, addressBook: LocalAddressBook): Destination? = runCatching {
+            val manager = AccountManager.get(context)
+            val native = addressBook.androidAccount
+            val creationId = manager.getUserData(native, LocalAddressBook.USER_DATA_CREATION_ID)?.takeIf { it.isNotBlank() }
+                ?: return null
+            val ownerIdentity = manager.getUserData(native, LocalAddressBook.USER_DATA_MAIN_ACCOUNT_IDENTITY)?.takeIf { it.isNotBlank() }
+                ?: return null
+            val url = manager.getUserData(native, LocalAddressBook.USER_DATA_URL)?.takeIf { it.isNotBlank() } ?: return null
+            val main = addressBook.mainAccountOrNull ?: return null
+            val mainCreationId = manager.getUserData(main, AccountSettings.KEY_CREATION_ID)?.takeIf { it.isNotBlank() }
+                ?: return null
+            if (SyncStatusStore(context).identity(main).storageKey != ownerIdentity) return null
+            Destination(native, creationId, ownerIdentity, url, main, mainCreationId)
+        }.getOrNull()
+
+        private fun marker(destination: Destination): ByteArray =
+            listOf(POPULATED_MARKER, destination.creationId, destination.url, destination.ownerIdentity)
+                .joinToString("\u0000").toByteArray(Charsets.UTF_8)
+
         /** Process-local fault for a native-store marker read (false) or write (true); never set in release. */
         @Volatile
         private var installedSyncStateFault: ((Boolean) -> Exception?)? = null
@@ -158,9 +199,113 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
     @Throws(CalendarStorageException::class, ContactsStorageException::class)
     override fun postProcess() {
         super.postProcess()
+        if (keepsLocalEditsOfThisRun) deferMembershipsWithLocalChanges()
         /* VCard4 group handling: there are group contacts and individual contacts */
         Logger.log.info("Assigning memberships of downloaded contact groups")
         LocalGroup.applyPendingMemberships(localAddressBook())
+    }
+
+    /**
+     * A replay lists every entry, so a local change made while it runs would otherwise be written
+     * over. On a writable address book such changes are kept for the next run's upload. A read-only
+     * address book keeps the server's content, as an incremental run does.
+     */
+    private val keepsLocalEditsOfThisRun: Boolean
+        get() = replaying && cachedCollection.col.accessLevel != CollectionAccessLevel.ReadOnly
+
+    /**
+     * Groups whose memberships changed locally keep them: in one batch their pending server member
+     * list is dropped and they are marked dirty, so the next run uploads the local memberships and no
+     * stale list is applied over them, whether or not that run fetches.
+     */
+    private fun deferMembershipsWithLocalChanges() {
+        val addressBook = localAddressBook()
+        val deferred = HashSet<Long>()
+        for (group in addressBook.findDirtyGroups())
+            group.id?.let { deferred += it }
+        for (contact in addressBook.findDirtyContacts()) {
+            try {
+                deferred.addAll(SetUtils.disjunction(contact.getCachedGroupMemberships(), contact.getGroupMemberships()))
+            } catch (ignored: FileNotFoundException) {
+            }
+        }
+        if (deferred.isEmpty())
+            return
+        Logger.log.info("Keeping local memberships of ${deferred.size} group(s) for the next upload")
+        val batch = BatchOperation(addressBook.provider!!)
+        for (groupId in deferred)
+            batch.enqueue(BatchOperation.CpoBuilder.newUpdate(addressBook.syncAdapterURI(ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId)))
+                    .withValue(LocalGroup.COLUMN_PENDING_MEMBERS, null)
+                    .withValue(ContactsContract.Groups.DIRTY, 1)
+            )
+        batch.commit()
+    }
+
+    private fun isDirty(local: LocalAddress): Boolean {
+        val addressBook = localAddressBook()
+        val (uri, column) = when (local) {
+            is LocalContact -> ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, local.id ?: return false) to
+                ContactsContract.RawContacts.DIRTY
+            is LocalGroup -> ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, local.id ?: return false) to
+                ContactsContract.Groups.DIRTY
+            else -> return false
+        }
+        return addressBook.provider!!.query(addressBook.syncAdapterURI(uri), arrayOf(column), null, null, null)?.use { cursor ->
+            cursor.moveToNext() && cursor.getInt(0) != 0
+        } ?: false
+    }
+
+    @Throws(ContactsStorageException::class)
+    override fun replayFromStart(): Boolean {
+        val stored = storageAccess("read") {
+            syncStateFaultFor(false)?.let { throw it }
+            localAddressBook().syncState
+        }
+        val exact = destination ?: return true
+        if (stored != null && stored.contentEquals(marker(exact)))
+            return false
+        Logger.log.info("Listing this address book from the start, as it isn't marked complete")
+        return true
+    }
+
+    @Throws(ContactsStorageException::class)
+    override fun onReplayCompleted() {
+        val exact = destination ?: return
+        if (!destinationStillCurrent(exact)) {
+            Logger.log.info("Not marking an address book whose generation changed during this run")
+            return
+        }
+        val expected = marker(exact)
+        storageAccess("write") {
+            syncStateFaultFor(true)?.let { throw it }
+            val addressBook = localAddressBook()
+            addressBook.syncState = expected
+            if (addressBook.syncState?.contentEquals(expected) != true)
+                throw ContactsStorageException("The address book's sync state did not read back as written")
+        }
+    }
+
+    /** Fresh reads: the same native row, owner and main account generation as when this run began. */
+    private fun destinationStillCurrent(exact: Destination): Boolean = runCatching {
+        val manager = AccountManager.get(context)
+        manager.getAccountsByType(exact.native.type).any { it == exact.native } &&
+            manager.getUserData(exact.native, LocalAddressBook.USER_DATA_CREATION_ID) == exact.creationId &&
+            manager.getUserData(exact.native, LocalAddressBook.USER_DATA_MAIN_ACCOUNT_IDENTITY) == exact.ownerIdentity &&
+            manager.getUserData(exact.native, LocalAddressBook.USER_DATA_URL) == exact.url &&
+            manager.getAccountsByType(exact.main.type).any { it == exact.main } &&
+            manager.getUserData(exact.main, AccountSettings.KEY_CREATION_ID) == exact.mainCreationId &&
+            SyncStatusStore(context).identity(exact.main).storageKey == exact.ownerIdentity
+    }.getOrDefault(false)
+
+    /** Sync-state access as a Contacts storage failure, which the run reports as a database error. */
+    private inline fun <R> storageAccess(what: String, access: () -> R): R = try {
+        access()
+    } catch (e: ContactsStorageException) {
+        throw e
+    } catch (e: RemoteException) {
+        throw ContactsStorageException("Couldn't $what the address book's sync state", e)
+    } catch (e: RuntimeException) {
+        throw ContactsStorageException("Couldn't $what the address book's sync state", e)
     }
 
 
@@ -172,6 +317,11 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
 
     override fun processItem(item: Item) {
         val local = localCollection!!.findByFilename(item.uid)
+
+        if (local != null && !item.isDeleted && keepsLocalEditsOfThisRun && isDirty(local)) {
+            Logger.log.info("Keeping a local change made during this listing for the next upload")
+            return
+        }
 
         if (!item.isDeleted) {
             val inputReader = StringReader(String(item.content))

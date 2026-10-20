@@ -306,7 +306,7 @@ def test_dashboard_uses_every_exact_approved_pr1_copy_string():
         "dashboard_detail_paused": "Turn on Android system sync to continue.",
         "dashboard_status_permission_needed": "Permission needed",
         "dashboard_status_task_app_needed": "Task app needed",
-        "dashboard_detail_task_provider": "Install Tasks.org or OpenTasks to sync tasks on this device.",
+        "dashboard_detail_task_provider": "Tasks don't sync on this device without a compatible task app, such as Tasks.org or OpenTasks.",
         "dashboard_status_authentication": "Sign in again",
         "dashboard_detail_authentication": "This account couldn't authenticate. Open account settings or sign out and sign in again.",
         "dashboard_status_configuration": "Review sync settings",
