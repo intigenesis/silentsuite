@@ -21,6 +21,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.Preference
+import androidx.preference.PreferenceCategory
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.SwitchPreferenceCompat
 import at.bitfire.cert4android.CustomCertManager
@@ -44,6 +45,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.silentsuite.sync.ui.settings.ProxySettingsValidation
 import java.util.UUID
+
+/** An address book offered by Settings → Recover deleted contacts; identifiers and name only. */
+internal data class RecoveryAddressBook(val uid: String, val name: String)
+
+internal const val RECOVERY_NONE_KEY = "recover_deleted_contacts_none"
+
+internal fun recoveryAddressBookKey(account: Account, addressBookUid: String) =
+    "recover_deleted_contacts:${account.name}:$addressBookUid"
 
 class AppSettingsActivity : BaseActivity() {
     var selectedAccount: Account? = null
@@ -69,6 +78,13 @@ class AppSettingsActivity : BaseActivity() {
          */
         @VisibleForTesting
         @JvmField internal var notesToggleEffectOverride: ((Context, Account, String, Boolean) -> Unit)? = null
+
+        /**
+         * No-network instrumentation seam for the address books the recovery picker lists for one
+         * exact account generation. Production reads the account's local collection cache.
+         */
+        @VisibleForTesting
+        @JvmField internal var recoveryAddressBooksOverride: ((Context, Account, String) -> List<RecoveryAddressBook>)? = null
 
         /** Global settings have no account identity and intentionally carry no account extra. */
         fun newIntent(context: Context): Intent = Intent(context, AppSettingsActivity::class.java)
@@ -154,6 +170,29 @@ class AppSettingsActivity : BaseActivity() {
         return exact
     }
 
+    /**
+     * The exact accounts whose address books the recovery picker offers: only the routed account
+     * for an explicit route, which never falls back to another account, otherwise every account.
+     */
+    internal fun recoveryAccounts(): List<Pair<Account, String>> {
+        if (hasExplicitAccountRoute) {
+            val exact = exactSelectedAccount() ?: return emptyList()
+            return listOf(exact to selectedCreationId!!)
+        }
+        val manager = AccountManager.get(this)
+        return manager.getAccountsByType(App.accountType).mapNotNull { account ->
+            val creationId = manager.getUserData(account, AccountSettings.KEY_CREATION_ID) ?: return@mapNotNull null
+            ExactAccountRouting.validate(account, creationId, App.accountType, manager)?.let { it to creationId }
+        }
+    }
+
+    internal fun canRecoverContacts(): Boolean = !hasExplicitAccountRoute || exactSelectedAccount() != null
+
+    internal fun showRecoverContacts() {
+        supportFragmentManager.beginTransaction().replace(android.R.id.content, RecoverContactsFragment())
+            .addToBackStack(RecoverContactsFragment::class.java.name).commit()
+    }
+
     internal fun showCategory(category: SettingsCategory, addToBackStack: Boolean = true) {
         currentCategory = category
         val fragment = if (category == SettingsCategory.HOME) HomeFragment() else CategoryFragment.newInstance(category)
@@ -164,6 +203,10 @@ class AppSettingsActivity : BaseActivity() {
     }
 
     private fun updateTitle() {
+        if (supportFragmentManager.findFragmentById(android.R.id.content) is RecoverContactsFragment) {
+            title = getString(R.string.settings_recover_deleted_contacts)
+            return
+        }
         title = getString(when (currentCategory) {
             SettingsCategory.HOME -> R.string.app_settings
             SettingsCategory.ACCOUNT -> R.string.settings_category_account
@@ -197,6 +240,87 @@ class AppSettingsActivity : BaseActivity() {
                     activity.showCategory(category)
                     true
                 }
+            }
+            findPreference<Preference>("recover_deleted_contacts")?.apply {
+                isEnabled = activity.canRecoverContacts()
+                setOnPreferenceClickListener {
+                    if (!activity.canRecoverContacts()) return@setOnPreferenceClickListener false
+                    activity.showRecoverContacts()
+                    true
+                }
+            }
+        }
+    }
+
+    /** Settings → Recover deleted contacts: pick an account's address book to open its deleted contacts. */
+    class RecoverContactsFragment : PreferenceFragmentCompat() {
+        private val host: AppSettingsActivity get() = requireActivity() as AppSettingsActivity
+
+        override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+            preferenceManager.sharedPreferencesName = AppPreferences.PREFERENCES_NAME
+            val screen = preferenceManager.createPreferenceScreen(requireContext())
+            preferenceScreen = screen
+            val targets = host.recoveryAccounts()
+            val appContext = requireContext().applicationContext
+            lifecycleScope.launch {
+                val loaded = withContext(Dispatchers.IO) {
+                    targets.map { (account, creationId) -> Triple(account, creationId, loadAddressBooks(appContext, account, creationId)) }
+                }
+                if (!isAdded) return@launch
+                // Publish only generations that are still current; a replaced account shows nothing.
+                val current = loaded.filter { (account, creationId, books) ->
+                    books != null && ExactAccountRouting.validate(account, creationId, App.accountType,
+                        AccountManager.get(appContext)) != null
+                }
+                current.forEach { (account, creationId, books) ->
+                    val category = PreferenceCategory(requireContext()).apply { title = account.name }
+                    screen.addPreference(category)
+                    books!!.forEach { book ->
+                        category.addPreference(Preference(requireContext()).apply {
+                            key = recoveryAddressBookKey(account, book.uid)
+                            title = book.name
+                            isPersistent = false
+                            setOnPreferenceClickListener { open(account, creationId, book.uid) }
+                        })
+                    }
+                }
+                if (current.all { it.third.isNullOrEmpty() }) screen.addPreference(Preference(requireContext()).apply {
+                    key = RECOVERY_NONE_KEY
+                    setTitle(R.string.settings_recover_deleted_contacts_none)
+                    isEnabled = false
+                    isPersistent = false
+                })
+            }
+        }
+
+        private fun open(account: Account, creationId: String, addressBookUid: String): Boolean {
+            val context = requireContext()
+            if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null) {
+                requireActivity().finish()
+                return false
+            }
+            startActivity(io.silentsuite.sync.ui.etebase.CollectionActivity.newRecoveryIntent(context, account, creationId, addressBookUid))
+            return true
+        }
+
+        private fun loadAddressBooks(context: Context, account: Account, creationId: String): List<RecoveryAddressBook>? {
+            if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null)
+                return null
+            if (BuildConfig.DEBUG) recoveryAddressBooksOverride?.let { return it(context, account, creationId) }
+            return try {
+                val settings = AccountSettings(context, account)
+                val cache = io.silentsuite.sync.EtebaseLocalCache.getInstance(context, account.name)
+                val httpClient = io.silentsuite.sync.HttpClient.Builder(context).setForeground(true).build().okHttpClient
+                val colMgr = io.silentsuite.sync.EtebaseLocalCache.getEtebase(context, httpClient, settings).collectionManager
+                synchronized(cache) {
+                    cache.decodableCollectionList(colMgr, io.silentsuite.sync.Constants.ETEBASE_TYPE_ADDRESS_BOOK) { _, error ->
+                        // The binding's message can quote a decrypted value; log only the exception class.
+                        io.silentsuite.sync.log.Logger.log.warning("Skipping an address book that could not be decoded: ${error.javaClass.name}")
+                    }
+                }.map { RecoveryAddressBook(it.col.uid, it.meta.name.orEmpty()) }
+            } catch (e: Exception) {
+                io.silentsuite.sync.log.Logger.log.warning("Could not list address books for recovery: ${e.javaClass.name}")
+                null
             }
         }
     }
