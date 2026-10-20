@@ -1458,9 +1458,42 @@ class PendingNotesStoreTest {
         assertEquals(listOf("b9"), store.pruneNotebooks())
     }
 
+    @Test fun `a prune runs no recovery that is owed, and lists and removes nothing until another call has run it`() {
+        store.putNotebook("b9", blob("key b9"))
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false, notebookCopy = blob("key b1"))
+        // A refresh of a copy that is there already stops at its rename, so a recovery is owed: it drops the
+        // write left beside that copy.
+        PendingNotesStore.beforeRenameForTesting = {
+            if (it.name == "b1.notebook") throw java.io.IOException("rename refused")
+        }
+        assertThrows(java.io.IOException::class.java) { store.putNotebook("b1", blob("key b1 again")) }
+        PendingNotesStore.beforeRenameForTesting = null
+        assertTrue(File(dir, "b1.notebook.new").exists())
+        // Run by the prune, a recovery that fails would only be logged. The prune asks for no listing at all.
+        val asked = ArrayList<String>()
+        PendingNotesStore.listFilesForTesting = { d -> asked += d.name; null }
+        assertEquals(emptyList<String>(), store.pruneNotebooks())
+        assertEquals("no listing, so no recovery either", emptyList<String>(), asked)
+        PendingNotesStore.listFilesForTesting = null
+        assertTrue(File(dir, "b9.notebook").exists() && File(dir, "b1.notebook.new").exists())
+        // The next other call runs the recovery, where a failure counts, and a prune after it works as before.
+        assertEquals(listOf("n1"), store.scan().entries.map { it.noteUid })
+        assertFalse(File(dir, "b1.notebook.new").exists())
+        assertEquals(listOf("b9"), store.pruneNotebooks())
+        assertArrayEquals(blob("key b1"), store.notebook("b1"))
+        assertNull(store.notebook("b9"))
+    }
+
     @Test fun `a store whose directory was never created prunes nothing and stays uncreated`() {
         val never = File(tmp.root, "never")
-        assertTrue(open(never).pruneNotebooks().isEmpty())
+        val s = open(never)
+        // A prune runs no recovery, so a scan runs it first; the prune then lists the directory itself.
+        assertTrue(s.scan().entries.isEmpty())
+        val asked = ArrayList<String>()
+        PendingNotesStore.listFilesForTesting = { d -> asked += d.name; d.listFiles() }
+        assertTrue(s.pruneNotebooks().isEmpty())
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("not there, as the directory above shows", listOf("never", tmp.root.name), asked)
         assertFalse(never.exists())
     }
 
@@ -1491,14 +1524,13 @@ class PendingNotesStoreTest {
         val s = restarted()
         PendingNotesStore.listFilesForTesting = { d -> if (d.name == s.dir.name) null else d.listFiles() }
         assertThrows(java.io.IOException::class.java) { s.read("n1") }
-        assertThrows("nothing is pruned while the store cannot be listed", java.io.IOException::class.java) {
-            s.pruneNotebooks()
-        }
+        assertEquals("a prune runs no recovery, and removes nothing while one is owed",
+            emptyList<String>(), s.pruneNotebooks())
         PendingNotesStore.listFilesForTesting = null
         // Taken for done, the failed recovery would leave n1 uncommitted, and no scan or snapshot would
         // show it.
-        assertEquals("the copy the stranded text needs is kept", emptyList<String>(), s.pruneNotebooks())
         assertEquals(listOf("n1"), s.snapshot { false }.headers.map { it.noteUid })
+        assertEquals("the copy the stranded text needs is kept", emptyList<String>(), s.pruneNotebooks())
         assertEquals(only, s.entry("n1"))
         assertFalse(File(dir, "n1.note.new").exists())
         assertArrayEquals(blob("key b1"), s.notebook("b1"))

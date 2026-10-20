@@ -626,16 +626,23 @@ internal class PendingNotesStore private constructor(
      * first write that is not committed yet ("<uid>.note.new"), which may be the only copy of a note
      * whose notebook no committed entry names. A listing that fails throws, as every listing of the store
      * does, and nothing is removed.
+     *
+     * It runs no recovery: while one is owed, it lists and removes nothing and returns at once. The runner
+     * only logs a prune that fails, so a recovery that failed here would be logged and nothing more. The
+     * next other call runs it instead, at the latest the snapshot of the next run, where a failure counts.
      */
-    fun pruneNotebooks(): List<String> = locked {
-        val listed = listing()
-        if (listed.any { it.name.endsWith(NOTE + NEW) }) return@locked emptyList()
-        val scan = scanOf(withSuffix(listed, NOTE))
-        if (scan.unreadable.isNotEmpty()) return@locked emptyList()
-        val referenced = scan.entries.map { it.notebookUid }.toSet()
-        withSuffix(listed, NOTEBOOK).filter { it.isFile }.map { it.name.removeSuffix(NOTEBOOK) }
-            .filter { it !in referenced }
-            .onEach { remove(notebookFile(it)) }
+    fun pruneNotebooks(): List<String> = synchronized(lock) {
+        check(!closed) { "the pending store was cleared" }
+        if (!recovered) emptyList() else locked {
+            val listed = listing()
+            if (listed.any { it.name.endsWith(NOTE + NEW) }) return@locked emptyList()
+            val scan = scanOf(withSuffix(listed, NOTE))
+            if (scan.unreadable.isNotEmpty()) return@locked emptyList()
+            val referenced = scan.entries.map { it.notebookUid }.toSet()
+            withSuffix(listed, NOTEBOOK).filter { it.isFile }.map { it.name.removeSuffix(NOTEBOOK) }
+                .filter { it !in referenced }
+                .onEach { remove(notebookFile(it)) }
+        }
     }
 
     /**
@@ -655,14 +662,18 @@ internal class PendingNotesStore private constructor(
     // ---- internals ----
 
     /**
-     * Every public operation except [clearAll]: refuse after [clearAll], and finish any interrupted work
-     * first. Recovery runs again before the next operation for as long as anything in it did not work
-     * out, including a write or removal inside recovery itself, or a listing it works from. A recovery
-     * whose listing fails throws, so the operation fails with it and the recovery is not taken for done:
-     * a first write it did not see may be the only copy of a note's text, and an original it did not
-     * see may still wait for its conflict copy.
+     * Every public operation except [clearAll] and [pruneNotebooks]: refuse after [clearAll], and finish
+     * any interrupted work first. Recovery runs again before the next operation for as long as anything in
+     * it did not work out, including a write or removal inside recovery itself, or a listing it works
+     * from. A recovery whose listing fails throws, so the operation fails with it and the recovery is not
+     * taken for done: a first write it did not see may be the only copy of a note's text, and an original
+     * it did not see may still wait for its conflict copy.
      *
-     * It runs once per operation, at its start. An operation that calls another one under the lock (a
+     * [pruneNotebooks] refuses after [clearAll] as well, but runs no recovery: while one is owed it does
+     * nothing, and it comes here only when none is, so no recovery runs inside a prune, where a failure
+     * would show only as a log line.
+     *
+     * Recovery runs once per operation, at its start. An operation that calls another one under the lock (a
      * save through a handle, anything that goes through [update]) does not recover again in between:
      * recovery can remove an original and move editors, and what the outer call read or decided before
      * the inner one must still hold when the inner one writes.
