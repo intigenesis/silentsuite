@@ -192,6 +192,12 @@ class AppSettingsActivity : BaseActivity() {
             .addToBackStack(RecoverContactsFragment::class.java.name).commit()
     }
 
+    /** Settings → Unsynced Notes, on the back stack of the hub. */
+    internal fun showUnsyncedNotes() {
+        supportFragmentManager.beginTransaction().replace(android.R.id.content, UnsyncedNotesFragment())
+            .addToBackStack(UnsyncedNotesFragment::class.java.name).commit()
+    }
+
     internal fun showCategory(category: SettingsCategory, addToBackStack: Boolean = true) {
         currentCategory = category
         val fragment = if (category == SettingsCategory.HOME) HomeFragment() else CategoryFragment.newInstance(category)
@@ -204,6 +210,10 @@ class AppSettingsActivity : BaseActivity() {
     private fun updateTitle() {
         if (supportFragmentManager.findFragmentById(android.R.id.content) is RecoverContactsFragment) {
             title = getString(R.string.settings_recover_deleted_contacts)
+            return
+        }
+        if (supportFragmentManager.findFragmentById(android.R.id.content) is UnsyncedNotesFragment) {
+            title = getString(R.string.settings_unsynced_notes)
             return
         }
         title = getString(when (currentCategory) {
@@ -248,6 +258,25 @@ class AppSettingsActivity : BaseActivity() {
                     true
                 }
             }
+            // For every store on this device, whatever the route: shown once the stores are read, while one holds
+            // anything or cannot be read.
+            findPreference<Preference>(UNSYNCED_NOTES_KEY)?.apply {
+                isVisible = false
+                setOnPreferenceClickListener {
+                    activity.showUnsyncedNotes()
+                    true
+                }
+            }
+        }
+
+        /** Each time, since a return from the screen does not create the preferences again. */
+        override fun onResume() {
+            super.onResume()
+            findPreference<Preference>(UNSYNCED_NOTES_KEY)?.let { UnsyncedNotesFragment.refreshHubRow(this, it) }
+        }
+
+        companion object {
+            internal const val UNSYNCED_NOTES_KEY = "unsynced_notes"
         }
     }
 

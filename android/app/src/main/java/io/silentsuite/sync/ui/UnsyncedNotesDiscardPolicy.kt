@@ -1,5 +1,7 @@
 package io.silentsuite.sync.ui
 
+import androidx.annotation.StringRes
+import io.silentsuite.sync.R
 import io.silentsuite.sync.notes.edit.PendingNotesStore.DiscardOutcome
 import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.ui.UnsyncedNotesSignOutPolicy.Text
@@ -117,4 +119,32 @@ internal object UnsyncedNotesDiscardPolicy {
 
     /** Only a discard that did not finish is offered Retry. */
     fun offersRetry(result: Result): Boolean = result is Result.NotFinished
+
+    /**
+     * The words the screen shows for [result], or null for one that shows the dialog again or only reads the stores
+     * again. The two that can follow an acknowledgement say that this attempt deleted no Notes text, and that
+     * unsynced text may remain on this device and may no longer sync; neither calls it a discard.
+     */
+    @StringRes
+    fun message(result: Result): Int? = when (result) {
+        Result.Done -> R.string.notes_discard_done
+        Result.NothingDeleted -> R.string.notes_discard_nothing_deleted
+        is Result.NotFinished -> R.string.notes_discard_not_finished
+        Result.Acknowledged -> R.string.notes_acknowledged
+        Result.AcknowledgementNotRecorded -> R.string.notes_acknowledgement_not_recorded
+        is Result.Ask, Result.Reload -> null
+    }
+
+    /** Whether [held], the result the screen holds, is a discard of the store in [directory] that did not finish. */
+    fun notFinished(directory: String, held: Result?): Boolean =
+        held is Result.NotFinished && held.directory == directory
+
+    /**
+     * Whether a tap on the row of the store in [directory] opens a confirmation now. Not while one runs
+     * ([answering]), so none is dropped unseen and no result is read as another store's. And not while the screen
+     * holds a discard of that store that did not finish ([notFinished]): only its Retry goes on, so the screen never
+     * moves from "may already be deleted" to a new step for that store, such as an acknowledgement.
+     */
+    fun rowOpens(directory: String, held: Result?, answering: Boolean): Boolean =
+        !answering && !notFinished(directory, held)
 }

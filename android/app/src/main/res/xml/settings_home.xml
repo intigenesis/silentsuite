@@ -13,5 +13,6 @@
     <Preference android:key="settings_category_appearance" android:title="@string/settings_category_appearance" android:summary="@string/settings_category_appearance_summary" android:persistent="false" />
     <Preference android:key="settings_category_privacy_security" android:title="@string/settings_category_privacy_security" android:summary="@string/settings_category_privacy_security_summary" android:persistent="false" />
     <Preference android:key="recover_deleted_contacts" android:title="@string/settings_recover_deleted_contacts" android:summary="@string/settings_recover_deleted_contacts_summary" android:persistent="false" />
+    <Preference android:key="unsynced_notes" android:title="@string/settings_unsynced_notes" android:persistent="false" />
     <Preference android:key="settings_category_help" android:title="@string/settings_category_help" android:summary="@string/settings_category_help_summary" android:persistent="false" />
 </PreferenceScreen>

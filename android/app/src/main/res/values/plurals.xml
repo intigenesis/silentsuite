@@ -16,4 +16,16 @@
         <item quantity="one">%d unsynced Notes change will be deleted from this device when you sign out. This cannot be undone.</item>
         <item quantity="other">%d unsynced Notes changes will be deleted from this device when you sign out. This cannot be undone.</item>
     </plurals>
+    <plurals name="settings_unsynced_notes_summary">
+        <item quantity="one">%d unsynced Notes change on this device</item>
+        <item quantity="other">%d unsynced Notes changes on this device</item>
+    </plurals>
+    <plurals name="notes_store_unsynced">
+        <item quantity="one">%d unsynced change</item>
+        <item quantity="other">%d unsynced changes</item>
+    </plurals>
+    <plurals name="notes_discard_store_text">
+        <item quantity="one">%1$d unsynced Notes change from %2$s will be deleted from this device. This cannot be undone.</item>
+        <item quantity="other">%1$d unsynced Notes changes from %2$s will be deleted from this device. This cannot be undone.</item>
+    </plurals>
 </resources>

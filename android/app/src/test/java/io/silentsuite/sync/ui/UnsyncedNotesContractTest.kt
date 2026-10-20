@@ -22,7 +22,8 @@ class UnsyncedNotesContractTest {
         .replace(Regex("(?s)/\\*.*?\\*/"), "").replace(Regex("//[^\n]*"), "")
 
     @Test fun `the Unsynced Notes files name no network, session or sync start`() {
-        assertTrue(files.map { it.name }.containsAll(listOf("UnsyncedNotesStores.kt", "UnsyncedNotesDiscardPolicy.kt")))
+        assertTrue(files.map { it.name }.containsAll(listOf("UnsyncedNotesStores.kt", "UnsyncedNotesDiscardPolicy.kt",
+            "UnsyncedNotesFragment.kt")))
         val forbidden = listOf("HttpClient", "EtebaseLocalCache", "getEtebase", "etebaseSession", "KEY_ETEBASE_SESSION",
             "okhttp", "java.net", "NotesSyncRunner", "requestSync", ".request(", "clearAll")
         for (file in files) {
