@@ -267,13 +267,13 @@ internal object NotesSyncRunner {
      * or its discard finished, and an instance dropped since ([PendingNotesStore.unregister]) had. Any other cleared
      * instance stopped partway, also one that lists and counts nothing, since a listing can come back short and an
      * unlink whose sync failed can come back: that throws IOException, which the run records as a storage failure,
-     * never as a success, for the rest of the process or until another confirmed sign-out finishes the clear, and
+     * never as a success, for the rest of the process or until another confirmed discard finishes the clear, and
      * the fetch still runs. This instance never pushes what a clear that stopped left. After a restart a new
      * instance sends none of the notes the clear's discard permit names
      * ([PendingNotesStore.Snapshot.discardConfirmed]), every note counting as named while the permit cannot be
      * read or was recorded as for an answer that could not be counted, makes no rebase or conflict copy while a file it
      * names is there ([PendingNotesStore.HeldBack]), and the push step records a storage failure while one is
-     * ([PendingNotesStore.Snapshot.discardUnfinished]), until another confirmed sign-out finishes the clear, or a
+     * ([PendingNotesStore.Snapshot.discardUnfinished]), until another confirmed discard finishes the clear, or a
      * save or a release from holding withdraws the permit. A listing that fails still throws IOException, as before.
      */
     internal fun waitingIn(store: PendingNotesStore): PendingNotesStore.Snapshot? = try {

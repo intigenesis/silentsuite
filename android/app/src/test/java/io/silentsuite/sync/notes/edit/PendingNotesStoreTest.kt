@@ -4307,7 +4307,7 @@ class PendingNotesStoreTest {
         assertEquals("nothing was made", emptySet<String>(), namesIn(noBackup))
     }
 
-    @Test fun `outside the pending store's package only the sign-out seam calls discardStore`() {
+    @Test fun `outside the store's package only the sign-out seam and the Settings discard call discardStore`() {
         // A discard deletes unsynced text, so each caller comes with a change and a review of its own. Any code
         // line that names the function counts, so a call inside a scope function or a reference is found too;
         // comment and KDoc lines, which only link to it, do not.
@@ -4323,12 +4323,15 @@ class PendingNotesStoreTest {
                     }
                 }
                 .map { it.relativeTo(main).invariantSeparatorsPath }
-                .filterNot { it.startsWith("io/silentsuite/sync/notes/edit/") }.toList()
+                .filterNot { it.startsWith("io/silentsuite/sync/notes/edit/") }.sorted().toList()
         }
         assertTrue("the store defines it",
             File(main, "io/silentsuite/sync/notes/edit/PendingNotesStore.kt").readText().contains("fun discardStore("))
-        assertEquals(listOf("io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt"), callersOf("discardStore"))
-        assertEquals(listOf("io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt"), callersOf("unregister"))
+        // Sorted, since the order of the walk is not defined.
+        val callers = listOf("io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt",
+            "io/silentsuite/sync/ui/UnsyncedNotesStores.kt")
+        assertEquals(callers, callersOf("discardStore"))
+        assertEquals(callers, callersOf("unregister"))
         assertEquals("clearAll is for test teardown only", emptyList<String>(), callersOf("clearAll"))
     }
 }

@@ -1093,7 +1093,7 @@ internal class PendingNotesStore private constructor(
         try {
             permits.remove(dir.name)
         } catch (e: IOException) {
-            // It is for a directory that is gone, and the next new version withdraws it, or a later sign-out that
+            // It is for a directory that is gone, and the next new version withdraws it, or a later discard that
             // finishes removes it. Until then a store opened again in that folder, as after an account removal that
             // fails, holds back by it: for one recorded as for an answer that could not be counted, every note, so
             // each of its runs records a storage failure.
@@ -1376,7 +1376,7 @@ internal class PendingNotesStore private constructor(
      * ([discardStore], step 3). A permit for such an answer names only what listings held, the count's, its
      * confirmation's and an earlier permit's, each of which can come back short and say nothing, while the user
      * confirmed the discard of all of the store. Every note is held back then, until a save or a release withdraws
-     * the permit, or a sign-out that finishes removes it, none of which needs to read it. While the check of whether
+     * the permit, or a discard that finishes removes it, none of which needs to read it. While the check of whether
      * a permit that cannot be read is there fails as well, as when notes-discard itself cannot be checked, a save or
      * a release that cannot unlink it fails, and every note stays held back until that check works again.
      *
