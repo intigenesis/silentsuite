@@ -670,39 +670,96 @@ internal class PendingNotesStore private constructor(
         }
     }
 
+    // ---- the whole store ----
+
     /**
      * Sign-out: everything for this identity goes. The closed instance stays registered for the rest of
      * the process, so a late save that opens the store again gets this instance and is refused instead
      * of recreating the directory. The identity (account generation) never comes back after sign-out. A
      * call after a failed one tries the deletion again, so a sign-out cleanup retry does real work.
      *
-     * It returns only once the directory is shown gone by two checks that agree: its presence check answers
-     * [Presence.ABSENT], and the nearest directory above it that can be listed does not hold the next name
-     * on the way down to it ([knownAbsent]). A listing alone is no proof, since File.listFiles can return
-     * what it read so far when reading a directory fails partway. Otherwise it throws IOException, whatever
-     * the deletion answered, since the deletion counts a file it could not remove as gone when File.exists()
-     * says so, and that answers false for a check that failed as well. A caller may rely on a clear only
-     * when it returned.
+     * It returns only once the directory is shown gone by two checks that agree ([shownGone]). Otherwise it
+     * throws IOException, whatever the deletion answered, since the deletion counts a file it could not
+     * remove as gone when File.exists() says so, and that answers false for a check that failed as well. A
+     * caller may rely on a clear only when it returned.
      */
     fun clearAll() {
         synchronized(lock) {
             closed = true
             beforeClearForTesting?.invoke()
             dir.deleteRecursively()
-            if (presenceOf(dir) != Presence.ABSENT || !knownAbsent(dir)) {
-                throw IOException("could not clear the pending store")
-            }
+            if (!shownGone(dir)) throw IOException("could not clear the pending store")
         }
+    }
+
+    /**
+     * What removing this identity's account would lose, read from the directory alone. Unlike every other
+     * read it runs no recovery and writes nothing, and a cleared store answers too, from what is still on
+     * disk: a clear that failed may have left text there.
+     *
+     * Counted: each note with an entry file (waiting, held, or one this build cannot read), and each first
+     * write that never got its name and is intact, which recovery would commit. Not counted: a first write
+     * that is cut short or fails its checksum, and an uncommitted write beside an entry, which recovery
+     * drops, and notebook copies and landed records, which hold no unsynced text. No entry is decoded while
+     * the counter file reads.
+     *
+     * The sequence is the one [nextVersion] builds on: the counter, or with the counter lost, cut short or
+     * failing its checksum, the strict rebuild ([currentSequence]) from every file that may hold a version
+     * (each entry's header, each landed record, each intact uncommitted write). A counter written in full in
+     * a layout this build does not know, a version that cannot be read, and a file of a kind this build does
+     * not know stop that rebuild, since a newer build may have handed out versions above all of them.
+     *
+     * A directory that cannot be listed, a read in it that fails, a version that the rebuild cannot read,
+     * and a file of a kind this build does not know, whether or not the counter reads, answer "could not be
+     * counted" ([UnsyncedNotes.unreadable]), never "nothing": such a file may hold text a newer build wrote.
+     * Only a directory shown not to be there by two checks that agree ([shownGone]) lists as empty. After a
+     * failed read, or beside a file of an unknown kind, every entry file and every "<uid>.note.new" counts by
+     * its name, whatever its state, so the number is of files and one note can count twice. Such an answer
+     * still carries the sequence when [nextVersion] could read it, so a save since moves it, and 0 only when
+     * it cannot ([uncountedSequence]).
+     */
+    fun unsynced(): UnsyncedNotes = synchronized(lock) { countUnsynced() }
+
+    /** [unsynced], under the store lock. */
+    private fun countUnsynced(): UnsyncedNotes {
+        val listed = listDirectory(dir)
+        if (listed == null && !shownGone(dir)) return UnsyncedNotes(0, uncountedSequence(), unreadable = true)
+        val names = listed.orEmpty().map { it.name }
+        return try {
+            val unknown = names.firstOrNull { !isKnownKind(it) }
+            if (unknown != null) throw IOException("$unknown is of a kind this build does not know")
+            val committed = names.filter { it.endsWith(NOTE) }.mapTo(HashSet()) { it.removeSuffix(NOTE) }
+            val stranded = names.filter { it.endsWith(NOTE + NEW) }.map { it.removeSuffix(NEW).removeSuffix(NOTE) }
+                .filter { it !in committed && PendingCodec.isIntact(File(dir, it + NOTE + NEW).readBytes()) }
+            val count = committed.size + stranded.size
+            if (count == 0) UnsyncedNotes.NOTHING
+            else UnsyncedNotes(count, currentSequence(strict = true), unreadable = false)
+        } catch (e: IOException) {
+            val files = names.count { it.endsWith(NOTE) || it.endsWith(NOTE + NEW) }
+            UnsyncedNotes(files, uncountedSequence(), unreadable = true)
+        }
+    }
+
+    /**
+     * The sequence of an answer that could not be counted: the one [nextVersion] builds on, so a save
+     * between two such answers moves it. 0 when that cannot be read, and then no new version can be handed
+     * out either, since [nextVersion] reads it the same way. A counter file that reads needs no listing, so
+     * a store that cannot be listed carries it too.
+     */
+    private fun uncountedSequence(): Long = try {
+        currentSequence(strict = true)
+    } catch (e: IOException) {
+        0L
     }
 
     // ---- internals ----
 
     /**
-     * Every public operation except [clearAll] and [pruneNotebooks]: refuse after [clearAll], and finish
-     * any interrupted work first. Recovery runs again before the next operation for as long as anything in
-     * it did not work out, including a write or removal inside recovery itself, or a listing it works
-     * from. A recovery whose listing fails throws, so the operation fails with it and the recovery is not
-     * taken for done: a first write it did not see may be the only copy of a note's text, and an original
+     * Every public operation except [unsynced], [clearAll] and [pruneNotebooks]: refuse after [clearAll], and
+     * finish any interrupted work first. Recovery runs again before the next operation for as long as
+     * anything in it did not work out, including a write or removal inside recovery itself, or a listing it
+     * works from. A recovery whose listing fails throws, so the operation fails with it and the recovery is
+     * not taken for done: a first write it did not see may be the only copy of a note's text, and an original
      * it did not see may still wait for its conflict copy.
      *
      * [pruneNotebooks] refuses after [clearAll] as well, but runs no recovery: while one is owed it does
@@ -851,6 +908,13 @@ internal class PendingNotesStore private constructor(
     private fun isKnownWrite(name: String): Boolean =
         name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) || name.endsWith(NOTEBOOK + NEW) ||
             name == SEQUENCE + NEW
+
+    /**
+     * A file of a kind this build writes: an entry, a landed record, a notebook copy, the counter, or a
+     * write of one of them.
+     */
+    private fun isKnownKind(name: String): Boolean = name.endsWith(NOTE) || name.endsWith(LANDED) ||
+        name.endsWith(NOTEBOOK) || name == SEQUENCE || isKnownWrite(name)
 
     /**
      * Recovery problems that still stand: the file is not shown to be gone, and is not an entry that now
@@ -1050,6 +1114,18 @@ internal class PendingNotesStore private constructor(
             if (names != null) return below.name !in names
             below = above
         }
+    }
+
+    /**
+     * Whether [d] is shown gone by two checks that agree: the nearest directory above it that can be listed
+     * does not hold the next name on the way down to it ([knownAbsent]), and its presence check answers
+     * [Presence.ABSENT]. A listing alone is no proof, since File.listFiles can return what it read so far
+     * when reading a directory fails partway.
+     */
+    private fun shownGone(d: File): Boolean {
+        if (!knownAbsent(d)) return false
+        if (presenceOf(d) != Presence.ABSENT) return false
+        return true
     }
 
     /**

@@ -1939,8 +1939,9 @@ class PendingNotesStoreTest {
         assertEquals(1, Regex("""\bisDirectory\b""").findAll(code).count())
         assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(code).count())
         // The presence check is asked only where a check that failed cannot pass for an absence: isPresent,
-        // which throws on UNKNOWN, two decisions that need ABSENT (a recovery problem stays, a clear throws),
-        // and createDirectory, which makes a level not shown PRESENT and lets mkdir decide.
+        // which throws on UNKNOWN, two decisions that need ABSENT (a recovery problem stays; shownGone, for a
+        // clear and for a count of nothing), and createDirectory, which makes a level not shown PRESENT and
+        // lets mkdir decide.
         assertFalse(Regex("""==\s*Presence\.PRESENT\b|\bPresence\.PRESENT\s*==""").containsMatchIn(code))
         assertEquals(6, Regex("""\bpresenceOf\(""").findAll(code).count())
         assertEquals(1, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
@@ -2056,5 +2057,210 @@ class PendingNotesStoreTest {
         assertFalse(replacement.dir.exists())
         assertEquals(before, oldFiles())
         assertEquals(listOf(old.dir.name), File(root, "notes-pending").list()!!.toList())
+    }
+
+    // ---- what a removal of the account would lose ----
+
+    /** Every file of [d] with its bytes, read without the store. */
+    private fun filesOf(d: File) = d.listFiles()!!.associate { it.name to it.readBytes().toList() }
+
+    @Test fun `what a store holds is read from its directory alone, and asking changes nothing`() {
+        val never = tmp.newFolder("never").also { it.delete() }
+        assertEquals(UnsyncedNotes.NOTHING, open(never).unsynced())
+        assertFalse("asking does not create the directory", never.exists())
+        assertEquals("a store whose directory cannot be listed could not be counted, which is not nothing",
+            UnsyncedNotes(0, 0, unreadable = true), open(tmp.newFile("plain")).unsynced())
+        assertTrue("an answer that could not be counted is not nothing",
+            UnsyncedNotes(0, 0, unreadable = true).anything)
+        assertFalse(UnsyncedNotes.NOTHING.anything)
+
+        // The notebook copy that comes with the first save is in the directory and is not counted, and
+        // neither is the landed record an open editor keeps after a push.
+        store.saveLocal("waiting", "b1", "r1", blob("a"), isCreate = false, notebookCopy = blob("key b1"))
+        store.editorOpened("pushed")
+        store.saveLocal("pushed", "b1", "r1", blob("p"), isCreate = false)
+        val sent = store.beginSend("pushed")!!
+        assertEquals(SendOutcome.Done, store.completeSend("pushed", sent.version, "r1", blob("landed")))
+        assertTrue(File(dir, "pushed.landed").exists())
+        store.saveLocal("held", "b1", "r1", blob("b"), isCreate = false)
+        assertEquals(PendingNotesStore.HoldOutcome.HELD, store.hold("held", HeldReason.READ_ONLY, now = 5))
+        val last = entry("held").version
+        assertEquals("a waiting change and held text; the hold did not move the counter",
+            UnsyncedNotes(2, last, false), store.unsynced())
+
+        // Behind the store's back: an entry this build cannot read, an intact first write that never
+        // got its name, a first write that was cut short, and an intact uncommitted write beside an entry.
+        File(dir, "damaged.note").writeBytes(byteArrayOf(0))
+        val complete = PendingEntry("stranded", "b1", PendingEntry.State.UPSERT, 9, "r9", false, blob = blob("c"))
+        File(dir, "stranded.note.new").writeBytes(PendingCodec.encodeEntry(complete))
+        File(dir, "cut.note.new").writeBytes(PendingCodec.encodeEntry(complete.copy(noteUid = "cut")).copyOf(20))
+        File(dir, "waiting.note.new").writeBytes(PendingCodec.encodeEntry(complete.copy(noteUid = "waiting")))
+        val before = filesOf(dir)
+        // A new instance, as after a restart: any other read of it would run recovery first.
+        val fresh = restarted()
+        assertEquals("the damaged entry and the intact first write count; the cut one and the leftover do not",
+            UnsyncedNotes(4, last, false), fresh.unsynced())
+        assertEquals("no recovery ran and nothing was written", before, filesOf(dir))
+    }
+
+    @Test fun `a store whose last change was pushed holds nothing, and what a failed clear left is counted`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        assertTrue(store.unsynced().anything)
+        val sent = store.beginSend("n1")!!
+        assertEquals(SendOutcome.Done, store.completeSend("n1", sent.version, "r1", blob("landed")))
+        assertEquals("only the counter is left", setOf("sequence"), dir.list()!!.toSet())
+        assertEquals(UnsyncedNotes.NOTHING, store.unsynced())
+
+        val v2 = saved(store.saveLocal("n2", "b1", "r1", blob("t"), isCreate = false))
+        PendingNotesStore.beforeClearForTesting = { throw java.io.IOException("could not clear the pending store") }
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        PendingNotesStore.beforeClearForTesting = null
+        assertTrue("the failed clear left the files", File(dir, "n2.note").exists())
+        assertEquals("a cleared store still answers, from what is on disk",
+            UnsyncedNotes(1, v2, false), store.unsynced())
+        store.clearAll()
+        assertEquals(UnsyncedNotes.NOTHING, store.unsynced())
+        assertFalse(dir.exists())
+    }
+
+    @Test fun `with the counter lost the answer still carries the highest version on disk`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val v2 = saved(store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false))
+        assertTrue(File(dir, "sequence").delete())
+        assertEquals(UnsyncedNotes(2, v2, false), restarted().unsynced())
+        assertFalse("and it does not write the counter back", File(dir, "sequence").exists())
+
+        // A directory named like a first write cannot be read as a file, so the read fails. The answer
+        // then is "could not be counted", with every entry file and first write by name, and not "nothing".
+        // With the counter lost too, the rebuild meets the same directory, so it carries sequence 0.
+        assertTrue(File(dir, "x.note.new").mkdir())
+        assertEquals(UnsyncedNotes(3, 0, unreadable = true), restarted().unsynced())
+    }
+
+    @Test fun `a counter that cannot be read, or a lost one that cannot be rebuilt, could not be counted`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        val sequence = File(dir, "sequence")
+        assertTrue(sequence.delete() && sequence.mkdir())
+        assertEquals("a counter file that cannot be read at all",
+            UnsyncedNotes(1, 0, unreadable = true), store.unsynced())
+        // Counted by its name then, an uncommitted write beside the entry counts as a file of its own.
+        val beside = File(dir, "n1.note.new").also { it.writeBytes(File(dir, "n1.note").readBytes()) }
+        assertEquals(UnsyncedNotes(2, 0, unreadable = true), store.unsynced())
+        assertTrue(beside.delete() && sequence.delete())
+        // As after a downgrade: with the counter lost, the rebuild meets an entry a newer build wrote, at a
+        // version this build cannot read. The highest version it can read would not be above that one.
+        val newer = PendingEntry("n2", "b1", PendingEntry.State.UPSERT, 7, "r7", false, blob = blob("by a newer build"))
+        File(dir, "n2.note").writeBytes(withFormatVersion(PendingCodec.encodeEntry(newer), 3))
+        assertEquals(UnsyncedNotes(2, 0, unreadable = true), store.unsynced())
+        assertFalse("and nothing is written", sequence.exists())
+    }
+
+    @Test fun `a file of a kind this build does not know could not be counted, whether or not the counter reads`() {
+        // A newer build may keep text in a file of a kind this one does not know, so it never counts as nothing.
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
+        File(dir, "n2.draft").writeBytes(blob("kept by a newer build"))
+        val before = filesOf(dir)
+        assertEquals("beside an entry, with the counter there",
+            UnsyncedNotes(1, v1, unreadable = true), store.unsynced())
+        assertEquals("and asking changes nothing", before, filesOf(dir))
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r1", blob("landed")))
+        assertEquals("on its own", UnsyncedNotes(0, v1, unreadable = true), store.unsynced())
+        assertTrue(File(dir, "sequence").delete())
+        assertEquals("with the counter lost, the rebuild stops at it as well",
+            UnsyncedNotes(0, 0, unreadable = true), store.unsynced())
+        // An uncommitted write of an unknown kind, which recovery leaves as it is, and a directory.
+        assertTrue(File(dir, "n2.draft").renameTo(File(dir, "n2.draft.new")))
+        val next = restarted()
+        assertTrue(next.scan().entries.isEmpty())
+        assertTrue("recovery left it as it is", File(dir, "n2.draft.new").isFile)
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true), next.unsynced())
+        assertTrue(File(dir, "n2.draft.new").delete() && File(dir, "attachments").mkdir())
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true), next.unsynced())
+        assertTrue(File(dir, "attachments").delete())
+        assertEquals(UnsyncedNotes.NOTHING, next.unsynced())
+    }
+
+    @Test fun `an answer that could not be counted carries the sequence, so a save since moves it`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false))
+        // A first write that cannot be read: a directory under its name.
+        assertTrue(File(dir, "n9.note.new").mkdir())
+        val shown = store.unsynced()
+        assertEquals(UnsyncedNotes(2, v1, unreadable = true), shown)
+        val v2 = saved(store.saveLocal("n1", "b1", "r2", blob("typed after the answer was shown"), isCreate = false))
+        assertEquals("the same number of files, at the new sequence",
+            UnsyncedNotes(2, v2, unreadable = true), store.unsynced())
+        assertFalse(shown.covers(store.unsynced()))
+
+        // One note pushed and a new one saved leave the number of files as it was; the sequence moves on.
+        val again = store.unsynced()
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r2", blob("landed")))
+        val v3 = saved(store.saveLocal("n3", "b1", "r1", blob("a new note"), isCreate = false))
+        assertEquals(UnsyncedNotes(2, v3, unreadable = true), store.unsynced())
+        assertFalse("one note took the place of another", again.covers(store.unsynced()))
+    }
+
+    @Test fun `a store directory that is there but cannot be listed is not counted as nothing, however far up`() {
+        // File.exists() answers false for a check that fails as well as for a directory that is not there.
+        val root = tmp.newFolder("no_backup")
+        val s = open(PendingNotesStore.identityDir(root, "io.silentsuite", "alice@example.invalid", "gen-1"))
+        val v = saved(s.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
+        // The counter file reads without a listing, so the answer carries the sequence still.
+        val uncounted = UnsyncedNotes(0, v, unreadable = true)
+        // The directories each case lists, so that every case is seen to take its own way up.
+        val asked = ArrayList<String>()
+        fun failing(vararg names: String): (File) -> Array<File>? =
+            { d -> asked += d.name; if (d.name in names) null else d.listFiles() }
+        PendingNotesStore.listFilesForTesting = failing(s.dir.name)
+        assertEquals("the directory above shows it is there", uncounted, s.unsynced())
+        assertEquals(listOf(s.dir.name, "notes-pending"), asked)
+        asked.clear()
+        PendingNotesStore.listFilesForTesting = failing(s.dir.name, "notes-pending")
+        assertEquals("the nearest directory above that can be listed shows the one below it", uncounted, s.unsynced())
+        assertEquals(listOf(s.dir.name, "notes-pending", "no_backup"), asked)
+        PendingNotesStore.listFilesForTesting = { null }
+        assertEquals("no directory above can be listed", uncounted, s.unsynced())
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("the change was there all along", UnsyncedNotes(1, v, false), s.unsynced())
+    }
+
+    @Test fun `a store under directories that were never made counts nothing, and asking makes none of them`() {
+        // As for an account that never saved a note on a device where no account did: no notes-pending either.
+        val root = tmp.newFolder("no_backup")
+        val never = open(PendingNotesStore.identityDir(root, "io.silentsuite", "alice@example.invalid", "gen-1"))
+        assertEquals(UnsyncedNotes.NOTHING, never.unsynced())
+        assertFalse(File(root, "notes-pending").exists())
+        // A listing above that does not show it is no proof while its own check fails: a listing can come back short.
+        checksFailFor(never.dir.name)
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true), never.unsynced())
+        assertFalse(File(root, "notes-pending").exists())
+    }
+
+    @Test fun `an answer covers the store as it was shown or with less in it, and not after a save`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        val shown = store.unsynced()
+        assertTrue(shown.covers(store.unsynced()))
+        // A change that was pushed meanwhile takes away nothing the user did not see.
+        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r1", blob("landed")))
+        assertEquals(UnsyncedNotes(1, shown.sequence, false), store.unsynced())
+        assertTrue(shown.covers(store.unsynced()))
+        // A save moves the sequence on, also when the count stays the same.
+        store.saveLocal("n2", "b1", "r2", blob("typed after the answer was shown"), isCreate = false)
+        assertEquals(1, store.unsynced().count)
+        assertFalse(shown.covers(store.unsynced()))
+
+        val counted = UnsyncedNotes(2, 7, false)
+        assertFalse("one change more than was shown", counted.covers(UnsyncedNotes(3, 7, false)))
+        assertFalse("what was counted can no longer be counted", counted.covers(UnsyncedNotes(2, 7, true)))
+        assertFalse("a store that holds nothing now carries sequence 0", counted.covers(UnsyncedNotes.NOTHING))
+        assertTrue(UnsyncedNotes.NOTHING.covers(UnsyncedNotes.NOTHING))
+        // Shown as a store that could not be counted: it covers an answer that again could not be counted,
+        // with no higher number of files than was shown, and no counted answer.
+        val uncounted = UnsyncedNotes(2, 0, unreadable = true)
+        assertTrue(uncounted.covers(uncounted))
+        assertTrue("fewer files", uncounted.covers(UnsyncedNotes(1, 0, unreadable = true)))
+        assertFalse("a higher number of files than was shown", uncounted.covers(UnsyncedNotes(3, 0, unreadable = true)))
+        assertFalse("a store that is counted now", uncounted.covers(UnsyncedNotes(1, 1, false)))
+        assertFalse("not even a counted answer that carries sequence 0", uncounted.covers(UnsyncedNotes(1, 0, false)))
     }
 }
