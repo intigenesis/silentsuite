@@ -2090,13 +2090,16 @@ class PendingNotesStoreTest {
         assertEquals(1, Regex("""\bisDirectory\b""").findAll(code).count())
         assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(code).count())
         // The presence check is asked only where a check that failed cannot pass for an absence: isPresent and
-        // syncRemoval, which throw on UNKNOWN, three decisions that need ABSENT (a recovery problem stays; shownGone,
-        // for a clear and for a count of nothing; a file a discard permit names holds back), and createDirectory,
-        // which makes a level not shown PRESENT and lets mkdir decide.
+        // syncRemoval, which throw on UNKNOWN, four decisions that need ABSENT (a recovery problem stays; shownGone,
+        // for a clear and for a count of nothing; a file a discard permit names holds back; storeDirectories, for a
+        // notes-pending that holds no store), and createDirectory, which makes a level not shown PRESENT and lets
+        // mkdir decide.
         assertFalse(Regex("""==\s*Presence\.PRESENT\b|\bPresence\.PRESENT\s*==""").containsMatchIn(code))
         assertEquals(8, Regex("""\bpresenceOf\(""").findAll(code).count())
         assertEquals(2, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
         assertEquals(3, Regex("""\) != Presence\.ABSENT\b""").findAll(code).count())
+        assertEquals(1, Regex("""\?: presence\(root\)\) == Presence\.ABSENT\b""").findAll(code).count())
+        assertEquals("no other test for ABSENT", 4, Regex("""[=!]=\s*Presence\.ABSENT\b""").findAll(code).count())
         assertEquals(2, Regex("""\) != Presence\.PRESENT\b""").findAll(code).count())
         // A clear returns only on its own check that the directory is gone, never on what the deletion answered.
         assertEquals(listOf("dir.deleteRecursively()"),
@@ -4156,6 +4159,152 @@ class PendingNotesStoreTest {
         store.unregister()
         assertSame("a second call does nothing", next, open(dir))
         assertEquals(1, next.unsynced().count)
+    }
+
+    // ---- the store folders in notes-pending, and a store opened by its folder's name ----
+
+    /** A store folder's name, as identityDir makes one. */
+    private fun storeName(accountName: String) =
+        PendingNotesStore.identityDir(tmp.root, "io.silentsuite", accountName, "gen-1").name
+
+    /**
+     * The names in [d], read from listings that must work: of [d], or of the folder above it when that listing shows
+     * [d] is not there. File.exists() is not asked.
+     */
+    private fun namesIn(d: File): Set<String> {
+        val above = d.parentFile!!.list() ?: throw AssertionError("${d.parentFile!!.name} could not be listed")
+        if (d.name !in above) return emptySet()
+        return (d.list() ?: throw AssertionError("${d.name} could not be listed")).toSet()
+    }
+
+    @Test fun `storeDirectories of a folder never created is empty and creates nothing`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val folders = PendingNotesStore.storeDirectories(noBackup)
+        assertEquals(emptyList<String>(), folders.stores)
+        assertFalse(folders.unknown)
+        assertEquals("nothing was made", emptySet<String>(), namesIn(noBackup))
+    }
+
+    @Test fun `storeDirectories keeps only lowercase 64-hex names, in order, flags any other, and asks nothing`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val pending = File(noBackup, "notes-pending")
+        val (a, b) = listOf(storeName("a"), storeName("b")).sorted()
+        assertTrue(File(pending, b).mkdirs() && File(pending, a).mkdir())
+        // Nothing is asked of a name: no presence check, and no listing but the one of notes-pending.
+        val asked = ArrayList<String>()
+        PendingNotesStore.presenceForTesting = { f -> asked += "presence ${f.name}"; null }
+        // In reverse order, so the order kept is the sort's, whatever order a file system lists in.
+        PendingNotesStore.listFilesForTesting = { d ->
+            asked += "listing ${d.name}"
+            d.listFiles()?.sortedByDescending { it.name }?.toTypedArray()
+        }
+        val folders = PendingNotesStore.storeDirectories(noBackup)
+        assertEquals(listOf(a, b), folders.stores)
+        assertFalse(folders.unknown)
+        assertEquals(listOf("listing notes-pending"), asked)
+
+        // Anything else is of a kind this build does not know: flagged, never kept, and never read as nothing.
+        val hex = "0123456789abcdef".repeat(4)
+        for (other in listOf("Abcdef" + hex.drop(6), hex.uppercase(), hex.drop(1), "$a.new", "$a.permit",
+                "notes-discard")) {
+            assertTrue(other, File(pending, other).mkdir())
+            asked.clear()
+            val withOther = PendingNotesStore.storeDirectories(noBackup)
+            assertEquals(other, listOf(a, b), withOther.stores)
+            assertTrue(other, withOther.unknown)
+            assertEquals(listOf("listing notes-pending"), asked)
+            assertTrue(File(pending, other).delete())
+        }
+        PendingNotesStore.presenceForTesting = null
+        PendingNotesStore.listFilesForTesting = null
+
+        // A plain file with a store folder's name is kept, as nothing is asked of it, and its count then says that it
+        // could not be listed.
+        val plain = storeName("plain")
+        assertTrue(File(pending, plain).createNewFile())
+        assertEquals((listOf(a, b) + plain).sorted(), PendingNotesStore.storeDirectories(noBackup).stores)
+        val opened = PendingNotesStore.forNoBackupDirectory(noBackup, plain, {}, atomicMove)
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true, listed = false), opened.unsynced())
+    }
+
+    @Test fun `storeDirectories throws while notes-pending cannot be listed and is not shown gone`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val pending = File(noBackup, "notes-pending")
+        assertTrue(File(pending, storeName("a")).mkdirs())
+        fun failing(vararg names: String): (File) -> Array<File>? =
+            { d -> if (d.name in names) null else d.listFiles() }
+        PendingNotesStore.listFilesForTesting = failing("notes-pending")
+        assertThrows(java.io.IOException::class.java) { PendingNotesStore.storeDirectories(noBackup) }
+        PendingNotesStore.listFilesForTesting = failing("notes-pending", "no_backup")
+        assertThrows(java.io.IOException::class.java) { PendingNotesStore.storeDirectories(noBackup) }
+        // A listing of no_backup that comes back short, without notes-pending, is no proof on its own: the presence
+        // check still finds it.
+        PendingNotesStore.listFilesForTesting = { d ->
+            when (d.name) {
+                "notes-pending" -> null
+                "no_backup" -> d.listFiles()?.filter { it.name != "notes-pending" }?.toTypedArray()
+                else -> d.listFiles()
+            }
+        }
+        assertThrows(java.io.IOException::class.java) { PendingNotesStore.storeDirectories(noBackup) }
+        // Not there, but the folder above cannot be listed to show it, and the one above that shows no_backup.
+        assertTrue(File(pending, storeName("a")).delete() && pending.delete())
+        PendingNotesStore.listFilesForTesting = failing("no_backup")
+        assertThrows(java.io.IOException::class.java) { PendingNotesStore.storeDirectories(noBackup) }
+        // Not there, and the folder above shows it, but the presence check fails.
+        PendingNotesStore.listFilesForTesting = null
+        PendingNotesStore.presenceForTesting = { f -> if (f == pending) PendingNotesStore.Presence.UNKNOWN else null }
+        assertThrows(java.io.IOException::class.java) { PendingNotesStore.storeDirectories(noBackup) }
+        PendingNotesStore.presenceForTesting = null
+        assertEquals(emptyList<String>(), PendingNotesStore.storeDirectories(noBackup).stores)
+    }
+
+    @Test fun `forDirectory and forIdentity share one instance whichever opens first`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val byIdentity = identityStore(noBackup)
+        val name = byIdentity.dir.name
+        assertEquals(PendingNotesStore.identityDir(noBackup, "io.silentsuite", "alice@example.invalid", "gen-1").name,
+            name)
+        assertSame(byIdentity, PendingNotesStore.forNoBackupDirectory(noBackup, name, {}, atomicMove))
+        PendingNotesStore.resetForTesting()
+        val byFolder = PendingNotesStore.forNoBackupDirectory(noBackup, name, {}, atomicMove)
+        assertNotSame(byIdentity, byFolder)
+        assertSame(byFolder, identityStore(noBackup))
+        assertEquals(byIdentity.dir, byFolder.dir)
+    }
+
+    @Test fun `a discard through forDirectory keeps its permit beside notes-pending`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val name = identityStore(noBackup).dir.name
+        identityStore(noBackup).saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        PendingNotesStore.resetForTesting()
+        val s = PendingNotesStore.forNoBackupDirectory(noBackup, name, {}, atomicMove)
+        val shown = s.unsynced()
+        // Recorded at the first removal, and checked after it, so nothing is asserted inside the store.
+        val atFirstRemoval = ArrayList<Pair<UnsyncedNotes?, Set<String>>>()
+        PendingNotesStore.beforeRemoveForTesting = {
+            if (atFirstRemoval.isEmpty()) {
+                atFirstRemoval += permitsOf(s).read(name) to namesIn(File(noBackup, PendingNotesDiscardPermits.ROOT))
+            }
+        }
+        assertEquals(DiscardOutcome.Done, s.discardStore(shown))
+        assertEquals(listOf(shown to setOf("$name.permit")), atFirstRemoval)
+        assertEquals("nothing else was ever put in notes-pending", emptySet<String>(), namesIn(File(noBackup,
+            "notes-pending")))
+        assertEquals("the permit went with the folder", emptySet<String>(), namesIn(File(noBackup,
+            PendingNotesDiscardPermits.ROOT)))
+    }
+
+    @Test fun `forDirectory refuses a name that is not a store folder`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val name = storeName("a")
+        for (wrong in listOf("", ".", "..", "../x", "../$name".take(64), name.uppercase(), name.drop(1), name + "0",
+                "$name/x")) {
+            assertThrows(wrong, IllegalArgumentException::class.java) {
+                PendingNotesStore.forNoBackupDirectory(noBackup, wrong, {}, atomicMove)
+            }
+        }
+        assertEquals("nothing was made", emptySet<String>(), namesIn(noBackup))
     }
 
     @Test fun `outside the pending store's package only the sign-out seam calls discardStore`() {

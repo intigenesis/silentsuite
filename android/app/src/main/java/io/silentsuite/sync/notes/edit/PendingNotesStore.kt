@@ -1893,6 +1893,12 @@ internal class PendingNotesStore private constructor(
          */
         private val floors = ConcurrentHashMap<String, Long>()
 
+        /** The folder in noBackupFilesDir that holds one store folder per exact identity ([identityDir]). */
+        private const val PENDING = "notes-pending"
+
+        /** The name of a store folder: [identityDir]'s SHA-256 digest, in lowercase hex. */
+        private val STORE_DIRECTORY = Regex("^[0-9a-f]{64}$")
+
         /** Test seams: crash points inside the write, conflict, and sign-out sequences. */
         @Volatile internal var beforeOriginalRemovedForTesting: (() -> Unit)? = null
         @Volatile internal var beforeRenameForTesting: ((File) -> Unit)? = null
@@ -1931,6 +1937,37 @@ internal class PendingNotesStore private constructor(
         }
 
         /**
+         * The store folders in notes-pending, by name in sorted order ([stores]), and whether notes-pending holds a
+         * name of any other kind ([unknown]). Only store folders are ever made there, so another name is of a kind
+         * this build does not know, which may hold unsynced text a newer build wrote: it is never read as nothing.
+         */
+        internal class StoreFolders(val stores: List<String>, val unknown: Boolean)
+
+        /**
+         * The folders of notes-pending in [noBackup], chosen by name alone from one listing: nothing is asked of each
+         * name. A notes-pending shown not to be there by two checks that agree, as a store's own folder is
+         * ([shownGone]), holds none, such as one that was never made: the folder above lists without it
+         * ([knownAbsent]), and its [presence] check answers [Presence.ABSENT]. A listing that fails otherwise throws
+         * IOException: read as an empty one, it would hide every store. A listing that works can still come back
+         * short, as in [unsynced], so a store missing from it is not shown to be gone, and neither is notes-pending
+         * by a listing of the folder above alone.
+         */
+        internal fun storeDirectories(noBackup: File, presence: (File) -> Presence = nioPresence): StoreFolders {
+            val root = File(noBackup, PENDING)
+            val listed = listDirectory(root)
+            if (listed == null) {
+                val gone = knownAbsent(root) && (presenceForTesting?.invoke(root) ?: presence(root)) == Presence.ABSENT
+                if (gone) return StoreFolders(emptyList(), unknown = false)
+                throw IOException("could not list the pending stores")
+            }
+            val (stores, others) = listed.map { it.name }.partition { STORE_DIRECTORY.matches(it) }
+            return StoreFolders(stores.sorted(), unknown = others.isNotEmpty())
+        }
+
+        /** [storeDirectories] in noBackupFilesDir, with the presence check [forDirectory] gives a store on a device. */
+        internal fun storeDirectories(context: Context) = storeDirectories(context.noBackupFilesDir, lstatPresence)
+
+        /**
          * Test seam: what a check of whether the path it is given is there answers in place of the store's
          * own [Presence] check; null leaves the answer to that check. [Presence.UNKNOWN] is a check that failed.
          * It answers the checks of the discard permits too ([PendingNotesDiscardPermits]).
@@ -1940,7 +1977,7 @@ internal class PendingNotesStore private constructor(
         /**
          * lstat(2) through java.nio, for the JVM tests, which cannot call [Os]: NoSuchFileException is ENOENT,
          * and any other failure is unknown. Android has java.nio.file only from API 26, so a store on a device
-         * gets [lstatPresence] through [forIdentity].
+         * gets [lstatPresence] through [forIdentity] or [forDirectory].
          */
         @SuppressLint("NewApi")
         internal val nioPresence: (File) -> Presence = { path ->
@@ -1976,7 +2013,7 @@ internal class PendingNotesStore private constructor(
         /**
          * lstat(2)'s device and inode numbers through java.nio's unix view, for the JVM tests, which cannot
          * call [Os]. Where the JVM has no such view (Windows), or the read fails, the identity cannot be read.
-         * A store on a device gets [lstatIdentity] through [forIdentity].
+         * A store on a device gets [lstatIdentity] through [forIdentity] or [forDirectory].
          */
         @SuppressLint("NewApi")
         private val nioIdentity: (File) -> DirectoryIdentity? = { path ->
@@ -2013,7 +2050,7 @@ internal class PendingNotesStore private constructor(
         /**
          * Whether lstat(2) through java.nio shows a symbolic link, for the JVM tests, which cannot call [Os]:
          * NoSuchFileException is ENOENT, which is no link, and any other failure is unknown. A store on a device
-         * gets [lstatLink] through [forIdentity].
+         * gets [lstatLink] through [forIdentity] or [forDirectory].
          */
         private val nioLink: (File) -> Boolean? = { path ->
             try {
@@ -2055,10 +2092,10 @@ internal class PendingNotesStore private constructor(
         /**
          * The single instance for [dir] in this process, so every caller shares its lock. [rename] must
          * replace an existing target in one step; JVM tests on Windows pass a java.nio atomic move. The
-         * default [presence] is for the JVM tests; a store on a device is opened through [forIdentity]. So are
-         * the default [permits], in a root beside [dir] ([forIdentity] keeps every permit in
-         * noBackupFilesDir/notes-discard), and the default [identity] and [link]. The first opener's functions and
-         * permits are the ones kept.
+         * default [presence] is for the JVM tests; a store on a device is opened through [forIdentity] or
+         * [forDirectory]. So are the default [permits], in a root beside [dir] (both keep every permit in
+         * noBackupFilesDir/notes-discard), and the default [identity] and [link]. The first opener's functions
+         * and permits are the ones kept.
          *
          * The folders above [dir] are resolved to their canonical path, and [dir]'s own name is kept as given, never
          * resolved: the instance's [PendingNotesStore.dir], and the key it is registered under, are that parent and
@@ -2102,7 +2139,7 @@ internal class PendingNotesStore private constructor(
         internal fun identityDir(root: File, accountType: String, accountName: String, creationId: String): File {
             val digest = MessageDigest.getInstance("SHA-256")
                 .digest("v1\u0000$accountType\u0000$accountName\u0000$creationId".toByteArray(Charsets.UTF_8))
-            return File(File(root, "notes-pending"), digest.joinToString("") { "%02x".format(it) })
+            return File(File(root, PENDING), digest.joinToString("") { "%02x".format(it) })
         }
 
         /**
@@ -2143,6 +2180,30 @@ internal class PendingNotesStore private constructor(
                 androidRename, lstatPresence, lstatIdentity, lstatLink)
 
         /**
+         * The store in folder [name] of notes-pending ([storeDirectories]), opened as [forIdentity] opens it, for a
+         * caller that knows the folder and not the identity, such as a store whose account is gone. It is the same
+         * instance [forIdentity] gives for that folder, whichever opens it first, with its permits in the same root.
+         * A name that is not a store folder is refused (IllegalArgumentException).
+         */
+        fun forDirectory(context: Context, name: String) = forNoBackupDirectory(context.noBackupFilesDir, name,
+            androidDirectorySync, androidRename, lstatPresence, lstatIdentity, lstatLink)
+
+        /** [forDirectory] in [noBackup], as [forNoBackup] is [forIdentity] there. */
+        internal fun forNoBackupDirectory(
+            noBackup: File,
+            name: String,
+            syncDirectory: (File) -> Unit,
+            rename: (File, File) -> Unit,
+            presence: (File) -> Presence = nioPresence,
+            identity: (File) -> DirectoryIdentity? = nioIdentity,
+            link: (File) -> Boolean? = nioLink,
+        ): PendingNotesStore {
+            require(STORE_DIRECTORY.matches(name)) { "not a pending store folder" }
+            return openIn(noBackup, File(File(noBackup, PENDING), name), syncDirectory, rename, presence, identity,
+                link)
+        }
+
+        /**
          * [forIdentity] in [noBackup]: the store in notes-pending, and its discard permit and acknowledgement in
          * a root of their own beside notes-pending, so they stay readable when notes-pending cannot be listed.
          * JVM tests pass their own [syncDirectory] and [rename], and keep the default [presence], [identity] and
@@ -2158,7 +2219,19 @@ internal class PendingNotesStore private constructor(
             presence: (File) -> Presence = nioPresence,
             identity: (File) -> DirectoryIdentity? = nioIdentity,
             link: (File) -> Boolean? = nioLink,
-        ) = open(identityDir(noBackup, accountType, accountName, creationId), syncDirectory, rename, presence,
+        ) = openIn(noBackup, identityDir(noBackup, accountType, accountName, creationId), syncDirectory, rename,
+            presence, identity, link)
+
+        /** The store in [dir] of notes-pending in [noBackup], with its permits in their root beside notes-pending. */
+        private fun openIn(
+            noBackup: File,
+            dir: File,
+            syncDirectory: (File) -> Unit,
+            rename: (File, File) -> Unit,
+            presence: (File) -> Presence,
+            identity: (File) -> DirectoryIdentity?,
+            link: (File) -> Boolean?,
+        ) = open(dir, syncDirectory, rename, presence,
             PendingNotesDiscardPermits(File(noBackup, PendingNotesDiscardPermits.ROOT), syncDirectory, rename,
                 presence), identity, link)
     }
