@@ -474,6 +474,35 @@ class PendingNotesRemovalGuardTest {
             PendingNotesRemovalGuard.decide(real(noBackup, "b", CreationId.Unreadable, rows)))
     }
 
+    @Test fun `the Settings list finds by path the stores the guard finds, from notes-discard and the known paths`() {
+        val noBackup = tmp.newFolder("no_backup")
+        fun dir(name: String, id: String) = PendingNotesStore.identityDir(noBackup, TYPE, name, id).name
+        val discard = File(noBackup, PendingNotesDiscardPermits.ROOT).also { it.mkdirs() }
+        // A permit, an acknowledgement and an uncommitted write of each, every one for another store folder.
+        val ends = listOf(".permit", ".acknowledgement", ".permit.new", ".acknowledgement.new")
+        val recorded = ends.mapIndexed { i, end ->
+            dir("k$i", "gen-$i").also { File(discard, it + end).writeBytes(ByteArray(1)) }
+        }
+        File(discard, "not-a-record").writeBytes(ByteArray(1))
+        val active = "p" to "gen-p"
+        val records = listOf(
+            AccountCreationRegistry.Record("r", "gen-r", AccountCreationRegistry.Phase.RECOVERY_REQUIRED, 1, TYPE),
+            AccountCreationRegistry.Record("x", "gen-x", AccountCreationRegistry.Phase.PREPARED, 1, "other.type"))
+        val byKnownPath = setOf(dir("p", "gen-p"), dir("r", "gen-r"))
+        fun found() =
+            PendingNotesRemovalGuard.foundByPath(noBackup, TYPE, PendingNotesStore.nioPresence, active, records)
+        val guard = real(noBackup, "b", CreationId.Unreadable, null, active, records)
+        assertEquals(recorded.toSet() + byKnownPath, found())
+        assertEquals("the guard's own two readings", found(), guard.discard().orEmpty() + guard.known())
+        // While notes-discard cannot be listed, the known paths alone, as for the guard.
+        PendingNotesStore.listFilesForTesting = { d ->
+            if (d.name == PendingNotesDiscardPermits.ROOT) null else d.listFiles()
+        }
+        assertEquals(byKnownPath, found())
+        assertNull(guard.discard())
+        assertEquals(found(), guard.known())
+    }
+
     @Test fun `while notes-discard cannot be read, a clean account is decided with no permit or acknowledgement`() {
         val noBackup = tmp.newFolder("no_backup")
         // An orphan whose last change was pushed: clean, with its counter and notebook copy left.

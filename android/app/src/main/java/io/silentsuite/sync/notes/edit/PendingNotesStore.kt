@@ -2221,7 +2221,7 @@ internal class PendingNotesStore private constructor(
          * A store on a device gets [lstatIdentity] through [forIdentity] or [forDirectory].
          */
         @SuppressLint("NewApi")
-        private val nioIdentity: (File) -> DirectoryIdentity? = { path ->
+        internal val nioIdentity: (File) -> DirectoryIdentity? = { path ->
             try {
                 val read = Files.readAttributes(path.toPath(), "unix:dev,ino", LinkOption.NOFOLLOW_LINKS)
                 val device = read["dev"] as? Long

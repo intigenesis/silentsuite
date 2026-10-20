@@ -43,11 +43,12 @@ internal data class UnsyncedNotesListing(
 
 /**
  * The Settings way out for unsynced Notes, below its screen: it finds every Notes store on this device and discards
- * one store that the user confirmed. It reads the account list, the store files, the discard permits, and from memory
- * the stores whose discard stopped in this process ([PendingNotesStore.stoppedIn]) only, so it works offline and
- * without a session, also for a store whose account is gone (the maintainer's condition of 2026-10-18 on #709). It
- * opens every store by its folder's name ([PendingNotesStore.forDirectory]), never keeps an instance, and reads no
- * acknowledgement as authority for anything.
+ * one store that the user confirmed. It reads only the account list, the store files, the discard permits, from
+ * memory the stores whose discard stopped in this process ([PendingNotesStore.stoppedIn]), and, while notes-pending
+ * cannot be listed, the names of notes-discard's records, the active-account preference and the creation registry, so
+ * it works offline and without a session, also for a store whose account is gone (the maintainer's condition of
+ * 2026-10-18 on #709). It opens every store by its folder's name ([PendingNotesStore.forDirectory]), never keeps an
+ * instance, and reads no acknowledgement as authority for anything.
  */
 internal object UnsyncedNotesStores {
     /** The exact identity of an account row whose creation id [creationId] reads, or null when it does not. */
@@ -74,25 +75,36 @@ internal object UnsyncedNotesStores {
     @WorkerThread
     fun read(context: Context): UnsyncedNotesListing = read(context.noBackupFilesDir, presentAccounts(context),
         folders = { PendingNotesStore.storeDirectories(context) },
-        open = { PendingNotesStore.forDirectory(context, it) })
+        open = { PendingNotesStore.forDirectory(context, it) },
+        pathFound = { PendingNotesRemovalGuard.foundByPath(context) },
+        presence = PendingNotesStore::presenceOnDevice)
 
     /**
      * [read] for the stores in [noBackup], with [accounts] present, the folders of notes-pending listed by [folders]
      * and each store opened by [open]. The folders are those notes-pending lists, every present account's own, so a
      * listing that comes back short cannot hide a present account's store, and every folder whose clear or discard
      * stopped in this process ([PendingNotesStore.stoppedIn]), which can be gone, or left out of a listing, while its
-     * Retry is owed; a folder that is not there counts nothing and is not made. While notes-pending cannot be listed
-     * and is not shown gone, only the present accounts' folders and those are read. A store is kept while it holds
+     * Retry is owed; a folder that is not there counts nothing and is not made. A store is kept while it holds
      * anything, its read throws, or its discard stopped ([UnsyncedNotesRow.stopped]). The last is told by the store's
      * state, never by its count, which can come back short, or find nothing once the text went while an unlink whose
      * sync failed can come back. The counts run no recovery and write nothing in a store, though a count of a store
      * that lists withdraws its acknowledgement ([PendingNotesStore.unsynced]).
+     *
+     * While notes-pending cannot be listed and is not shown gone, the folders read are the present accounts', those
+     * whose path is known otherwise ([pathFound]: records in notes-discard, the active account, the creation registry),
+     * so those keep their normal checks, and those whose clear or discard stopped. Of the first two, a folder that its
+     * [presence] check shows not to be there is left out, a present account's included: it holds nothing, and an
+     * acknowledgement for it could never be recorded, since a folder that is not there has no identity. A folder whose
+     * check fails is kept, and so is every folder whose clear or discard stopped, whatever its check shows: its row is
+     * the Retry.
      */
     internal fun read(
         noBackup: File,
         accounts: List<ExactAccountIdentity>,
         folders: () -> StoreFolders = { PendingNotesStore.storeDirectories(noBackup) },
         open: (String) -> PendingNotesStore,
+        pathFound: () -> Set<String> = { emptySet() },
+        presence: (File) -> PendingNotesStore.Presence = PendingNotesStore.nioPresence,
     ): UnsyncedNotesListing {
         val byDirectory = accounts.associateBy { directoryOf(noBackup, it) }
         val listed = try {
@@ -100,8 +112,20 @@ internal object UnsyncedNotesStores {
         } catch (e: IOException) {
             null
         }
-        val directories = (listed?.stores.orEmpty() + byDirectory.keys + PendingNotesStore.stoppedIn(noBackup))
-            .distinct().sorted()
+        val stopped = PendingNotesStore.stoppedIn(noBackup)
+        val directories = if (listed != null) {
+            (listed.stores + byDirectory.keys + stopped).distinct().sorted()
+        } else {
+            val known = try {
+                pathFound()
+            } catch (e: Exception) {
+                emptySet()
+            }
+            val pending = File(noBackup, PendingNotesStore.PENDING)
+            val found = (byDirectory.keys + known).distinct().sorted()
+                .filter { presence(File(pending, it)) != PendingNotesStore.Presence.ABSENT }
+            (found + stopped).distinct().sorted()
+        }
         val rows = directories.map { row(it, byDirectory[it], open) }
             .filter { it.answer == null || it.answer.anything || it.stopped }
         return UnsyncedNotesListing(rows, othersUnlisted = listed == null, unknownOthers = listed?.unknown == true)

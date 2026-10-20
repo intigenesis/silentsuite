@@ -39,7 +39,7 @@ import java.io.IOException
  * both folders at once by the reply of 2026-10-21: only a folder that cannot be read stands in the way. A fourth,
  * [Verdict.UNKNOWN_KIND_ONLY], is the one proposed to the maintainer for names of a kind this build does not know in
  * notes-pending. Two open points each have one named value, a refusal:
- * [READABLE_ID_UNDER_UNLISTED_PERMITS] and [UNKNOWN_KIND_IN_PENDING]. Nothing calls the guard yet.
+ * [READABLE_ID_UNDER_UNLISTED_PERMITS] and [UNKNOWN_KIND_IN_PENDING]. No removal is refused through it yet.
  */
 internal object PendingNotesRemovalGuard {
     /**
@@ -311,6 +311,33 @@ internal object PendingNotesRemovalGuard {
     }
 
     /**
+     * The store folders notes-discard in [noBackup] holds a record of ([PendingNotesDiscardPermits.listNames]), or null
+     * when it cannot be listed, from a reader that only lists.
+     */
+    internal fun discardNames(noBackup: File, presence: (File) -> PendingNotesStore.Presence): Set<String>? =
+        PendingNotesDiscardPermits(File(noBackup, PendingNotesDiscardPermits.ROOT), syncDirectory = {},
+            rename = { _, _ -> throw IOException("this reader only lists") }, presence = presence).listNames()
+
+    /**
+     * Every store folder in [noBackup] whose path is known without a listing of notes-pending: those notes-discard
+     * holds a record of, when it lists ([discardNames]), and [known]'s, the same two readings the guard takes for a row
+     * without a readable creation id ([input]). For the Settings way out while notes-pending cannot be listed.
+     */
+    internal fun foundByPath(
+        noBackup: File,
+        mainType: String,
+        presence: (File) -> PendingNotesStore.Presence,
+        active: Pair<String, String>?,
+        records: List<AccountCreationRegistry.Record>?,
+    ): Set<String> = discardNames(noBackup, presence).orEmpty() + known(noBackup, mainType, active, records)
+
+    /** [foundByPath] on this device, from the active-account preference and the creation registry. */
+    @WorkerThread
+    internal fun foundByPath(context: Context): Set<String> = foundByPath(context.noBackupFilesDir, App.accountType,
+        PendingNotesStore::presenceOnDevice, ActiveAccountManager.savedIdentity(context),
+        AccountCreationRegistry.open(context).records())
+
+    /**
      * [Input] over the stores in [noBackup], each opened by [open], with [presence] for the folders' own checks; the
      * reader of notes-discard here only lists it.
      */
@@ -327,10 +354,7 @@ internal object PendingNotesRemovalGuard {
         open: (String) -> PendingNotesStore,
     ) = Input(mainType, type, name, id, accounts,
         pending = { PendingNotesStore.storeDirectories(noBackup, presence) },
-        discard = {
-            PendingNotesDiscardPermits(File(noBackup, PendingNotesDiscardPermits.ROOT), syncDirectory = {},
-                rename = { _, _ -> throw IOException("this reader only lists") }, presence = presence).listNames()
-        },
+        discard = { discardNames(noBackup, presence) },
         known = { known(noBackup, mainType, active(), records()) },
         folderOf = { rowName, rowId -> PendingNotesStore.identityDir(noBackup, mainType, rowName, rowId).name },
         check = { open(it).removalCheck() })

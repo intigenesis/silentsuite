@@ -30,6 +30,8 @@ class AccountRowChangesContractTest {
         assertEquals(mapOf(
             // Address books: their add, rename, and removal.
             "resource/LocalAddressBook.kt" to 3,
+            // The removal the one-time confirmation starts itself, through the authenticator.
+            "ui/NotesRemovalOffer.kt" to 1,
             // The creation's add seam, the one production add of a main-type row.
             "ui/setup/CreateAccountFragment.kt" to 1,
             // The two removal helpers, one removal each.
@@ -65,10 +67,11 @@ class AccountRowChangesContractTest {
         assertFalse(Regex("""\bApp\.accountType\b""").containsMatchIn(books))
         assertFalse(books.contains("AccountRowChanges"))
 
-        // Only those three places move it, and nothing in main code compares it yet.
+        // Only those three places move it before a call; the one-time allowance moves it in its own atomic steps, the
+        // confirmation's by a compare-and-set before its removal starts (NotesRemovalOffer.confirm).
         assertEquals(mapOf("ui/setup/CreateAccountFragment.kt" to 1, "utils/AndroidCompat.kt" to 2),
             callsOf(Regex("""\bAccountRowChanges\.mainType\.before\(\)""")))
-        assertEquals(emptyMap<String, Int>(), callsOf(Regex("""\bmoveIfUnchanged\(""")).filterKeys {
+        assertEquals(mapOf("ui/NotesRemovalAllowance.kt" to 2), callsOf(Regex("""\bmoveIfUnchanged\(""")).filterKeys {
             it != "utils/AccountRowChanges.kt"
         })
     }

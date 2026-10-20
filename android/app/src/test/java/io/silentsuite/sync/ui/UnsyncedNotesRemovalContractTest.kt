@@ -52,7 +52,7 @@ class UnsyncedNotesRemovalContractTest {
         // The files that ask for the guard's verdict, or compare with an allowed one, are these alone, and none of them
         // clears, discards, unregisters or deletes, or writes a permit.
         val acting = naming(Regex("""\bPendingNotesRemovalGuard\.(decide|decision|allows)\b|\bVerdict\.ALLOW\b"""))
-        assertEquals(listOf("PendingNotesRemovalGuard.kt"), acting)
+        assertEquals(listOf("NotesRemovalAllowance.kt", "NotesRemovalOffer.kt", "PendingNotesRemovalGuard.kt"), acting)
         for (file in acting) {
             for (word in listOf("""\bdiscardStore\(""", """\bclearAll\b""", """\bunregister\(""",
                     """\bdeleteRecursively\b""", """\.delete\(""", """\bdeleteIfExists\b""", """\bFiles\.delete\b""")) {
@@ -73,5 +73,80 @@ class UnsyncedNotesRemovalContractTest {
     @Test fun `the guard's log line holds its verdict and a count only`() {
         val logs = guard.lines().filter { "Logger." in it }.map { it.trim() }
         assertEquals(listOf("Logger.log.info(\"Notes removal guard: \$verdict after \$checks store checks\")"), logs)
+    }
+
+    private val allowance get() = code(File(ui, "NotesRemovalAllowance.kt"))
+    private val offer get() = code(File(ui, "NotesRemovalOffer.kt"))
+    private val dialog get() = code(File(ui, "NotesRemovalDialogFragment.kt"))
+
+    @Test fun `the allowance lives in memory only, and its lock is a leaf`() {
+        for (word in listOf("File", "SharedPreferences", "getSharedPreferences", "setUserData", "Bundle", "Parcelable",
+                "Serializable", "Intent", "savedInstanceState", "Logger", "AccountManager", "removeAccount",
+                "PendingNotesStore", "PendingNotesRemovalGuard.decision", "AccountSettings", "KEY_CREATION_ID")) {
+            assertFalse(word, Regex("""\b${Regex.escape(word)}\b""").containsMatchIn(allowance))
+        }
+        assertEquals("one lock", 1, Regex("""private val lock = Any\(\)""").findAll(allowance).count())
+        // The dialog carries the confirmation's id alone.
+        assertEquals(listOf("putString(ARG_SHOWN, shown)"), Regex("""put\w+\([^)]*\)""").findAll(dialog)
+            .map { it.value }.toList())
+    }
+
+    @Test fun `the button removes the account through AccountManager itself, after its mint`() {
+        assertFalse(offer.contains("AndroidCompat"))
+        assertEquals(1, Regex("""\.removeAccount\(""").findAll(offer).count())
+        assertTrue(offer.contains("AccountManager.get(context).removeAccount(Account(name, type),"))
+        val confirm = offer.substringAfter("fun confirm(", "").substringBefore("\n    }\n")
+        val mint = confirm.indexOf("allowance.mint(")
+        assertTrue(confirm, mint >= 0 && mint < confirm.indexOf("afterMintForTesting") &&
+            confirm.indexOf("afterMintForTesting") < confirm.indexOf("seams.remove("))
+        assertEquals("the seam that removes is called from the tap alone", 1, Regex("""seams\.remove\(""")
+            .findAll(offer).count())
+    }
+
+    @Test fun `nothing answers for the authenticator yet, and the stores never name the allowance`() {
+        val main = File("src/main/java")
+        val answers = Regex("""NotesRemovalAllowance\b[^\n]*\.answer\(|allowance\.answer\(""")
+        val answering = main.walk().filter { it.isFile && it.extension == "kt" }
+            .filter { file -> answers.containsMatchIn(code(file)) }.map { it.name }.toList()
+        assertEquals(emptyList<String>(), answering)
+        for (store in listOf("notes/edit/PendingNotesStore.kt", "notes/edit/PendingNotesDiscardPermits.kt",
+                "ui/UnsyncedNotesStores.kt")) {
+            val text = code(File(main, "io/silentsuite/sync/$store"))
+            assertFalse(store, text.contains("NotesRemovalAllowance") || text.contains("AccountRowChanges"))
+        }
+        // The authenticator runs in the app's own process, and overrides no cloning of accounts.
+        assertFalse(File("src/main/AndroidManifest.xml").readText().contains("android:process"))
+        val authenticator = code(File(main, "io/silentsuite/sync/syncadapter/AccountAuthenticatorService.kt"))
+        for (word in listOf("getAccountCredentialsForCloning", "addAccountFromCredentials")) {
+            assertFalse(word, authenticator.contains(word))
+        }
+    }
+
+    /** The text of the string resource [name] in the default resources. */
+    private fun stringText(name: String): String =
+        Regex("<string name=\"$name\">(.*?)</string>").find(File("src/main/res/values/strings.xml").readText())
+            ?.groupValues?.get(1) ?: throw AssertionError("no string $name")
+
+    @Test fun `each confirmation says what may remain, and promises nothing`() {
+        for (reason in listOf("root", "permits", "both", "unknown_kind")) {
+            val text = stringText("notes_remove_uncheckable_text_$reason")
+            for (said in listOf("%1\$s", "may remain on this device", "may no longer sync")) {
+                assertTrue("$reason: $said", text.contains(said))
+            }
+            // About Notes alone: what Android does with calendars, contacts and tasks is not promised.
+            for (word in listOf("recover", "restore", "back up", "safe", "later", "deleted", "calendar", "contact",
+                    "task")) {
+                assertFalse("$reason: $word", text.contains(word, ignoreCase = true))
+            }
+        }
+        assertEquals("Remove %1\$s from this device?", stringText("notes_remove_uncheckable_title"))
+        assertEquals("Remove account", stringText("notes_remove_uncheckable_confirm"))
+        for (result in listOf("readable", "changed", "retry")) {
+            assertTrue(result, stringText("notes_remove_uncheckable_$result").startsWith("Nothing was removed."))
+        }
+        // Rows that cannot be read after Android answered prove nothing either way, and a confirmation that ended
+        // claims no change of the accounts.
+        assertFalse(stringText("notes_remove_uncheckable_unknown").contains("Nothing was removed"))
+        assertFalse(stringText("notes_remove_uncheckable_ended").contains("changed"))
     }
 }
