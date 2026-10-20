@@ -12,12 +12,14 @@ import android.accounts.Account
 import android.content.*
 import android.os.Bundle
 import android.provider.ContactsContract
+import androidx.annotation.VisibleForTesting
 import at.bitfire.ical4android.CalendarStorageException
 import at.bitfire.vcard4android.BatchOperation
 import at.bitfire.vcard4android.Contact
 import at.bitfire.vcard4android.ContactsStorageException
 import com.etebase.client.Item
 import io.silentsuite.sync.AccountSettings
+import io.silentsuite.sync.BuildConfig
 import io.silentsuite.sync.Constants
 import io.silentsuite.sync.HttpClient
 import io.silentsuite.sync.R
@@ -53,6 +55,23 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
     init {
         localCollection = localAddressBook
         resourceDownloader = ResourceDownloader(context)
+    }
+
+    companion object {
+        /** Process-local fault for a native-store marker read (false) or write (true); never set in release. */
+        @Volatile
+        private var installedSyncStateFault: ((Boolean) -> Exception?)? = null
+
+        /** Debug-only instrumentation seam; installing it in a release build fails. */
+        @VisibleForTesting
+        internal fun installSyncStateFaultForTest(fault: ((write: Boolean) -> Exception?)?) {
+            check(BuildConfig.DEBUG) { "The sync-state fault hook is unavailable in release builds" }
+            installedSyncStateFault = fault
+        }
+
+        /** The injected fault for a marker read or write, or null; always null in release builds. */
+        internal fun syncStateFaultFor(write: Boolean): Exception? =
+            if (BuildConfig.DEBUG) installedSyncStateFault?.invoke(write) else null
     }
 
     override fun notificationId(): Int {

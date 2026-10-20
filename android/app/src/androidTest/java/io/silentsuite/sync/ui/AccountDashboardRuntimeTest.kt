@@ -129,6 +129,52 @@ class AccountDashboardRuntimeTest {
         }
     }
 
+    @Test fun missingTaskProviderOutranksTaskLifecycleWithoutChangingSiblingsOrEvidence() {
+        val phase = AtomicInteger(0)
+        AccountActivity.AccountInfoViewModel.lifecycleWindowsOverride =
+            SyncLifecycleWindows(interruptionAfterMillis = Long.MAX_VALUE)
+        withDashboardAccount(loaderOverride = { loaderContext, exact, _ ->
+            val store = SyncStatusStore(loaderContext)
+            AccountActivity.AccountInfo().apply {
+                caldav = service(CollectionInfo.Type.CALENDAR, store.status(exact, SyncStatusStore.Service.CALENDAR))
+                carddav = service(CollectionInfo.Type.ADDRESS_BOOK, store.status(exact, SyncStatusStore.Service.CONTACTS))
+                taskdav = service(CollectionInfo.Type.TASKS, store.status(exact, SyncStatusStore.Service.TASKS)).also {
+                    it.pending = phase.get() == 2
+                    it.refreshing = phase.get() == 3
+                }
+            }
+        }) { context, account, scenario ->
+            assertEquals("this check needs a device without a task provider", null,
+                io.silentsuite.sync.utils.TaskProviderHandling.getWantedTaskSyncProvider(context))
+            val store = SyncStatusStore(context)
+            val now = System.currentTimeMillis()
+            assertTrue(store.recordRequested(account, setOf(SyncStatusStore.Service.TASKS), "tasks-request", now - 2))
+            assertTrue(store.recordRequested(account, setOf(SyncStatusStore.Service.CALENDAR), "calendar-request", now - 2))
+            val appNeeded = context.getString(R.string.dashboard_status_task_app_needed)
+            val appDetail = context.getString(R.string.dashboard_detail_task_provider)
+            val calendarRequested = context.getString(R.string.dashboard_status_requested)
+            var contactsShown: String? = null
+            listOf("open request", "open attempt", "pending", "running").forEachIndexed { index, name ->
+                if (index == 1) assertTrue(store.beginAttempt(account, SyncStatusStore.Service.TASKS, "tasks-attempt", now - 1, "tasks-request"))
+                phase.set(index)
+                val stored = store.status(account, SyncStatusStore.Service.TASKS)
+                var before = 0
+                scenario.onActivity { before = it.accountInfoDeliveryCount; it.refresh() }
+                waitForDeliveryAfter(scenario, before)
+                scenario.onActivity { activity ->
+                    assertEquals("Tasks without a task app, $name", appNeeded,
+                        activity.findViewById<TextView>(R.id.taskdav_status).text.toString())
+                    assertEquals(appDetail, activity.findViewById<TextView>(R.id.taskdav_status_detail).text.toString())
+                    assertEquals(calendarRequested, activity.findViewById<TextView>(R.id.dashboard_overall_status).text.toString())
+                    val contacts = activity.findViewById<TextView>(R.id.carddav_status).text.toString()
+                    contactsShown?.let { assertEquals(it, contacts) } ?: run { contactsShown = contacts }
+                }
+                assertEquals("rendering leaves the stored Tasks evidence as it was", stored,
+                    store.status(account, SyncStatusStore.Service.TASKS))
+            }
+        }
+    }
+
     @Test fun freshContactsGenerationFinishesBeforeChildDispatchOrCompletion() {
         withDashboardAccount(loaderOverride = { loaderContext, exact, _ ->
             val store = SyncStatusStore(loaderContext)

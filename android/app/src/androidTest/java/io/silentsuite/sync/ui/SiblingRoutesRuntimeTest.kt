@@ -41,6 +41,19 @@ import io.silentsuite.sync.ui.importlocal.ImportFragment
 import io.silentsuite.sync.ui.importlocal.ResultFragment
 import io.silentsuite.sync.model.CollectionInfo
 import io.silentsuite.sync.utils.AndroidCompat
+import android.content.ContentResolver
+import android.content.ContentUris
+import android.content.ContentValues
+import android.content.SyncResult
+import android.content.SyncStateContract
+import android.provider.ContactsContract
+import io.silentsuite.sync.EtebaseLocalCache
+import io.silentsuite.sync.HttpClient
+import io.silentsuite.sync.notes.FakeEtebaseServer
+import io.silentsuite.sync.resource.LocalAddressBook
+import io.silentsuite.sync.syncadapter.ContactsSyncManager
+import io.silentsuite.sync.syncadapter.SyncManager
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -1067,5 +1080,568 @@ class SiblingRoutesRuntimeTest {
         val context=InstrumentationRegistry.getInstrumentation().targetContext;val manager=AccountManager.get(context);val account=addAccount(manager,"ac41-reject","ac41-reject-generation");val rows=AtomicReference(listOf(RuntimeInvitation("invite-r","bob",com.etebase.client.CollectionAccessLevel.ReadOnly,"CC:DD")));val calls=AtomicInteger()
         invitationsOverride={rows.get()};invitationActionOverride={ _,id,key,action -> assertEquals(account,id.account);assertEquals("ac41-reject-generation",id.creationId);assertEquals("invite-r",key);assertEquals(RuntimeInvitationAction.REJECT,action);rows.set(emptyList());calls.incrementAndGet();Result.success(Unit) }
         try { ActivityScenario.launchActivityForResult<InvitationsActivity>(InvitationsActivity.newIntent(context,account,"ac41-reject-generation")).use { s -> s.recreate();waitUntil("invitation row laid out") {var ok=false;s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as? InvitationsListFragment;ok=f?.listAdapter?.count==1&&f.listView.getChildAt(0)!=null };ok};s.onActivity {val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as InvitationsListFragment;assertEquals("ac41-reject-generation",f.arguments!!.getString("invitation.identity.creationId"));f.onItemClick(f.listView,requireNotNull(f.listView.getChildAt(0)),0,0)};onView(withText("CC:DD")).inRoot(isDialog()).check(matches(isDisplayed()));onView(withText(R.string.invitations_reject)).inRoot(isDialog()).perform(click());waitUntil("rendered rejection") {var ok=false;s.onActivity {val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as? InvitationsListFragment;ok=calls.get()==1&&f?.listAdapter?.count==0};ok};s.onActivity {val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as InvitationsListFragment;assertEquals(0,f.listAdapter!!.count);assertEquals(Lifecycle.State.RESUMED,it.lifecycle.currentState);it.onBackPressedDispatcher.onBackPressed()};waitUntil("reject return") {s.state==Lifecycle.State.DESTROYED};assertEquals(Lifecycle.State.DESTROYED,s.state);assertEquals(android.app.Activity.RESULT_CANCELED,s.result.resultCode)}} finally {invitationActionOverride=null;invitationsOverride=null;removeAccountAndWait(manager,account)}
+    }
+
+    // ---- Contacts native-store repopulation ----
+    // Real Etebase cache, the in-process stand-in server and the real ContactsProvider; every sync is a
+    // direct ContactsSyncManager run, with platform sync kept off for the whole fixture.
+
+    private val nativeItemList = Regex("collection/[^/]+/item/")
+    private val nativeItemUpload = Regex("POST collection/[^/]+/item/(batch|transaction)/.*")
+
+    private fun nativeVcard(uid: String, name: String) =
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:$uid\r\nFN:$name\r\nN:$name;;;;\r\nEND:VCARD\r\n"
+
+    private fun nativeGroupVcard(uid: String, title: String, members: List<String>) =
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:$uid\r\nFN:$title\r\nN:$title;;;;\r\nX-ADDRESSBOOKSERVER-KIND:group\r\n" +
+            members.joinToString("") { "X-ADDRESSBOOKSERVER-MEMBER:urn:uuid:$it\r\n" } + "END:VCARD\r\n"
+
+    private fun people(vararg uids: String) = uids.map { it to nativeVcard(it, "Person $it") }
+
+    private val success = SyncManager.ProviderOutcome.SUCCESS
+
+    private inner class NativeStore {
+        val context: Context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager: AccountManager = AccountManager.get(context)
+        val fake = FakeEtebaseServer()
+        private val previousMasterSync = ContentResolver.getMasterSyncAutomatically()
+        var main: Account? = null
+        lateinit var generation: String
+        lateinit var colMgr: com.etebase.client.CollectionManager
+        lateinit var cache: EtebaseLocalCache
+        lateinit var colUid: String
+        private val itemUids = LinkedHashMap<String, String>()
+        private val natives = mutableListOf<Account>()
+        private val threads = mutableListOf<Thread>()
+
+        fun setUp(prefix: String) {
+            // Off before any account exists, so no platform sync competes with the direct runs below.
+            ContentResolver.setMasterSyncAutomatically(false)
+            HttpClient.testInterceptor = fake
+            val client = com.etebase.client.Client.create(okhttp3.OkHttpClient.Builder().addInterceptor(fake).build(), fake.baseUrl)
+            val session = com.etebase.client.Account.signup(client,
+                com.etebase.client.User("$prefix-${System.nanoTime()}", "$prefix@example.invalid"),
+                "stand-in-server-only").save(null)
+            colMgr = com.etebase.client.Account.restore(client, session, null).collectionManager
+            generation = "$prefix-generation-${System.nanoTime()}"
+            val account = addAccount(manager, prefix, generation)
+            main = account
+            listOf(App.addressBooksAuthority, android.provider.CalendarContract.AUTHORITY).forEach {
+                ContentResolver.setIsSyncable(account, it, 0)
+            }
+            ContentResolver.cancelSync(account, null)
+            AccountSettings.setUserData(manager, account, java.net.URI(fake.baseUrl), account.name)
+            check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
+            AccountSettings(context, account).etebaseSession = session
+            cache = EtebaseLocalCache.getInstance(context, account.name)
+        }
+
+        /** Returns the first cleanup failure instead of throwing, so it never hides the test's own failure. */
+        fun tearDown(): Throwable? {
+            val failures = mutableListOf<Throwable>()
+            fun attempt(step: () -> Unit) {
+                try { step() } catch (t: Throwable) { failures.add(t) }
+            }
+            attempt { ContactsSyncManager.installSyncStateFaultForTest(null) }
+            attempt { fake.releaseAll() }
+            threads.forEach { thread ->
+                attempt {
+                    thread.join(60_000)
+                    if (thread.isAlive) { thread.interrupt(); thread.join(10_000) }
+                }
+            }
+            natives.forEach { native -> attempt { removeAccountAndWait(manager, native) } }
+            main?.let { account ->
+                attempt { removeAccountAndWait(manager, account) }
+                attempt { EtebaseLocalCache.clearUserCache(context, account.name) }
+            }
+            attempt { HttpClient.testInterceptor = null }
+            attempt { ContentResolver.setMasterSyncAutomatically(previousMasterSync) }
+            return failures.firstOrNull()
+        }
+
+        /** An address book with [entries] on the server, cached the way a collection refresh caches it. */
+        fun book(name: String, entries: List<Pair<String, String>>) {
+            val created = colMgr.create(Constants.ETEBASE_TYPE_ADDRESS_BOOK, com.etebase.client.ItemMetadata().apply { this.name = name }, "")
+            colMgr.upload(created)
+            colUid = created.uid
+            upload(entries)
+            recache()
+        }
+
+        private fun items() = colMgr.getItemManager(colMgr.fetch(colUid))
+
+        /** Adds [entries] in one upload, as another device would. */
+        fun upload(entries: List<Pair<String, String>>) {
+            val itemMgr = items()
+            val created = entries.map { (uid, content) ->
+                itemMgr.create(com.etebase.client.ItemMetadata().apply { this.name = uid; mtime = System.currentTimeMillis() }, content)
+                    .also { itemUids[uid] = it.uid }
+            }
+            itemMgr.batch(created.toTypedArray())
+        }
+
+        fun changeRemote(uid: String, content: String) {
+            val itemMgr = items()
+            val item = itemMgr.fetch(itemUids.getValue(uid))
+            item.setContent(content)
+            itemMgr.batch(arrayOf(item))
+        }
+
+        fun serverContent(uid: String): String = items().fetch(itemUids.getValue(uid)).contentString
+        fun serverDeleted(uid: String): Boolean = items().fetch(itemUids.getValue(uid)).isDeleted
+
+        fun recache() = synchronized(cache) { cache.collectionSet(colMgr, colMgr.fetch(colUid)) }
+        fun cursor(): String? = synchronized(cache) { cache.collectionLoadStoken(colUid) }
+
+        /** A native address book for the collection, created as the parent adapter creates it, then kept from syncing. */
+        fun createNative(): Account {
+            val owner = requireNotNull(main)
+            val provider = requireNotNull(context.contentResolver.acquireContentProviderClient(ContactsContract.AUTHORITY))
+            try {
+                val cached = synchronized(cache) { cache.collectionGet(colMgr, colUid) }
+                LocalAddressBook.create(context, provider, owner, cached)
+                val native = Account(LocalAddressBook.accountName(owner, cached), App.addressBookAccountType)
+                natives += native
+                // create() turns Contacts sync on for the new row; master sync is already off.
+                ContentResolver.setSyncAutomatically(native, ContactsContract.AUTHORITY, false)
+                ContentResolver.setIsSyncable(native, ContactsContract.AUTHORITY, 0)
+                ContentResolver.cancelSync(native, ContactsContract.AUTHORITY)
+                ContentResolver.cancelSync(owner, null)
+                return native
+            } finally {
+                provider.release()
+            }
+        }
+
+        fun removeNative(native: Account) {
+            removeAccountAndWait(manager, native)
+            waitUntil("provider rows of the removed address book") {
+                rawRows(native, includeDeleted = true).isEmpty() && groupRows(native, "").isEmpty()
+            }
+        }
+
+        fun sync(native: Account, result: SyncResult = SyncResult()): SyncManager.ProviderOutcome {
+            val provider = requireNotNull(context.contentResolver.acquireContentProviderClient(ContactsContract.AUTHORITY))
+            try {
+                return ContactsSyncManager(context, native, AccountSettings(context, requireNotNull(main)), Bundle(),
+                    ContactsContract.AUTHORITY, provider, result, LocalAddressBook(context, native, provider),
+                    fake.baseUrl.toHttpUrl()).use { it.performSync() }
+            } finally {
+                provider.release()
+            }
+        }
+
+        /** Runs [sync] on its own thread; [join] returns its outcome, or the throwable it ended with. */
+        fun syncInBackground(native: Account): Pair<Thread, AtomicReference<Any?>> {
+            val outcome = AtomicReference<Any?>()
+            val thread = Thread { outcome.set(try { sync(native) } catch (t: Throwable) { t }) }
+            threads += thread
+            thread.start()
+            return thread to outcome
+        }
+
+        fun join(run: Pair<Thread, AtomicReference<Any?>>): Any? {
+            run.first.join(60_000)
+            assertFalse("the background sync finished", run.first.isAlive)
+            return run.second.get()
+        }
+
+        fun holdItemList(): FakeEtebaseServer.Hold = fake.hold("GET", nativeItemList)
+
+        fun itemListRequests() = fake.requests.filter {
+            it.startsWith("GET ") && nativeItemList.matches(it.removePrefix("GET ").substringBefore('?'))
+        }
+        fun itemUploadRequests() = fake.requests.filter { nativeItemUpload.matches(it) }
+
+        private fun ofAccount(native: Account) = arrayOf(native.name, native.type)
+
+        fun rawRows(native: Account, includeDeleted: Boolean = false): List<Pair<Long, String>> = context.contentResolver.query(
+            ContactsContract.RawContacts.CONTENT_URI,
+            arrayOf(ContactsContract.RawContacts._ID, ContactsContract.RawContacts.SYNC1),
+            "${ContactsContract.RawContacts.ACCOUNT_NAME}=? AND ${ContactsContract.RawContacts.ACCOUNT_TYPE}=?" +
+                if (includeDeleted) "" else " AND ${ContactsContract.RawContacts.DELETED}=0",
+            ofAccount(native), null)!!.use { c ->
+            generateSequence { if (c.moveToNext()) c.getLong(0) to c.getString(1).orEmpty() else null }.toList()
+        }
+
+        fun liveUids(native: Account): List<String> = rawRows(native).map { it.second }.sorted()
+        fun rawId(native: Account, uid: String): Long = rawRows(native).single { it.second == uid }.first
+
+        /** Group rows of [native] with vCard UID [uid] (all rows when blank), deleted ones included only when blank. */
+        fun groupRows(native: Account, uid: String): List<Long> = context.contentResolver.query(
+            ContactsContract.Groups.CONTENT_URI, arrayOf(ContactsContract.Groups._ID),
+            "${ContactsContract.Groups.ACCOUNT_NAME}=? AND ${ContactsContract.Groups.ACCOUNT_TYPE}=?" +
+                if (uid.isEmpty()) "" else " AND ${ContactsContract.Groups.SYNC1}=? AND ${ContactsContract.Groups.DELETED}=0",
+            if (uid.isEmpty()) ofAccount(native) else ofAccount(native) + uid, null)!!.use { c ->
+            generateSequence { if (c.moveToNext()) c.getLong(0) else null }.toList()
+        }
+
+        fun groupId(native: Account, uid: String): Long {
+            val rows = groupRows(native, uid)
+            assertEquals("exactly one group $uid", 1, rows.size)
+            return rows.single()
+        }
+
+        fun groupTitle(groupId: Long): String? = context.contentResolver.query(
+            ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId),
+            arrayOf(ContactsContract.Groups.TITLE), null, null, null)!!.use { c -> if (c.moveToNext()) c.getString(0) else null }
+
+        fun members(native: Account, groupId: Long): Set<String> {
+            val live = rawRows(native).toMap()
+            return context.contentResolver.query(ContactsContract.Data.CONTENT_URI,
+                arrayOf(ContactsContract.Data.RAW_CONTACT_ID),
+                "${ContactsContract.Data.MIMETYPE}=? AND ${ContactsContract.CommonDataKinds.GroupMembership.GROUP_ROW_ID}=?",
+                arrayOf(ContactsContract.CommonDataKinds.GroupMembership.CONTENT_ITEM_TYPE, groupId.toString()), null)!!.use { c ->
+                generateSequence { if (c.moveToNext()) c.getLong(0) else null }.toList()
+            }.mapNotNull { live[it] }.toSet()
+        }
+
+        fun phones(rawId: Long): List<String> = context.contentResolver.query(ContactsContract.Data.CONTENT_URI,
+            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
+            "${ContactsContract.Data.RAW_CONTACT_ID}=? AND ${ContactsContract.Data.MIMETYPE}=?",
+            arrayOf(rawId.toString(), ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE), null)!!.use { c ->
+            generateSequence { if (c.moveToNext()) c.getString(0).orEmpty() else null }.toList()
+        }
+
+        fun dirty(rawId: Long): Boolean = context.contentResolver.query(
+            ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, rawId),
+            arrayOf(ContactsContract.RawContacts.DIRTY), null, null, null)!!.use { c -> c.moveToNext() && c.getInt(0) != 0 }
+
+        /** The provider's sync-state slot of [native]; null when nothing is stored. */
+        fun slot(native: Account): ByteArray? {
+            val provider = requireNotNull(context.contentResolver.acquireContentProviderClient(ContactsContract.AUTHORITY))
+            try { return ContactsContract.SyncState.get(provider, native) } finally { provider.release() }
+        }
+
+        /** Models an address book an earlier app version populated: no sync-state slot. */
+        fun clearSlot(native: Account) {
+            val provider = requireNotNull(context.contentResolver.acquireContentProviderClient(ContactsContract.AUTHORITY))
+            try {
+                provider.delete(ContactsContract.SyncState.CONTENT_URI,
+                    "${SyncStateContract.Columns.ACCOUNT_NAME}=? AND ${SyncStateContract.Columns.ACCOUNT_TYPE}=?", ofAccount(native))
+            } finally {
+                provider.release()
+            }
+        }
+
+        // Native user changes (not as a sync adapter, so the provider marks them dirty or deleted).
+        fun addPhone(rawId: Long, number: String) {
+            context.contentResolver.insert(ContactsContract.Data.CONTENT_URI, ContentValues().apply {
+                put(ContactsContract.Data.RAW_CONTACT_ID, rawId)
+                put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
+                put(ContactsContract.CommonDataKinds.Phone.NUMBER, number)
+                put(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+            })
+        }
+
+        fun userDelete(rawId: Long) {
+            context.contentResolver.delete(ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, rawId), null, null)
+        }
+
+        fun addToGroup(rawId: Long, groupId: Long) {
+            context.contentResolver.insert(ContactsContract.Data.CONTENT_URI, ContentValues().apply {
+                put(ContactsContract.Data.RAW_CONTACT_ID, rawId)
+                put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.GroupMembership.CONTENT_ITEM_TYPE)
+                put(ContactsContract.CommonDataKinds.GroupMembership.GROUP_ROW_ID, groupId)
+            })
+        }
+
+        fun retitleGroup(groupId: Long, title: String) {
+            context.contentResolver.update(ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId),
+                ContentValues().apply { put(ContactsContract.Groups.TITLE, title) }, null, null)
+        }
+
+        /** Removes a row as a sync adapter would, without leaving a local deletion to upload. */
+        fun hardDelete(native: Account, uid: String) {
+            context.contentResolver.delete(ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, rawId(native, uid))
+                .buildUpon()
+                .appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true")
+                .appendQueryParameter(ContactsContract.RawContacts.ACCOUNT_NAME, native.name)
+                .appendQueryParameter(ContactsContract.RawContacts.ACCOUNT_TYPE, native.type)
+                .build(), null, null)
+        }
+
+        fun hardDeleteIfPresent(native: Account, uid: String) {
+            if (liveUids(native).contains(uid)) hardDelete(native, uid)
+        }
+    }
+
+    private fun withNativeStore(prefix: String, block: (NativeStore) -> Unit) {
+        val store = NativeStore()
+        var failed = false
+        try {
+            store.setUp(prefix)
+            block(store)
+        } catch (t: Throwable) {
+            failed = true
+            throw t
+        } finally {
+            val cleanup = store.tearDown()
+            if (!failed && cleanup != null) throw cleanup
+        }
+    }
+
+    /** Populates [entries] into a new native address book through a real sync and returns it. */
+    private fun NativeStore.populated(name: String, entries: List<Pair<String, String>>): Account {
+        book(name, entries)
+        val native = createNative()
+        assertEquals(success, sync(native))
+        return native
+    }
+
+    @Test
+    fun contactsNativeStoreRepopulatesRecreatedAddressBookFromCachedCursor() = withNativeStore("native-recreated") { f ->
+        val first = f.populated("Recreated contacts",
+            people("a", "b", "c", "d") + ("g" to nativeGroupVcard("g", "Group G", listOf("a", "b"))))
+        assertEquals(listOf("a", "b", "c", "d"), f.liveUids(first))
+        assertEquals(setOf("a", "b"), f.members(first, f.groupId(first, "g")))
+        f.removeNative(first)
+        val recreated = f.createNative()
+        f.upload(people("e"))
+        f.recache()
+        assertEquals(success, f.sync(recreated))
+        assertEquals("every live remote contact is in the recreated native address book",
+            listOf("a", "b", "c", "d", "e"), f.liveUids(recreated))
+        assertEquals(setOf("a", "b"), f.members(recreated, f.groupId(recreated, "g")))
+    }
+
+    @Test
+    fun contactsNativeStoreRestoresMissingRowsAndMembershipsOfUnmarkedAddressBook() = withNativeStore("native-unmarked") { f ->
+        val native = f.populated("Unmarked contacts",
+            people("a", "b", "c", "d") + ("g" to nativeGroupVcard("g", "Group G", listOf("a", "b"))))
+        f.addPhone(f.rawId(native, "c"), "5550102")
+        f.userDelete(f.rawId(native, "d"))
+        f.hardDelete(native, "a")
+        f.hardDelete(native, "b")
+        f.clearSlot(native)
+        assertEquals(success, f.sync(native))
+        assertEquals("missing rows of an address book without a completion marker are restored",
+            listOf("a", "b", "c"), f.liveUids(native))
+        assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "g")))
+        assertTrue(f.phones(f.rawId(native, "c")).contains("5550102"))
+        assertTrue(f.serverContent("c").contains("5550102"))
+        assertTrue(f.serverDeleted("d"))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayContinuesPastTheCachedCollectionTokenAndCertifiesOnlyADonePage() = withNativeStore("native-pages") { f ->
+        f.fake.itemPageSize = 2
+        // Four items, then the cache: the cached collection token is the cursor that ends the second page.
+        val first = f.populated("Paged contacts", people("a", "b", "c", "d"))
+        f.upload(people("e", "f", "g"))  // not cached again, so the cached collection token stays at d
+        f.removeNative(first)
+        val recreated = f.createNative()
+        assertEquals(success, f.sync(recreated))
+        assertEquals("the listing continues past the page whose cursor equals the cached collection token",
+            listOf("a", "b", "c", "d", "e", "f", "g"), f.liveUids(recreated))
+        val cursor = requireNotNull(f.cursor())
+        f.fake.requests.clear()
+        assertEquals(success, f.sync(recreated))
+        val lists = f.itemListRequests()
+        assertTrue("an incremental request follows a completed listing", lists.isNotEmpty())
+        lists.forEach { line -> assertTrue(line, line.substringAfter('?', "").split('&').contains("stoken=$cursor")) }
+        f.recache()
+        f.fake.requests.clear()
+        assertEquals(success, f.sync(recreated))
+        assertEquals(emptyList<String>(), f.itemListRequests())
+    }
+
+    @Test
+    fun contactsNativeStoreStalledReplayLeavesNoMarkerAndRetriesExactly() = withNativeStore("native-stalled") { f ->
+        f.fake.itemPageSize = 2
+        val native = f.populated("Stalled contacts", people("a", "b", "c", "d"))
+        f.hardDelete(native, "a")
+        f.hardDelete(native, "b")
+        f.clearSlot(native)
+        f.upload(people("e"))
+        f.recache()
+        f.fake.stallItemList(f.colUid, FakeEtebaseServer.Stall.SAME_CURSOR)
+        assertEquals(SyncManager.ProviderOutcome.FAILURE, f.sync(native))
+        assertTrue(f.slot(native)?.isNotEmpty() != true)
+        f.fake.stallItemList(f.colUid, null)
+        assertEquals(success, f.sync(native))
+        assertEquals("the retry after a stalled listing restores every live contact exactly once",
+            listOf("a", "b", "c", "d", "e"), f.liveUids(native))
+    }
+
+    @Test
+    fun contactsNativeStoreCancelledReplayLeavesNoMarkerAndKeepsTheEdit() = withNativeStore("native-cancelled") { f ->
+        val native = f.populated("Cancelled contacts", people("a", "b", "c", "d"))
+        f.hardDelete(native, "a")
+        f.clearSlot(native)
+        f.upload(people("e"))
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        assertTrue(f.liveUids(native).contains("c"))
+        f.addPhone(f.rawId(native, "c"), "5550103")
+        run.first.interrupt()
+        hold.release()
+        val outcome = f.join(run)
+        assertTrue("the interrupted run did not complete: $outcome", outcome != success)
+        assertTrue(f.slot(native)?.isNotEmpty() != true)
+        assertEquals(success, f.sync(native))
+        assertEquals("the retry after a cancelled listing restores every live contact exactly once",
+            listOf("a", "b", "c", "d", "e"), f.liveUids(native))
+        assertTrue(f.phones(f.rawId(native, "c")).contains("5550103"))
+        assertTrue(f.serverContent("c").contains("5550103"))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsADirtyRowEditMadeDuringTheListing() = withNativeStore("native-dirty-row") { f ->
+        val native = f.populated("Dirty row contacts", people("a", "b", "c", "d", "e", "f"))
+        f.clearSlot(native)
+        f.changeRemote("f", nativeVcard("f", "Person f renamed elsewhere"))
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        f.addPhone(f.rawId(native, "f"), "5550104")
+        hold.release()
+        assertEquals(success, f.join(run))
+        assertTrue("a native edit made during the listing is kept",
+            f.phones(f.rawId(native, "f")).contains("5550104"))
+        assertTrue(f.dirty(f.rawId(native, "f")))
+        assertEquals(success, f.sync(native))
+        assertTrue(f.serverContent("f").contains("5550104"))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsAMembershipEditMadeDuringTheListing() = withNativeStore("native-membership") { f ->
+        val native = f.populated("Membership contacts",
+            people("a", "b", "c", "d") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+        f.clearSlot(native)
+        f.changeRemote("h", nativeGroupVcard("h", "Group H renamed", listOf("a")))
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        val group = f.groupId(native, "h")
+        assertFalse(f.members(native, group).contains("c"))
+        f.addToGroup(f.rawId(native, "c"), group)
+        hold.release()
+        assertEquals(success, f.join(run))
+        assertTrue("a membership edit made during the listing is kept",
+            f.members(native, f.groupId(native, "h")).contains("c"))
+        // Next run: the cursor equals the cached collection token, so the fetch is skipped.
+        assertEquals(success, f.sync(native))
+        assertTrue(f.members(native, f.groupId(native, "h")).contains("c"))
+        assertTrue(f.serverContent("h").contains("urn:uuid:c"))
+        // A refreshed collection makes the fetch return the uploaded revisions.
+        f.recache()
+        assertEquals(success, f.sync(native))
+        assertTrue(f.members(native, f.groupId(native, "h")).contains("c"))
+    }
+
+    @Test
+    fun contactsNativeStoreReadOnlyReplayKeepsServerGroupContentAndMembership() = withNativeStore("native-read-only") { f ->
+        val native = f.populated("Shared contacts",
+            people("a", "b", "c", "d") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+        f.changeRemote("h", nativeGroupVcard("h", "Group H renamed", listOf("a")))
+        f.fake.setAccessLevel(f.colUid, 0L)
+        f.recache()
+        LocalAddressBook(f.context, native, null).readOnly = true
+        f.clearSlot(native)
+        val hold = f.holdItemList()
+        f.fake.requests.clear()  // boundary: only the measured run's requests count
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        val group = f.groupId(native, "h")
+        f.retitleGroup(group, "Local title")
+        f.addToGroup(f.rawId(native, "c"), group)
+        hold.release()
+        assertEquals(success, f.join(run))
+        assertEquals("Group H renamed", f.groupTitle(f.groupId(native, "h")))
+        assertEquals(setOf("a"), f.members(native, f.groupId(native, "h")))
+        assertEquals(emptyList<String>(), f.itemUploadRequests())
+        f.fake.requests.clear()  // a fresh boundary for the second measured run
+        assertEquals(success, f.sync(native))
+        assertEquals("Group H renamed", f.groupTitle(f.groupId(native, "h")))
+        assertEquals(setOf("a"), f.members(native, f.groupId(native, "h")))
+        assertEquals(emptyList<String>(), f.itemUploadRequests())
+    }
+
+    @Test
+    fun contactsNativeStoreReplayNeverCertifiesAReplacedNativeGeneration() = withNativeStore("native-replaced") { f ->
+        val first = f.populated("Replaced contacts", people("a", "b", "c", "d"))
+        f.clearSlot(first)
+        f.upload(people("x"))
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(first)
+        hold.awaitArrival()
+        f.removeNative(first)
+        val replacement = f.createNative()
+        assertEquals(first, replacement)
+        hold.release()
+        f.join(run)  // the old run's own outcome is the inherited race, not asserted here
+        f.hardDeleteIfPresent(replacement, "a")
+        f.hardDeleteIfPresent(replacement, "x")
+        assertEquals(success, f.sync(replacement))
+        assertEquals("a same-name replacement is refilled, never certified by the old run",
+            listOf("a", "b", "c", "d", "x"), f.liveUids(replacement))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayNeverCertifiesAReplacedMainGeneration() = withNativeStore("native-main-replaced") { f ->
+        val native = f.populated("Main replaced contacts", people("a", "b", "c", "d"))
+        f.clearSlot(native)
+        f.upload(people("x"))
+        f.recache()
+        val hold = f.holdItemList()
+        val run = f.syncInBackground(native)
+        hold.awaitArrival()
+        val owner = requireNotNull(f.main)
+        check(AccountSettings.writeVerified(f.manager, owner, AccountSettings.KEY_CREATION_ID, "${f.generation}-replaced"))
+        hold.release()
+        f.join(run)
+        check(AccountSettings.writeVerified(f.manager, owner, AccountSettings.KEY_CREATION_ID, f.generation))
+        f.hardDeleteIfPresent(native, "a")
+        f.hardDeleteIfPresent(native, "x")
+        assertEquals(success, f.sync(native))
+        assertEquals("a run that saw another main generation certifies nothing",
+            listOf("a", "b", "c", "d", "x"), f.liveUids(native))
+    }
+
+    @Test
+    fun contactsNativeStoreMarkerWriteFailureIsADatabaseErrorNotSuccess() = withNativeStore("native-marker-write") { f ->
+        val first = f.populated("Marker write contacts", people("a", "b", "c", "d"))
+        f.removeNative(first)
+        val recreated = f.createNative()
+        f.upload(people("e"))
+        f.recache()
+        ContactsSyncManager.installSyncStateFaultForTest { write -> if (write) android.os.RemoteException("marker write") else null }
+        val result = SyncResult()
+        assertEquals("a completion marker that could not be stored is a failure, not a success",
+            SyncManager.ProviderOutcome.FAILURE, f.sync(recreated, result))
+        assertTrue(result.databaseError)
+        ContactsSyncManager.installSyncStateFaultForTest(null)
+        assertEquals(success, f.sync(recreated))
+        assertEquals(listOf("a", "b", "c", "d", "e"), f.liveUids(recreated))
+        f.recache()
+        f.fake.requests.clear()
+        assertEquals(success, f.sync(recreated))
+        assertEquals(emptyList<String>(), f.itemListRequests())
+    }
+
+    @Test
+    fun contactsNativeStoreMarkerReadFailureIsADatabaseErrorBeforeAnyUploadOrListing() = withNativeStore("native-marker-read") { f ->
+        val native = f.populated("Marker read contacts", people("a", "b", "c", "d", "e"))
+        f.clearSlot(native)
+        f.addPhone(f.rawId(native, "c"), "5550106")
+        f.changeRemote("e", nativeVcard("e", "Person e renamed elsewhere"))
+        f.recache()
+        ContactsSyncManager.installSyncStateFaultForTest { write -> if (!write) android.os.RemoteException("marker read") else null }
+        f.fake.requests.clear()  // boundary after every setup call and the hook
+        val result = SyncResult()
+        assertEquals("a completion marker that could not be read fails the run",
+            SyncManager.ProviderOutcome.FAILURE, f.sync(native, result))
+        assertTrue(result.databaseError)
+        assertEquals(emptyList<String>(), f.itemUploadRequests())
+        assertEquals(emptyList<String>(), f.itemListRequests())
+        assertTrue(f.dirty(f.rawId(native, "c")))
+        assertTrue(f.phones(f.rawId(native, "c")).contains("5550106"))
     }
 }
