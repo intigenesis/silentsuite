@@ -218,8 +218,8 @@ internal object NotesSyncRunner {
 
     /**
      * The push step (design 3.3): the changes waiting in the account's pending store are sent, one note
-     * per request, before the fetch. Null when the store holds no entry and nothing unreadable, in which
-     * case no request is made.
+     * per request, before the fetch. Null when the store holds no entry and nothing unreadable, or was
+     * cleared in full ([waitingIn]), in which case no request is made.
      */
     private fun pushPending(
         context: Context,
@@ -231,7 +231,7 @@ internal object NotesSyncRunner {
         guard: SyncRunGuard,
     ): NotePushStep.Result? {
         val store = PendingNotesStore.forIdentity(context, account.type, account.name, creationId)
-        val waiting = store.snapshot { false }
+        val waiting = waitingIn(store) ?: return null
         if (waiting.headers.isEmpty() && waiting.unreadable.isEmpty()) {
             // A copy whose last entry went outside a run (held text discarded), or whose removal failed
             // before, goes here. Nothing is written when there is none.
@@ -247,6 +247,29 @@ internal object NotesSyncRunner {
         Logger.log.info("Notes push ${result.ended}: pushed ${result.pushed}, held ${result.held}, " +
             "conflicts ${result.conflicts.values.sum()}, failure ${result.failure}, carried ${result.carriedFailure}")
         return result
+    }
+
+    /**
+     * What waits in [store] to be pushed, or null for a store that was cleared in full. A cleared instance
+     * refuses every read and write from then on ([PendingNotesStore.Cleared]), so nothing in it is pushed, and
+     * without this that refusal would end every run of the account as an unknown failure before its fetch.
+     * When the cleared instance still counts anything, or cannot be counted, a clear stopped partway and left
+     * files on disk: that throws IOException, which the run records as a storage failure, never as a success,
+     * and the fetch still runs. An instance dropped since ([PendingNotesStore.unregister]) was cleared in full.
+     * This instance never pushes what a clear that stopped left. After a restart a new instance takes those
+     * files as ordinary waiting changes and pushes them, unless another confirmed sign-out finishes the clear
+     * first. A listing that fails still throws IOException, as before.
+     */
+    internal fun waitingIn(store: PendingNotesStore): PendingNotesStore.Snapshot? = try {
+        store.snapshot { false }
+    } catch (e: PendingNotesStore.Cleared) {
+        val left = try {
+            store.unsynced()
+        } catch (dropped: IllegalStateException) {
+            null
+        }
+        if (left?.anything == true) throw IOException("a clear of the pending store stopped with files left")
+        null
     }
 
     private fun pruneNotebookCopies(store: PendingNotesStore) {

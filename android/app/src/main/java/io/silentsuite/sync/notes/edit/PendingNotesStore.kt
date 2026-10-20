@@ -225,6 +225,13 @@ internal class PendingNotesStore private constructor(
         data class NewerLocalChange(val entry: PendingEntry) : SendOutcome()
     }
 
+    /**
+     * What every operation but [unsynced], [discardStore], [acknowledged], [unregister] and [clearAll] throws once
+     * [clearAll], or a [discardStore] that got as far as deleting, has closed the store: nothing in it is read,
+     * pushed, pruned or written from then on. An IllegalStateException, as before it had a type of its own.
+     */
+    class Cleared : IllegalStateException("the pending store was cleared")
+
     // ---- reading ----
 
     fun read(noteUid: String): Read = locked { readEntry(noteUid) }
@@ -719,7 +726,7 @@ internal class PendingNotesStore private constructor(
      * next other call runs it instead, at the latest the snapshot of the next run, where a failure counts.
      */
     fun pruneNotebooks(): List<String> = synchronized(lock) {
-        check(!closed) { "the pending store was cleared" }
+        if (closed) throw Cleared()
         if (!recovered) emptyList() else locked {
             val listed = listing()
             if (listed.any { it.name.endsWith(NOTE + NEW) }) return@locked emptyList()
@@ -1122,12 +1129,12 @@ internal class PendingNotesStore private constructor(
 
     /**
      * Every public operation except [unsynced], [discardStore], [acknowledged], [unregister], [clearAll] and
-     * [pruneNotebooks]: refuse once [clearAll], or a [discardStore] that got as far as deleting, has closed the
-     * store, and finish any interrupted work first. Recovery runs again before the next operation for as long
-     * as anything in it did not work out, including a write or removal inside recovery itself, or a listing it
-     * works from. A recovery whose listing fails throws, so the operation fails with it and the recovery is
-     * not taken for done: a first write it did not see may be the only copy of a note's text, and an original
-     * it did not see may still wait for its conflict copy. A listing also fails while the store's
+     * [pruneNotebooks]: refuse ([Cleared]) once [clearAll], or a [discardStore] that got as far as deleting, has
+     * closed the store, and finish any interrupted work first. Recovery runs again before the next operation for
+     * as long as anything in it did not work out, including a write or removal inside recovery itself, or a
+     * listing it works from. A recovery whose listing fails throws, so the operation fails with it and the
+     * recovery is not taken for done: a first write it did not see may be the only copy of a note's text, and an
+     * original it did not see may still wait for its conflict copy. A listing also fails while the store's
      * acknowledgement cannot be shown gone ([listing]), so a new instance does nothing while notes-discard is
      * there but cannot be listed.
      *
@@ -1136,7 +1143,7 @@ internal class PendingNotesStore private constructor(
      * link came, so nothing is read, written or deleted through the link. Recovery is then owed again, so it runs
      * over whatever the folder holds once it can be followed.
      *
-     * [pruneNotebooks] refuses after [clearAll] as well, but runs no recovery: while one is owed it does
+     * [pruneNotebooks] refuses ([Cleared]) after [clearAll] as well, but runs no recovery: while one is owed it does
      * nothing, and it comes here only when none is, so no recovery runs inside a prune, where a failure
      * would show only as a log line.
      *
@@ -1146,7 +1153,7 @@ internal class PendingNotesStore private constructor(
      * the inner one must still hold when the inner one writes.
      */
     private inline fun <T> locked(block: () -> T): T = synchronized(lock) {
-        check(!closed) { "the pending store was cleared" }
+        if (closed) throw Cleared()
         if (depth == 0 && !followable()) {
             recovered = false
             throw IOException(LINKED)
