@@ -142,8 +142,15 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
     override fun prepareLocal() {
         // A replay first finishes the server member lists an earlier run left pending against those same
         // lists, before this run's snapshot, upload or listing can replace them.
-        if (keepsLocalEditsOfThisRun && exactDestinationCurrent())
+        if (keepsLocalEditsOfThisRun) {
+            if (!exactDestinationCurrent()) {
+                // It cannot do that for a generation it was not admitted for, so it stops here, before any
+                // upload or listing, as a cancelled run; the pending lists stay for the next run.
+                Logger.log.info("Stopping a replay whose address book generation changed before its pending memberships were merged")
+                throw InterruptedException()
+            }
             LocalGroup.applyPendingMemberships(localAddressBook(), keepLocalChanges = true)
+        }
         super.prepareLocal()
     }
 
@@ -174,10 +181,13 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
         }
         batch.commit()
 
-        // A replay withholds groups the server already knows until their server members are merged,
-        // so an incomplete local member list is never uploaded; local-only groups upload as usual.
+        // A replay withholds groups the server may already know until their server members are merged,
+        // so an incomplete local member list is never uploaded; groups without a filename upload as usual.
+        // A filename, not an eTag, marks them: an upload whose dirty flag could not be cleared afterwards
+        // leaves the filename without an eTag. A filename assigned before a failed upload only defers
+        // that group's creation to the next ordinary run.
         if (keepsLocalEditsOfThisRun)
-            localDirty = localDirty.filterNot { it is LocalGroup && !it.isLocalOnly }
+            localDirty = localDirty.filterNot { it is LocalGroup && it.fileName != null }
     }
 
     /**
