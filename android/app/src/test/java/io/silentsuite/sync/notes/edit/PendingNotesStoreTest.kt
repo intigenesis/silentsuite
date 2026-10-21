@@ -1807,6 +1807,58 @@ class PendingNotesStoreTest {
         assertArrayEquals("the last content a save reported", committed, File(dir, "n1.note").readBytes())
     }
 
+    /**
+     * A listing of the store that comes back short, as File.listFiles can when reading the directory fails
+     * partway: it still shows the write beside [name] but leaves out [name] itself.
+     */
+    private fun listingLeavesOut(name: String) {
+        PendingNotesStore.listFilesForTesting = { d ->
+            if (d.name == dir.name) d.listFiles()?.filter { it.name != name }?.toTypedArray() else d.listFiles()
+        }
+    }
+
+    @Test fun `an uncommitted write beside a committed file that a short listing leaves out is dropped, not committed over it`() {
+        store.saveLocal("n1", "b1", "r1", blob("committed"), isCreate = false)
+        val committed = File(dir, "n1.note").readBytes()
+        // An intact later entry whose write never reported success: committed, it would replace the text a save did.
+        val later = entry("n1").copy(version = 9, revision = "r-newer", blob = blob("never reported saved"))
+        File(dir, "n1.note.new").writeBytes(PendingCodec.encodeEntry(later))
+        listingLeavesOut("n1.note")
+        // The committed file's own check still finds it there.
+        val s = restarted()
+        assertTrue(s.scan().unreadable.isEmpty())
+        assertArrayEquals("the last content a save reported", committed, File(dir, "n1.note").readBytes())
+        assertFalse(File(dir, "n1.note.new").exists())
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("r1", s.entry("n1").revision)
+    }
+
+    @Test fun `an uncommitted write beside a committed file that a short listing leaves out and whose check fails is kept and reported`() {
+        store.saveLocal("n1", "b1", "r1", blob("committed"), isCreate = false)
+        val committed = File(dir, "n1.note").readBytes()
+        val later = PendingCodec.encodeEntry(
+            entry("n1").copy(version = 9, revision = "r-newer", blob = blob("never reported saved")))
+        File(dir, "n1.note.new").writeBytes(later)
+        listingLeavesOut("n1.note")
+        checksFailFor("n1.note")
+        val s = restarted()
+        val scan = s.scan()
+        assertArrayEquals("the last content a save reported", committed, File(dir, "n1.note").readBytes())
+        assertArrayEquals("neither dropped nor committed while it cannot be told", later, File(dir, "n1.note.new").readBytes())
+        val problem = listOf(Read.Unreadable("n1.note.new", "could not tell whether n1.note is there"))
+        assertEquals(problem, scan.unreadable)
+        assertEquals(problem, s.snapshot { false }.unreadable)
+        assertArrayEquals(later, File(dir, "n1.note.new").readBytes())
+        // With a full listing and a check that works, the next recovery drops the write as usual.
+        PendingNotesStore.listFilesForTesting = null
+        PendingNotesStore.presenceForTesting = null
+        val after = s.scan()
+        assertTrue(after.unreadable.isEmpty())
+        assertEquals(listOf("r1"), after.entries.map { it.revision })
+        assertArrayEquals(committed, File(dir, "n1.note").readBytes())
+        assertFalse(File(dir, "n1.note.new").exists())
+    }
+
     @Test fun `a landed record or notebook copy whose presence cannot be told is not read as none`() {
         store.saveLocal("n0", "b1", "r1", blob("t"), isCreate = false)
         checksFailFor("n1.landed", "b2.notebook")

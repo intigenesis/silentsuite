@@ -947,14 +947,18 @@ internal class PendingNotesStore private constructor(
         // A ".new" of any other kind is left as it is: not deleted, not committed and not reported, since
         // this build cannot judge it and a newer build may keep versions in it. With the counter lost, the
         // version rebuild ([versionOf]) then takes it for a file of a kind this build does not know.
-        // Whether "<name>" is there comes from the same listing, which worked, so a check that fails cannot
-        // make a write that never reported success replace the committed file.
+        // "<name>" is there when the same listing shows it. A listing can come back short, since
+        // File.listFiles can return what it read so far when reading the directory fails partway, so a
+        // "<name>" that the listing leaves out is checked on its own ([isPresent]), and only a check that
+        // shows it absent lets the write be committed: a write that never reported success never replaces
+        // the committed file. A check that fails throws, so the write is reported, both files stay, and the
+        // next recovery decides again.
         val listed = listing()
         val names = listed.mapTo(HashSet()) { it.name }
         for (tmp in listed.filter { isKnownWrite(it.name) }) {
             try {
                 val target = File(dir, tmp.name.removeSuffix(NEW))
-                if (target.name in names || !PendingCodec.isIntact(tmp.readBytes())) {
+                if (target.name in names || isPresent(target) || !PendingCodec.isIntact(tmp.readBytes())) {
                     if (!tmp.delete()) throw IOException("could not remove ${tmp.name}")
                 } else {
                     FileOutputStream(tmp, true).use { it.fd.sync() }
