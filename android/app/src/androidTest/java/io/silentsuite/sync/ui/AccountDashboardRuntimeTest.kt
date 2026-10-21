@@ -153,25 +153,44 @@ class AccountDashboardRuntimeTest {
             val appNeeded = context.getString(R.string.dashboard_status_task_app_needed)
             val appDetail = context.getString(R.string.dashboard_detail_task_provider)
             val calendarRequested = context.getString(R.string.dashboard_status_requested)
+            // The running phase shows the Tasks row's indeterminate ProgressBar. Like the mixed test,
+            // take the Activity once before that row renders and read it through bounded main-thread
+            // posts: scenario.onActivity first waits for a main queue the spinner keeps busy on API 21.
+            val dashboardActivity = AtomicReference<AccountActivity>()
+            scenario.onActivity { dashboardActivity.set(it) }
+            val activity = dashboardActivity.get()
+            fun <T> onMain(read: () -> T): T {
+                val value = AtomicReference<T>()
+                val done = CountDownLatch(1)
+                activity.runOnUiThread { try { value.set(read()) } finally { done.countDown() } }
+                assertTrue("dashboard main thread did not run the read", done.await(10, TimeUnit.SECONDS))
+                return value.get()
+            }
+            fun refreshAndWaitForDelivery() {
+                val before = onMain { activity.accountInfoDeliveryCount.also { activity.refresh() } }
+                waitUntil("dashboard model delivered again") { onMain { activity.accountInfoDeliveryCount } > before }
+            }
             var contactsShown: String? = null
             listOf("open request", "open attempt", "pending", "running").forEachIndexed { index, name ->
                 if (index == 1) assertTrue(store.beginAttempt(account, SyncStatusStore.Service.TASKS, "tasks-attempt", now - 1, "tasks-request"))
                 phase.set(index)
                 val stored = store.status(account, SyncStatusStore.Service.TASKS)
-                var before = 0
-                scenario.onActivity { before = it.accountInfoDeliveryCount; it.refresh() }
-                waitForDeliveryAfter(scenario, before)
-                scenario.onActivity { activity ->
-                    assertEquals("Tasks without a task app, $name", appNeeded,
-                        activity.findViewById<TextView>(R.id.taskdav_status).text.toString())
-                    assertEquals(appDetail, activity.findViewById<TextView>(R.id.taskdav_status_detail).text.toString())
-                    assertEquals(calendarRequested, activity.findViewById<TextView>(R.id.dashboard_overall_status).text.toString())
-                    val contacts = activity.findViewById<TextView>(R.id.carddav_status).text.toString()
-                    contactsShown?.let { assertEquals(it, contacts) } ?: run { contactsShown = contacts }
+                refreshAndWaitForDelivery()
+                val (tasks, tasksDetail, overall, contacts) = onMain {
+                    listOf(R.id.taskdav_status, R.id.taskdav_status_detail, R.id.dashboard_overall_status, R.id.carddav_status)
+                        .map { activity.findViewById<TextView>(it).text.toString() }
                 }
+                assertEquals("Tasks without a task app, $name", appNeeded, tasks)
+                assertEquals(appDetail, tasksDetail)
+                assertEquals(calendarRequested, overall)
+                contactsShown?.let { assertEquals(it, contacts) } ?: run { contactsShown = contacts }
                 assertEquals("rendering leaves the stored Tasks evidence as it was", stored,
                     store.status(account, SyncStatusStore.Service.TASKS))
             }
+            // Leave the running row before ActivityScenario.close() waits for the main queue.
+            phase.set(-1)
+            refreshAndWaitForDelivery()
+            assertEquals(View.GONE, onMain { activity.findViewById<View>(R.id.taskdav_refreshing).visibility })
         }
     }
 
