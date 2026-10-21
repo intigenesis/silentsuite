@@ -171,26 +171,38 @@ class AccountDashboardRuntimeTest {
                 waitUntil("dashboard model delivered again") { onMain { activity.accountInfoDeliveryCount } > before }
             }
             var contactsShown: String? = null
-            listOf("open request", "open attempt", "pending", "running").forEachIndexed { index, name ->
-                if (index == 1) assertTrue(store.beginAttempt(account, SyncStatusStore.Service.TASKS, "tasks-attempt", now - 1, "tasks-request"))
-                phase.set(index)
-                val stored = store.status(account, SyncStatusStore.Service.TASKS)
-                refreshAndWaitForDelivery()
-                val (tasks, tasksDetail, overall, contacts) = onMain {
-                    listOf(R.id.taskdav_status, R.id.taskdav_status_detail, R.id.dashboard_overall_status, R.id.carddav_status)
-                        .map { activity.findViewById<TextView>(it).text.toString() }
+            var failure: Throwable? = null
+            try {
+                listOf("open request", "open attempt", "pending", "running").forEachIndexed { index, name ->
+                    if (index == 1) assertTrue(store.beginAttempt(account, SyncStatusStore.Service.TASKS, "tasks-attempt", now - 1, "tasks-request"))
+                    phase.set(index)
+                    val stored = store.status(account, SyncStatusStore.Service.TASKS)
+                    refreshAndWaitForDelivery()
+                    val (tasks, tasksDetail, overall, contacts) = onMain {
+                        listOf(R.id.taskdav_status, R.id.taskdav_status_detail, R.id.dashboard_overall_status, R.id.carddav_status)
+                            .map { activity.findViewById<TextView>(it).text.toString() }
+                    }
+                    assertEquals("Tasks without a task app, $name", appNeeded, tasks)
+                    assertEquals(appDetail, tasksDetail)
+                    assertEquals(calendarRequested, overall)
+                    contactsShown?.let { assertEquals(it, contacts) } ?: run { contactsShown = contacts }
+                    assertEquals("rendering leaves the stored Tasks evidence as it was", stored,
+                        store.status(account, SyncStatusStore.Service.TASKS))
                 }
-                assertEquals("Tasks without a task app, $name", appNeeded, tasks)
-                assertEquals(appDetail, tasksDetail)
-                assertEquals(calendarRequested, overall)
-                contactsShown?.let { assertEquals(it, contacts) } ?: run { contactsShown = contacts }
-                assertEquals("rendering leaves the stored Tasks evidence as it was", stored,
-                    store.status(account, SyncStatusStore.Service.TASKS))
+            } catch (e: Throwable) {
+                failure = e
+                throw e
+            } finally {
+                // Leave the running row before ActivityScenario.close() waits for the main queue, also
+                // when a phase failed. A cleanup failure never replaces the phase's own failure.
+                phase.set(-1)
+                try {
+                    refreshAndWaitForDelivery()
+                    assertEquals(View.GONE, onMain { activity.findViewById<View>(R.id.taskdav_refreshing).visibility })
+                } catch (cleanup: Throwable) {
+                    failure?.addSuppressed(cleanup) ?: throw cleanup
+                }
             }
-            // Leave the running row before ActivityScenario.close() waits for the main queue.
-            phase.set(-1)
-            refreshAndWaitForDelivery()
-            assertEquals(View.GONE, onMain { activity.findViewById<View>(R.id.taskdav_refreshing).visibility })
         }
     }
 

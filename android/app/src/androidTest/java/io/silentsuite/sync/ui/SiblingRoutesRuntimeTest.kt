@@ -1420,6 +1420,50 @@ class SiblingRoutesRuntimeTest {
                 null, null)
         }
 
+        /** The group row's filename and eTag columns. */
+        fun groupFileNameAndETag(groupId: Long): Pair<String?, String?> = context.contentResolver.query(
+            ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId),
+            arrayOf(ContactsContract.Groups.SOURCE_ID, ContactsContract.Groups.SYNC2), null, null, null)!!.use { c ->
+            if (c.moveToNext()) c.getString(0) to c.getString(1) else null to null
+        }
+
+        /**
+         * The row an upload leaves when the server and the item cache took the group but clearing the
+         * provider's dirty flag failed: the filename stays, no eTag was written, the row is still dirty.
+         */
+        fun keepDirtyWithoutETagAsSyncAdapter(native: Account, groupId: Long) {
+            context.contentResolver.update(
+                asSyncAdapter(ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId), native),
+                ContentValues().apply {
+                    putNull(ContactsContract.Groups.SYNC2)
+                    put(ContactsContract.Groups.DIRTY, 1)
+                },
+                null, null)
+        }
+
+        /**
+         * One sync whose main generation is replaced after the run captured its destination and before
+         * it starts; the original generation is restored when the run ends, however it ends.
+         */
+        fun syncWithMainGenerationReplacedAfterCapture(native: Account): SyncManager.ProviderOutcome {
+            val owner = requireNotNull(main)
+            val provider = requireNotNull(context.contentResolver.acquireContentProviderClient(ContactsContract.AUTHORITY))
+            try {
+                return ContactsSyncManager(context, native, AccountSettings(context, owner), Bundle(),
+                    ContactsContract.AUTHORITY, provider, SyncResult(), LocalAddressBook(context, native, provider),
+                    fake.baseUrl.toHttpUrl()).use { run ->
+                    check(AccountSettings.writeVerified(manager, owner, AccountSettings.KEY_CREATION_ID, "$generation-replaced"))
+                    try {
+                        run.performSync()
+                    } finally {
+                        check(AccountSettings.writeVerified(manager, owner, AccountSettings.KEY_CREATION_ID, generation))
+                    }
+                }
+            } finally {
+                provider.release()
+            }
+        }
+
         /** Removes a row as a sync adapter would, without leaving a local deletion to upload. */
         fun hardDelete(native: Account, uid: String) {
             context.contentResolver.delete(ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, rawId(native, uid))
@@ -1824,6 +1868,91 @@ class SiblingRoutesRuntimeTest {
             assertEquals(success, f.sync(native))
             assertEquals(setOf("a"), f.members(native, f.groupId(native, "h")))
             assertFalse(f.serverContent("h").contains("urn:uuid:b"))
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreReplayWithholdsAnUploadedGroupWhoseDirtyFlagWasNotCleared() {
+        withNativeStore("native-uncleared-upload") { f ->
+            val native = f.populated("Uncleared upload contacts",
+                people("a", "b", "c") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+            val h = f.groupId(native, "h")
+            f.keepDirtyWithoutETagAsSyncAdapter(native, h)
+            // Setup guards: a server-known filename, no eTag, still dirty, members {a}.
+            assertTrue(f.groupFileNameAndETag(h).first != null)
+            assertEquals(null, f.groupFileNameAndETag(h).second)
+            assertTrue(f.groupDirty(h))
+            assertEquals(setOf("a"), f.members(native, h))
+            // Meanwhile another device adds b on the server.
+            f.changeRemote("h", nativeGroupVcard("h", "Group H", listOf("a", "b")))
+            f.recache()
+            f.clearSlot(native)
+            f.fake.requests.clear()  // boundary: only the replay's requests count
+            assertEquals(success, f.sync(native))
+            assertTrue("a replay never uploads a server-known group before its server members are merged",
+                f.serverContent("h").contains("urn:uuid:b"))
+            assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+            assertTrue(f.groupDirty(f.groupId(native, "h")))
+            assertTrue(f.slot(native)?.isNotEmpty() == true)
+            // The next run uploads the merged list.
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertTrue(f.serverContent("h").contains("urn:uuid:a"))
+            assertTrue(f.serverContent("h").contains("urn:uuid:b"))
+            assertFalse(f.groupDirty(f.groupId(native, "h")))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreGenerationChangeBeforePreReconciliationStopsBeforeListing() {
+        withNativeStore("native-generation-prefix") { f ->
+            val native = f.populated("Generation prefix contacts",
+                people("a", "b", "c") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+            val h = f.groupId(native, "h")
+            // The prefix of an interrupted reconciliation against S0 = {a, b}: b's membership row was
+            // inserted, its cached row was not, and S0 is still pending.
+            f.insertMembershipAsSyncAdapter(native, f.rawId(native, "b"), h)
+            f.stagePendingAsSyncAdapter(native, h, listOf("a", "b"))
+            val s0 = requireNotNull(f.pendingMembers(h))
+            // Setup guards.
+            assertEquals(setOf("a", "b"), f.members(native, h))
+            assertEquals(setOf("a"), f.cachedMembers(native, h))
+            assertFalse(f.groupDirty(h))
+            // Meanwhile the server list is S1 = {a}.
+            f.changeRemote("h", nativeGroupVcard("h", "Group H", listOf("a")))
+            f.recache()
+            f.clearSlot(native)
+            f.fake.requests.clear()  // boundary: only the measured run's requests count
+            val outcome = f.syncWithMainGenerationReplacedAfterCapture(native)
+            assertEquals("a run that cannot first finish the pending server list never lists the server",
+                emptyList<String>(), f.itemListRequests())
+            assertTrue("the pending server list S0 is kept for its own reconciliation",
+                f.pendingMembers(h)?.contentEquals(s0) == true)
+            assertEquals(emptyList<String>(), f.itemUploadRequests())
+            assertTrue("the stopped run did not report success: $outcome", outcome != success)
+            assertTrue(f.slot(native)?.isNotEmpty() != true)
+            assertEquals(setOf("a", "b"), f.members(native, h))
+            assertEquals(setOf("a"), f.cachedMembers(native, h))
+            // The retry with the restored generation finishes S0 first, then takes S1.
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals("a partly applied server member is not kept as a local addition",
+                setOf("a"), f.members(native, f.groupId(native, "h")))
+            assertFalse(f.groupDirty(f.groupId(native, "h")))
+            assertEquals(emptyList<String>(), f.itemUploadRequests())
+            assertTrue(f.slot(native)?.isNotEmpty() == true)
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(emptyList<String>(), f.itemUploadRequests())
+            assertFalse(f.serverContent("h").contains("urn:uuid:b"))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a"), f.members(native, f.groupId(native, "h")))
         }
     }
 
