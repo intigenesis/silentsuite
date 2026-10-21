@@ -1360,6 +1360,66 @@ class SiblingRoutesRuntimeTest {
                 ContentValues().apply { put(ContactsContract.Groups.TITLE, title) }, null, null)
         }
 
+        /** A native removal of one membership row, so the provider marks the contact dirty. */
+        fun removeFromGroup(rawId: Long, groupId: Long) {
+            context.contentResolver.delete(ContactsContract.Data.CONTENT_URI,
+                "${ContactsContract.Data.RAW_CONTACT_ID}=? AND ${ContactsContract.Data.MIMETYPE}=? AND " +
+                    "${ContactsContract.CommonDataKinds.GroupMembership.GROUP_ROW_ID}=?",
+                arrayOf(rawId.toString(), ContactsContract.CommonDataKinds.GroupMembership.CONTENT_ITEM_TYPE, groupId.toString()))
+        }
+
+        fun groupDirty(groupId: Long): Boolean = context.contentResolver.query(
+            ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId),
+            arrayOf(ContactsContract.Groups.DIRTY), null, null, null)!!.use { c -> c.moveToNext() && c.getInt(0) != 0 }
+
+        /** Members of [groupId] by its cached membership rows: the state last agreed with the server. */
+        fun cachedMembers(native: Account, groupId: Long): Set<String> {
+            val live = rawRows(native).toMap()
+            return context.contentResolver.query(ContactsContract.Data.CONTENT_URI,
+                arrayOf(ContactsContract.Data.RAW_CONTACT_ID),
+                "${ContactsContract.Data.MIMETYPE}=? AND ${at.bitfire.vcard4android.CachedGroupMembership.GROUP_ID}=?",
+                arrayOf(at.bitfire.vcard4android.CachedGroupMembership.CONTENT_ITEM_TYPE, groupId.toString()), null)!!.use { c ->
+                generateSequence { if (c.moveToNext()) c.getLong(0) else null }.toList()
+            }.mapNotNull { live[it] }.toSet()
+        }
+
+        /** The group's pending server member list, as LocalGroup stores it; null when none is pending. */
+        fun pendingMembers(groupId: Long): ByteArray? = context.contentResolver.query(
+            ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId),
+            arrayOf(io.silentsuite.sync.resource.LocalGroup.COLUMN_PENDING_MEMBERS), null, null, null)!!.use { c ->
+            if (c.moveToNext() && !c.isNull(0)) c.getBlob(0) else null
+        }
+
+        private fun asSyncAdapter(uri: android.net.Uri, native: Account): android.net.Uri = uri.buildUpon()
+            .appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true")
+            .appendQueryParameter(ContactsContract.RawContacts.ACCOUNT_NAME, native.name)
+            .appendQueryParameter(ContactsContract.RawContacts.ACCOUNT_TYPE, native.type)
+            .build()
+
+        /** One membership row only, without its cached row, written as the sync adapter writes rows. */
+        fun insertMembershipAsSyncAdapter(native: Account, rawId: Long, groupId: Long) {
+            context.contentResolver.insert(asSyncAdapter(ContactsContract.Data.CONTENT_URI, native), ContentValues().apply {
+                put(ContactsContract.Data.RAW_CONTACT_ID, rawId)
+                put(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.GroupMembership.CONTENT_ITEM_TYPE)
+                put(ContactsContract.CommonDataKinds.GroupMembership.GROUP_ROW_ID, groupId)
+            })
+        }
+
+        /** A pending server member list in the column and format LocalGroup.contentValues writes. */
+        fun stagePendingAsSyncAdapter(native: Account, groupId: Long, memberUids: List<String>) {
+            val parcel = android.os.Parcel.obtain()
+            val marshalled = try {
+                parcel.writeStringList(memberUids)
+                parcel.marshall()
+            } finally {
+                parcel.recycle()
+            }
+            context.contentResolver.update(
+                asSyncAdapter(ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId), native),
+                ContentValues().apply { put(io.silentsuite.sync.resource.LocalGroup.COLUMN_PENDING_MEMBERS, marshalled) },
+                null, null)
+        }
+
         /** Removes a row as a sync adapter would, without leaving a local deletion to upload. */
         fun hardDelete(native: Account, uid: String) {
             context.contentResolver.delete(ContentUris.withAppendedId(ContactsContract.RawContacts.CONTENT_URI, rawId(native, uid))
@@ -1555,6 +1615,216 @@ class SiblingRoutesRuntimeTest {
         assertEquals(success, f.sync(native))
         assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "h")))
         assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "g")))
+    }
+
+    @Test
+    fun contactsNativeStoreReplayAppliesBothServerAddedSharedMembers() {
+        withNativeStore("native-both-shared") { f ->
+            val native = f.populated("Both shared contacts", people("a", "b", "c", "d") +
+                ("g" to nativeGroupVcard("g", "Group G", listOf("a"))) +
+                ("h" to nativeGroupVcard("h", "Group H", listOf("c"))))
+            // Each group gains the other group's member on the server, so either application order exposes a wipe.
+            f.changeRemote("g", nativeGroupVcard("g", "Group G", listOf("a", "c")))
+            f.changeRemote("h", nativeGroupVcard("h", "Group H", listOf("c", "a")))
+            f.recache()
+            f.clearSlot(native)
+            fun memberships() = mapOf(
+                "g" to f.members(native, f.groupId(native, "g")),
+                "h" to f.members(native, f.groupId(native, "h")))
+            val complete = mapOf("g" to setOf("a", "c"), "h" to setOf("a", "c"))
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals("both groups keep every server member", complete, memberships())
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(complete, memberships())
+            listOf("g", "h").forEach { group ->
+                assertTrue(f.serverContent(group).contains("urn:uuid:a"))
+                assertTrue(f.serverContent(group).contains("urn:uuid:c"))
+            }
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(complete, memberships())
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsALateGroupEditWithIncomingServerMembers() {
+        withNativeStore("native-late-group-edit") { f ->
+            val native = f.populated("Late group edit contacts",
+                people("a", "b", "c") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+            f.changeRemote("h", nativeGroupVcard("h", "Group H", listOf("a", "b")))
+            f.recache()
+            f.clearSlot(native)
+            val hold = f.holdItemList()
+            f.fake.requests.clear()
+            val run = f.syncInBackground(native)
+            hold.awaitArrival()
+            f.retitleGroup(f.groupId(native, "h"), "Local title")
+            hold.release()
+            assertEquals(success, f.join(run))
+            assertEquals("a group edited during the listing keeps the server's members",
+                setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+            assertEquals("Local title", f.groupTitle(f.groupId(native, "h")))
+            assertTrue(f.groupDirty(f.groupId(native, "h")))
+            // Next run: the cursor equals the cached collection token, so the fetch is skipped.
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertTrue(f.serverContent("h").contains("urn:uuid:b"))
+            assertTrue(f.serverContent("h").contains("Local title"))
+            assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+            assertEquals("Local title", f.groupTitle(f.groupId(native, "h")))
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsALateMembershipRemovalAgainstTheServerList() {
+        withNativeStore("native-late-removal") { f ->
+            val native = f.populated("Late removal contacts", people("a", "b", "c", "d") +
+                ("g" to nativeGroupVcard("g", "Group G", listOf("a", "c"))) +
+                ("h" to nativeGroupVcard("h", "Group H", listOf("a", "c"))))
+            f.changeRemote("h", nativeGroupVcard("h", "Group H renamed", listOf("a", "c")))
+            f.recache()
+            f.clearSlot(native)
+            val hold = f.holdItemList()
+            f.fake.requests.clear()
+            val run = f.syncInBackground(native)
+            hold.awaitArrival()
+            val h = f.groupId(native, "h")
+            assertTrue(f.members(native, h).contains("c"))
+            f.removeFromGroup(f.rawId(native, "c"), h)
+            hold.release()
+            assertEquals(success, f.join(run))
+            assertEquals("a membership removed during the listing stays removed",
+                setOf("a"), f.members(native, f.groupId(native, "h")))
+            assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "g")))
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertFalse(f.serverContent("h").contains("urn:uuid:c"))
+            assertTrue(f.serverContent("h").contains("urn:uuid:a"))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a"), f.members(native, f.groupId(native, "h")))
+            assertEquals(setOf("a", "c"), f.members(native, f.groupId(native, "g")))
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreRetryNeverUploadsAnUnreconciledGroupEdit() {
+        withNativeStore("native-unreconciled-retry") { f ->
+            f.fake.itemPageSize = 2
+            val native = f.populated("Unreconciled retry contacts",
+                people("a", "b", "c", "d") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+            // Listing order is the order of the last upload: a, b, c, d, then the changed H, then e and f.
+            // With two entries a page, H is applied on page three before page four is held.
+            f.changeRemote("h", nativeGroupVcard("h", "Group H", listOf("a", "b")))
+            f.upload(people("e", "f"))
+            f.recache()
+            f.clearSlot(native)
+            val hold = f.fake.hold("GET", nativeItemList, skip = 3)
+            f.fake.requests.clear()
+            val run = f.syncInBackground(native)
+            hold.awaitArrival()
+            assertTrue(f.liveUids(native).containsAll(listOf("a", "b", "c", "d")))
+            val h = f.groupId(native, "h")
+            assertEquals(setOf("a"), f.members(native, h))
+            f.retitleGroup(h, "Local title")
+            run.first.interrupt()
+            hold.release()
+            val outcome = f.join(run)
+            assertTrue("the interrupted run ended with a provider outcome, not a crash: $outcome",
+                outcome is SyncManager.ProviderOutcome)
+            assertTrue("the interrupted run did not complete: $outcome", outcome != success)
+            assertTrue(f.slot(native)?.isNotEmpty() != true)
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertTrue("the retry does not upload the group before its server members are merged",
+                f.serverContent("h").contains("urn:uuid:b"))
+            assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+            assertEquals("Local title", f.groupTitle(f.groupId(native, "h")))
+            assertTrue(f.groupDirty(f.groupId(native, "h")))
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertTrue(f.serverContent("h").contains("urn:uuid:b"))
+            assertTrue(f.serverContent("h").contains("Local title"))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a", "b"), f.members(native, f.groupId(native, "h")))
+            assertEquals("Local title", f.groupTitle(f.groupId(native, "h")))
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreReplayKeepsALocalRemovalWhoseServerListStillHasTheMember() {
+        withNativeStore("native-durable-removal") { f ->
+            val native = f.populated("Durable removal contacts",
+                people("a", "b", "c") + ("g" to nativeGroupVcard("g", "Group G", listOf("a", "c"))))
+            val g = f.groupId(native, "g")
+            f.removeFromGroup(f.rawId(native, "c"), g)
+            assertEquals(setOf("a"), f.members(native, g))
+            assertEquals(setOf("a", "c"), f.cachedMembers(native, g))
+            f.clearSlot(native)
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a"), f.members(native, f.groupId(native, "g")))
+            assertTrue(f.liveUids(native).contains("c"))
+            assertTrue(f.groupDirty(f.groupId(native, "g")))
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertFalse(f.serverContent("g").contains("urn:uuid:c"))
+            assertTrue(f.serverContent("g").contains("urn:uuid:a"))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a"), f.members(native, f.groupId(native, "g")))
+        }
+    }
+
+    @Test
+    fun contactsNativeStoreReplayNeverTurnsAPartlyAppliedServerMemberIntoALocalAddition() {
+        withNativeStore("native-partly-applied") { f ->
+            val native = f.populated("Partly applied contacts",
+                people("a", "b", "c") + ("h" to nativeGroupVcard("h", "Group H", listOf("a"))))
+            val h = f.groupId(native, "h")
+            assertEquals(setOf("a"), f.members(native, h))
+            assertEquals(setOf("a"), f.cachedMembers(native, h))
+            // The prefix of an interrupted reconciliation against S0 = {a, b}: b's membership row was
+            // inserted, its cached row was not, and S0 is still pending.
+            f.insertMembershipAsSyncAdapter(native, f.rawId(native, "b"), h)
+            f.stagePendingAsSyncAdapter(native, h, listOf("a", "b"))
+            assertEquals(setOf("a", "b"), f.members(native, h))
+            assertEquals(setOf("a"), f.cachedMembers(native, h))
+            assertTrue(f.pendingMembers(h) != null)
+            assertFalse(f.dirty(f.rawId(native, "b")))
+            assertFalse(f.groupDirty(h))
+            // Meanwhile the server list is S1 = {a}.
+            f.changeRemote("h", nativeGroupVcard("h", "Group H", listOf("a")))
+            f.recache()
+            f.clearSlot(native)
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals("a partly applied server member is not kept as a local addition",
+                setOf("a"), f.members(native, f.groupId(native, "h")))
+            assertTrue(f.liveUids(native).contains("b"))
+            assertFalse(f.groupDirty(f.groupId(native, "h")))
+            assertEquals(emptyList<String>(), f.itemUploadRequests())
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(emptyList<String>(), f.itemUploadRequests())
+            assertFalse(f.serverContent("h").contains("urn:uuid:b"))
+            f.recache()
+            f.fake.requests.clear()
+            assertEquals(success, f.sync(native))
+            assertEquals(setOf("a"), f.members(native, f.groupId(native, "h")))
+            assertFalse(f.serverContent("h").contains("urn:uuid:b"))
+        }
     }
 
     @Test
