@@ -168,6 +168,7 @@ class LoginLifecycleContractTest {
         assertEquals(1, Regex("""api-level: 36\n\s+arch: x86_64\n\s+shard: account-dashboard""").findAll(job).count())
         assertEquals(1, Regex("""api-level: 36\n\s+arch: x86_64\n\s+shard: first-run-setup""").findAll(job).count())
         assertEquals(1, Regex("""api-level: 36\n\s+arch: x86_64\n\s+shard: status-routes""").findAll(job).count())
+        assertEquals(1, Regex("""api-level: 36\n\s+arch: x86_64\n\s+shard: sibling-routes""").findAll(job).count())
         assertEquals(1, Regex("shard: mixed").findAll(job).count())
         assertEquals(1, Regex("shard: remaining").findAll(job).count())
         assertEquals(1, Regex("shard: all").findAll(job).count())
@@ -265,13 +266,13 @@ class LoginLifecycleContractTest {
         listOf(
             "\"21:mixed\": 1", "\"21:requested\": 1", "\"21:remaining\": 159",
             "\"35:all\": 161", "\"36:account-dashboard\": 30",
-            "\"36:first-run-setup\": 19", "\"36:status-routes\": 112",
+            "\"36:first-run-setup\": 19", "\"36:sibling-routes\": 45", "\"36:status-routes\": 67",
         ).forEach { assertTrue(runtimeScript.contains(it)) }
         assertTrue(runtimeScript.contains("remaining_selectors=\"\$(ledger_selectors '21:remaining')\""))
         assertTrue(runtimeScript.contains("all_selectors=\"\$(ledger_selectors '35:all')\""))
         assertFalse(runtimeScript.contains("other77_selectors"))
         assertFalse(runtimeScript.contains("focused_classes="))
-        assertEquals(listOf("600", "600", "1500", "2400", "1800", "1800", "1800"),
+        assertEquals(listOf("600", "600", "1500", "2400", "1800", "1800", "1800", "1800"),
             Regex("""timeout --signal=TERM --kill-after=10s (\d+)s""")
                 .findAll(runtimeScript).map { it.groupValues[1] }.toList())
         assertTrue(600 + 1500 < 45 * 60 && 2400 < 45 * 60)
