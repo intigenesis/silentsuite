@@ -352,6 +352,11 @@ constructor(protected val context: Context, protected val account: Account, prot
             i++
             Logger.log.info("Processing remote resource (${i}/${size}) deleted=${item.isDeleted}")
 
+            if (keepsLocalChange(item)) {
+                // Neither applied nor cached: the cached copy stays the base of the local change's upload.
+                Logger.log.info("Keeping a local change over a server deletion for the next upload")
+                continue
+            }
             processItem(item)
             persistItem(item)
         }
@@ -561,6 +566,13 @@ constructor(protected val context: Context, protected val account: Account, prot
      */
     @Throws(CalendarStorageException::class, ContactsStorageException::class)
     protected open fun replayFromStart(): Boolean = false
+
+    /**
+     * Whether a server deletion [item] is left unapplied and uncached because a local change of that
+     * entry is still to be uploaded. Off by default.
+     */
+    @Throws(CalendarStorageException::class, ContactsStorageException::class)
+    protected open fun keepsLocalChange(item: Item): Boolean = false
 
     /** Called once a listing from the start has reached its done page and post-processing succeeded. */
     @Throws(CalendarStorageException::class, ContactsStorageException::class)

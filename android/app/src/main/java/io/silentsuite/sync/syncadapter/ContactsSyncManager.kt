@@ -138,6 +138,15 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
         return true
     }
 
+    @Throws(CalendarStorageException::class, ContactsStorageException::class, FileNotFoundException::class)
+    override fun prepareLocal() {
+        // A replay first finishes the server member lists an earlier run left pending against those same
+        // lists, before this run's snapshot, upload or listing can replace them.
+        if (keepsLocalEditsOfThisRun && exactDestinationCurrent())
+            LocalGroup.applyPendingMemberships(localAddressBook(), keepLocalChanges = true)
+        super.prepareLocal()
+    }
+
     @Throws(CalendarStorageException::class, ContactsStorageException::class)
     override fun prepareDirty() {
         super.prepareDirty()
@@ -164,6 +173,11 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
 
         }
         batch.commit()
+
+        // A replay withholds groups the server already knows until their server members are merged,
+        // so an incomplete local member list is never uploaded; local-only groups upload as usual.
+        if (keepsLocalEditsOfThisRun)
+            localDirty = localDirty.filterNot { it is LocalGroup && !it.isLocalOnly }
     }
 
     /**
@@ -199,10 +213,19 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
     @Throws(CalendarStorageException::class, ContactsStorageException::class)
     override fun postProcess() {
         super.postProcess()
-        if (keepsLocalEditsOfThisRun) deferMembershipsWithLocalChanges()
         /* VCard4 group handling: there are group contacts and individual contacts */
-        Logger.log.info("Assigning memberships of downloaded contact groups")
-        LocalGroup.applyPendingMemberships(localAddressBook())
+        if (keepsLocalEditsOfThisRun) {
+            if (!exactDestinationCurrent()) {
+                // The pending lists stay for the next run; this run certifies nothing.
+                Logger.log.info("Not merging memberships into an address book whose generation changed during this run")
+                return
+            }
+            Logger.log.info("Merging memberships of downloaded contact groups with local changes")
+            LocalGroup.applyPendingMemberships(localAddressBook(), keepLocalChanges = true)
+        } else {
+            Logger.log.info("Assigning memberships of downloaded contact groups")
+            LocalGroup.applyPendingMemberships(localAddressBook())
+        }
     }
 
     /**
@@ -214,31 +237,21 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
         get() = replaying && cachedCollection.col.accessLevel != CollectionAccessLevel.ReadOnly
 
     /**
-     * Groups whose memberships changed locally keep them: in one batch their pending server member
-     * list is dropped and they are marked dirty, so the next run uploads the local memberships and no
-     * stale list is applied over them, whether or not that run fetches.
+     * False only when the native address book or owner generation this run captured has since been
+     * replaced; a destination that could not be captured is never marked complete, but its memberships
+     * are still applied as before.
      */
-    private fun deferMembershipsWithLocalChanges() {
-        val addressBook = localAddressBook()
-        val deferred = HashSet<Long>()
-        for (group in addressBook.findDirtyGroups())
-            group.id?.let { deferred += it }
-        for (contact in addressBook.findDirtyContacts()) {
-            try {
-                deferred.addAll(SetUtils.disjunction(contact.getCachedGroupMemberships(), contact.getGroupMemberships()))
-            } catch (ignored: FileNotFoundException) {
-            }
-        }
-        if (deferred.isEmpty())
-            return
-        Logger.log.info("Keeping local memberships of ${deferred.size} group(s) for the next upload")
-        val batch = BatchOperation(addressBook.provider!!)
-        for (groupId in deferred)
-            batch.enqueue(BatchOperation.CpoBuilder.newUpdate(addressBook.syncAdapterURI(ContentUris.withAppendedId(ContactsContract.Groups.CONTENT_URI, groupId)))
-                    .withValue(LocalGroup.COLUMN_PENDING_MEMBERS, null)
-                    .withValue(ContactsContract.Groups.DIRTY, 1)
-            )
-        batch.commit()
+    private fun exactDestinationCurrent(): Boolean = destination?.let { destinationStillCurrent(it) } ?: true
+
+    /**
+     * On a writable replay, a server deletion of a row with a local change still to upload leaves the
+     * row and the cached copy alone, so the next run uploads the local change (local wins).
+     */
+    override fun keepsLocalChange(item: Item): Boolean {
+        if (!item.isDeleted || !keepsLocalEditsOfThisRun)
+            return false
+        val local = localCollection!!.findByFilename(item.uid) ?: return false
+        return isDirty(local)
     }
 
     private fun isDirty(local: LocalAddress): Boolean {
@@ -320,6 +333,11 @@ constructor(context: Context, account: Account, settings: AccountSettings, extra
 
         if (local != null && !item.isDeleted && keepsLocalEditsOfThisRun && isDirty(local)) {
             Logger.log.info("Keeping a local change made during this listing for the next upload")
+            // A locally edited group still takes the server's member list as its merge baseline.
+            if (local is LocalGroup)
+                Contact.fromReader(StringReader(String(item.content)), resourceDownloader).firstOrNull()
+                    ?.takeIf { it.group }
+                    ?.let { local.stagePendingMembers(it) }
             return
         }
 
