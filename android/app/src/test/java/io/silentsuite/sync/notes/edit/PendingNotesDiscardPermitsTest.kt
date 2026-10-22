@@ -329,6 +329,10 @@ class PendingNotesDiscardPermitsTest {
         failing = true
         assertThrows(IOException::class.java) { p.remove("store-a") }
         assertTrue("unlinked, though the removal may not be on disk", p.root.list()!!.isEmpty())
+        // Found gone while the sync still fails: not reported gone either.
+        events.clear()
+        assertThrows(IOException::class.java) { p.remove("store-a") }
+        assertEquals(listOf("sync notes-discard"), events)
         failing = false
         events.clear()
         p.remove("store-a")
