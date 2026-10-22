@@ -41,6 +41,7 @@ class PendingNotesStoreTest {
         PendingNotesStore.beforeRemoveForTesting = null
         PendingNotesStore.beforeClearForTesting = null
         PendingNotesStore.listFilesForTesting = null
+        PendingNotesStore.presenceForTesting = null
         PendingNotesStore.resetForTesting()
     }
 
@@ -1723,6 +1724,231 @@ class PendingNotesStoreTest {
         assertEquals(first, next.entry("n1"))
         assertEquals("an entry names it now", emptyList<String>(), next.pruneNotebooks())
         assertArrayEquals(blob("key b1"), next.notebook("b1"))
+    }
+
+    // ---- a check that fails is never an absence ----
+
+    /** Every check of whether one of [names] is there fails, as lstat(2) can (EACCES, EIO); others work. */
+    private fun checksFailFor(vararg names: String) {
+        PendingNotesStore.presenceForTesting = { f ->
+            if (f.name in names) PendingNotesStore.Presence.UNKNOWN else null
+        }
+    }
+
+    @Test fun `an entry whose presence cannot be told reads as unreadable, never as missing`() {
+        store.saveLocal("n0", "b1", "r1", blob("t"), isCreate = false)
+        // n1 has neither an entry nor a first write, but neither can be shown not to be there.
+        checksFailFor("n1.note")
+        assertEquals(Read.Unreadable("n1.note", "could not tell whether n1.note is there"), store.read("n1"))
+        assertEquals(Read.Unreadable("n1.note", "could not tell whether n1.note is there"), store.observe("n1").read)
+        assertEquals(PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.UNREADABLE), store.startSend("n1"))
+        checksFailFor("n1.note.new")
+        assertEquals(Read.Unreadable("n1.note.new", "could not tell whether n1.note.new is there"), store.read("n1"))
+        PendingNotesStore.presenceForTesting = null
+        assertEquals("shown not to be there, it is missing as before", Read.Missing, store.read("n1"))
+    }
+
+    @Test fun `a save over an entry whose presence cannot be told is blocked and writes nothing`() {
+        store.saveLocal("n0", "b1", "r1", blob("t"), isCreate = false)
+        fun files() = dir.listFiles()!!.associate { it.name to it.readBytes().toList() }
+        val before = files()
+        for (name in listOf("n1.note", "n1.note.new")) {
+            checksFailFor(name)
+            assertEquals(name, SaveOutcome.Blocked,
+                store.saveLocal("n1", "b2", "r1", blob("typed"), isCreate = true, notebookCopy = blob("key b2")))
+            assertEquals("no entry, no counter and no notebook copy: $name", before, files())
+        }
+        PendingNotesStore.presenceForTesting = null
+        assertTrue(store.saveLocal("n1", "b2", "r1", blob("typed"), isCreate = true) is SaveOutcome.Saved)
+    }
+
+    @Test fun `a removal whose check fails throws and keeps the file`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
+        val bytes = File(dir, "n1.note").readBytes()
+        // The entry, and a first write that may be left beside it: either one passed over as absent, the
+        // removal would report success over a file that may still be there.
+        for (name in listOf("n1.note", "n1.note.new")) {
+            checksFailFor(name)
+            assertThrows(name, java.io.IOException::class.java) { store.discard("n1") }
+            assertThrows(name, java.io.IOException::class.java) { store.completeSend("n1", v1, "r1", blob("landed")) }
+            assertArrayEquals(name, bytes, File(dir, "n1.note").readBytes())
+        }
+        checksFailFor("n1.landed")
+        assertThrows(java.io.IOException::class.java) { store.clearLanded("n1") }
+        PendingNotesStore.presenceForTesting = null
+        store.discard("n1")
+        assertEquals(Read.Missing, store.read("n1"))
+    }
+
+    @Test fun `a recovery problem stays reported while its file cannot be shown gone`() {
+        val d = tmp.newFolder("problem")
+        val only = PendingEntry("n1", "b1", PendingEntry.State.UPSERT, 4, "r4", false, blob = blob("the only copy"))
+        File(d, "n1.note.new").writeBytes(PendingCodec.encodeEntry(only))
+        // Its commit keeps failing, so recovery reports it each time it runs.
+        val s = refusingRenames(d, "n1.note") { true }
+        assertEquals(listOf("n1.note.new"), s.scan().unreadable.map { it.file })
+        checksFailFor("n1.note.new")
+        // Dropped, the problem would show in no report, and a run could record success while the text waits.
+        assertEquals(listOf("n1.note.new"), s.scan().unreadable.map { it.file })
+        assertEquals(listOf("n1.note.new"), s.snapshot { false }.unreadable.map { it.file })
+        assertArrayEquals(PendingCodec.encodeEntry(only), File(d, "n1.note.new").readBytes())
+    }
+
+    @Test fun `an uncommitted write beside a committed file whose check fails is dropped, not committed over it`() {
+        store.saveLocal("n1", "b1", "r1", blob("committed"), isCreate = false)
+        val committed = File(dir, "n1.note").readBytes()
+        // An intact later entry whose write never reported success: committed, it would replace the text a save did.
+        val later = entry("n1").copy(version = 9, revision = "r-newer", blob = blob("never reported saved"))
+        File(dir, "n1.note.new").writeBytes(PendingCodec.encodeEntry(later))
+        checksFailFor("n1.note")
+        val s = restarted()
+        assertTrue(s.scan().unreadable.isEmpty())
+        assertFalse(File(dir, "n1.note.new").exists())
+        assertArrayEquals("the last content a save reported", committed, File(dir, "n1.note").readBytes())
+    }
+
+    /**
+     * A listing of the store that comes back short, as File.listFiles can when reading the directory fails
+     * partway: it still shows the write beside [name] but leaves out [name] itself.
+     */
+    private fun listingLeavesOut(name: String) {
+        PendingNotesStore.listFilesForTesting = { d ->
+            if (d.name == dir.name) d.listFiles()?.filter { it.name != name }?.toTypedArray() else d.listFiles()
+        }
+    }
+
+    @Test fun `an uncommitted write beside a committed file that a short listing leaves out is dropped, not committed over it`() {
+        store.saveLocal("n1", "b1", "r1", blob("committed"), isCreate = false)
+        val committed = File(dir, "n1.note").readBytes()
+        // An intact later entry whose write never reported success: committed, it would replace the text a save did.
+        val later = entry("n1").copy(version = 9, revision = "r-newer", blob = blob("never reported saved"))
+        File(dir, "n1.note.new").writeBytes(PendingCodec.encodeEntry(later))
+        listingLeavesOut("n1.note")
+        // The committed file's own check still finds it there.
+        val s = restarted()
+        assertTrue(s.scan().unreadable.isEmpty())
+        assertArrayEquals("the last content a save reported", committed, File(dir, "n1.note").readBytes())
+        assertFalse(File(dir, "n1.note.new").exists())
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("r1", s.entry("n1").revision)
+    }
+
+    @Test fun `an uncommitted write beside a committed file that a short listing leaves out and whose check fails is kept and reported`() {
+        store.saveLocal("n1", "b1", "r1", blob("committed"), isCreate = false)
+        val committed = File(dir, "n1.note").readBytes()
+        val later = PendingCodec.encodeEntry(
+            entry("n1").copy(version = 9, revision = "r-newer", blob = blob("never reported saved")))
+        File(dir, "n1.note.new").writeBytes(later)
+        listingLeavesOut("n1.note")
+        checksFailFor("n1.note")
+        val s = restarted()
+        val scan = s.scan()
+        assertArrayEquals("the last content a save reported", committed, File(dir, "n1.note").readBytes())
+        assertArrayEquals("neither dropped nor committed while it cannot be told", later, File(dir, "n1.note.new").readBytes())
+        val problem = listOf(Read.Unreadable("n1.note.new", "could not tell whether n1.note is there"))
+        assertEquals(problem, scan.unreadable)
+        assertEquals(problem, s.snapshot { false }.unreadable)
+        assertArrayEquals(later, File(dir, "n1.note.new").readBytes())
+        // With a full listing and a check that works, the next recovery drops the write as usual.
+        PendingNotesStore.listFilesForTesting = null
+        PendingNotesStore.presenceForTesting = null
+        val after = s.scan()
+        assertTrue(after.unreadable.isEmpty())
+        assertEquals(listOf("r1"), after.entries.map { it.revision })
+        assertArrayEquals(committed, File(dir, "n1.note").readBytes())
+        assertFalse(File(dir, "n1.note.new").exists())
+    }
+
+    @Test fun `a landed record or notebook copy whose presence cannot be told is not read as none`() {
+        store.saveLocal("n0", "b1", "r1", blob("t"), isCreate = false)
+        checksFailFor("n1.landed", "b2.notebook")
+        assertThrows(java.io.IOException::class.java) { store.landed("n1") }
+        assertThrows(java.io.IOException::class.java) { store.notebook("b2") }
+        // A new entry starts from the note's landed record, so none is written while that cannot be ruled out.
+        assertThrows(java.io.IOException::class.java) { store.saveLocal("n1", "b1", "r1", blob("u"), isCreate = true) }
+        assertFalse(File(dir, "n1.note").exists() || File(dir, "n1.note.new").exists())
+        PendingNotesStore.presenceForTesting = null
+        assertNull(store.landed("n1"))
+        assertNull(store.notebook("b2"))
+        assertTrue(store.saveLocal("n1", "b1", "r1", blob("u"), isCreate = true) is SaveOutcome.Saved)
+        assertTrue("no landed record, so still a create", entry("n1").isCreate)
+    }
+
+    @Test fun `with the counter lost, a counter whose presence cannot be told stops new versions and reads`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("one"), isCreate = false))
+        assertTrue(File(dir, "sequence").delete())
+        checksFailFor("sequence")
+        // Its own check fails, so the counter is not taken for lost, though the listing no longer shows it.
+        assertThrows(java.io.IOException::class.java) { store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        assertFalse("no counter is written", File(dir, "sequence").exists() || File(dir, "sequence.new").exists())
+        assertThrows(java.io.IOException::class.java) { store.observe("n1") }
+        assertThrows(java.io.IOException::class.java) { store.snapshot { false } }
+        PendingNotesStore.presenceForTesting = null
+        assertEquals(Read.Missing, store.read("n2"))
+        assertEquals("shown to be lost, it is rebuilt as before",
+            v1 + 1, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
+    }
+
+    @Test fun `a conflict copy keeps its link while the original it replaced cannot be shown gone`() {
+        val v1 = saved(store.saveLocal("orig", "b1", "r1", blob("mine"), isCreate = false))
+        PendingNotesStore.beforeOriginalRemovedForTesting = { throw IllegalStateException("process died") }
+        assertThrows(IllegalStateException::class.java) { store.replaceWithNewNote("orig", v1, "srv", newNote()) }
+        PendingNotesStore.beforeOriginalRemovedForTesting = null
+        // The original goes, and the next process cannot show that it is gone.
+        assertTrue(File(dir, "orig.note").delete())
+        checksFailFor("orig.note")
+        val next = restarted()
+        assertNull(next.beginSend("copy1"))
+        assertThrows(java.io.IOException::class.java) { next.discard("copy1") }
+        assertEquals("orig", next.entry("copy1").origin?.noteUid)
+        PendingNotesStore.presenceForTesting = null
+        assertNull("shown gone, the link is cleared", restarted().beginSend("copy1")!!.origin)
+    }
+
+    @Test fun `a sign-out clear returns only once the store directory is shown gone`() {
+        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        // The deletion works, but no directory above the store can be listed, so it cannot be shown gone.
+        PendingNotesStore.listFilesForTesting = { null }
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        // A listing above that still shows the directory is no proof either.
+        val above = store.dir.parentFile!!
+        PendingNotesStore.listFilesForTesting = { d -> if (d.path == above.path) arrayOf(store.dir) else d.listFiles() }
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        // Nor is a listing that no longer shows it while its own check fails, since a listing can come back short.
+        PendingNotesStore.listFilesForTesting = null
+        checksFailFor(store.dir.name)
+        assertThrows(java.io.IOException::class.java) { store.clearAll() }
+        PendingNotesStore.presenceForTesting = null
+        store.clearAll()
+        assertFalse(dir.exists())
+        assertThrows(IllegalStateException::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("late"), isCreate = false)
+        }
+    }
+
+    @Test fun `the store asks File exists nothing, and keeps only checks that cannot make a file absent`() {
+        // File.exists() answers false for a check that failed as well as for a file that is not there.
+        val code = File("src/main/java/io/silentsuite/sync/notes/edit/PendingNotesStore.kt").readText()
+            .replace(Regex("(?s)/\\*.*?\\*/"), "").replace(Regex("//[^\n]*"), "")
+        // Words, not calls, so that a reference such as File::exists is caught as well.
+        assertFalse(Regex("""\b(exists|notExists)\b""").containsMatchIn(code))
+        // A true answer from these needs a check that worked. Each removal keeps only regular files on top
+        // of a listing, so a false answer keeps a file; mkdir answered first, so a false answer fails a write.
+        assertEquals(2, Regex("""\bisFile\b""").findAll(code).count())
+        assertEquals(2, Regex("""\.filter \{ it\.isFile\b""").findAll(code).count())
+        assertEquals(1, Regex("""\bisDirectory\b""").findAll(code).count())
+        assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(code).count())
+        // The presence check is asked only where a check that failed cannot pass for an absence: isPresent,
+        // which throws on UNKNOWN, two decisions that need ABSENT (a recovery problem stays, a clear throws),
+        // and createDirectory, which makes a level not shown PRESENT and lets mkdir decide.
+        assertFalse(Regex("""==\s*Presence\.PRESENT\b|\bPresence\.PRESENT\s*==""").containsMatchIn(code))
+        assertEquals(6, Regex("""\bpresenceOf\(""").findAll(code).count())
+        assertEquals(1, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
+        assertEquals(2, Regex("""\) != Presence\.ABSENT\b""").findAll(code).count())
+        assertEquals(2, Regex("""\) != Presence\.PRESENT\b""").findAll(code).count())
+        // A clear returns only on its own check that the directory is gone, never on what the deletion answered.
+        assertEquals(listOf("dir.deleteRecursively()"),
+            code.lines().filter { "deleteRecursively" in it }.map { it.trim() })
     }
 
     @Test fun `uids that could escape the directory are refused for every kind of file`() {
