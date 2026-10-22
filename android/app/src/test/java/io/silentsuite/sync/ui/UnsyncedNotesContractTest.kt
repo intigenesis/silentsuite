@@ -48,6 +48,34 @@ class UnsyncedNotesContractTest {
         }
     }
 
+    /**
+     * A store call: a member or callable reference of UnsyncedNotesStores or PendingNotesStore, so a nested type such
+     * as PendingNotesStore.DiscardOutcome, which the policy imports, is not one. The class is group 1, the member 4.
+     */
+    private val storeCall =
+        Regex("""\b(UnsyncedNotesStores|PendingNotesStore)(\s*\.\s*Companion)?\s*(\.|::)\s*([a-z]\w*)""")
+
+    @Test fun `the Unsynced Notes screens reach the stores only on the IO dispatcher`() {
+        val fragment = code(File(ui, "UnsyncedNotesFragment.kt"))
+        val calls = storeCall.findAll(fragment).toList()
+        assertEquals("the hub row's read, the screen's read and its discard",
+            listOf("UnsyncedNotesStores.read", "UnsyncedNotesStores.read", "UnsyncedNotesStores.discard"),
+            calls.map { it.groupValues[1] + "." + it.groupValues[4] })
+        // Where a withContext(Dispatchers.IO) block's first statement starts: each call must start there.
+        val onIo = Regex("""withContext\(\s*Dispatchers\.IO\s*\)\s*\{\s*""").findAll(fragment)
+            .map { it.range.last + 1 }.toSet()
+        for (call in calls) {
+            assertTrue("${call.value} is not inside withContext(Dispatchers.IO)", call.range.first in onIo)
+        }
+        assertFalse("no account read in the screen", fragment.contains("AccountManager"))
+
+        val others = listOf("UnsyncedNotesDiscardPolicy.kt", "AppSettingsActivity.kt", "UnsyncedNotesEntry.kt",
+            "setup/LoginActivity.kt", "setup/PostLoginSetupActivity.kt")
+        for (name in others) {
+            assertEquals(name, emptyList<String>(), storeCall.findAll(code(File(ui, name))).map { it.value }.toList())
+        }
+    }
+
     /** What follows [start] in [text], up to the first closing brace at [indent]: one function or block. */
     private fun body(text: String, start: String, indent: String = "    ") =
         text.substringAfter(start, "").substringBefore("\n$indent}\n")

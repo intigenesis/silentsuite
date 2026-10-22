@@ -32,6 +32,7 @@ import io.silentsuite.sync.Constants
 import io.silentsuite.sync.HttpClient
 import io.silentsuite.sync.R
 import io.silentsuite.sync.log.Logger
+import io.silentsuite.sync.notes.MainThreadStoreProbe
 import io.silentsuite.sync.notes.NotesSyncCoordinator
 import io.silentsuite.sync.notes.edit.PendingNotesDiscardPermits
 import io.silentsuite.sync.notes.edit.PendingNotesStore
@@ -739,7 +740,7 @@ class SettingsRuntimeTest {
             val filesB = notes.filesOf(b)
             // From here on the screen opens every store first, through forDirectory, as after a restart.
             PendingNotesStore.resetForTesting()
-            PendingNotesStore.listFilesForTesting = { d -> if (d.name == b) null else d.listFiles() }
+            notes.probe.listing = { d -> if (d.name == b) null else d.listFiles() }
             LoginActivity.controllerFactory = { _, _ ->
                 AuthenticatorResponseController(object : AuthenticatorResponseController.Delivery {
                     override fun continued() = Unit
@@ -827,7 +828,7 @@ class SettingsRuntimeTest {
                     assertTrue("held, and bound to B through the screen's opener", opener.acknowledged())
 
                     // 6. Once B lists, its count withdraws the acknowledgement, and B is a discard with its real count.
-                    PendingNotesStore.listFilesForTesting = null
+                    notes.probe.listing = null
                     instrumentation.runOnMainSync { settings.recreate() }
                     settings = notes.resumedSettings(settings)
                     notes.awaitRows(settings, listOf(UnsyncedNotesOnDevice.Row(UnsyncedNotesFragment.rowKey(b),
@@ -852,6 +853,7 @@ class SettingsRuntimeTest {
             }
             assertEquals("no request", 0, notes.requests.get())
             assertEquals("no Notes run", 0, notes.runs.get())
+            notes.probe.assertNoneOnMain()
         } finally {
             instrumentation.removeMonitor(monitor)
             LoginActivity.controllerFactory = null
@@ -905,7 +907,7 @@ class SettingsRuntimeTest {
                 notes.awaitHubSummary(context.resources.getQuantityString(R.plurals.settings_unsynced_notes_summary,
                     2, 2))
                 // 2. With notes-pending unlistable, the hub says that not all of them could be counted.
-                PendingNotesStore.listFilesForTesting = { d -> if (d.name == "notes-pending") null else d.listFiles() }
+                notes.probe.listing = { d -> if (d.name == "notes-pending") null else d.listFiles() }
                 scenario.moveToState(Lifecycle.State.STARTED)
                 scenario.moveToState(Lifecycle.State.RESUMED)
                 notes.awaitHubSummary(context.getString(R.string.settings_unsynced_notes_uncounted))
@@ -943,7 +945,7 @@ class SettingsRuntimeTest {
                 notes.awaitRows(settings, listOf(stopped, others))
 
                 // 6. Once notes-pending lists, the folder is shown gone, and Retry finishes under the same permit.
-                PendingNotesStore.listFilesForTesting = null
+                notes.probe.listing = null
                 assertFalse("the folder itself went", folder in notes.stores())
                 assertTrue("$folder.permit" in notes.permits())
                 val closed = PendingNotesStore.forIdentity(context, account.type, account.name, generation)
@@ -957,6 +959,7 @@ class SettingsRuntimeTest {
             }
             assertEquals("no request", 0, notes.requests.get())
             assertEquals("no Notes run", 0, notes.runs.get())
+            notes.probe.assertNoneOnMain()
         } finally {
             notes.restore(folder)
             if (added) removeAccountAndWait(manager, account)
@@ -1058,8 +1061,8 @@ class SettingsRuntimeTest {
 /**
  * What the Unsynced Notes cases of [SettingsRuntimeTest] share: the app's own no_backup folder, the store and Notes job
  * seams, set by [isolate] and reset by [restore], and the screen, read and tapped on the main thread. Files are
- * checked by listing, never with File.exists(). The store seam only records: it runs on the IO thread inside a store
- * call, which rethrows anything, so an assertion there would end the app process.
+ * checked by listing, never with File.exists(). The store seams are the [probe]'s, and only record: they run on the IO
+ * thread inside a store call, which rethrows anything, so an assertion there would end the app process.
  */
 private class UnsyncedNotesOnDevice(private val context: Context) {
     data class Row(val key: String, val title: String?, val summary: String?, val enabled: Boolean = true)
@@ -1080,6 +1083,12 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
     /** Requests any client of the app made, each refused; and Notes runs, each replaced by nothing. */
     val requests = AtomicInteger()
     val runs = AtomicInteger()
+
+    /**
+     * Every store listing and removal, and which ran on the main thread. A case that needs a listing to fail sets it
+     * here ([MainThreadStoreProbe.listing]), never on the store, and ends with [MainThreadStoreProbe.assertNoneOnMain].
+     */
+    val probe = MainThreadStoreProbe()
 
     /** What notes-discard listed at the first removal of a file in each store folder, by folder. */
     private val firstRemovals = HashMap<String, Set<String>?>()
@@ -1104,7 +1113,10 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
         assertTrue("accounts left on this device: $accounts", accounts.isEmpty())
     }
 
-    /** Master sync off, every request refused and counted, every Notes run counted, and the first removals noted. */
+    /**
+     * Master sync off, every request refused and counted, every Notes run counted, the [probe] installed, and the
+     * first removals noted.
+     */
     fun isolate() {
         previousMasterSync = ContentResolver.getMasterSyncAutomatically()
         ContentResolver.setMasterSyncAutomatically(false)
@@ -1115,12 +1127,13 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
             }
         }
         NotesSyncCoordinator.runnerOverride = { _, _, _, _ -> runs.incrementAndGet() }
-        PendingNotesStore.beforeRemoveForTesting = { file ->
+        probe.removal = { file ->
             val folder = file.parentFile?.name
             if (folder != null) synchronized(firstRemovals) {
                 if (folder !in firstRemovals) firstRemovals[folder] = discards.list()?.toSet()
             }
         }
+        probe.install()
     }
 
     /** No adapter sync is scheduled or started for [account]. */
@@ -1328,8 +1341,7 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
      * deletes their permits and acknowledgements, and checks by listing that nothing of theirs is left.
      */
     fun restore(vararg folders: String) {
-        PendingNotesStore.listFilesForTesting = null
-        PendingNotesStore.beforeRemoveForTesting = null
+        probe.uninstall()
         HttpClient.testInterceptor = null
         NotesSyncCoordinator.runnerOverride = null
         ContentResolver.setMasterSyncAutomatically(previousMasterSync)
