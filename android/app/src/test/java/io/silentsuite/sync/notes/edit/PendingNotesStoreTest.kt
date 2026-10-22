@@ -129,8 +129,9 @@ class PendingNotesStoreTest {
         bytes[bytes.size - 6] = (bytes[bytes.size - 6].toInt() xor 0x40).toByte()
         file.writeBytes(bytes)
         assertTrue(File(dir, "sequence").delete())
+        // A new instance, as after a restart, so that only the rebuild keeps the save above.
         assertTrue("n2 still holds its version",
-            saved(store.saveLocal("n3", "b1", "r1", blob("three"), isCreate = false)) > high)
+            saved(restarted().saveLocal("n3", "b1", "r1", blob("three"), isCreate = false)) > high)
     }
 
     @Test fun `with the counter lost, a write fails while an entry's version cannot be read, and nothing is written`() {
@@ -168,6 +169,103 @@ class PendingNotesStoreTest {
         // The record goes with its editor, and then the save goes through.
         store.editorClosed(editor)
         assertTrue(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) is SaveOutcome.Saved)
+    }
+
+    @Test fun `with the counter lost after the highest note was pushed, a confirmation does not cover a later save`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        val shown = store.unsynced()
+        assertEquals(UnsyncedNotes(2, 2, false, names = notes("n1", "n2")), shown)
+        // n2, at the highest version, is pushed, and the counter is lost: the rebuild falls to n1's version.
+        assertEquals(SendOutcome.Done, store.completeSend("n2", store.beginSend("n2")!!.version, "r2", blob("landed")))
+        assertTrue(File(dir, "sequence").delete())
+        val typed = saved(store.saveLocal("n1", "b1", "r2", blob("typed after the confirmation"), isCreate = false))
+        assertTrue("above the sequence that was confirmed", typed > shown.sequence)
+        val before = filesOf(dir)
+        assertEquals(DiscardOutcome.Changed(store.unsynced()), store.discardStore(shown))
+        assertEquals("nothing was deleted", before, filesOf(dir))
+        assertArrayEquals(blob("typed after the confirmation"), entry("n1").blob)
+    }
+
+    @Test fun `with the counter lost, text saved after an answer was shown is not covered by it, though the rebuild falls`() {
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        // An instance that handed out no version itself shows the answer.
+        val s = restarted()
+        val shown = s.unsynced()
+        assertEquals(UnsyncedNotes(2, 2, false, names = notes("n1", "n2")), shown)
+        // n1 held the highest version and goes, and the counter is lost: the rebuild falls to n2's version.
+        s.discard("n1")
+        assertTrue(File(dir, "sequence").delete())
+        val typed = saved(s.saveLocal("n1", "b1", "r2", blob("typed after the answer was shown"), isCreate = false))
+        assertTrue("above the sequence that was shown", typed > shown.sequence)
+        val before = filesOf(dir)
+        assertEquals(DiscardOutcome.Changed(s.unsynced()), s.discardStore(shown))
+        assertEquals("nothing was deleted", before, filesOf(dir))
+        assertArrayEquals(blob("typed after the answer was shown"), s.entry("n1").blob)
+    }
+
+    @Test fun `with the counter lost, a save does not give back the sequence an editor was handed`() {
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val s = restarted()
+        val handed = s.observe("n2").sequence
+        s.discard("n1")
+        assertTrue(File(dir, "sequence").delete())
+        s.saveLocal("n1", "b1", "r2", blob("typed later"), isCreate = false)
+        assertTrue(s.observe("n2").sequence > handed)
+    }
+
+    @Test fun `with the counter lost, a note saved again after its entry went does not take the version an upload carries`() {
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        store.saveLocal("n1", "b1", "r1", blob("sent"), isCreate = false)
+        // A new instance, as after a restart, that reads no sequence before the upload starts: only the upload keeps
+        // the next version above the one it carries.
+        val s = restarted()
+        val sent = s.beginSend("n1")!!
+        // n1's entry goes while its upload is in flight, the counter is lost, and n1 is saved again: the rebuild
+        // falls to n2's version.
+        s.discard("n1")
+        assertTrue(File(dir, "sequence").delete())
+        val typed = saved(s.saveLocal("n1", "b1", "r2", blob("typed after the discard"), isCreate = false))
+        assertTrue("above the version that was sent", typed > sent.version)
+        assertTrue(s.completeSend("n1", sent.version, "r1", blob("landed")) is SendOutcome.NewerLocalChange)
+        assertArrayEquals("the new text stays to be sent", blob("typed after the discard"), s.entry("n1").blob)
+    }
+
+    @Test fun `with the counter lost, an instance does not hand out a version it handed out before`() {
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        val handed = saved(store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false))
+        store.discard("n1")
+        assertTrue(File(dir, "sequence").delete())
+        assertTrue(saved(store.saveLocal("n1", "b1", "r2", blob("again"), isCreate = false)) > handed)
+    }
+
+    @Test fun `in one process the sequence an answer carries does not fall when the counter is lost`() {
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val s = restarted()
+        assertEquals(2L, s.unsynced().sequence)
+        s.discard("n1")
+        assertTrue(File(dir, "sequence").delete())
+        assertEquals("n2 alone holds version 1 now", UnsyncedNotes(1, 2, false, names = notes("n2")), s.unsynced())
+        assertEquals(2L, s.observe("n2").sequence)
+        assertFalse("and nothing is written", File(dir, "sequence").exists())
+    }
+
+    @Test fun `an answer shown before a discard that finished does not cover text saved in the store opened after it`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val shown = store.unsynced()
+        assertEquals(DiscardOutcome.Done, store.discardStore(shown))
+        store.unregister()
+        // The discard deleted the counter with the store; the next instance in this process starts above it all
+        // the same.
+        val next = open(dir)
+        val typed = saved(next.saveLocal("n1", "b1", "r2", blob("typed after the discard"), isCreate = false))
+        assertTrue("above the sequence that was shown", typed > shown.sequence)
+        val before = filesOf(dir)
+        assertEquals(DiscardOutcome.Changed(next.unsynced()), next.discardStore(shown))
+        assertEquals("nothing was deleted", before, filesOf(dir))
     }
 
     @Test fun `a lost counter is rebuilt above a first write that recovery cannot commit yet`() {
@@ -216,11 +314,13 @@ class PendingNotesStoreTest {
         assertEquals(Read.Missing, store.read("copy1"))
         assertEquals("r1", entry("n1").revision)
         assertEquals(PendingEntry.State.HELD, entry("n2").state)
-        // Reads take the highest version they can read, and a push needs no new version.
-        assertEquals(v2, store.snapshot { false }.sequence)
-        assertEquals(v2, store.observe("n1").sequence)
-        assertEquals(SendOutcome.Done, store.completeSend("n1", store.beginSend("n1")!!.version, "r1", blob("landed")))
-        assertEquals(Read.Missing, store.read("n1"))
+        // Reads take the highest version they can read, and a push needs no new version. In a new instance, as after
+        // a restart, so that what the reads find on disk alone gives the sequence.
+        val s = restarted()
+        assertEquals(v2, s.snapshot { false }.sequence)
+        assertEquals(v2, s.observe("n1").sequence)
+        assertEquals(SendOutcome.Done, s.completeSend("n1", s.beginSend("n1")!!.version, "r1", blob("landed")))
+        assertEquals(Read.Missing, s.read("n1"))
         assertArrayEquals(counter, File(dir, "sequence").readBytes())
     }
 
@@ -232,8 +332,9 @@ class PendingNotesStoreTest {
         val sequence = File(dir, "sequence")
         assertArrayEquals(PendingCodec.encodeSequence(2), sequence.readBytes())
         sequence.writeBytes(sequence.readBytes().also { it[6] = (it[6].toInt() xor 0x40).toByte() })
-        // Damaged, not written in another layout: no version is left on disk to stay above.
-        assertEquals(1L, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
+        // Damaged, not written in another layout: no version is left on disk to stay above, so a new instance, as
+        // after a restart, starts at 1. The instance that handed out 2 would stay above it.
+        assertEquals(1L, saved(restarted().saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
         assertArrayEquals("written anew", PendingCodec.encodeSequence(1), sequence.readBytes())
     }
 
@@ -245,15 +346,17 @@ class PendingNotesStoreTest {
         assertEquals("while the counter reads, nothing else is looked at",
             v1 + 1, saved(store.saveLocal("n1", "b1", "r2", blob("two"), isCreate = false)))
         assertTrue(File(dir, "sequence").delete())
-        assertThrows(java.io.IOException::class.java) { store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        // A new instance, as after a restart, so that what is on disk alone gives each version below.
+        val s = restarted()
+        assertThrows(java.io.IOException::class.java) { s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
         assertFalse("no counter is written", File(dir, "sequence").exists() || File(dir, "sequence.new").exists())
-        assertEquals(Read.Missing, store.read("n2"))
-        assertEquals("reads pass over them", v1 + 1, store.snapshot { false }.sequence)
+        assertEquals(Read.Missing, s.read("n2"))
+        assertEquals("reads pass over them", v1 + 1, s.snapshot { false }.sequence)
         assertTrue(File(dir, "n1.draft").delete())
-        assertThrows(java.io.IOException::class.java) { store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        assertThrows(java.io.IOException::class.java) { s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
         assertTrue(File(dir, "versions").delete())
         assertEquals("then above every version on disk",
-            v1 + 2, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
+            v1 + 2, saved(s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
     }
 
     @Test fun `a leftover new file of a kind this build does not know is left as it is, and stops new versions`() {
@@ -284,12 +387,14 @@ class PendingNotesStoreTest {
         // With the counter lost, each of them is a file of a kind this build does not know, alone as well.
         assertTrue(File(dir, "sequence").delete())
         assertTrue(File(dir, "y.draft").delete())
-        val save = { s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
+        // A new instance, as after a restart, so that what is on disk alone gives each version below.
+        val t = restarted()
+        val save = { t.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false) }
         assertThrows(java.io.IOException::class.java) { save() }
         assertFalse("no counter is written", File(dir, "sequence").exists() || File(dir, "sequence.new").exists())
         assertFalse("no entry is written", File(dir, "n2.note").exists() || File(dir, "n2.note.new").exists())
-        assertEquals("reads still work", "r1", (s.read("n1") as Read.Present).entry.revision)
-        assertEquals(v1, s.snapshot { false }.sequence)
+        assertEquals("reads still work", "r1", (t.read("n1") as Read.Present).entry.revision)
+        assertEquals(v1, t.snapshot { false }.sequence)
         assertTrue(File(dir, "y.draft.new").delete() && File(dir, "z.draft.new").delete())
         assertThrows("the one that fails the check, alone", java.io.IOException::class.java) { save() }
         assertTrue(File(dir, "x.draft.new").delete())
@@ -1616,8 +1721,9 @@ class PendingNotesStoreTest {
         // And a load would carry sequence 0, below the save that n1 holds.
         assertThrows(java.io.IOException::class.java) { store.observe("n1") }
         PendingNotesStore.listFilesForTesting = null
+        // In a new instance, as after a restart, so that only the rebuild keeps it above.
         assertTrue("it restarts above every version on disk",
-            saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
+            saved(restarted().saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
     }
 
     @Test fun `a damaged version counter is not rebuilt from a listing that fails, and is left as it is`() {
@@ -1633,7 +1739,8 @@ class PendingNotesStoreTest {
         assertThrows(java.io.IOException::class.java) { store.observe("n1") }
         PendingNotesStore.listFilesForTesting = null
         assertEquals(Read.Missing, store.read("n2"))
-        assertTrue(saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
+        // In a new instance, as after a restart, so that only the rebuild keeps it above.
+        assertTrue(saved(restarted().saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
     }
 
     @Test fun `a store directory that is there but cannot be listed is not empty, however far up the walk goes`() {
@@ -1686,10 +1793,12 @@ class PendingNotesStoreTest {
         assertEquals(listOf("n1"), store.scan().entries.map { it.noteUid })
         assertEquals(emptyList<String>(), store.pruneNotebooks())
         assertTrue(File(dir, "sequence").delete())
+        // A new instance, as after a restart, so that only the rebuild keeps the save above.
+        val s = restarted()
         assertTrue("above the version n1 holds",
-            saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
+            saved(s.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)) > v1)
         PendingNotesStore.listFilesForTesting = null
-        assertArrayEquals(blob("key b1"), store.notebook("b1"))
+        assertArrayEquals(blob("key b1"), s.notebook("b1"))
     }
 
     @Test fun `a prune decides from one listing, so a listing above that wrongly shows nothing removes no copy`() {
@@ -1890,8 +1999,9 @@ class PendingNotesStoreTest {
         assertThrows(java.io.IOException::class.java) { store.snapshot { false } }
         PendingNotesStore.presenceForTesting = null
         assertEquals(Read.Missing, store.read("n2"))
+        // In a new instance, as after a restart, so that only the rebuild gives it.
         assertEquals("shown to be lost, it is rebuilt as before",
-            v1 + 1, saved(store.saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
+            v1 + 1, saved(restarted().saveLocal("n2", "b1", "r1", blob("u"), isCreate = false)))
     }
 
     @Test fun `a conflict copy keeps its link while the original it replaced cannot be shown gone`() {
@@ -2154,22 +2264,46 @@ class PendingNotesStoreTest {
     }
 
     @Test fun `a counter that cannot be read, or a lost one that cannot be rebuilt, could not be counted`() {
-        store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false)
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("t"), isCreate = false))
         val sequence = File(dir, "sequence")
         assertTrue(sequence.delete() && sequence.mkdir())
+        // Carrying the highest sequence this instance handed out.
         assertEquals("a counter file that cannot be read at all",
-            UnsyncedNotes(1, 0, unreadable = true, names = notes("n1")), store.unsynced())
+            UnsyncedNotes(1, v1, unreadable = true, names = notes("n1")), store.unsynced())
         // Counted by its name then, an uncommitted write beside the entry counts as a file of its own, under the
         // name of the same note.
         val beside = File(dir, "n1.note.new").also { it.writeBytes(File(dir, "n1.note").readBytes()) }
-        assertEquals(UnsyncedNotes(2, 0, unreadable = true, names = notes("n1")), store.unsynced())
+        assertEquals(UnsyncedNotes(2, v1, unreadable = true, names = notes("n1")), store.unsynced())
         assertTrue(beside.delete() && sequence.delete())
         // As after a downgrade: with the counter lost, the rebuild meets an entry a newer build wrote, at a
         // version this build cannot read. The highest version it can read would not be above that one.
         val newer = PendingEntry("n2", "b1", PendingEntry.State.UPSERT, 7, "r7", false, blob = blob("by a newer build"))
         File(dir, "n2.note").writeBytes(withFormatVersion(PendingCodec.encodeEntry(newer), 3))
-        assertEquals(UnsyncedNotes(2, 0, unreadable = true, names = notes("n1", "n2")), store.unsynced())
+        assertEquals(UnsyncedNotes(2, v1, unreadable = true, names = notes("n1", "n2")), store.unsynced())
         assertFalse("and nothing is written", sequence.exists())
+        assertEquals("a new instance has read none", UnsyncedNotes(2, 0, unreadable = true, names = notes("n1", "n2")),
+            restarted().unsynced())
+    }
+
+    @Test fun `a save between two answers given while the counter cannot be read moves their sequence`() {
+        store.saveLocal("n1", "b1", "r1", blob("shown"), isCreate = false)
+        val sequence = File(dir, "sequence")
+        val counter = sequence.readBytes()
+        assertTrue(sequence.delete() && sequence.mkdir())
+        val shown = store.unsynced()
+        assertTrue(shown.unreadable)
+        // The counter reads again, the note is saved over, and the counter fails again: the same note and the
+        // same number of files, with text that was never shown.
+        assertTrue(sequence.delete())
+        sequence.writeBytes(counter)
+        store.saveLocal("n1", "b1", "r1", blob("typed after the question"), isCreate = false)
+        assertTrue(sequence.delete() && sequence.mkdir())
+        val now = store.unsynced()
+        assertEquals(shown.copy(sequence = now.sequence), now)
+        assertTrue("above the one shown", now.sequence > shown.sequence)
+        assertEquals(DiscardOutcome.Changed(now), store.discardStore(shown))
+        assertEquals("nothing was deleted", setOf("n1.note", "sequence"), dir.list()!!.toSet())
+        assertArrayEquals(blob("typed after the question"), entry("n1").blob)
     }
 
     @Test fun `a file of a kind this build does not know could not be counted, whether or not the counter reads`() {
@@ -2184,8 +2318,8 @@ class PendingNotesStoreTest {
         val alone = setOf("n2.draft")
         assertEquals("on its own", UnsyncedNotes(0, v1, unreadable = true, names = alone), store.unsynced())
         assertTrue(File(dir, "sequence").delete())
-        assertEquals("with the counter lost, the rebuild stops at it as well",
-            UnsyncedNotes(0, 0, unreadable = true, names = alone), store.unsynced())
+        assertEquals("with the counter lost, the rebuild stops at it as well, and the answer keeps what was read",
+            UnsyncedNotes(0, v1, unreadable = true, names = alone), store.unsynced())
         // An uncommitted write of an unknown kind, which recovery leaves as it is, and a directory.
         assertTrue(File(dir, "n2.draft").renameTo(File(dir, "n2.draft.new")))
         val next = restarted()

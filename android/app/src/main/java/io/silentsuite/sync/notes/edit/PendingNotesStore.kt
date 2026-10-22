@@ -71,6 +71,13 @@ internal class PendingNotesStore private constructor(
     private var permitWithdrawn = false
 
     /**
+     * The highest sequence this instance has read from its store, handed out or handed to an upload, and no
+     * lower than a dropped instance of the same directory had ([unregister]). [currentSequence] never answers
+     * below it; see [nextVersion].
+     */
+    private var highWater = 0L
+
+    /**
      * Whether this instance has listed or written the store since it last recorded an acknowledgement, which
      * no longer holds then, even when its withdrawal failed; see [withdrawAcknowledgement].
      */
@@ -408,6 +415,8 @@ internal class PendingNotesStore private constructor(
                 else -> {
                     val updated = e.withSent(e.revision)
                     start = SendStart.Ready(updated)
+                    // The upload carries this version: no note saved again after its entry went may take it.
+                    if (updated.version > highWater) highWater = updated.version
                     if (updated === e) Change.Keep else Change.Write(updated)
                 }
             }
@@ -752,9 +761,10 @@ internal class PendingNotesStore private constructor(
      *
      * The sequence is the one [nextVersion] builds on: the counter, or with the counter lost, cut short or
      * failing its checksum, the strict rebuild ([currentSequence]) from every file that may hold a version
-     * (each entry's header, each landed record, each intact uncommitted write). A counter written in full in
-     * a layout this build does not know, a version that cannot be read, and a file of a kind this build does
-     * not know stop that rebuild, since a newer build may have handed out versions above all of them.
+     * (each entry's header, each landed record, each intact uncommitted write), and never below [highWater],
+     * what this instance has read or handed out or a dropped one had. A counter written in full in a layout
+     * this build does not know, a version that cannot be read, and a file of a kind this build does not know
+     * stop that rebuild, since a newer build may have handed out versions above all of them.
      *
      * A directory that cannot be listed, a read in it that fails, a version that the rebuild cannot read,
      * and a file of a kind this build does not know, whether or not the counter reads, answer "could not be
@@ -764,7 +774,7 @@ internal class PendingNotesStore private constructor(
      * directory shown not to be there by two checks that agree ([shownGone]) lists as empty. After a failed
      * read, or beside a file of an unknown kind, every entry file and every "<uid>.note.new" counts by its name,
      * whatever its state, so the number is of files and one note can count twice. Such an answer still carries
-     * the sequence when [nextVersion] could read it, so a save since moves it, and 0 only when it cannot
+     * the sequence when [nextVersion] could read it, so a save since moves it, and otherwise [highWater]
      * ([uncountedSequence]).
      *
      * A listing that works can still come back short: File.listFiles returns what it read so far, or nothing,
@@ -820,14 +830,16 @@ internal class PendingNotesStore private constructor(
 
     /**
      * The sequence of an answer that could not be counted: the one [nextVersion] builds on, so a save
-     * between two such answers moves it. 0 when that cannot be read, and then no new version can be handed
-     * out either, since [nextVersion] reads it the same way. A counter file that reads needs no listing, so
-     * a store that cannot be listed carries it too.
+     * between two such answers moves it. When that cannot be read, [highWater]: no new version can be
+     * handed out while it cannot, since [nextVersion] reads it the same way, but the counter can read again
+     * between two answers, and a save then moves this on too. 0 only in an instance that has read and
+     * handed out none and follows no dropped instance, as after a restart. A counter file that reads needs no
+     * listing, so a store that cannot be listed carries it too.
      */
     private fun uncountedSequence(): Long = try {
         currentSequence(strict = true)
     } catch (e: IOException) {
-        0L
+        highWater
     }
 
     sealed class DiscardOutcome {
@@ -908,13 +920,13 @@ internal class PendingNotesStore private constructor(
      * 5. The files the count listed go ([deleteAll]), each of a kind this build writes with its write beside it, in
      *    this order: entries and first writes, landed records, then, once a second listing works (or the directory
      *    is shown gone) and shows no note and nothing the count's listing did not hold, notebook copies and anything
-     *    else, the counter, then the directory. With the counter last,
-     *    while the counter file reads, what a discard that stopped leaves keeps its sequence and the count only
-     *    falls, so its permit still covers it. With the counter lost, cut short or failing its checksum, the
-     *    sequence is rebuilt from what is left and can fall, and an answer that could not be counted can become
-     *    a counted one once the file that stopped the count is gone. The permit then no longer covers the
-     *    store: the next call gives [DiscardOutcome.Changed], and the user is asked again. So does a note that a
-     *    short listing left out of the count and a later listing shows, since the confirmation does not name it.
+     *    else, the counter, then the directory. With the counter last, while the counter file reads, what a
+     *    discard that stopped leaves keeps its sequence and the count only falls, so its permit still covers
+     *    it. With the counter lost, cut short or failing its checksum, the sequence is rebuilt from what is left
+     *    and, in a new instance after a restart, can fall, and an answer that could not be counted can become a
+     *    counted one once the file that stopped the count is gone. The permit then no longer covers the store:
+     *    the next call gives [DiscardOutcome.Changed], and the user is asked again. So does a note that a short
+     *    listing left out of the count and a later listing shows, since the confirmation does not name it.
      * 6. [DiscardOutcome.Done] only once the directory is shown gone by two checks that agree ([shownGone]),
      *    and then the permit is removed; a removal that fails then is logged, and the permit is left for the
      *    next new version to withdraw. Otherwise, a failed removal included, the permit stays
@@ -1069,6 +1081,7 @@ internal class PendingNotesStore private constructor(
             if (dropped) return
             check(discarded) { "only a discarded store is dropped" }
             dropped = true
+            floors.merge(dir.path, highWater, ::maxOf)
             registry.remove(dir.path, this)
         }
     }
@@ -1139,20 +1152,33 @@ internal class PendingNotesStore private constructor(
      * of a kind it does not know), it throws, and nothing is written, the counter included. A version that
      * is not above all of them could be one an entry already holds, and a drop or a rebase that checks the
      * version would then take the newer text for the older.
+     *
+     * It is also above [highWater], which [currentSequence] never answers below: every sequence this instance
+     * has read or handed out, the version it handed to an upload, and what a dropped instance of the same
+     * directory had. The store-wide sequence that [observe] hands an editor and that a discard's confirmation
+     * compares must not come back for text saved after it was shown, nor the version an upload carries for a
+     * note saved again after its entry went, and a rebuild after the counter is lost can fall below both, when
+     * the entries that held the highest versions are gone. That bound is kept in memory only. After a
+     * restart a new instance starts from the counter, so an answer a dialog keeps in its arguments across a
+     * restart holds only while the counter reads, as [UnsyncedNotes.covers] says, and one shown before a
+     * discard that finished, which deletes the counter, does not hold at all. The push order, which compares
+     * versions across notes, is bounded the same way.
      */
     private fun nextVersion(): Long {
         withdrawPermit()
         val next = currentSequence(strict = true) + 1
         writeAtomically(File(dir, SEQUENCE), PendingCodec.encodeSequence(next))
+        highWater = next
         return next
     }
 
     /**
      * A discard permit never covers text saved after it, so before the first new version this instance
      * hands out, the store's permit is removed ([PendingNotesDiscardPermits.remove]). Comparing answers
-     * is not enough: with the counter gone and nothing versioned left on disk, versions start at 1 again,
-     * and an answer that could not be counted and carries sequence 0 compares only a number of files. A
-     * removal that cannot be shown throws before the counter or the entry is written. Once shown, it is
+     * is not enough: with the counter gone and nothing versioned left on disk, versions start at 1 again in
+     * a new instance after a restart, and there two answers that could not be counted can carry the same
+     * sequence and compare only files, by number and name ([uncountedSequence]). A removal that cannot be
+     * shown throws before the counter or the entry is written. Once shown, it is
      * not asked again by this instance until a [discardStore], which may leave a permit behind.
      */
     private fun withdrawPermit() {
@@ -1189,9 +1215,11 @@ internal class PendingNotesStore private constructor(
      * is for [nextVersion], it throws, as a version on disk that cannot be read does. A counter file that
      * cannot be read at all throws, and so does one that cannot be shown not to be there ([readIfPresent]):
      * of a counter whose read fails, only one shown to be missing is rebuilt. The readers ([snapshot],
-     * [observe]) take the highest version they can read instead: the value is only compared, never
-     * written, and a push needs no new version, so one file that cannot be read does not stop a run from
-     * pushing the others.
+     * [observe]) take the highest version they can read instead: a push needs no new version, so one file
+     * that cannot be read does not stop a run from pushing the others. What they read is a version on disk
+     * all the same, so it raises [highWater], and the next version goes above it. Whatever it reads, it
+     * answers no lower than [highWater], so in one process the sequence does not fall, also once the counter
+     * is lost.
      *
      * The counter shares [PendingCodec.RECORD_FORMAT_VERSION] with landed records and notebook copies, and
      * the codec reads no other format version, an earlier one included. A build that raises it must keep
@@ -1201,7 +1229,9 @@ internal class PendingNotesStore private constructor(
      */
     private fun currentSequence(strict: Boolean): Long {
         val stored = readIfPresent(File(dir, SEQUENCE))?.let { PendingCodec.decodeSequence(it) }
-        return (stored as? PendingCodec.Decoded.Ok)?.value ?: highestVersion(strict)
+        val sequence = (stored as? PendingCodec.Decoded.Ok)?.value ?: highestVersion(strict)
+        if (sequence > highWater) highWater = sequence
+        return highWater
     }
 
     /**
@@ -1597,6 +1627,13 @@ internal class PendingNotesStore private constructor(
         private val UID = Regex("^[A-Za-z0-9_-]{1,128}$")
         private val registry = ConcurrentHashMap<String, PendingNotesStore>()
 
+        /**
+         * The [highWater] of each directory's dropped instance ([unregister]), which the next instance of that
+         * directory in this process starts from. A discard that finished deletes the counter, and an answer a
+         * dialog showed before it must not cover text saved in the store opened after it.
+         */
+        private val floors = ConcurrentHashMap<String, Long>()
+
         /** Test seams: crash points inside the write, conflict, and sign-out sequences. */
         @Volatile internal var beforeOriginalRemovedForTesting: (() -> Unit)? = null
         @Volatile internal var beforeRenameForTesting: ((File) -> Unit)? = null
@@ -1739,11 +1776,16 @@ internal class PendingNotesStore private constructor(
                 File(dir.parentFile, PendingNotesDiscardPermits.ROOT), syncDirectory, rename, presence),
             identity: (File) -> DirectoryIdentity? = nioIdentity,
         ): PendingNotesStore = registry.computeIfAbsent(dir.canonicalPath) {
-            PendingNotesStore(File(it), syncDirectory, rename, presence, permits, identity)
+            PendingNotesStore(File(it), syncDirectory, rename, presence, permits, identity).apply {
+                highWater = floors[it] ?: 0L
+            }
         }
 
         /** Test seam: forget every instance, as a process restart would. */
-        internal fun resetForTesting() = registry.clear()
+        internal fun resetForTesting() {
+            registry.clear()
+            floors.clear()
+        }
 
         /** Uids come from the server and from collaborators, so they never reach a file name unchecked. */
         internal fun checkedUid(uid: String): String {
