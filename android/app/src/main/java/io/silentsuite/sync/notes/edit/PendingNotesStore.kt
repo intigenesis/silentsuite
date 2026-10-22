@@ -190,13 +190,16 @@ internal class PendingNotesStore private constructor(
 
     /**
      * One consistent view taken under one lock: every header, the full entries the caller asked for,
-     * the files that cannot be read, and the store-wide sequence at that moment.
+     * the files that cannot be read, and the store-wide sequence at that moment. [discardConfirmed] holds the
+     * notes among [headers] whose entry file the store's discard permit names: text the user confirmed for
+     * discard in a discard that has not finished, which is never sent ([startSend]).
      */
     data class Snapshot(
         val headers: List<EntryHeader>,
         val entries: Map<String, PendingEntry>,
         val unreadable: List<Read.Unreadable>,
         val sequence: Long,
+        val discardConfirmed: Set<String> = emptySet(),
     )
 
     /** One note's entry and the store-wide sequence, read together. */
@@ -287,8 +290,10 @@ internal class PendingNotesStore private constructor(
             }
         }
         unreadable += currentRecoveryProblems(headers.mapTo(HashSet()) { it.noteUid })
+        val confirmed = permitNames()
         Snapshot(headers.sortedBy { it.noteUid }, kept, unreadable.sortedBy { it.file },
-            currentSequence(strict = false))
+            currentSequence(strict = false),
+            headers.filter { noteFile(it.noteUid).name in confirmed }.mapTo(HashSet()) { it.noteUid })
     }
 
     /**
@@ -409,8 +414,14 @@ internal class PendingNotesStore private constructor(
      */
     fun beginSend(noteUid: String): PendingEntry? = (startSend(noteUid) as? SendStart.Ready)?.entry
 
-    /** [beginSend] with the reason when nothing is sent, which the push step needs for the run's status. */
+    /**
+     * [beginSend] with the reason when nothing is sent, which the push step needs for the run's status. A note
+     * whose entry file the store's discard permit names is not sent and its file is not touched: the user
+     * confirmed its discard, and a discard that stopped keeps the permit until it finishes, while any save
+     * withdraws it first ([withdrawPermit]). A permit that cannot be read holds nothing back.
+     */
     fun startSend(noteUid: String): SendStart = locked {
+        if (noteFile(noteUid).name in permitNames()) return@locked SendStart.Refused(Refusal.DISCARD_CONFIRMED)
         if (noteUid in unfinishedOriginals) {
             recovered = false
             return@locked SendStart.Refused(Refusal.UNFINISHED_ORIGINAL)
@@ -456,6 +467,8 @@ internal class PendingNotesStore private constructor(
         UNFINISHED_ORIGINAL,
         /** A conflict copy that still carries its origin link. */
         LINKED_COPY,
+        /** Text the store's discard permit names: the user confirmed its discard, which has not finished. */
+        DISCARD_CONFIRMED,
     }
 
     /**
@@ -1239,6 +1252,13 @@ internal class PendingNotesStore private constructor(
         permits.remove(dir.name)
         permitWithdrawn = true
     }
+
+    /**
+     * The files the store's discard permit names, read by path, never listed: what a discard that has not
+     * finished was confirmed for, which is not sent ([startSend], [Snapshot.discardConfirmed]). Empty when
+     * there is no permit, and when it cannot be read, so a damaged permit holds nothing back.
+     */
+    private fun permitNames(): Set<String> = permits.read(dir.name)?.names ?: emptySet()
 
     /**
      * An acknowledgement holds only while the store cannot be listed and is not written ([acknowledged]), so

@@ -199,6 +199,9 @@ internal class NotePushStep(
         val snapshot = store.snapshot { false }
         // A file that cannot be read is kept and reported, and the run never records success over it.
         if (snapshot.unreadable.isNotEmpty()) noteFailure(FailureKind.LOCAL)
+        // Text a discard that has not finished was confirmed for is never sent ([PendingNotesStore.startSend]),
+        // and the run does not record success while it is there.
+        if (snapshot.discardConfirmed.isNotEmpty()) noteFailure(FailureKind.LOCAL)
         // Design 3.3 step 1: a notebook that takes no pushes gets none. The server would accept writes
         // into a deleted notebook that no client shows. Every notebook is looked up before anything is
         // held, so a cache that cannot be read fails the pass before it has written anything.
@@ -250,9 +253,10 @@ internal class NotePushStep(
                     // Design 3.4: while the original's removal keeps failing, neither note is sent, and
                     // the run records a storage failure for the original.
                     Refusal.UNFINISHED_ORIGINAL -> unfinishedOriginal(uid)
-                    // A copy still waiting on its original, or on the write that clears its link, and a
-                    // file that cannot be read: the run does not record success over either.
-                    Refusal.LINKED_COPY, Refusal.UNREADABLE -> noteFailure(FailureKind.LOCAL)
+                    // A copy still waiting on its original, or on the write that clears its link, a file
+                    // that cannot be read, and text confirmed for a discard that has not finished: the run
+                    // does not record success over any of them.
+                    Refusal.LINKED_COPY, Refusal.UNREADABLE, Refusal.DISCARD_CONFIRMED -> noteFailure(FailureKind.LOCAL)
                     Refusal.NOTHING -> Unit
                 }
                 settled += uid

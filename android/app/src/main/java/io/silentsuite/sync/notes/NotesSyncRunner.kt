@@ -256,9 +256,10 @@ internal object NotesSyncRunner {
      * When the cleared instance still counts anything, or cannot be counted, a clear stopped partway and left
      * files on disk: that throws IOException, which the run records as a storage failure, never as a success,
      * and the fetch still runs. An instance dropped since ([PendingNotesStore.unregister]) was cleared in full.
-     * This instance never pushes what a clear that stopped left. After a restart a new instance takes those
-     * files as ordinary waiting changes and pushes them, unless another confirmed sign-out finishes the clear
-     * first. A listing that fails still throws IOException, as before.
+     * This instance never pushes what a clear that stopped left. After a restart a new instance sends none of
+     * the notes the clear's discard permit names ([PendingNotesStore.Snapshot.discardConfirmed]), and the push
+     * step records a storage failure for them, until another confirmed sign-out finishes the clear or a save
+     * withdraws the permit. A listing that fails still throws IOException, as before.
      */
     internal fun waitingIn(store: PendingNotesStore): PendingNotesStore.Snapshot? = try {
         store.snapshot { false }

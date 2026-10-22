@@ -320,6 +320,34 @@ class NotePushStepTest {
         assertTrue(waiting().isEmpty())
     }
 
+    @Test fun `text a discard that has not finished was confirmed for is not sent, and the run is a storage failure`() {
+        save("n1", "confirmed for discard")
+        save("n2", "not named")
+        // As after a restart: the discard permit, which a discard that stopped keeps, names n1 alone.
+        PendingNotesDiscardPermits(File(dir.parentFile, PendingNotesDiscardPermits.ROOT), {}, atomicMove,
+            PendingNotesStore.nioPresence).record(dir.name, UnsyncedNotes(1, 2, false, names = setOf("n1.note")))
+        PendingNotesStore.resetForTesting()
+        val s = PendingNotesStore.open(dir, rename = atomicMove)
+        val kept = File(dir, "n1.note").readBytes()
+        val result = NotePushStep(s, remote, memory, true, { true }) { now }.pass()
+        assertEquals(listOf("n2"), uploaded())
+        assertEquals(FailureKind.LOCAL, result.failure)
+        assertFalse(result.succeeded)
+        assertTrue("n1 is kept as it was", kept.contentEquals(File(dir, "n1.note").readBytes()))
+    }
+
+    @Test fun `held text a discard that has not finished was confirmed for still keeps the run from success`() {
+        save("n1", "confirmed for discard")
+        store.hold("n1", HeldReason.LOST_ACCESS, now)
+        PendingNotesDiscardPermits(File(dir.parentFile, PendingNotesDiscardPermits.ROOT), {}, atomicMove,
+            PendingNotesStore.nioPresence).record(dir.name, UnsyncedNotes(1, 1, false, names = setOf("n1.note")))
+        PendingNotesStore.resetForTesting()
+        val s = PendingNotesStore.open(dir, rename = atomicMove)
+        val result = NotePushStep(s, remote, memory, true, { true }) { now }.pass()
+        assertTrue(uploaded().isEmpty())
+        assertEquals(FailureKind.LOCAL, result.failure)
+    }
+
     @Test fun `a store listing that fails while a notebook's entries are held is a storage failure, not a pass`() {
         save("a", "one")
         server.uploadError = { PermissionDeniedException("no_write_access") }

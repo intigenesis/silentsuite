@@ -116,6 +116,8 @@ class PendingNotesDiscardPermitsTest {
     @Test fun `a permit covers the store as shown across a restart, and a change pushed since does not end it`() {
         store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
         store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        // n1's upload starts before the permit is recorded.
+        val sent = store.beginSend("n1")!!
         val shown = store.unsynced()
         permits.record(store.dir.name, shown)
 
@@ -123,8 +125,9 @@ class PendingNotesDiscardPermitsTest {
         val permit = freshPermits().read(again.dir.name)!!
         assertTrue(permit.covers(again.unsynced()))
         assertTrue("asking does not use it up", permit.covers(again.unsynced()))
-        // A push hands out no new version, so the permit stays, and what is left is still covered.
-        val sent = again.beginSend("n1")!!
+        assertEquals("what the permit names is not sent",
+            PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.DISCARD_CONFIRMED), again.startSend("n2"))
+        // An upload that lands hands out no new version, so the permit stays, and what is left is still covered.
         assertEquals(SendOutcome.Done, again.completeSend("n1", sent.version, "r1", blob("landed")))
         assertEquals(UnsyncedNotes(1, shown.sequence, false, names = setOf("n2.note")), again.unsynced())
         assertEquals(shown, freshPermits().read(again.dir.name))

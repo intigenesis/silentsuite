@@ -2618,6 +2618,51 @@ class PendingNotesStoreTest {
         assertNull(permitsOf(next).read(next.dir.name))
     }
 
+    @Test fun `what a discard that stopped was confirmed for is not sent after a restart, and what its count missed is`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        store.saveLocal("n3", "b1", "r1", blob("missed by the count"), isCreate = false)
+        // The count's listing leaves out n3, as a listing that comes back short can.
+        PendingNotesStore.listFilesForTesting = { d ->
+            val all = d.listFiles()
+            if (all != null && d.name == dir.name) all.filter { it.name != "n3.note" }.toTypedArray() else all
+        }
+        val shown = store.unsynced()
+        assertEquals(notes("n1", "n2"), shown.names)
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw java.io.IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(shown))
+        PendingNotesStore.beforeRemoveForTesting = null
+        PendingNotesStore.listFilesForTesting = null
+
+        val s = restarted()
+        val left = listOf("n1", "n2").filterTo(HashSet()) { File(dir, "$it.note").isFile }
+        assertTrue("n2", "n2" in left)
+        val before = filesOf(dir)
+        assertEquals(PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.DISCARD_CONFIRMED), s.startSend("n2"))
+        assertEquals("n2 is not touched", before, filesOf(dir))
+        assertEquals(left, s.snapshot { false }.discardConfirmed)
+        assertTrue("what the count missed is sent", s.startSend("n3") is PendingNotesStore.SendStart.Ready)
+    }
+
+    @Test fun `a permit holds back what it names until a save withdraws it, and one that cannot be read holds nothing`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val s = restarted()
+        permitsOf(s).record(dir.name, s.unsynced())
+        assertEquals(PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.DISCARD_CONFIRMED), s.startSend("n1"))
+        // A save withdraws the permit first, and the note is sent again.
+        s.saveLocal("n1", "b1", "r2", blob("typed later"), isCreate = false)
+        assertNull(permitsOf(s).read(dir.name))
+        assertTrue(s.startSend("n1") is PendingNotesStore.SendStart.Ready)
+
+        permitsOf(s).record(dir.name, s.unsynced())
+        val next = restarted()
+        val permit = File(permitsOf(next).root, "${dir.name}.permit")
+        permit.writeBytes(permit.readBytes().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 0x01).toByte() })
+        assertNull("a damaged permit is none", permitsOf(next).read(dir.name))
+        assertTrue(next.startSend("n1") is PendingNotesStore.SendStart.Ready)
+        assertTrue(next.snapshot { false }.discardConfirmed.isEmpty())
+    }
+
     @Test fun `a discard that meets more than was shown gives Changed, and writes and deletes nothing`() {
         store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
         val shown = store.unsynced()
