@@ -37,6 +37,13 @@ import java.util.concurrent.ConcurrentHashMap
  * that way could be written over, skipped by a removal that then reports success, or left out of what a
  * run reports.
  *
+ * A store folder that is a symbolic link is never followed: [open] keeps the link's own path and name, and lstat(2),
+ * which does not follow it, tells a link apart ([followable]). Nothing is read, written or deleted through it. While
+ * the folder is a link, or lstat cannot tell, it cannot be counted and is not listed ([unsynced]), every read and
+ * write of it fails at its start, also in an instance that recovered before the link came ([locked]), and [clearAll]
+ * deletes nothing. Its only step is an acknowledgement ([discardStore]), bound to the link's own identity under its
+ * own name, which deletes nothing. Removing the link itself is not offered.
+ *
  * A confirmed discard of the whole store ([discardStore]) runs under the same lock and, when the store holds
  * anything a removal would lose ([UnsyncedNotes.anything]), records a permit outside the store before any
  * file goes ([PendingNotesDiscardPermits]). An instance dropped after it ([unregister]) refuses everything,
@@ -62,6 +69,8 @@ internal class PendingNotesStore private constructor(
     private val permits: PendingNotesDiscardPermits,
     /** The identity of a directory, without following a link; null when it cannot be read. */
     private val identity: (File) -> DirectoryIdentity?,
+    /** Whether lstat shows a path is a symbolic link: false for anything else or ENOENT, null when it fails. */
+    private val link: (File) -> Boolean?,
 ) {
     private val lock = Any()
     private var closed = false
@@ -735,13 +744,16 @@ internal class PendingNotesStore private constructor(
      * throws IOException, whatever the deletion answered, since the deletion counts a file it could not
      * remove as gone when File.exists() says so, and that answers false for a check that failed as well. A
      * caller may rely on a clear only when it returned. A clear writes the store, so it withdraws the store's
-     * acknowledgement first ([acknowledged]), and throws before anything goes when that cannot be shown.
+     * acknowledgement first ([acknowledged]), and throws before anything goes when that cannot be shown. While the
+     * folder is a link, or lstat cannot tell ([followable]), it throws before that and deletes nothing, since the
+     * deletion would follow a link to a directory.
      */
     fun clearAll() {
         synchronized(lock) {
             checkNotDropped()
             closed = true
             beforeClearForTesting?.invoke()
+            if (!followable()) throw IOException(LINKED)
             withdrawAcknowledgement()
             dir.deleteRecursively()
             if (!shownGone(dir)) throw IOException("could not clear the pending store")
@@ -787,6 +799,10 @@ internal class PendingNotesStore private constructor(
      * A listing that works, or a directory shown gone, withdraws the store's acknowledgement, which holds only
      * while the store cannot be listed ([acknowledged]); while that cannot be shown, the store is listed but
      * the answer is "could not be counted", an empty store's included.
+     *
+     * A folder that is a link, or whose lstat cannot tell ([followable]), is not listed and nothing in it is read,
+     * the counter included: the answer is that it could not be counted, with [UnsyncedNotes.listed] false, no
+     * names, and [highWater] for its sequence, and the acknowledgement is not withdrawn.
      */
     fun unsynced(): UnsyncedNotes = synchronized(lock) {
         checkNotDropped()
@@ -798,6 +814,7 @@ internal class PendingNotesStore private constructor(
 
     /** [unsynced], under the store lock. */
     private fun countUnsynced(): Count {
+        if (!followable()) return Count(UnsyncedNotes(0, highWater, unreadable = true, listed = false), names = null)
         val listed = listDirectory(dir)
         if (listed == null && !shownGone(dir)) {
             return Count(UnsyncedNotes(0, uncountedSequence(), unreadable = true, listed = false), names = null)
@@ -915,7 +932,8 @@ internal class PendingNotesStore private constructor(
      *    ([DiscardOutcome.Acknowledged], [acknowledged]), and discardStore does not close the instance. When the
      *    directory's identity cannot be read, or the record fails, no acknowledgement holds for this instance,
      *    though one that reached the disk may read as held for a new one
-     *    ([DiscardOutcome.AcknowledgementNotRecorded]).
+     *    ([DiscardOutcome.AcknowledgementNotRecorded]). A folder that is a link, or whose lstat cannot tell, is
+     *    never listed ([unsynced]), so it gets this step alone, bound to the link's own identity under its own name.
      * 3. When anything is there, a permit for it is recorded ([PendingNotesDiscardPermits.record]) before any
      *    file goes. When that fails, nothing is deleted ([DiscardOutcome.PermitNotRecorded]), though a permit
      *    may be left for the next new version to withdraw.
@@ -1063,8 +1081,9 @@ internal class PendingNotesStore private constructor(
      * store that would list now.
      *
      * The acknowledgement is bound to this store's directory: it is kept under the directory's name, which the
-     * record names as well, with the identity the directory had when it was recorded ([DirectoryIdentity]). It
-     * holds for no other store, and it stops holding:
+     * record names as well, with the identity the directory had when it was recorded ([DirectoryIdentity]), for a
+     * folder that is a link the link's own, read without following it. It holds for no other store, and it stops
+     * holding:
      * - once a listing of the store works, or shows the directory gone, a count included: that listing removes
      *   it, so a later state in which the store cannot be listed needs a new one;
      * - once anything is written to the store or removed from it: every write and removal this build makes
@@ -1112,6 +1131,11 @@ internal class PendingNotesStore private constructor(
      * acknowledgement cannot be shown gone ([listing]), so a new instance does nothing while notes-discard is
      * there but cannot be listed.
      *
+     * While the store's folder is a link, or lstat cannot tell ([followable]), every such operation throws
+     * IOException at its start, before recovery and on every call, also in an instance that recovered before the
+     * link came, so nothing is read, written or deleted through the link. Recovery is then owed again, so it runs
+     * over whatever the folder holds once it can be followed.
+     *
      * [pruneNotebooks] refuses after [clearAll] as well, but runs no recovery: while one is owed it does
      * nothing, and it comes here only when none is, so no recovery runs inside a prune, where a failure
      * would show only as a log line.
@@ -1123,6 +1147,10 @@ internal class PendingNotesStore private constructor(
      */
     private inline fun <T> locked(block: () -> T): T = synchronized(lock) {
         check(!closed) { "the pending store was cleared" }
+        if (depth == 0 && !followable()) {
+            recovered = false
+            throw IOException(LINKED)
+        }
         if (depth == 0 && !recovered) {
             // Done only once it returned with nothing left over: a recovery that ends with an error
             // that is not an I/O failure (out of memory on a large entry) runs again as well.
@@ -1223,6 +1251,14 @@ internal class PendingNotesStore private constructor(
 
     private fun identityOf(d: File): DirectoryIdentity? =
         identityForTesting.let { if (it != null) it(d) else identity(d) }
+
+    /**
+     * Whether the store's folder may be followed: lstat shows it is not a symbolic link, or is not there. A folder
+     * that is a link is not, and neither is one whose lstat fails, since it may be one. It is asked at the start of
+     * each operation, under the store lock, so it does not see a link that something outside this process puts in
+     * the folder's place while the operation runs.
+     */
+    private fun followable(): Boolean = linkForTesting.let { if (it != null) it(dir) else link(dir) } == false
 
     /**
      * The last version handed out. A counter that is lost, cut short or fails its checksum is rebuilt as
@@ -1664,6 +1700,7 @@ internal class PendingNotesStore private constructor(
         private const val NOTEBOOK = ".notebook"
         private const val NEW = ".new"
         private const val SEQUENCE = "sequence"
+        private const val LINKED = "the pending store folder is a link, or lstat cannot tell"
         private val UID = Regex("^[A-Za-z0-9_-]{1,128}$")
         private val registry = ConcurrentHashMap<String, PendingNotesStore>()
 
@@ -1785,6 +1822,40 @@ internal class PendingNotesStore private constructor(
             }
         }
 
+        /**
+         * Test seam: what a check of whether the path it is given is a symbolic link answers in place of the store's
+         * own; null is a check that failed, which the store takes for a link ([followable]).
+         */
+        @Volatile internal var linkForTesting: ((File) -> Boolean?)? = null
+
+        /**
+         * Whether lstat(2) through java.nio shows a symbolic link, for the JVM tests, which cannot call [Os]:
+         * NoSuchFileException is ENOENT, which is no link, and any other failure is unknown. A store on a device
+         * gets [lstatLink] through [forIdentity].
+         */
+        private val nioLink: (File) -> Boolean? = { path ->
+            try {
+                Files.readAttributes(path.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                    .isSymbolicLink
+            } catch (e: NoSuchFileException) {
+                false
+            } catch (e: IOException) {
+                null
+            }
+        }
+
+        /**
+         * Whether lstat(2), which does not follow a link, shows one: ENOENT is no link, and any other errno is
+         * unknown.
+         */
+        private val lstatLink: (File) -> Boolean? = { path ->
+            try {
+                OsConstants.S_ISLNK(Os.lstat(path.path).st_mode)
+            } catch (e: ErrnoException) {
+                if (e.errno == OsConstants.ENOENT) false else null
+            }
+        }
+
         /** rename(2) through File.renameTo: on Android and Linux it replaces the target in one step. */
         private val renameTo: (File, File) -> Unit = { from, to ->
             if (!from.renameTo(to)) throw IOException("could not replace ${to.name}")
@@ -1804,8 +1875,14 @@ internal class PendingNotesStore private constructor(
          * replace an existing target in one step; JVM tests on Windows pass a java.nio atomic move. The
          * default [presence] is for the JVM tests; a store on a device is opened through [forIdentity]. So are
          * the default [permits], in a root beside [dir] ([forIdentity] keeps every permit in
-         * noBackupFilesDir/notes-discard), and the default [identity]. The first opener's functions and permits
-         * are the ones kept.
+         * noBackupFilesDir/notes-discard), and the default [identity] and [link]. The first opener's functions and
+         * permits are the ones kept.
+         *
+         * The folders above [dir] are resolved to their canonical path, and [dir]'s own name is kept as given, never
+         * resolved: the instance's [PendingNotesStore.dir], and the key it is registered under, are that parent and
+         * that name. So a store folder that is a link is opened at the link, never at what it points to: it never
+         * shares an instance with its target, and its permit and acknowledgement are never filed under the target's
+         * name. [dir] must name a folder of its own, not "." or "..".
          */
         fun open(
             dir: File,
@@ -1815,9 +1892,15 @@ internal class PendingNotesStore private constructor(
             permits: PendingNotesDiscardPermits = PendingNotesDiscardPermits(
                 File(dir.parentFile, PendingNotesDiscardPermits.ROOT), syncDirectory, rename, presence),
             identity: (File) -> DirectoryIdentity? = nioIdentity,
-        ): PendingNotesStore = registry.computeIfAbsent(dir.canonicalPath) {
-            PendingNotesStore(File(it), syncDirectory, rename, presence, permits, identity).apply {
-                highWater = floors[it] ?: 0L
+            link: (File) -> Boolean? = nioLink,
+        ): PendingNotesStore {
+            val given = dir.absoluteFile
+            val parent = given.parentFile
+            require(parent != null && given.name != "." && given.name != "..") { "not a store folder of its own" }
+            return registry.computeIfAbsent(File(parent.canonicalFile, given.name).path) {
+                PendingNotesStore(File(it), syncDirectory, rename, presence, permits, identity, link).apply {
+                    highWater = floors[it] ?: 0L
+                }
             }
         }
 
@@ -1875,13 +1958,13 @@ internal class PendingNotesStore private constructor(
         /** Outside backup and device transfer, and outside the Etebase cache's per-username directories. */
         fun forIdentity(context: Context, accountType: String, accountName: String, creationId: String) =
             forNoBackup(context.noBackupFilesDir, accountType, accountName, creationId, androidDirectorySync,
-                androidRename, lstatPresence, lstatIdentity)
+                androidRename, lstatPresence, lstatIdentity, lstatLink)
 
         /**
          * [forIdentity] in [noBackup]: the store in notes-pending, and its discard permit and acknowledgement in
          * a root of their own beside notes-pending, so they stay readable when notes-pending cannot be listed.
-         * JVM tests pass their own [syncDirectory] and [rename], and keep the default [presence] and
-         * [identity], which are for them.
+         * JVM tests pass their own [syncDirectory] and [rename], and keep the default [presence], [identity] and
+         * [link], which are for them.
          */
         internal fun forNoBackup(
             noBackup: File,
@@ -1892,8 +1975,9 @@ internal class PendingNotesStore private constructor(
             rename: (File, File) -> Unit,
             presence: (File) -> Presence = nioPresence,
             identity: (File) -> DirectoryIdentity? = nioIdentity,
+            link: (File) -> Boolean? = nioLink,
         ) = open(identityDir(noBackup, accountType, accountName, creationId), syncDirectory, rename, presence,
             PendingNotesDiscardPermits(File(noBackup, PendingNotesDiscardPermits.ROOT), syncDirectory, rename,
-                presence), identity)
+                presence), identity, link)
     }
 }

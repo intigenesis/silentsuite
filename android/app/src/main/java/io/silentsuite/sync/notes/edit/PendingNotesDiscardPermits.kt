@@ -47,6 +47,7 @@ internal class PendingNotesDiscardPermits(
      * record kind of its own.
      */
     fun read(store: String): UnsyncedNotes? {
+        onReadForTesting?.invoke(file(store))
         val bytes = try {
             file(store).readBytes()
         } catch (e: IOException) {
@@ -90,6 +91,7 @@ internal class PendingNotesDiscardPermits(
      * ([PendingNotesStore.acknowledged]), and it is never a permit.
      */
     fun acknowledgement(store: String): PendingNotesStore.DirectoryIdentity? {
+        onReadForTesting?.invoke(acknowledgementFile(store))
         val bytes = try {
             acknowledgementFile(store).readBytes()
         } catch (e: IOException) {
@@ -197,5 +199,8 @@ internal class PendingNotesDiscardPermits(
 
         /** Test seam: a failure point before a permit or acknowledgement is deleted, which leaves it as it is. */
         @Volatile internal var beforeDeleteForTesting: ((File) -> Unit)? = null
+
+        /** Test seam: called with the file before a permit ([read]) or an acknowledgement is read. */
+        @Volatile internal var onReadForTesting: ((File) -> Unit)? = null
     }
 }

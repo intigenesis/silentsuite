@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.provider.CalendarContract
 import android.system.Os
+import android.system.OsConstants
 import android.widget.ListView
 import android.widget.TextView
 import androidx.lifecycle.Lifecycle
@@ -1895,6 +1896,41 @@ class NotesSyncBoundaryRuntimeTest {
         }
         assertNotNull(store.notebook(notebook))
         assertNotNull(store.notebook(home))
+
+        // A store folder that is a link is never followed. The folder, holding both changes, is moved aside and a
+        // link to it takes its place: nothing is read or pushed through the link, nothing in the folder changes, the
+        // link stays, and the run is a storage failure. The fetch still runs.
+        uploadNote(notebook, "Through a link", "Newest", mtime = 6_000L)
+        val aside = File(context.noBackupFilesDir, "notes-link-target-${System.nanoTime()}")
+        assertTrue(storeDir.renameTo(aside))
+        val heldAside = aside.listFiles()!!.associate { it.name to it.readBytes() }
+        assertTrue("both changes are in it: ${heldAside.keys}",
+            heldAside.keys.containsAll(setOf("${note.uid}.note", "${list.uid}.note")))
+        val beforeLink = status(account, "gen-unreadable")
+        val throughLink = fake.requests.size
+        try {
+            Os.symlink(aside.path, storeDir.path)
+            syncNow(account, "gen-unreadable")
+            assertEquals("nothing was pushed", emptyList<String>(), uploads(throughLink))
+            assertTrue("the fetch still ran", "Through a link" in cachedNotes(account, notebook))
+            status(account, "gen-unreadable").let {
+                assertEquals("a failure, not a success: $it", SyncStatusStore.TerminalResult.FAILURE,
+                    it.lastTerminalResult)
+                assertEquals(SyncStatusStore.FailureCategory.STORAGE, it.lastFailureCategory)
+                assertTrue("recorded by this run", it.lastFailureAt!! > beforeLink.lastFailureAt!!)
+            }
+            assertTrue("the link is still there", OsConstants.S_ISLNK(Os.lstat(storeDir.path).st_mode))
+            assertEquals(aside.path, Os.readlink(storeDir.path))
+            assertSameFiles("the folder the link points to", heldAside,
+                aside.listFiles()!!.associate { it.name to it.readBytes() })
+        } finally {
+            // The store's own folder comes back, so the step below still holds.
+            if (runCatching { OsConstants.S_ISLNK(Os.lstat(storeDir.path).st_mode) }.getOrDefault(false)) {
+                Os.remove(storeDir.path)
+            }
+            aside.renameTo(storeDir)
+        }
+        assertSameFiles("the store's folder is back", heldAside, filesOnDisk(store))
         // Once the store can be listed again, both changes go out.
         syncNow(account, "gen-unreadable")
         assertEquals("Second phone edit", itemManager(notebook).fetch(note.uid).contentString)

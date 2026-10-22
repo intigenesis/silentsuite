@@ -15,10 +15,14 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 
 class PendingNotesStoreTest {
     @get:Rule val tmp = TemporaryFolder()
@@ -45,8 +49,10 @@ class PendingNotesStoreTest {
         PendingNotesStore.listFilesForTesting = null
         PendingNotesStore.presenceForTesting = null
         PendingNotesStore.identityForTesting = null
+        PendingNotesStore.linkForTesting = null
         PendingNotesDiscardPermits.beforeRecordForTesting = null
         PendingNotesDiscardPermits.beforeDeleteForTesting = null
+        PendingNotesDiscardPermits.onReadForTesting = null
         PendingNotesStore.resetForTesting()
     }
 
@@ -3366,6 +3372,215 @@ class PendingNotesStoreTest {
         assertEquals(listOf("n1"), fresh.scan().entries.map { it.noteUid })
         assertNotNull(fresh.beginSend("n1"))
         assertEquals(UnsyncedNotes(1, v, false, names = notes("n1")), fresh.unsynced())
+    }
+
+    // ---- a store folder that is a link: never followed ----
+
+    /** A symbolic link at [at] to [target], or a skip where this machine cannot make one. */
+    private fun linked(at: File, target: File) {
+        assertTrue("the link's folder is there", at.parentFile!!.isDirectory)
+        val made = try {
+            Files.createSymbolicLink(at.toPath(), target.toPath())
+            true
+        } catch (e: java.io.IOException) {
+            false
+        } catch (e: UnsupportedOperationException) {
+            false
+        }
+        assumeTrue("this machine cannot make a symbolic link", made)
+    }
+
+    /**
+     * Every path at and below [root] as lstat shows it, no link followed: a link by what it points to, a directory
+     * as null, a file by its bytes. A path that is not there gives nothing.
+     */
+    private fun treeOf(root: File): Map<String, List<Byte>?> {
+        val tree = HashMap<String, List<Byte>?>()
+        fun walk(f: File, name: String) {
+            val path = f.toPath()
+            when {
+                Files.isSymbolicLink(path) -> tree[name] = "-> ${Files.readSymbolicLink(path)}".toByteArray().toList()
+                Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) -> {
+                    tree[name] = null
+                    for (child in f.listFiles()!!) walk(child, "$name/${child.name}")
+                }
+                Files.exists(path, LinkOption.NOFOLLOW_LINKS) -> tree[name] = f.readBytes().toList()
+            }
+        }
+        walk(root, root.name)
+        return tree
+    }
+
+    /**
+     * Stand-ins for lstat's numbers ([inodes]) of any path that is there, read without following a link: a link has
+     * one of its own, and a directory that takes a link's place has another.
+     */
+    private fun identifyWithoutFollowing() {
+        PendingNotesStore.identityForTesting = { d ->
+            val read = try {
+                Files.readAttributes(d.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            } catch (e: java.io.IOException) {
+                null
+            }
+            read?.let {
+                val key = (if (it.isSymbolicLink) "link " else "") + d.path
+                PendingNotesStore.DirectoryIdentity(device = 7, inode = inodes.getOrPut(key) { ++lastInode })
+            }
+        }
+    }
+
+    /**
+     * Store A's folder made a link to [target], given store B beside it, which holds a saved note. A is not B's
+     * instance and keeps the link's name; it could not be counted and is not listed; nothing is read, written or
+     * sent through it, on every call; its only step is an acknowledgement under its own name; and a clear deletes
+     * nothing. The target, B and the link are as they were, and no permit or record is read but A's own.
+     */
+    private fun assertLinkNeverFollowed(target: (PendingNotesStore) -> File) {
+        identifyWithoutFollowing()
+        val noBackup = tmp.newFolder("no_backup")
+        val b = identityStore(noBackup, creationId = "gen-2")
+        b.saveLocal("n1", "b1", "r1", blob("B's own note"), isCreate = false, notebookCopy = blob("key b1"))
+        val to = target(b)
+        val folder = PendingNotesStore.identityDir(noBackup, "io.silentsuite", "alice@example.invalid", "gen-1")
+        linked(folder, to)
+        val tree = treeOf(to)
+        val bFiles = filesOf(b.dir)
+        val bCount = b.unsynced()
+        val pointsAt = Files.readSymbolicLink(folder.toPath())
+        val read = ArrayList<String>()
+        PendingNotesDiscardPermits.onReadForTesting = { read += it.name }
+
+        val a = identityStore(noBackup)
+        assertNotSame("a link never shares its target's instance", b, a)
+        assertEquals("the link's own name", folder.name, a.dir.name)
+        val shown = a.unsynced()
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true, listed = false), shown)
+        repeat(2) {
+            assertThrows(java.io.IOException::class.java) { a.scan() }
+            assertThrows(java.io.IOException::class.java) { a.read("n1") }
+            assertThrows(java.io.IOException::class.java) { a.snapshot { true } }
+            assertThrows(java.io.IOException::class.java) {
+                a.saveLocal("n2", "b1", "r1", blob("typed"), isCreate = false)
+            }
+            assertThrows(java.io.IOException::class.java) { a.startSend("n1") }
+            assertThrows(java.io.IOException::class.java) { a.putNotebook("b1", blob("key b1")) }
+        }
+        assertEquals("a prune with a recovery owed lists nothing", emptyList<String>(), a.pruneNotebooks())
+
+        assertEquals("B's own answer covers nothing here", DiscardOutcome.Changed(shown), a.discardStore(bCount))
+        assertFalse(a.acknowledged())
+        assertEquals(DiscardOutcome.Acknowledged, a.discardStore(shown))
+        assertTrue(a.acknowledged())
+        assertEquals("a record under the link's own name, and nothing under B's or the target's",
+            listOf(folder.name + ".acknowledgement"), File(noBackup, "notes-discard").list()!!.toList())
+        assertThrows(java.io.IOException::class.java) { a.clearAll() }
+        assertTrue("a clear refused withdraws nothing", a.acknowledged())
+        assertThrows("a clear refused still closes the instance", IllegalStateException::class.java) { a.scan() }
+
+        assertEquals("the target, byte for byte", tree, treeOf(to))
+        assertEquals("B's files", bFiles, filesOf(b.dir))
+        assertEquals("B's count", bCount, b.unsynced())
+        assertTrue("the link is still a link", Files.isSymbolicLink(folder.toPath()))
+        assertEquals("to the same path", pointsAt, Files.readSymbolicLink(folder.toPath()))
+        assertEquals("no permit or record read but the link's own", setOf(folder.name + ".acknowledgement"),
+            read.toSet())
+    }
+
+    @Test fun `a store folder that is a link to another store is never followed, only acknowledged`() =
+        assertLinkNeverFollowed { b -> b.dir }
+
+    @Test fun `a store folder that is a link to a file is never followed, only acknowledged`() =
+        assertLinkNeverFollowed { tmp.newFile("plain").also { it.writeBytes(blob("not a store")) } }
+
+    @Test fun `a store folder that is a link to nothing is never followed, only acknowledged`() =
+        assertLinkNeverFollowed { File(tmp.root, "missing") }
+
+    @Test fun `an instance that recovered over its folder refuses everything once a link takes the folder's place`() {
+        identifyWithoutFollowing()
+        val s = identityStore()
+        val v = saved(s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false, notebookCopy = blob("key b1")))
+        val editor = s.editorOpened("n1")
+        assertEquals(UnsyncedNotes(1, v, false, names = notes("n1")), s.unsynced())
+        // The same folder, moved aside, with a link to it in its place: it holds the same, and is not followed.
+        val aside = File(s.dir.parentFile!!.parentFile!!, "aside")
+        assertTrue(s.dir.renameTo(aside))
+        linked(s.dir, aside)
+        val held = filesOf(aside)
+        val shown = s.unsynced()
+        assertEquals("not counted through the link", UnsyncedNotes(0, v, unreadable = true, listed = false), shown)
+        assertThrows("a recovered instance's prune", java.io.IOException::class.java) { s.pruneNotebooks() }
+        assertEquals("a recovery is owed from then on", emptyList<String>(), s.pruneNotebooks())
+        repeat(2) {
+            assertThrows(java.io.IOException::class.java) { s.read("n1") }
+            assertThrows(java.io.IOException::class.java) { s.scan() }
+            assertThrows(java.io.IOException::class.java) { s.saveLocal(editor, "n1", "b1", "r2", blob("b"), false) }
+            assertThrows(java.io.IOException::class.java) { s.beginSend("n1") }
+        }
+        assertThrows(java.io.IOException::class.java) { s.snapshot { true } }
+        assertThrows(java.io.IOException::class.java) { s.observe("n1") }
+        assertThrows(java.io.IOException::class.java) { s.completeSend("n1", v, "r1", blob("landed")) }
+        assertThrows(java.io.IOException::class.java) { s.recordFailure("n1", v, "TRANSIENT", now = 1) }
+        assertThrows(java.io.IOException::class.java) { s.hold("n1", HeldReason.READ_ONLY, now = 1) }
+        assertThrows(java.io.IOException::class.java) { s.release("n1") }
+        assertThrows(java.io.IOException::class.java) { s.discard("n1") }
+        assertThrows(java.io.IOException::class.java) { s.landed("n1") }
+        assertThrows(java.io.IOException::class.java) { s.clearLanded("n1") }
+        assertThrows(java.io.IOException::class.java) { s.notebook("b1") }
+        assertThrows(java.io.IOException::class.java) { s.putNotebook("b1", blob("key")) }
+        assertThrows(java.io.IOException::class.java) { s.editorOpened("n2") }
+        assertThrows(java.io.IOException::class.java) { s.editorClosed(editor) }
+        assertEquals(DiscardOutcome.Acknowledged, s.discardStore(shown))
+        assertTrue(s.acknowledged())
+        assertEquals("nothing was read, written or deleted through it", held, filesOf(aside))
+
+        // The real folder back in the link's place is not what was acknowledged, and the instance recovers over it
+        // and works again.
+        Files.delete(s.dir.toPath())
+        assertTrue(aside.renameTo(s.dir))
+        assertFalse(s.acknowledged())
+        assertTrue(s.read("n1") is Read.Present)
+        assertNull("the listing removed the record", permitsOf(s).acknowledgement(s.dir.name))
+        assertEquals(UnsyncedNotes(1, v, false, names = notes("n1")), s.unsynced())
+        assertTrue(s.saveLocal(editor, "n1", "b1", "r2", blob("b"), isCreate = false) is SaveOutcome.Saved)
+    }
+
+    @Test fun `a store folder whose lstat cannot tell is taken for a link, and nothing is read or deleted`() {
+        identifyDirectories()
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup)
+        val v = saved(s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false, notebookCopy = blob("key b1")))
+        val before = filesOf(s.dir)
+        val asked = HashSet<String>()
+        PendingNotesStore.linkForTesting = { d -> asked += d.path; null }
+        val shown = s.unsynced()
+        assertEquals(UnsyncedNotes(0, v, unreadable = true, listed = false), shown)
+        assertThrows(java.io.IOException::class.java) { s.pruneNotebooks() }
+        repeat(2) {
+            assertThrows(java.io.IOException::class.java) { s.scan() }
+            assertThrows(java.io.IOException::class.java) { s.read("n1") }
+            assertThrows(java.io.IOException::class.java) {
+                s.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+            }
+            assertThrows(java.io.IOException::class.java) { s.beginSend("n1") }
+        }
+        assertEquals(DiscardOutcome.Acknowledged, s.discardStore(shown))
+        assertTrue(s.acknowledged())
+        assertEquals("nothing was read, written or deleted", before, filesOf(s.dir))
+
+        // Once lstat tells, the folder is followed again.
+        PendingNotesStore.linkForTesting = null
+        assertTrue(s.read("n1") is Read.Present)
+        assertFalse(s.acknowledged())
+        // A new instance, as after a restart, is refused before its recovery, and its clear deletes nothing.
+        PendingNotesStore.linkForTesting = { d -> asked += d.path; null }
+        PendingNotesStore.resetForTesting()
+        val fresh = identityStore(noBackup)
+        assertThrows(java.io.IOException::class.java) { fresh.scan() }
+        assertEquals(UnsyncedNotes(0, 0, unreadable = true, listed = false), fresh.unsynced())
+        assertThrows(java.io.IOException::class.java) { fresh.clearAll() }
+        assertThrows("a clear refused still closes the instance", IllegalStateException::class.java) { fresh.scan() }
+        assertEquals(before, filesOf(s.dir))
+        assertEquals("only the store's own folder was asked about", setOf(s.dir.path), asked)
     }
 
     @Test fun `a dropped store refuses everything, and the next open starts empty and takes a save`() {
