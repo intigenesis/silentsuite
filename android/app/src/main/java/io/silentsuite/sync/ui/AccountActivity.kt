@@ -118,6 +118,7 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
     private var signOutOnly = false
     private var renderedSignOutErrorId = 0L
     private var signOutCompletionHandled = false
+    private var unsyncedNotesReadInFlight = false
     // Hidden for this account-screen visit only; "Don't show again" lives in AppPreferences.
     private var taskAppReminderDismissed = false
     @VisibleForTesting
@@ -692,12 +693,37 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
         // A sign-out message that is still showing goes while the question is asked. When a dialog
         // reports that it ended without a sign-out and the last attempt failed, it is shown again.
         signOutErrorSnackbar?.dismiss()
-        when (val next = UnsyncedNotesSignOutPolicy.start(signOutModel.unsyncedNotes())) {
-            is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
-                showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
-            else -> confirmPlainLogout()
+        withUnsyncedNotes { unsynced ->
+            when (val next = UnsyncedNotesSignOutPolicy.start(unsynced)) {
+                is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
+                    showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
+                else -> confirmPlainLogout()
+            }
         }
     }
+
+    /**
+     * Reads what this account's pending Notes store holds that has not synced, on IO, and hands the
+     * answer to [then] on the main thread. The read takes the store's lock, the lock every save
+     * takes, so it never runs on the main thread. One read at a time: while one is in flight,
+     * another call does nothing, so a second tap never asks a second question. A read that ends
+     * after this screen is destroyed hands nothing on.
+     */
+    private fun withUnsyncedNotes(then: (UnsyncedNotes) -> Unit) {
+        if (unsyncedNotesReadInFlight) return
+        unsyncedNotesReadInFlight = true
+        lifecycleScope.launch {
+            val unsynced = try {
+                withContext(Dispatchers.IO) { signOutModel.unsyncedNotes() }
+            } finally {
+                unsyncedNotesReadInFlight = false
+            }
+            then(unsynced)
+        }
+    }
+
+    @VisibleForTesting
+    internal fun unsyncedNotesReadInFlightForTesting() = unsyncedNotesReadInFlight
 
     /**
      * The sign-out question with the words it had before, asked when the store's answer, read right
@@ -746,16 +772,18 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
             onSignOutDialogClosedWithoutSignOut()
             return
         }
-        when (val next = UnsyncedNotesSignOutPolicy.answered(answer, shown, signOutModel.unsyncedNotes())) {
-            UnsyncedNotesSignOutPolicy.Next.AskPlain -> confirmPlainLogout()
-            is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
-                showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
-            is UnsyncedNotesSignOutPolicy.Next.ShowDiscard ->
-                showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.DISCARD, next.unsynced)
-            UnsyncedNotesSignOutPolicy.Next.SyncNotes -> syncNotesBeforeSignOut(identity)
-            is UnsyncedNotesSignOutPolicy.Next.ConfirmAndSignOut -> {
-                signOutModel.confirmNotesDiscard(next.shown)
-                signOutModel.begin()
+        withUnsyncedNotes { now ->
+            when (val next = UnsyncedNotesSignOutPolicy.answered(answer, shown, now)) {
+                UnsyncedNotesSignOutPolicy.Next.AskPlain -> confirmPlainLogout()
+                is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
+                    showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)
+                is UnsyncedNotesSignOutPolicy.Next.ShowDiscard ->
+                    showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.DISCARD, next.unsynced)
+                UnsyncedNotesSignOutPolicy.Next.SyncNotes -> syncNotesBeforeSignOut(identity)
+                is UnsyncedNotesSignOutPolicy.Next.ConfirmAndSignOut -> {
+                    signOutModel.confirmNotesDiscard(next.shown)
+                    signOutModel.begin()
+                }
             }
         }
     }
@@ -796,15 +824,17 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     /**
      * Retry from the failure message. After a failed removal or a clear of the Notes store that
-     * stopped, the coordinator has withdrawn the discard confirmation, so the store is read again
-     * and, when it holds anything, the count is shown before a new try. After a failed cleanup the
-     * retry starts at once and shows no dialog.
+     * stopped, the coordinator has withdrawn the discard confirmation, so the store is read again,
+     * on IO, and, when it holds anything, the count is shown before a new try. After a failed
+     * cleanup nothing is read: the retry starts at once and shows no dialog.
      */
     private fun retrySignOut(failed: CurrentAccountSignOutState) {
-        val unsynced = if (failed is CurrentAccountSignOutState.CleanupFailed) UnsyncedNotes.NOTHING
-            else signOutModel.unsyncedNotes()
-        if (unsynced.anything) showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, unsynced)
-        else signOutModel.begin()
+        val retry: (UnsyncedNotes) -> Unit = { unsynced ->
+            if (unsynced.anything) showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, unsynced)
+            else signOutModel.begin()
+        }
+        if (failed is CurrentAccountSignOutState.CleanupFailed) retry(UnsyncedNotes.NOTHING)
+        else withUnsyncedNotes(retry)
     }
 
     /**

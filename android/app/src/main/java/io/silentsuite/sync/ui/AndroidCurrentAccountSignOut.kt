@@ -21,6 +21,11 @@ import io.silentsuite.sync.resource.LocalAddressBook
 import io.silentsuite.sync.syncadapter.SyncStatusStore
 import io.silentsuite.sync.utils.AndroidCompat
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 fun interface ExactAccountStatusCleanup {
     fun clear(identity: ExactAccountIdentity): Boolean
@@ -171,6 +176,37 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
     private var exactAccount: ExactAccountIdentity? = null
     private var coordinator: CurrentAccountSignOutCoordinator? = null
 
+    /**
+     * Where the coordinator's store steps run: on IO, each handing its result back on the main thread. The scope
+     * is not the view model's own and is never canceled, so a sign-out past its count runs to its end after the
+     * screen is gone, as the removal's answer always did.
+     */
+    private val steps = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /** Steps started and not ended. Main thread only. */
+    private var inFlight = 0
+
+    /** Whether [onCleared] ran. The seams are closed once no step is in flight. Main thread only. */
+    private var cleared = false
+
+    private val offMain = object : CurrentAccountSignOutCoordinator.OffMain {
+        override fun <T> run(work: () -> T, then: (T) -> Unit) {
+            inFlight++
+            steps.launch {
+                try {
+                    then(withContext(Dispatchers.IO) { work() })
+                } finally {
+                    inFlight--
+                    if (cleared && inFlight == 0) coordinator?.close()
+                }
+            }
+        }
+
+        override fun onMain(block: () -> Unit) {
+            steps.launch { block() }
+        }
+    }
+
     fun initialize(account: Account, creationId: String) {
         val identity = ExactAccountIdentity(account.type, account.name, creationId)
         if (exactAccount == identity) return
@@ -179,7 +215,8 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
         val appContext = getApplication<Application>().applicationContext
         coordinator = CurrentAccountSignOutCoordinator(
             seamsFactory?.invoke(appContext, account, creationId)
-                ?: AndroidCurrentAccountSignOut(appContext, account, creationId)
+                ?: AndroidCurrentAccountSignOut(appContext, account, creationId),
+            offMain,
         ) { mutableState.postValue(it) }
     }
 
@@ -198,6 +235,10 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
     internal fun hasObservedMainGenerationInvalidation() =
         coordinator?.hasObservedMainGenerationInvalidation() == true
 
+    /** The coordinator's store steps in flight. Main thread only. */
+    @VisibleForTesting
+    internal fun stepsInFlight() = inFlight
+
     fun begin() = coordinator?.begin()
 
     /** The exact account this owner was initialized for, or null before that. */
@@ -211,7 +252,7 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
 
     /**
      * What this account's pending Notes store holds that has not synced, as the coordinator answers it. Nothing
-     * before [initialize].
+     * before [initialize]. It reads the store, so the screen asks it on IO.
      */
     internal fun unsyncedNotes(): UnsyncedNotes =
         exactAccount?.let { coordinator?.unsyncedNotes(it) } ?: UnsyncedNotes.NOTHING
@@ -223,8 +264,10 @@ class CurrentAccountSignOutViewModel(application: Application) : AndroidViewMode
 
     internal fun acknowledgeRefusal() { coordinator?.acknowledgeRefusal() }
 
+    /** A step in flight still uses the seams, so they are closed only once the last one ends. */
     override fun onCleared() {
-        coordinator?.close()
+        cleared = true
+        if (inFlight == 0) coordinator?.close()
         super.onCleared()
     }
 }

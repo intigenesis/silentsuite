@@ -319,9 +319,15 @@ class UnsyncedNotesSignOutPolicyTest {
             "if (identity == null || supportFragmentManager.isStateSaved) {\n            $hook\n            return\n"))
         val retry = body(activity, "private fun retrySignOut(failed: CurrentAccountSignOutState) {")
         assertTrue("before the removal Retry reads the store, and it starts at once only when nothing is there",
-            retry.contains("if (failed is CurrentAccountSignOutState.CleanupFailed) UnsyncedNotes.NOTHING\n" +
-                "            else signOutModel.unsyncedNotes()") &&
+            retry.contains("if (failed is CurrentAccountSignOutState.CleanupFailed) retry(UnsyncedNotes.NOTHING)\n" +
+                "        else withUnsyncedNotes(retry)") &&
                 retry.contains("if (unsynced.anything) showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, " +
-                    "unsynced)\n        else signOutModel.begin()"))
+                    "unsynced)\n            else signOutModel.begin()"))
+        // The screen reads the store in one place, on IO, and the three that ask use what it hands back.
+        assertEquals("one read of the store", 1, Regex("signOutModel\\.unsyncedNotes\\(\\)").findAll(activity).count())
+        assertTrue("and it runs on IO", body(activity, "private fun withUnsyncedNotes(then: (UnsyncedNotes) -> Unit) {")
+            .contains("withContext(Dispatchers.IO) { signOutModel.unsyncedNotes() }"))
+        assertTrue("the question reads through it", confirm.contains("withUnsyncedNotes { unsynced ->"))
+        assertTrue("so does an answer", answer.contains("withUnsyncedNotes { now ->"))
     }
 }

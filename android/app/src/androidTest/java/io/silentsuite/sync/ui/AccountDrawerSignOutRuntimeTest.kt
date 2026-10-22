@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.DialogInterface
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.os.SystemClock
 import android.view.View
 import android.widget.TextView
@@ -217,11 +218,14 @@ class AccountDrawerSignOutRuntimeTest {
                     val model = androidx.lifecycle.ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java]
                     model.begin()
                     model.begin()
-                    assertEquals(1, fake.removeCalls)
                 }
+                // The count, and the clear with the removal request, run off the main thread.
+                settle(scenario)
+                assertEquals(1, fake.removeCalls)
                 scenario.recreate()
                 fake.callback!!(false)
-                InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+                // The answer is taken on the main thread, and the store is reopened off it before the failure shows.
+                settle(scenario)
                 scenario.onActivity { activity ->
                     assertTrue(activity.findViewById<com.google.android.material.navigation.NavigationView>(R.id.nav_view)
                         .menu.findItem(R.id.nav_logout).isEnabled)
@@ -407,6 +411,9 @@ class AccountDrawerSignOutRuntimeTest {
                 scenario.onActivity { activity ->
                     androidx.lifecycle.ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java].begin()
                 }
+                // The removal is asked for off the main thread, once the store steps before it have ended.
+                settle(scenario)
+                assertEquals(1, fake.removeCalls)
                 // The platform row disappears while the retained coordinator still awaits its
                 // callback. The recreated Activity must attach to that coordinator before trying
                 // to validate its now-stale explicit route.
@@ -467,19 +474,25 @@ class AccountDrawerSignOutRuntimeTest {
         fun snackbarText(activity: AccountActivity) =
             activity.findViewById<TextView>(com.google.android.material.R.id.snackbar_text)?.text?.toString()
         fun model(activity: AccountActivity) = ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java]
+        // The screen reads the store on IO before it asks anything, so the drawer's Sign out settles too.
         fun signOutFromDrawer(scenario: ActivityScenario<AccountActivity>) {
             scenario.onActivity { activity ->
                 activity.onNavigationItemSelected(requireNotNull(
                     activity.findViewById<com.google.android.material.navigation.NavigationView>(R.id.nav_view)
                         .menu.findItem(R.id.nav_logout)))
             }
-            instrumentation.waitForIdleSync()
+            settle(scenario)
         }
-        // AlertDialog posts the button's listener and its own dismissal to the main looper, so a tap
-        // waits until the main thread is idle.
-        fun tap(scenario: ActivityScenario<AccountActivity>, step: UnsyncedNotesSignOutPolicy.Step, button: Int) {
+        // AlertDialog posts the button's listener and its own dismissal to the main looper, so a click
+        // waits until the main thread is idle. A tap then waits until the store reads and steps it
+        // started have settled; a click does not, for a step that is held.
+        fun click(scenario: ActivityScenario<AccountActivity>, step: UnsyncedNotesSignOutPolicy.Step, button: Int) {
             scenario.onActivity { activity -> dialogOf(activity, step)!!.getButton(button).performClick() }
             instrumentation.waitForIdleSync()
+        }
+        fun tap(scenario: ActivityScenario<AccountActivity>, step: UnsyncedNotesSignOutPolicy.Step, button: Int) {
+            click(scenario, step, button)
+            settle(scenario)
         }
         fun assertNoDialog(scenario: ActivityScenario<AccountActivity>) {
             scenario.onActivity { activity ->
@@ -591,19 +604,21 @@ class AccountDrawerSignOutRuntimeTest {
                     assertEquals("the snackbar is the one from before the refused tap", before, after)
                 }
                 fake.clear = PendingNotesStore.DiscardOutcome.Done
-                // A sign-out that is refused does not count as started. Nothing is confirmed now, so this
-                // begin() is refused in the same call, before anything is canceled.
+                // Nothing is confirmed now, so this begin() is refused at its count, which runs off the main
+                // thread, before anything is canceled. A sign-out whose count is in flight has not started.
                 since = fake.calls.size
                 scenario.onActivity { activity ->
                     model(activity).begin()
-                    assertFalse("a refused sign-out does not count as started", model(activity).hasStarted())
+                    assertFalse("a sign-out whose count is in flight has not started", model(activity).hasStarted())
                 }
-                instrumentation.waitForIdleSync()
+                settle(scenario)
                 scenario.onActivity { activity ->
                     assertEquals("the screen acknowledged the refusal", CurrentAccountSignOutState.Idle,
                         model(activity).currentState())
+                    assertNotNull("the count is shown again", dialogOf(activity, count))
                 }
-                assertFalse("nothing was canceled", callsSince(since).contains(cancel))
+                assertEquals("the coordinator's count, then the screen's after the refusal; nothing canceled",
+                    listOf("count", "count"), callsSince(since))
 
                 // 8. A count that throws: both dialogs say the changes could not be counted, never nothing and
                 // never a number. Cancel on the confirmation asks for no sign-out.
@@ -651,21 +666,55 @@ class AccountDrawerSignOutRuntimeTest {
 
                 // 10. The confirmation survives a recreation, and its own button confirms and starts the
                 // sign-out, in this order: counted at the answer and before anything is canceled, the sync
-                // canceled, the store asked to clear what the dialog showed, and only then the removal.
+                // canceled, the store asked to clear what the dialog showed, and only then the removal. The
+                // clear is held, and the screen is created again while it is: the sign-out goes on in the
+                // view model, and the screen that comes back is the one that shows a sign-out under way.
                 signOutFromDrawer(scenario)
                 tap(scenario, count, neutral)
                 scenario.recreate()
-                instrumentation.waitForIdleSync()
+                settle(scenario)
                 scenario.onActivity { activity ->
                     assertNull("no count dialog after the recreation", dialogOf(activity, count))
                 }
                 since = fake.calls.size
-                tap(scenario, discard, positive)
-                assertEquals(listOf("count", "count", cancel, "clear:${UnsyncedNotes(2, 8, false)}", "remove"),
+                fake.holdClear()
+                click(scenario, discard, positive)
+                fake.awaitClear()
+                assertEquals("the clear is under way, and the removal waits for it",
+                    listOf("count", "count", cancel, "clear:${UnsyncedNotes(2, 8, false)}"), callsSince(since))
+                scenario.recreate()
+                scenario.onActivity { activity ->
+                    assertEquals(CurrentAccountSignOutState.Removing, model(activity).currentState())
+                    assertTrue("the clear is still in flight", model(activity).stepsInFlight() > 0)
+                    assertTrue("the recreated screen keeps the sign-out", model(activity).hasStarted())
+                }
+                assertEquals(0, fake.removeCalls)
+
+                // 11. The screen closes for good while the clear is still held. A sign-out past its count
+                // goes on without it: the clear ends, the removal is still asked for, and the seams are
+                // closed only after that. The removal then fails, from a thread of its own: its answer is
+                // still taken on the main thread and the store reopened off it, so the steps' scope
+                // outlived the screen, and the seams are closed again once that step ended.
+                scenario.moveToState(Lifecycle.State.DESTROYED)
+                assertFalse("nothing is closed while the clear is in flight", "close" in callsSince(since))
+                fake.releaseClear()
+                waitUntil("the removal to be asked for once the screen is gone") { fake.removeCalls == 1 }
+                waitUntil("the seams to be closed after the last step") { "close" in fake.calls }
+                assertEquals(listOf("count", "count", cancel, "clear:${UnsyncedNotes(2, 8, false)}", "remove", "close"),
                     callsSince(since))
+                val answer = requireNotNull(fake.removal) { "the removal's callback" }
+                answer(false)
+                waitUntil("the store to be reopened after the failed removal") { "reopen" in fake.calls }
+                waitUntil("the seams to be closed after the reopening") { fake.calls.count { it == "close" } == 2 }
+                assertEquals(listOf("count", "count", cancel, "clear:${UnsyncedNotes(2, 8, false)}", "remove", "close",
+                    "reopen", "close"), callsSince(since))
                 assertEquals(1, fake.removeCalls)
+                assertEquals("no count, clear, removal request or reopening ran on the main thread",
+                    emptyList<String>(), fake.onMainThread.toList())
             }
         } finally {
+            // A held clear is let go, so no thread is left waiting on it.
+            fake.releaseClear()
             // Notes goes off first, so a platform sync of this account that ends now asks for no Notes
             // run. Then what is queued is canceled and waited for, and only then is the stand-in taken
             // away.
@@ -680,11 +729,12 @@ class AccountDrawerSignOutRuntimeTest {
         }
     }
 
+    /** The removal is asked for off the main thread, so what it leaves is read across threads. */
     private class DelayedFailureSeams(account: Account) : CurrentAccountSignOutCoordinator.Seams {
         private val identity = ExactAccountIdentity(account.type, account.name, "failure-generation")
-        var removeCalls = 0
+        @Volatile var removeCalls = 0
         var destructiveCleanupCalls = 0
-        var callback: ((Boolean) -> Unit)? = null
+        @Volatile var callback: ((Boolean) -> Unit)? = null
         override fun snapshot() = CurrentAccountSignOutSnapshot(identity, emptyList(), listOf(identity))
         override fun cancelSync(identity: Pair<String, String>) = Unit
         override fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit) {
@@ -714,9 +764,9 @@ class AccountDrawerSignOutRuntimeTest {
         private val sibling: ExactAccountIdentity,
     ) : CurrentAccountSignOutCoordinator.Seams {
         private val targetIdentity = ExactAccountIdentity(target.type, target.name, generation)
-        var absent = false
-        var removeCalls = 0
-        var callback: ((Boolean) -> Unit)? = null
+        @Volatile var absent = false
+        @Volatile var removeCalls = 0
+        @Volatile var callback: ((Boolean) -> Unit)? = null
         override fun snapshot() = CurrentAccountSignOutSnapshot(targetIdentity, emptyList(), listOf(targetIdentity, sibling))
         override fun cancelSync(identity: Pair<String, String>) = Unit
         override fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit) {
@@ -736,23 +786,49 @@ class AccountDrawerSignOutRuntimeTest {
     }
 
     /**
-     * Seams that report unsynced Notes changes and never answer the removal, so the sign-out stays in
-     * progress and the screen stays. Every count, cancel, clear of the store, removal and reopening is
-     * logged in order ([calls]); what the clear answers can be set, and the count can be made to throw.
-     * They touch no store, sync or account, and every cleanup step answers yes.
+     * Seams that report unsynced Notes changes and never answer the removal themselves, so the sign-out
+     * stays in progress and the screen stays; a test can answer it ([removal]). Every count, cancel,
+     * clear of the store, removal, reopening and close is logged in order ([calls]); what the clear
+     * answers can be set, the count can be made to throw, and the next clear can be held
+     * ([holdClear]). A count, clear, removal request or reopening made on the main thread is logged in
+     * [onMainThread] as well. They touch no store, sync or account, and every cleanup step answers yes.
      */
     private class UnsyncedNotesSeams(account: Account, generation: String) : CurrentAccountSignOutCoordinator.Seams {
         private val identity = ExactAccountIdentity(account.type, account.name, generation)
         @Volatile var unsynced = UnsyncedNotes(2, 7, false)
         @Volatile var countThrows = false
         @Volatile var clear: PendingNotesStore.DiscardOutcome = PendingNotesStore.DiscardOutcome.Done
-        /** "count", "cancel:<name>", "clear:<the confirmed answer>", "remove" and "reopen", in the order asked. */
+        /** "count", "cancel:<name>", "clear:<the confirmed answer>", "remove", "reopen" and "close", in the order asked. */
         val calls = CopyOnWriteArrayList<String>()
+        /** The counts, clears, removal requests and reopenings made on the main thread. */
+        val onMainThread = CopyOnWriteArrayList<String>()
         @Volatile var removeCalls = 0
+        /** The callback of the last removal request, kept so a test can answer it. */
+        @Volatile var removal: ((Boolean) -> Unit)? = null
+        @Volatile private var held: CountDownLatch? = null
+        @Volatile private var arrived: CountDownLatch? = null
+
+        /** Holds the next clear, once it is asked for, until [releaseClear]. */
+        fun holdClear() {
+            arrived = CountDownLatch(1)
+            held = CountDownLatch(1)
+        }
+
+        /** Waits until the held clear has been asked for. */
+        fun awaitClear() = assertTrue("the held clear was asked for", arrived!!.await(10, TimeUnit.SECONDS))
+
+        fun releaseClear() { held?.countDown() }
+
+        private fun asked(call: String) {
+            calls += call
+            if (Thread.currentThread() === Looper.getMainLooper().thread) onMainThread += call
+        }
+
         override fun snapshot() = CurrentAccountSignOutSnapshot(identity, emptyList(), listOf(identity))
         override fun cancelSync(identity: Pair<String, String>) { calls += "cancel:${identity.second}" }
         override fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit) {
-            calls += "remove"
+            asked("remove")
+            removal = callback
             removeCalls++
         }
         override fun mainGenerationAbsent(main: ExactAccountIdentity) = false
@@ -763,13 +839,38 @@ class AccountDrawerSignOutRuntimeTest {
         override fun removeAndVerifyChildren(snapshot: CurrentAccountSignOutSnapshot, callback: (Boolean) -> Unit) =
             callback(true)
         override fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes {
-            calls += "count"
+            asked("count")
             if (countThrows) throw IllegalStateException("cannot look")
             return unsynced
         }
-        override fun discardPendingNotes(main: ExactAccountIdentity, confirmed: UnsyncedNotes?) =
-            clear.also { calls += "clear:$confirmed" }
-        override fun reopenPendingNotes(main: ExactAccountIdentity) { calls += "reopen" }
+        override fun discardPendingNotes(main: ExactAccountIdentity, confirmed: UnsyncedNotes?): PendingNotesStore.DiscardOutcome {
+            asked("clear:$confirmed")
+            arrived?.countDown()
+            held?.let { check(it.await(30, TimeUnit.SECONDS)) { "the held clear was never let go" } }
+            held = null
+            return clear
+        }
+        override fun reopenPendingNotes(main: ExactAccountIdentity) { asked("reopen") }
+        override fun close() { calls += "close" }
+    }
+
+    /**
+     * Waits until the screen reads no pending Notes store and the sign-out has no store step in
+     * flight, with the main thread idle before each look. It looks twice in a row: a step that ends
+     * posts its state, and showing that state can start another read.
+     */
+    private fun settle(scenario: ActivityScenario<AccountActivity>) {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        fun quiet(): Boolean {
+            instrumentation.waitForIdleSync()
+            var quiet = false
+            scenario.onActivity { activity ->
+                quiet = !activity.unsyncedNotesReadInFlightForTesting() &&
+                    ViewModelProvider(activity)[CurrentAccountSignOutViewModel::class.java].stepsInFlight() == 0
+            }
+            return quiet
+        }
+        waitUntil("the sign-out's store reads and steps to end") { quiet() && quiet() }
     }
 
     private fun removeAccountAndWait(manager: AccountManager, account: Account) {

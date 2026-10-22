@@ -76,15 +76,40 @@ sealed class CurrentAccountSignOutState {
  * that fails or stops keeps the account, so another confirmed sign-out can finish it, and so does one that
  * deletes nothing because the store cannot be listed, where the confirmation is only an acknowledgement.
  * A refused attempt and one whose clear failed keep no snapshot.
+ *
+ * Every call that reaches the pending Notes store, and the request for the removal, runs off the main thread,
+ * through [offMain]: the count, one step that clears the store and, only once the clear is shown finished,
+ * asks for the removal, with nothing in between, and the reopening of a cleared store. The state, the refusal,
+ * the cancels, the removal's answer and cleanup stay on the main thread. While a step is in flight, [begin]
+ * starts nothing, and an attempt past its count runs to its end.
  * Internal, since its seams speak of the pending Notes store's own types.
  */
 internal class CurrentAccountSignOutCoordinator(
     private val seams: Seams,
+    private val offMain: OffMain = OffMain.INLINE,
     private val onStateChanged: (CurrentAccountSignOutState) -> Unit = {}
 ) {
+    /**
+     * Where the coordinator's store steps run. [run] runs work off the main thread and hands its result to
+     * then on the main thread; [onMain] runs a block on the main thread. [INLINE] runs both at once on the
+     * caller's thread: the unit tests use it, and so do callers that are not on the main thread.
+     */
+    interface OffMain {
+        fun <T> run(work: () -> T, then: (T) -> Unit)
+        fun onMain(block: () -> Unit)
+
+        companion object {
+            val INLINE = object : OffMain {
+                override fun <T> run(work: () -> T, then: (T) -> Unit) = then(work())
+                override fun onMain(block: () -> Unit) = block()
+            }
+        }
+    }
+
     interface Seams {
         fun snapshot(): CurrentAccountSignOutSnapshot?
         fun cancelSync(identity: Pair<String, String>)
+        /** Asked off the main thread. [callback] may come on any thread; the coordinator takes it on the main one. */
         fun removeMain(main: ExactAccountIdentity, callback: (Boolean) -> Unit)
         fun mainGenerationAbsent(main: ExactAccountIdentity): Boolean
         fun clearCache(main: ExactAccountIdentity): Boolean
@@ -115,6 +140,17 @@ internal class CurrentAccountSignOutCoordinator(
     private var mainRemovalConfirmed = false
     private var nextErrorId = 1L
 
+    /** Steps handed to [offMain] whose result has not come back. [begin] starts nothing while one is in flight. */
+    private var stepsInFlight = 0
+
+    /**
+     * Whether the attempt under way has taken the removal's answer, or the failure of its request. The answer
+     * and the end of the step that asked for it come back separately, in either order. The end of the step
+     * counts only when the request threw and no answer came first; after that, or after an answer, nothing
+     * more is taken.
+     */
+    private var removalAnswered = false
+
     /**
      * The user's separate confirmation that unsynced Notes changes may be discarded: the account it was given
      * for, and the answer it was given for. Only the last one is kept. The next attempt takes it for itself, and
@@ -126,7 +162,7 @@ internal class CurrentAccountSignOutCoordinator(
     init { onStateChanged(state) }
 
     fun begin() {
-        if (state is CurrentAccountSignOutState.Removing ||
+        if (stepsInFlight > 0 || state is CurrentAccountSignOutState.Removing ||
             state is CurrentAccountSignOutState.CleaningUp ||
             state is CurrentAccountSignOutState.Complete) return
         val given = confirmation.also { confirmation = null }
@@ -145,15 +181,20 @@ internal class CurrentAccountSignOutCoordinator(
             mainRemovalConfirmed = true
             // The account is gone already, so there is no removal to clear the store before and nothing to
             // refuse. The store goes only when it holds nothing unsynced or the confirmation covers what it
-            // holds; any other stays on disk without an account. Cleanup goes on whatever the answer.
-            runCatching { seams.discardPendingNotes(captured.main, confirmed) }
-            cleanup(captured)
+            // holds; any other stays on disk without an account. Cleanup goes on whatever the answer. The
+            // attempt is cleaning up from before the clear, so nothing else starts while it runs.
+            transition(CurrentAccountSignOutState.CleaningUp)
+            step({ runCatching { seams.discardPendingNotes(captured.main, confirmed) } }) { cleanup(captured) }
             return
         }
 
         // The gate, before anything is canceled. A count that throws is an answer that could not be counted,
         // never nothing, and a confirmation given for that answer covers it.
-        val now = unsyncedNotes(captured.main)
+        step({ unsyncedNotes(captured.main) }) { now -> counted(captured, confirmed, now) }
+    }
+
+    /** The gate's answer [now], back on the main thread: the refusal, or the cancels and the clear. */
+    private fun counted(captured: CurrentAccountSignOutSnapshot, confirmed: UnsyncedNotes?, now: UnsyncedNotes) {
         if (now.anything && confirmed?.covers(now) != true) {
             refuse()
             return
@@ -167,50 +208,84 @@ internal class CurrentAccountSignOutCoordinator(
             failRemoval()
             return
         }
-        // Cleared before the removal, under the store's own lock. Only a clear shown finished (Done) lets the
-        // removal go ahead; one that fails, stops or deletes nothing keeps the account.
-        when (runCatching { seams.discardPendingNotes(captured.main, confirmed) }.getOrNull()) {
-            PendingNotesStore.DiscardOutcome.Done -> Unit
+        removalAnswered = false
+        // Cleared before the removal, under the store's own lock, and the removal asked for in the same step,
+        // so nothing comes between them. Only a clear shown finished (Done) lets the removal be asked for; one
+        // that fails, stops or deletes nothing keeps the account. The step gives back the clear's outcome and
+        // whether the removal's request threw.
+        step({
+            val outcome = runCatching { seams.discardPendingNotes(captured.main, confirmed) }.getOrNull()
+            var removalThrew = false
+            if (outcome == PendingNotesStore.DiscardOutcome.Done) {
+                try {
+                    seams.removeMain(captured.main) { removed ->
+                        offMain.onMain { answerRemoval(captured, removed, now.anything) }
+                    }
+                } catch (_: Exception) {
+                    removalThrew = true
+                }
+            }
+            outcome to removalThrew
+        }) { (outcome, removalThrew) -> cleared(captured, outcome, removalThrew, now.anything) }
+    }
+
+    /**
+     * The clear's [outcome], back on the main thread. After a clear shown finished, the removal was asked for
+     * in the same step, and its answer may come before this or after it ([answerRemoval]); here the attempt
+     * fails only when the request threw and no answer came first. [notesDiscarded]: the store held unsynced
+     * changes the user confirmed.
+     */
+    private fun cleared(
+        captured: CurrentAccountSignOutSnapshot,
+        outcome: PendingNotesStore.DiscardOutcome?,
+        removalThrew: Boolean,
+        notesDiscarded: Boolean,
+    ) {
+        when (outcome) {
+            PendingNotesStore.DiscardOutcome.Done -> if (removalThrew && !removalAnswered &&
+                state is CurrentAccountSignOutState.Removing) {
+                removalAnswered = true
+                failRemovalAfterClear(captured.main, notesDiscarded)
+            }
             // A change saved since the gate counted, or more than was confirmed: nothing was cleared.
-            is PendingNotesStore.DiscardOutcome.Changed -> {
-                refuse()
-                return
-            }
+            is PendingNotesStore.DiscardOutcome.Changed -> refuse()
             // The store could not be listed: nothing was deleted, and the confirmation is only an acknowledgement.
-            PendingNotesStore.DiscardOutcome.Acknowledged -> {
+            PendingNotesStore.DiscardOutcome.Acknowledged ->
                 failNotesClear(false, CurrentAccountSignOutState.NotesClearFailed.Acknowledgement.RECORDED)
-                return
-            }
-            PendingNotesStore.DiscardOutcome.AcknowledgementNotRecorded -> {
+            PendingNotesStore.DiscardOutcome.AcknowledgementNotRecorded ->
                 failNotesClear(false, CurrentAccountSignOutState.NotesClearFailed.Acknowledgement.NOT_RECORDED)
-                return
-            }
             // The permit could not be recorded, so nothing was deleted.
-            PendingNotesStore.DiscardOutcome.PermitNotRecorded -> {
-                failNotesClear(false)
-                return
-            }
+            PendingNotesStore.DiscardOutcome.PermitNotRecorded -> failNotesClear(false)
             // A clear that stopped, or threw, which can happen while it deletes, may have removed part of the store.
-            else -> {
-                failNotesClear(now.anything)
-                return
-            }
+            else -> failNotesClear(notesDiscarded)
         }
-        try {
-            seams.removeMain(captured.main) { removed ->
-                if (state !is CurrentAccountSignOutState.Removing) return@removeMain
-                if (removed && runCatching { seams.mainGenerationAbsent(captured.main) }.getOrDefault(false)) {
-                    mainRemovalConfirmed = true
-                    cleanup(captured)
-                } else failRemovalAfterClear(captured.main, now.anything)
-            }
-        } catch (_: Exception) {
-            if (state is CurrentAccountSignOutState.Removing) failRemovalAfterClear(captured.main, now.anything)
+    }
+
+    /**
+     * The removal's answer, on the main thread. It counts only while the attempt removes, and only when nothing
+     * was taken before it: no other answer, and no failed request ([removalAnswered]).
+     */
+    private fun answerRemoval(captured: CurrentAccountSignOutSnapshot, removed: Boolean, notesDiscarded: Boolean) {
+        if (removalAnswered || state !is CurrentAccountSignOutState.Removing) return
+        removalAnswered = true
+        if (removed && runCatching { seams.mainGenerationAbsent(captured.main) }.getOrDefault(false)) {
+            mainRemovalConfirmed = true
+            cleanup(captured)
+        } else failRemovalAfterClear(captured.main, notesDiscarded)
+    }
+
+    /** Runs [work] through [offMain], then [then] with its result on the main thread; in flight until then. */
+    private fun <T> step(work: () -> T, then: (T) -> Unit) {
+        stepsInFlight++
+        offMain.run(work) { result ->
+            stepsInFlight--
+            then(result)
         }
     }
 
     private fun cleanup(captured: CurrentAccountSignOutSnapshot) {
-        transition(CurrentAccountSignOutState.CleaningUp)
+        // An account found gone already is cleaning up from before its clear.
+        if (state !is CurrentAccountSignOutState.CleaningUp) transition(CurrentAccountSignOutState.CleaningUp)
         val replacement = AccountSwitcherPolicy.replacement(captured.main, captured.eligibleSiblings)
         val essentialCleanup = runCatching {
             if (!seams.clearCache(captured.main) || !seams.clearStatus(captured.main)) null
@@ -261,11 +336,13 @@ internal class CurrentAccountSignOutCoordinator(
     /**
      * The store was cleared and the removal then failed, so the account stays and its cleared store instance is
      * dropped, for its Notes to keep working. The state says that the store was cleared, so the message never says
-     * that local data were preserved. [notesDiscarded]: the store held unsynced changes the user confirmed.
+     * that local data were preserved. [notesDiscarded]: the store held unsynced changes the user confirmed. The
+     * store is reopened off the main thread, and the attempt stays removing until that ends.
      */
     private fun failRemovalAfterClear(main: ExactAccountIdentity, notesDiscarded: Boolean) {
-        runCatching { seams.reopenPendingNotes(main) }
-        transition(CurrentAccountSignOutState.RemovalFailed(nextErrorId++, notesDiscarded, notesCleared = true))
+        step({ runCatching { seams.reopenPendingNotes(main) } }) {
+            transition(CurrentAccountSignOutState.RemovalFailed(nextErrorId++, notesDiscarded, notesCleared = true))
+        }
     }
 
     private fun transition(next: CurrentAccountSignOutState) {
@@ -282,7 +359,10 @@ internal class CurrentAccountSignOutCoordinator(
     fun isMainGenerationPresent(main: ExactAccountIdentity) =
         !runCatching { seams.mainGenerationAbsent(main) }.getOrDefault(true)
 
-    /** The seam's answer. When the seam throws, the answer is that the changes could not be counted, never nothing. */
+    /**
+     * The seam's answer. When the seam throws, the answer is that the changes could not be counted, never nothing.
+     * It reads the store, so it is asked off the main thread, and it touches no state of the coordinator.
+     */
     fun unsyncedNotes(main: ExactAccountIdentity): UnsyncedNotes =
         runCatching { seams.unsyncedNotes(main) }.getOrDefault(UnsyncedNotes(0, 0, unreadable = true))
 

@@ -2243,10 +2243,12 @@ class NotesSyncBoundaryRuntimeTest {
 
     @Test fun signOutWhileAPushIsInFlightLetsItsLateAnswerWriteNothing() {
         // What this case shows about the push is in the request log: one upload, and no request after
-        // it. A confirmed sign-out clears the account's pending store under its lock before it removes
-        // the account, so the store's files cannot be compared after it. The case checks instead that a
-        // sign-out without the confirmation touches nothing, that a clear that stops keeps the account
-        // and every file, that a store that cannot be listed gets an acknowledgement, deletes nothing and
+        // it but those of one run after a restart, which uploads nothing. A confirmed sign-out clears the
+        // account's pending store under its lock before it removes the account, so the store's files
+        // cannot be compared after it. The case checks instead that a sign-out without the confirmation
+        // touches nothing, that a clear that stops keeps the account and every file, that after a restart
+        // a run sends nothing that clear's permit names, records a storage failure and still fetches,
+        // that a store that cannot be listed gets an acknowledgement, deletes nothing and
         // keeps the account, that the files go while the account row is still there, that the directory
         // stays gone after the late answer, and that the cleared store refuses a late save. Whether the
         // store, its permit and its acknowledgement are there is read from listings that must work, never
@@ -2312,6 +2314,37 @@ class NotesSyncBoundaryRuntimeTest {
         assertStillHeld(held.heldAt)
         val permitBytes = permit.readBytes()
 
+        // Then a restart: a new store instance takes the old one's place, here and in the steps below, and a
+        // real run sends nothing the permit names. Its push step records a storage failure, nothing is
+        // uploaded, and the fetch still runs. The canceled run still waits for its answer on the account's
+        // own worker, so this run is made on the test's thread.
+        PendingNotesStore.resetForTesting()
+        val restarted = pending(account, "gen-push-out")
+        assertFalse("a new instance after the restart", restarted === held.store)
+        assertFalse("the note from the web is not cached yet", "From the web" in cachedNotes(account, notebook))
+        forgetLastListing(account.name)
+        val restartRun = fake.requests.size
+        assertEquals("no request followed the held upload before this run", held.through, restartRun)
+        NotesSyncRunner.run(context, account, "gen-push-out", NotesSyncRunner.Request(requestId = null, manual = true))
+        assertEquals("nothing was uploaded", emptyList<String>(), uploads(restartRun))
+        assertTrue("the fetch still ran", "From the web" in cachedNotes(account, notebook))
+        status(account, "gen-push-out").let {
+            assertEquals("a failure, not a success: $it", SyncStatusStore.TerminalResult.FAILURE, it.lastTerminalResult)
+            assertEquals(SyncStatusStore.FailureCategory.STORAGE, it.lastFailureCategory)
+        }
+        assertEquals("the snapshot names both changes", setOf(note.uid, list.uid),
+            restarted.snapshot { false }.discardConfirmed)
+        // The run refreshed the notebook's copy, so the files are read again for the steps below; the
+        // changes themselves are byte for byte what the stopped sign-out left.
+        val kept = filesOnDisk(restarted)
+        assertEquals("no file came or went", held.files.keys, kept.keys)
+        for (name in held.files.keys.filter { it.endsWith(".note") }) {
+            assertArrayEquals("$name is untouched", held.files.getValue(name), kept.getValue(name))
+        }
+        assertArrayEquals("the permit stays as it was", permitBytes, permit.readBytes())
+        val afterRestart = fake.requests.size
+        assertStillHeld(held.heldAt)
+
         // 3. A confirmed sign-out while the store's directory cannot be listed deletes nothing. What the
         // user confirmed was shown as changes that could not be counted, and the store takes it only as an
         // acknowledgement bound to its directory, never as a permit. The account stays, and its removal is
@@ -2319,7 +2352,7 @@ class NotesSyncBoundaryRuntimeTest {
         val removals = AtomicInteger()
         PendingNotesStore.listFilesForTesting = { d -> if (d == held.store.dir) null else d.listFiles() }
         try {
-            val unlisted = held.store.unsynced()
+            val unlisted = restarted.unsynced()
             assertTrue("the store could not be listed: $unlisted", !unlisted.listed && unlisted.unreadable)
             awaitSyncManagerQuiet()
             val real = AndroidCurrentAccountSignOut(context, account, "gen-push-out")
@@ -2338,13 +2371,13 @@ class NotesSyncBoundaryRuntimeTest {
             } finally {
                 unlistedSignOut.close()
             }
-            assertTrue("an acknowledgement holds for the store", held.store.acknowledged())
+            assertTrue("an acknowledgement holds for the store", restarted.acknowledged())
         } finally {
             PendingNotesStore.listFilesForTesting = null
         }
         assertEquals("the removal was never asked for", 0, removals.get())
         assertTrue("the account stays", accountPresent())
-        assertSameFiles("nothing was deleted", held.files, filesOnDisk(held.store))
+        assertSameFiles("nothing was deleted", kept, filesOnDisk(restarted))
         assertTrue("the acknowledgement is a record of its own", acknowledgement in namesIn(permits))
         assertArrayEquals("the permit stays as it was", permitBytes, permit.readBytes())
         assertStillHeld(held.heldAt)
@@ -2379,7 +2412,7 @@ class NotesSyncBoundaryRuntimeTest {
         assertFalse("the store is gone", held.store.dir.name in namesIn(notesPending))
         assertFalse("the permit went with the store", permit.name in namesIn(permits))
         assertFalse("and so did the acknowledgement", acknowledgement in namesIn(permits))
-        assertFalse(held.store.acknowledged())
+        assertFalse(restarted.acknowledged())
         assertFalse("sign-out cancelled the Notes run", NotesSyncCoordinator.isActive(identity) || NotesSyncCoordinator.isPending(identity))
         assertTrue("sign-out cleared the cache: ${cacheFiles(account.name)}", cacheFiles(account.name).isEmpty())
         assertEquals("sign-out cleared the status", SyncStatusStore.Status(), status(account, "gen-push-out"))
@@ -2387,16 +2420,20 @@ class NotesSyncBoundaryRuntimeTest {
         release(held)
         assertTrue(NotesSyncCoordinator.drainForTesting(30_000))
         // The late answer did not bring the store back. The cleared store stays the one instance for its
-        // directory, closed, so a save that arrives late is refused too.
+        // directory, closed, so a save that arrives late is refused too, and so is one through the instance
+        // the run in flight holds, which the stopped clear closed before the restart.
         assertFalse("the store stays gone after the late answer", held.store.dir.name in namesIn(notesPending))
         assertTrue("the cleared store stays the one instance for its directory",
-            held.store === PendingNotesStore.forIdentity(context, account.type, account.name, "gen-push-out"))
-        assertTrue("a save that arrives late is refused", runCatching {
-            held.store.saveLocal(note.uid, notebook, "late", ByteArray(1), isCreate = false)
-        }.exceptionOrNull() is PendingNotesStore.Cleared)
+            restarted === PendingNotesStore.forIdentity(context, account.type, account.name, "gen-push-out"))
+        for (store in listOf(restarted, held.store)) {
+            assertTrue("a save that arrives late is refused", runCatching {
+                store.saveLocal(note.uid, notebook, "late", ByteArray(1), isCreate = false)
+            }.exceptionOrNull() is PendingNotesStore.Cleared)
+        }
         assertFalse("and it does not bring the directory back", held.store.dir.name in namesIn(notesPending))
         assertEquals("one upload, and none after it", listOf(transactionOf(notebook)), uploads(held.since))
-        assertEquals("no request of any kind followed the held upload", emptyList<String>(), fake.requests.drop(held.through))
+        assertEquals("no request of any kind followed the held upload but those of the run after the restart",
+            emptyList<String>(), fake.requests.drop(afterRestart))
         assertEquals("the server routed that one upload", listOf(1), fake.uploadSizes.drop(held.sizes))
         assertTrue("the late answer wrote nothing into the cache: ${cacheFiles(account.name)}", cacheFiles(account.name).isEmpty())
         assertEquals("the late run recorded nothing", SyncStatusStore.Status(), status(account, "gen-push-out"))
