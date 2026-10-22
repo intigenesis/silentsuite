@@ -317,4 +317,21 @@ class PendingNotesDiscardPermitsTest {
         assertEquals(listOf("sync notes-discard"), events)
         assertTrue(p.root.list()!!.isEmpty())
     }
+
+    @Test fun `a removal whose sync failed after the unlink is synced by the next, which finds the permit gone`() {
+        val events = ArrayList<String>()
+        var failing = false
+        val p = PendingNotesDiscardPermits(File(root, "notes-discard"), syncDirectory = {
+            events += "sync ${it.name}"
+            if (failing && it.name == "notes-discard") throw IOException("the sync fails")
+        }, rename = atomicMove, presence = presence)
+        p.record("store-a", UnsyncedNotes(2, 7, false))
+        failing = true
+        assertThrows(IOException::class.java) { p.remove("store-a") }
+        assertTrue("unlinked, though the removal may not be on disk", p.root.list()!!.isEmpty())
+        failing = false
+        events.clear()
+        p.remove("store-a")
+        assertEquals("the root is synced before the permit is reported gone", listOf("sync notes-discard"), events)
+    }
 }

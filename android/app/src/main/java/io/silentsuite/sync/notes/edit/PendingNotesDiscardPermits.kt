@@ -68,10 +68,11 @@ internal class PendingNotesDiscardPermits(
     /**
      * Removes the permit of the store in directory [store], and returns only once it is shown not to be
      * there: removed with the root synced, or shown absent by two checks that agree, its presence check and
-     * a listing of the root that does not hold it (or the root itself shown not to be there,
+     * a listing of the root that does not hold it, and then the root synced too, since an earlier call may
+     * have unlinked it and failed at its sync (or the root itself shown not to be there,
      * [PendingNotesStore.knownAbsent]). File.exists() is not asked: it answers false for a check that failed
-     * as well. Anything else throws IOException, a root that cannot be listed included, so no caller takes a
-     * permit that may still be there for gone.
+     * as well. Anything else throws IOException, a root that cannot be listed or synced included, so no
+     * caller takes a permit that may still be there, or come back after a power loss, for gone.
      */
     fun remove(store: String) = delete(file(store), "the discard permit of $store")
 
@@ -141,6 +142,9 @@ internal class PendingNotesDiscardPermits(
             throw IOException("could not list the discard permits")
         }
         if (listed.any { it.name == target.name }) throw IOException("could not remove $what")
+        // Gone, maybe by an earlier call whose sync failed after the unlink: the removal is on disk only once
+        // the root is synced.
+        syncDirectory(root)
     }
 
     private fun file(store: String): File = named(store, PERMIT)
