@@ -78,9 +78,12 @@ vi.mock('@/app/lib/etebase-auth', () => ({
   issueBillingLinkProof: vi.fn().mockResolvedValue('mock-link-proof-value-with-at-least-43-characters'),
 }))
 
-// Mock self-hosted checks
+// Mock self-hosted checks. `isSelfHosted` stays false except inside the
+// self-hosted newsletter test, which flips it in place: resetting the module
+// registry instead would hand later dynamic imports a second store instance.
+const selfHostedMode = vi.hoisted(() => ({ enabled: false }))
 vi.mock('@/app/lib/self-hosted', () => ({
-  isSelfHosted: false,
+  get isSelfHosted() { return selfHostedMode.enabled },
   isCustomServer: (serverUrl?: string) => Boolean(serverUrl && serverUrl !== 'https://server.silentsuite.io'),
 }))
 
@@ -154,6 +157,30 @@ function persistedPaidSignupIdentities() {
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const RECOVERY_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/
+
+// C1 W3: self-hosted signup subscribes only for a stored historical opt-in;
+// new drafts (no checkbox: absent or explicit false) never call the newsletter.
+describe('self-hosted signup newsletter consent', () => {
+  it.each([
+    ['an absent preference', undefined, 0],
+    ['an explicit false', false, 0],
+    ['a stored historical opt-in', true, 1],
+  ] as const)('%s sends %i newsletter requests', async (_label, wantsProductUpdates, expected) => {
+    selfHostedMode.enabled = true
+    try {
+      resetStore()
+      vi.mocked(fetch).mockReset()
+      vi.mocked(fetch).mockImplementation(async () => new Response('{}'))
+      useAuthStore.setState({ pendingSignup: { email: 'selfhost@example.com', ...(wantsProductUpdates === undefined ? {} : { wantsProductUpdates }) } })
+      await useAuthStore.getState().signup('self-hosted', '')
+      expect(vi.mocked(fetch).mock.calls.filter(([input]) => String(input).endsWith('/newsletter/subscribe'))).toHaveLength(expected)
+    } finally {
+      selfHostedMode.enabled = false
+      resetStore()
+      vi.mocked(fetch).mockReset()
+    }
+  })
+})
 
 describe('useAuthStore', () => {
   beforeEach(() => {
@@ -531,6 +558,30 @@ describe('useAuthStore', () => {
       expect(optedOut.wantsProductUpdates).toBe(false)
       expect(optedOut.requestKey).not.toBe(optedIn.requestKey)
       expect(optedOut.recoverySecret).not.toBe(optedIn.recoverySecret)
+    })
+
+    // C1 W3: with the opt-in removed, a draft never becomes an implicit opt-in
+    // on the wire, while paidSignupRecoveryScope stays byte-identical (an
+    // absent preference keeps its historical `true` scope).
+    it('never sends an implicit product-updates opt-in and keeps the historical recovery scope', async () => {
+      vi.mocked(fetch).mockImplementation(async (_input, init) => {
+        const body = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify(stripePayment(body.recoverySecret)))
+      })
+      useAuthStore.getState().prepareSignupDraft('implicit@example.com')
+      await startAnnualPayment()
+      useAuthStore.getState().prepareSignupDraft('explicit@example.com', false, false)
+      await startAnnualPayment()
+      useAuthStore.getState().prepareSignupDraft('historical@example.com', true, false)
+      await startAnnualPayment()
+
+      expect([0, 1, 2].map(index => paidSignupRequestBody(index).wantsProductUpdates)).toEqual([false, false, true])
+      const scopes = Object.keys(JSON.parse(sessionStorage.getItem('silentsuite-paid-signup-recovery')!).identities).map(scope => JSON.parse(scope))
+      expect(scopes).toEqual(expect.arrayContaining([
+        { email: 'implicit@example.com', contractVersion: 2, wantsProductUpdates: true, rememberDevice: false },
+        { email: 'explicit@example.com', contractVersion: 2, wantsProductUpdates: false, rememberDevice: false },
+        { email: 'historical@example.com', contractVersion: 2, wantsProductUpdates: true, rememberDevice: false },
+      ]))
     })
 
     it('clears a completed payment recovery capability before a new signup attempt', async () => {

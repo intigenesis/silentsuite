@@ -294,8 +294,6 @@ function StepCreateAccount({
   serverUrl,
   setServerUrl,
   initialData,
-  wantsProductUpdates,
-  onWantsProductUpdatesChange,
   rememberDevice,
   onRememberDeviceChange,
 }: {
@@ -303,8 +301,6 @@ function StepCreateAccount({
   serverUrl: string
   setServerUrl: (url: string) => void
   initialData?: SignupFormData | null
-  wantsProductUpdates: boolean
-  onWantsProductUpdatesChange: (value: boolean) => void
   rememberDevice: boolean
   onRememberDeviceChange: (value: boolean) => void
 }) {
@@ -446,21 +442,6 @@ function StepCreateAccount({
         </div>
 
         </>}
-
-        {/* Product updates opt-in */}
-        <label className="flex items-start gap-2.5 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={wantsProductUpdates}
-            onChange={(e) => onWantsProductUpdatesChange(e.target.checked)}
-            className="mt-0.5 h-4 w-4 rounded border-[rgb(var(--border))] bg-[rgb(var(--surface))] text-[rgb(var(--primary))] focus:ring-[rgb(var(--primary))] focus:ring-offset-0"
-          />
-          <span className="text-xs text-[rgb(var(--muted))] leading-relaxed">
-            Send me product updates and feature announcements
-            <br />
-            <span className="text-[rgb(var(--muted))]/70">We will never share your email. Unsubscribe anytime.</span>
-          </span>
-        </label>
 
         {!serverUrl.trim() && (
           <label className="flex items-start gap-2.5 cursor-pointer">
@@ -1493,6 +1474,10 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
   const [paymentNeedsVerification, setPaymentNeedsVerification] = useState(false)
   const [emailOwnershipExpiresAt, setEmailOwnershipExpiresAt] = useState<string | null>(null)
   const [paymentSwitch, setPaymentSwitch] = useState<'stripe' | 'btcpay' | null>(null)
+  // A refused (429) Back cancellation's deadline, held here so it survives the
+  // modal closing and reopening. It applies only to the same capability that
+  // sent the refused request; memory only.
+  const [cancelCooldown, setCancelCooldown] = useState<{ identity: string; until: number } | null>(null)
   const [selectionCancellation, setSelectionCancellation] = useState<'confirm' | 'unknown' | 'refused' | 'verify' | null>(null)
   const pendingAnnualClaimRef = useRef(pendingAnnualClaim)
   pendingAnnualClaimRef.current = pendingAnnualClaim
@@ -2334,8 +2319,6 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
               serverUrl={serverUrl}
               setServerUrl={setServerUrl}
               initialData={formDataRef.current}
-              wantsProductUpdates={wantsProductUpdates}
-              onWantsProductUpdatesChange={setWantsProductUpdates}
               rememberDevice={rememberDevice}
               onRememberDeviceChange={setRememberDevice}
             />}
@@ -2365,14 +2348,11 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
           <StepAdminInfo serverUrl={serverUrl.trim()} onNext={handleAdminInfoComplete} />
         )}
         {step === 'plan' && paymentSwitch && <PaymentBackModal provider={paymentSwitch} restoreFocusTo={paymentBackOpener.current}
+          cooldownUntil={cancelCooldown && cancelCooldown.identity === useAuthStore.getState().pendingSignup?.paymentSessionRequestKey ? cancelCooldown.until : undefined}
+          onRateLimited={(until, identity) => setCancelCooldown({ identity, until })}
           onStay={() => setPaymentSwitch(null)}
-          onLeaveUnreleased={() => {
-            // The payment stays owned and resumable; no other provider becomes payable.
-            setPaymentSwitch(null)
-            setProvisionError(null)
-            setPlanView('method')
-          }}
           onReleased={() => {
+            setCancelCooldown(null)
             setPaymentSwitch(null)
             setClientSecret(null)
             setCardDisclosure(null)

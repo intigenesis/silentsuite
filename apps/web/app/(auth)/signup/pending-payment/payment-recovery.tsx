@@ -100,6 +100,10 @@ export default function PendingPaymentRecovery({ onReleased }: { onReleased?: ()
   const [switching, setSwitching] = useState(false)
   const [released, setReleased] = useState(false)
   const backOpener = useRef<HTMLElement | null>(null)
+  // A refused (429) Back cancellation's deadline outlives the dialog, bound to
+  // the recovery identity the dialog was opened for; memory only.
+  const [cancelCooldown, setCancelCooldown] = useState<{ identity: string; until: number } | null>(null)
+  const backIdentity = useRef<string | null>(null)
   const releaseCallback = useRef(onReleased)
   releaseCallback.current = onReleased
   useEffect(() => {
@@ -147,6 +151,7 @@ export default function PendingPaymentRecovery({ onReleased }: { onReleased?: ()
     setOwnedPayable(undefined)
     setOwnedProvider(null)
     setSwitching(false)
+    setCancelCooldown(null)
     setState('pending')
   }, [recoveryIdentity])
   useEffect(() => {
@@ -381,7 +386,7 @@ export default function PendingPaymentRecovery({ onReleased }: { onReleased?: ()
       {hasRecovery && flowCheckState === 'loading' && <p role="status" className="text-xs text-[rgb(var(--muted))]">Checking current payment...</p>}
       {hasRecovery && flowCheckState === 'failed' && <button type="button" onClick={() => { void loadCurrentFlow() }} disabled={retryUntil > Date.now()} className="text-sm underline disabled:opacity-50">Retry</button>}
       {hasRecovery && backProvider
-        ? <button type="button" onClick={event => { backOpener.current = event.currentTarget; setSwitching(true) }} disabled={flowCheckState === 'loading'} className="inline-flex min-h-9 w-full items-center justify-center rounded-md border border-[rgb(var(--border))] px-4 py-2 text-sm disabled:opacity-50">Back</button>
+        ? <button type="button" onClick={event => { backOpener.current = event.currentTarget; backIdentity.current = recoveryIdentity; setSwitching(true) }} disabled={flowCheckState === 'loading'} className="inline-flex min-h-9 w-full items-center justify-center rounded-md border border-[rgb(var(--border))] px-4 py-2 text-sm disabled:opacity-50">Back</button>
         : <a href="/signup" className="inline-flex min-h-9 w-full items-center justify-center rounded-md border border-[rgb(var(--border))] px-4 py-2 text-sm">Back</a>}
       <PaymentProblemsLink />
     </div>
@@ -463,7 +468,9 @@ export default function PendingPaymentRecovery({ onReleased }: { onReleased?: ()
   return (
     <>
     {switching && backProvider && <PaymentBackModal provider={backProvider} restoreFocusTo={backOpener.current} onStay={() => setSwitching(false)}
-      onReleased={() => { setSwitching(false); setPayable(undefined); setReleased(true) }} />}
+      cooldownUntil={cancelCooldown?.identity === recoveryIdentity ? cancelCooldown.until : undefined}
+      onRateLimited={until => { const identity = backIdentity.current; if (identity !== null) setCancelCooldown({ identity, until }) }}
+      onReleased={() => { setCancelCooldown(null); setSwitching(false); setPayable(undefined); setReleased(true) }} />}
     <div aria-hidden={switching ? true : undefined} inert={switching} className="mx-auto flex min-h-[60vh] max-w-md flex-col justify-center space-y-6 text-center">
       <SignupRecoveryWarning />
       <CheckoutReturnAnalytics outcome="pending" paymentMethod="btcpay" />

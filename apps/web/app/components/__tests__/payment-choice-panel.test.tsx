@@ -601,6 +601,65 @@ describe('PaymentChoicePanel displayed-authority cancellation binding', () => {
   })
 })
 
+// C1 W2/B10: a 429 account cancellation (fine Problem or coarse plugin Error
+// body) keeps the displayed authority and inhibits futile retries until the
+// server's retry-after elapses, with fixed client copy only.
+describe('PaymentChoicePanel rate-limited cancellation', () => {
+  const COOLDOWN_2 = 'Too many attempts. Wait 2 minutes, then retry cancellation. This payment is still active; do not start another payment.'
+  const tooMany = (body: unknown) => new Response(JSON.stringify(body), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '120' } })
+  afterEach(() => { vi.useRealTimers() })
+
+  it.each([
+    ['fine Problem', { type: 'https://api.silentsuite.io/errors/rate-limit-exceeded', title: 'Too Many Requests', status: 429, detail: 'Rate limit exceeded for account:secret-id' }],
+    ['coarse plugin Error', { statusCode: 429, error: 'Too Many Requests', message: 'Rate limit exceeded, retry in 1 minute' }],
+  ] as const)('keeps the displayed card authority and disables cancel until retry-after for a %s body', async (_label, body) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const cancelReplies: Array<() => Response> = [() => tooMany(body), () => response({}, false, 503)]
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: null })
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      if (path === '/subscription/offers/v2/activate') return activation(cardDisclosure())
+      if (path === '/subscription/payment-flows/v2') return response({ contractVersion: 2, kind: 'stripe', authorityId: serverFlowId, clientSecret: 'pi_secret' })
+      if (path === '/subscription/payment-flows/cancel') return cancelReplies.shift()!()
+      return response({}, false)
+    })
+    const onCancel = renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
+    expect(await screen.findByTestId('stripe-payment-form')).toBeInTheDocument()
+    const cancelButtons = () => screen.getAllByRole('button', { name: 'Cancel card payment' })
+
+    fireEvent.click(cancelButtons()[0]!)
+    expect(await screen.findByText(COOLDOWN_2)).toBeInTheDocument()
+    expect(called('/subscription/payment-flows/cancel')).toHaveLength(1)
+    await waitFor(() => { for (const button of cancelButtons()) expect(button).toBeDisabled() })
+    expect(screen.getByTestId('stripe-payment-form')).toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/Rate limit exceeded|Too Many Requests|secret-id/)
+    fireEvent.click(cancelButtons()[0]!)
+    expect(called('/subscription/payment-flows/cancel')).toHaveLength(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+    for (const button of cancelButtons()) expect(button).toBeDisabled()
+    expect(called('/subscription/payment-flows/cancel')).toHaveLength(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(61_000) })
+    await waitFor(() => expect(cancelButtons()[0]).toBeEnabled())
+    expect(screen.queryByText(COOLDOWN_2)).not.toBeInTheDocument()
+    expect(called('/subscription/payment-flows/cancel')).toHaveLength(1)
+
+    // B11: an ordinary failure after expiry is unchanged and immediately retryable.
+    fireEvent.click(cancelButtons()[0]!)
+    await waitFor(() => expect(called('/subscription/payment-flows/cancel')).toHaveLength(2))
+    expect(await screen.findByText('Could not cancel the pending payment flow.')).toBeInTheDocument()
+    await waitFor(() => expect(cancelButtons()[0]).toBeEnabled())
+    expect(called('/subscription/payment-flows/cancel').map(([, init]) => JSON.parse(String(init!.body))))
+      .toEqual([{ expectedAuthorityId: serverFlowId }, { expectedAuthorityId: serverFlowId }])
+    expect(screen.getByTestId('stripe-payment-form')).toBeInTheDocument()
+    expect(called('/subscription/payment-flows/v2')).toHaveLength(1)
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+})
+
 describe('PaymentChoicePanel cancellation safety', () => {
   it('clears rejected activation consent before showing a renewed offer', async () => {
     let offerReads = 0
