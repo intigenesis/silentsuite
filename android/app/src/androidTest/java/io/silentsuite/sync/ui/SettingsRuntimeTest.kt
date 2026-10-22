@@ -10,6 +10,8 @@ import android.content.SharedPreferences
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.CalendarContract
+import android.system.Os
+import android.system.OsConstants
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.view.menu.MenuBuilder
@@ -716,8 +718,9 @@ class SettingsRuntimeTest {
      * Settings, Unsynced Notes from the sign-in screen's menu, with no account and no session: two stores whose account
      * is gone. One is discarded after Cancel and Back changed nothing and across a recreation of its open dialog, its
      * permit on disk before the first file goes. The other cannot be listed: it is offered only an acknowledgement,
-     * which deletes nothing, and once it lists, a discard with its real count. Every request is refused and counted,
-     * and so is every Notes run.
+     * which deletes nothing, and once it lists, a discard with its real count. A third store's folder is then replaced
+     * by a link to it: it too is offered only an acknowledgement, under the link's own name, and nothing behind the
+     * link changes. Every request is refused and counted, and so is every Notes run.
      */
     @Test
     fun unsyncedNotesFromSignInAreDiscardedOfflineAndAnUnlistableStoreIsOnlyAcknowledged() {
@@ -726,7 +729,8 @@ class SettingsRuntimeTest {
         val notes = UnsyncedNotesOnDevice(context)
         val a = notes.orphanFolder()
         val b = notes.orphanFolder()
-        notes.assertClean(a, b)
+        val c = notes.orphanFolder()
+        notes.assertClean(a, b, c)
         val monitor = android.app.Instrumentation.ActivityMonitor(AppSettingsActivity::class.java.name, null, false)
         val unmatched = context.getString(R.string.notes_store_unmatched)
         val one = context.resources.getQuantityString(R.plurals.notes_store_unsynced, 1, 1)
@@ -842,7 +846,40 @@ class SettingsRuntimeTest {
                     notes.awaitRows(settings, listOf(UnsyncedNotesOnDevice.Row(UnsyncedNotesFragment.KEY_NONE,
                         context.getString(R.string.notes_stores_none), null, enabled = false)))
 
-                    // 7. Back once leaves Settings for the sign-in screen.
+                    // 7. A store folder that is a link is never followed. C's folder, holding a change, is moved aside
+                    // and a link to it takes its place: its row says it cannot be read right now, it is offered only
+                    // the acknowledgement, recorded under the link's own name, and nothing behind the link changes.
+                    notes.save(PendingNotesStore.forDirectory(context, c), "n1")
+                    val link = notes.storeDir(c)
+                    val aside = File(context.noBackupFilesDir, "notes-link-target-${System.nanoTime()}")
+                    assertTrue(link.renameTo(aside))
+                    val heldAside = notes.filesIn(aside)
+                    try {
+                        Os.symlink(aside.path, link.path)
+                        instrumentation.runOnMainSync { settings.recreate() }
+                        settings = notes.resumedSettings(settings)
+                        notes.awaitRows(settings, listOf(UnsyncedNotesOnDevice.Row(UnsyncedNotesFragment.rowKey(c),
+                            unmatched, unlisted)))
+                        notes.tapRow(settings, c)
+                        assertEquals(acknowledgement, notes.texts(settings, Step.ACKNOWLEDGE, c))
+                        assertFalse("no discard step", notes.shows(settings, Step.DISCARD, c))
+                        notes.tap(settings, Step.ACKNOWLEDGE, c, DialogInterface.BUTTON_POSITIVE)
+                        notes.awaitSnackbar(settings, context.getString(R.string.notes_acknowledged))
+                        assertTrue("$c.acknowledgement" in notes.permits())
+                        assertFalse("$c.permit" in notes.permits())
+                        assertTrue("the link is still there", OsConstants.S_ISLNK(Os.lstat(link.path).st_mode))
+                        assertEquals(aside.path, Os.readlink(link.path))
+                        notes.assertFilesIn("behind the link", aside, heldAside)
+                    } finally {
+                        // The folder comes back, so restore() clears it as it clears the others.
+                        if (runCatching { OsConstants.S_ISLNK(Os.lstat(link.path).st_mode) }.getOrDefault(false)) {
+                            Os.remove(link.path)
+                        }
+                        aside.renameTo(link)
+                    }
+                    notes.assertFiles("C's folder, back", c, heldAside)
+
+                    // 8. Back once leaves Settings for the sign-in screen.
                     val last = settings
                     instrumentation.runOnMainSync { last.onBackPressedDispatcher.onBackPressed() }
                     notes.await("Settings closed") { last.isDestroyed }
@@ -857,7 +894,7 @@ class SettingsRuntimeTest {
         } finally {
             instrumentation.removeMonitor(monitor)
             LoginActivity.controllerFactory = null
-            notes.restore(a, b)
+            notes.restore(a, b, c)
             LoginFlowOwnerRegistry.resetForTests()
             SignupContinuationRegistry.resetForTests()
             SetupSecretHolder.resetForTests()
@@ -1162,15 +1199,23 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
 
     fun permits() = namesIn(discards)
 
+    /** The store folder [folder] in notes-pending. */
+    fun storeDir(folder: String) = File(pending, folder)
+
     /** Every file of the store in [folder], by name, read without the store. */
-    fun filesOf(folder: String): Map<String, ByteArray> {
-        val dir = File(pending, folder)
-        val names = dir.list() ?: throw AssertionError("$folder could not be listed")
+    fun filesOf(folder: String): Map<String, ByteArray> = filesIn(storeDir(folder))
+
+    /** Every file in [dir], by name, read without the store. */
+    fun filesIn(dir: File): Map<String, ByteArray> {
+        val names = dir.list() ?: throw AssertionError("${dir.name} could not be listed")
         return names.associateWith { File(dir, it).readBytes() }
     }
 
-    fun assertFiles(what: String, folder: String, expected: Map<String, ByteArray>) {
-        val actual = filesOf(folder)
+    fun assertFiles(what: String, folder: String, expected: Map<String, ByteArray>) =
+        assertFilesIn(what, storeDir(folder), expected)
+
+    fun assertFilesIn(what: String, dir: File, expected: Map<String, ByteArray>) {
+        val actual = filesIn(dir)
         assertEquals(what, expected.keys, actual.keys)
         for ((name, bytes) in expected) assertArrayEquals("$what: $name", bytes, actual.getValue(name))
     }
@@ -1248,6 +1293,13 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
         screen.childFragmentManager.executePendingTransactions()
         val shown = screen.childFragmentManager.findFragmentByTag(UnsyncedNotesDiscardDialogFragment.tag(step, folder))
         return ((shown as? DialogFragment)?.dialog as? AlertDialog)?.takeIf { it.isShowing }
+    }
+
+    /** Whether the dialog of [step] for the store in [folder] shows now, read on the main thread. */
+    fun shows(settings: AppSettingsActivity, step: Step, folder: String): Boolean {
+        var shown = false
+        instrumentation.runOnMainSync { shown = dialogOf(settings, step, folder) != null }
+        return shown
     }
 
     /** What the dialog of [step] for the store in [folder] says, once it shows. */

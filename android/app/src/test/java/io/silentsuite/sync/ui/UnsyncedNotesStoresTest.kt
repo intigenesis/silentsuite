@@ -17,11 +17,15 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 
 /**
  * The Settings way out for unsynced Notes, below its screen: which stores it finds and how it names them, and what a
@@ -49,6 +53,7 @@ class UnsyncedNotesStoresTest {
         PendingNotesStore.identityForTesting = null
         PendingNotesDiscardPermits.beforeRecordForTesting = null
         PendingNotesDiscardPermits.beforeDeleteForTesting = null
+        PendingNotesDiscardPermits.onReadForTesting = null
         PendingNotesStore.resetForTesting()
     }
 
@@ -541,6 +546,117 @@ class UnsyncedNotesStoresTest {
         PendingNotesDiscardPermits.beforeRecordForTesting = null
         assertFalse("$other.acknowledgement" in namesIn(discards))
     }
+
+    // ---- a store folder that is a link ----
+
+    /** A symbolic link at [at] to [target], or a skip where this machine cannot make one. */
+    private fun linked(at: File, target: File) {
+        val made = try {
+            Files.createSymbolicLink(at.toPath(), target.toPath())
+            true
+        } catch (e: IOException) {
+            false
+        } catch (e: UnsupportedOperationException) {
+            false
+        }
+        assumeTrue("this machine cannot make a symbolic link", made)
+    }
+
+    /**
+     * Every path at and below [root] as lstat shows it, no link followed: a link by what it points to, a directory as
+     * null, a file by its bytes. A path that is not there gives nothing.
+     */
+    private fun treeOf(root: File): Map<String, List<Byte>?> {
+        val tree = HashMap<String, List<Byte>?>()
+        fun walk(f: File, name: String) {
+            val path = f.toPath()
+            when {
+                Files.isSymbolicLink(path) -> tree[name] = "-> ${Files.readSymbolicLink(path)}".toByteArray().toList()
+                Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) -> {
+                    tree[name] = null
+                    for (child in f.list()!!) walk(File(f, child), "$name/$child")
+                }
+                Files.exists(path, LinkOption.NOFOLLOW_LINKS) -> tree[name] = f.readBytes().toList()
+            }
+        }
+        walk(root, root.name)
+        return tree
+    }
+
+    /**
+     * Stand-ins for lstat's inode numbers of any path that is there, read without following a link, so a link has one
+     * of its own; none for a path that is not there.
+     */
+    private fun identifyWithoutFollowing() {
+        val inodes = HashMap<String, Long>()
+        PendingNotesStore.identityForTesting = { d ->
+            val attributes = try {
+                Files.readAttributes(d.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+            } catch (e: IOException) {
+                null
+            }
+            attributes?.let {
+                val key = (if (it.isSymbolicLink) "link " else "") + d.path
+                PendingNotesStore.DirectoryIdentity(7, inodes.getOrPut(key) { inodes.size + 1L })
+            }
+        }
+    }
+
+    /**
+     * A present account's store folder A made a link to [target], given store B beside it, which holds a saved note.
+     * The screen shows A as a store that could not be counted and is not listed, and B with its own count; A's instance
+     * is not B's. A's confirmation is only an acknowledgement, under A's own name, which cancels nothing and deletes
+     * nothing. notes-pending, the link, B's files and count, and the link's target stay as they were, byte for byte,
+     * and no permit or record is read or written but A's own acknowledgement.
+     */
+    private fun assertLinkOnlyAcknowledged(target: (b: File) -> File) {
+        identifyWithoutFollowing()
+        val b = saveIn(account("b"), "n1")
+        val counted = UnsyncedNotes(1, 1, false, names = setOf("n1.note"))
+        assertEquals(counted, opened(b).unsynced())
+        val owner = account("a")
+        val a = folderOf(owner)
+        val to = target(File(pending, b))
+        linked(File(pending, a), to)
+        val before = treeOf(pending)
+        val targetBefore = treeOf(to)
+        val records = ArrayList<String>()
+        PendingNotesDiscardPermits.onReadForTesting = { records += it.name }
+
+        val listing = read(owner)
+        assertEquals(listOf(a, b).sorted(), listing.rows.map { it.directory })
+        assertFalse(listing.othersUnlisted || listing.unknownOthers)
+        val row = listing.rows.single { it.directory == a }
+        assertEquals(owner, row.owner)
+        val shown = row.answer!!
+        assertEquals("could not be counted, and not listed", UnsyncedNotes(0, 0, unreadable = true, listed = false),
+            shown)
+        assertEquals(Step.ACKNOWLEDGE, UnsyncedNotesDiscardPolicy.step(shown))
+        assertEquals(Text.Unlisted, UnsyncedNotesDiscardPolicy.rowText(shown))
+        assertEquals("B's own count", counted, listing.rows.single { it.directory == b }.answer)
+        assertNotSame("a link never shares its target's instance", opened(b), opened(a))
+        assertEquals("the link's own name", a, opened(a).dir.name)
+
+        assertEquals(Result.Acknowledged, discard(a, shown, owner = owner, running = true))
+        assertEquals("an acknowledgement cancels nothing", listOf("open"), calls)
+        assertTrue("bound to the link's own identity", opened(a).acknowledged())
+        assertEquals("a record under the link's own name, none under B's or the target's", setOf("$a.acknowledgement"),
+            namesIn(discards))
+        assertEquals("no permit or record read but A's own", setOf("$a.acknowledgement"), records.toSet())
+
+        assertEquals("notes-pending, the link and B's files", before, treeOf(pending))
+        assertEquals("the link's target", targetBefore, treeOf(to))
+        assertEquals("B's count", counted, opened(b).unsynced())
+    }
+
+    @Test fun `a store folder that is a link to another store is only acknowledged, and nothing behind it changes`() =
+        assertLinkOnlyAcknowledged { b -> b }
+
+    @Test fun `a store folder that is a link to a file is only acknowledged, and the file stays as it was`() =
+        assertLinkOnlyAcknowledged { tmp.newFile("plain").also { it.writeBytes("not a store".toByteArray()) } }
+
+    @Test fun `a store folder that is a link to nothing is only acknowledged, and nothing is made there`() =
+        assertLinkOnlyAcknowledged { File(tmp.root, "missing") }
 
     private companion object {
         const val TYPE = "io.silentsuite"
