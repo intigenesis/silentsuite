@@ -44,8 +44,9 @@ import java.util.concurrent.ConcurrentHashMap
  * the discard records an acknowledgement instead, which deletes nothing and is no authority for a deletion
  * ([acknowledged]).
  *
- * Each instance shows that acknowledgement gone before its first listing, write or removal of the store,
- * whether or not one was ever recorded ([withdrawAcknowledgement]), and that operation fails while it cannot.
+ * Each instance shows that acknowledgement gone before it uses its first listing of the store, a listing that
+ * worked, and before its first write or removal in it, whether or not one was ever recorded
+ * ([withdrawAcknowledgement]), and that operation fails while it cannot.
  * A new instance lists first, in its recovery, so while notes-discard is there but cannot be listed, every
  * operation of a new instance that runs recovery fails, reads and pushes of what waits included, a count of
  * any store, an empty one included, answers that it could not be counted, and no discard or clear finishes.

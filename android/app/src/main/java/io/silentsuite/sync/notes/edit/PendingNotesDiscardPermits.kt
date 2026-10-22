@@ -104,10 +104,11 @@ internal class PendingNotesDiscardPermits(
 
     /**
      * Removes the acknowledgement of the store in directory [store], and returns only once it is shown gone,
-     * as [remove] does for a permit. Each store instance asks this before its first listing, write or removal of
-     * the store, whether or not an acknowledgement was ever recorded, so while the root is there but cannot be
-     * listed, every store's first listing, write and removal fails, a count of it answers that it could not be
-     * counted, and no discard or clear of it can finish.
+     * as [remove] does for a permit. Each store instance asks this before it uses its first listing of the
+     * store, a listing that worked, and before its first write or removal in it, whether or not an
+     * acknowledgement was ever recorded, so while the root is there but cannot be listed, every store's first
+     * listing, write and removal fails, a count of it answers that it could not be counted, an empty store's
+     * included, and no discard or clear of it can finish.
      */
     fun withdrawAcknowledgement(store: String) = delete(acknowledgementFile(store), "the acknowledgement of $store")
 
