@@ -42,13 +42,13 @@ tests = sorted(
 if len(tests) != 163 or len(set(tests)) != 163:
     raise SystemExit(f"bad canonical runtime ledger size: {len(tests)}")
 
-mixed = [tuple(pair) for pair in ledger["shards"]["21:mixed"]]
+mixed = [tuple(pair) for pair in ledger["shards"]["29:mixed"]]
 requested = [pair for pair in tests if pair[1] == "requestedQueuedRunningSettlingAndTerminalStatesNeverFlashGenericAttention"]
-if mode == "21:mixed":
+if mode == "29:mixed":
     selected = mixed
-elif mode == "21:requested":
+elif mode == "29:requested":
     selected = requested
-elif mode == "21:remaining":
+elif mode == "29:remaining":
     selected = [pair for pair in tests if pair not in set(mixed + requested)]
 elif mode == "35:all":
     selected = tests
@@ -59,9 +59,9 @@ else:
     raise SystemExit(f"unsupported ledger selector mode: {mode}")
 
 expected = {
-    "21:mixed": 1,
-    "21:requested": 1,
-    "21:remaining": 161,
+    "29:mixed": 1,
+    "29:requested": 1,
+    "29:remaining": 161,
     "35:all": 163,
     "36:account-dashboard": 30,
     "36:first-run-setup": 19,
@@ -74,9 +74,9 @@ print(",".join(f"{class_name}#{method}" for class_name, method in selected))
 PY
 }
 
-mixed_selector="$(ledger_selectors '21:mixed')"
-requested_selector="$(ledger_selectors '21:requested')"
-remaining_selectors="$(ledger_selectors '21:remaining')"
+mixed_selector="$(ledger_selectors '29:mixed')"
+requested_selector="$(ledger_selectors '29:requested')"
+remaining_selectors="$(ledger_selectors '29:remaining')"
 all_selectors="$(ledger_selectors '35:all')"
 api36_account_dashboard_selectors="$(ledger_selectors '36:account-dashboard')"
 api36_first_run_setup_selectors="$(ledger_selectors '36:first-run-setup')"
@@ -111,10 +111,10 @@ import json, pathlib, re, subprocess, sys
 ledger_path, mode, nonce, output, run, attempt, job, checkout = sys.argv[1:]
 ledger=json.loads(pathlib.Path(ledger_path).read_text(encoding="utf-8"))
 tests=sorted((c,m) for c, methods in ledger["classes"].items() for m in methods)
-mixed=[tuple(pair) for pair in ledger["shards"]["21:mixed"]]
+mixed=[tuple(pair) for pair in ledger["shards"]["29:mixed"]]
 requested=[pair for pair in tests if pair[1] == "requestedQueuedRunningSettlingAndTerminalStatesNeverFlashGenericAttention"]
-if mode == "21:mixed": selected=mixed
-elif mode == "21:remaining": selected=[pair for pair in tests if pair not in set(mixed + requested)]
+if mode == "29:mixed": selected=mixed
+elif mode == "29:remaining": selected=[pair for pair in tests if pair not in set(mixed + requested)]
 elif mode == "35:all": selected=tests
 elif mode in {"36:account-dashboard", "36:first-run-setup", "36:sibling-routes", "36:status-routes"}:
     owners=set(ledger["shards"][mode]); selected=[pair for pair in tests if pair[0] in owners]
@@ -211,13 +211,13 @@ print(f"validated {len(expected)} focused runtime scenario records")
 PY
 }
 
-if [[ "${api_level}:${shard}" == "21:mixed" ]]; then
+if [[ "${api_level}:${shard}" == "29:mixed" ]]; then
   timeout --signal=TERM --kill-after=10s 600s \
     ./gradlew app:connectedDebugAndroidTest --no-daemon -PrequireEtebase16Kb=true -Pandroid.testInstrumentationRunnerArguments.class="${mixed_selector}" "${scenario_args[@]}"
-elif [[ "${api_level}:${shard}" == "21:remaining" ]]; then
+elif [[ "${api_level}:${shard}" == "29:remaining" ]]; then
   temp_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
   mkdir -p "${temp_root}"
-  requested_results="$(mktemp -d "${temp_root%/}/pr567-api21-requested.XXXXXX")"
+  requested_results="$(mktemp -d "${temp_root%/}/pr567-api29-requested.XXXXXX")"
   requested_saved=0
 
   save_requested_results() {
@@ -238,12 +238,12 @@ elif [[ "${api_level}:${shard}" == "21:remaining" ]]; then
         status="${save_status}"
       fi
     fi
-    mkdir -p "app/build/outputs/androidTest-results/connected/api21-requested"
+    mkdir -p "app/build/outputs/androidTest-results/connected/api29-requested"
     mkdir_status=$?
     if [[ "${status}" -eq 0 && "${mkdir_status}" -ne 0 ]]; then
       status="${mkdir_status}"
     fi
-    cp -R "${requested_results}/." "app/build/outputs/androidTest-results/connected/api21-requested/"
+    cp -R "${requested_results}/." "app/build/outputs/androidTest-results/connected/api29-requested/"
     restore_status=$?
     if [[ "${status}" -eq 0 && "${restore_status}" -ne 0 ]]; then
       status="${restore_status}"

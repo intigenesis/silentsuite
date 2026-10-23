@@ -475,7 +475,7 @@ def test_fresh_emulator_runtime_shards_are_ledger_derived_and_preserve_remaining
     assert navigation_wrapper.rstrip().endswith('exec bash "$(dirname "$0")/run-focused-runtime-tests.sh" "$api_level" "$shard"')
     rows = re.findall(r"- api-level: (\d+)\n\s+arch: (\S+)\n\s+shard: (\S+)", job)
     assert rows == [
-        ("21", "x86", "mixed"), ("21", "x86", "remaining"),
+        ("29", "x86", "mixed"), ("29", "x86", "remaining"),
         ("35", "x86_64", "all"), ("36", "x86_64", "account-dashboard"),
         ("36", "x86_64", "first-run-setup"), ("36", "x86_64", "status-routes"),
         ("36", "x86_64", "sibling-routes"),
@@ -490,7 +490,7 @@ def test_fresh_emulator_runtime_shards_are_ledger_derived_and_preserve_remaining
     canonical_bytes = (json.dumps(ledger, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     assert raw == canonical_bytes
     assert ledger["schema"] == 1
-    assert ledger["shards"]["21:remaining"] == "canonical-minus-mixed"
+    assert ledger["shards"]["29:remaining"] == "canonical-minus-mixed"
     assert ledger["shards"]["35:all"] == "canonical"
     assert list(ledger["classes"]) == sorted(ledger["classes"])
     assert all(methods == sorted(methods) and len(methods) == len(set(methods)) for methods in ledger["classes"].values())
@@ -511,7 +511,7 @@ def test_fresh_emulator_runtime_shards_are_ledger_derived_and_preserve_remaining
     assert len(canonical) == len(runtime_methods) == ledger_size == 163
     assert canonical == runtime_methods
 
-    mixed = {tuple(pair) for pair in ledger["shards"]["21:mixed"]}
+    mixed = {tuple(pair) for pair in ledger["shards"]["29:mixed"]}
     requested = {
         pair for pair in canonical
         if pair[1] == "requestedQueuedRunningSettlingAndTerminalStatesNeverFlashGenericAttention"
@@ -548,7 +548,7 @@ def test_fresh_emulator_runtime_shards_are_ledger_derived_and_preserve_remaining
 
     assert script.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
     subprocess.run(["bash", "-n", FOCUSED_RUNTIME_SCRIPT], check=True)
-    subprocess.run(["/usr/bin/dash", "-n", "-c", 'bash android/scripts/run-focused-runtime-tests.sh "21" "mixed"'], check=True)
+    subprocess.run(["/usr/bin/dash", "-n", "-c", 'bash android/scripts/run-focused-runtime-tests.sh "29" "mixed"'], check=True)
     assert script.count("app:connectedDebugAndroidTest") == 8
     assert "focused-runtime-ledger-v1.json" in script
     assert "object_pairs_hook=reject_duplicate_keys" in script
@@ -557,7 +557,7 @@ def test_fresh_emulator_runtime_shards_are_ledger_derived_and_preserve_remaining
     assert "remaining_selectors" in script
     assert "mktemp -d" in script and '${RUNNER_TEMP:-${TMPDIR:-/tmp}}' in script
     assert "app/build/outputs/androidTest-results/connected/." in script
-    assert "api21-requested" in script and "api21_batch_" not in script
+    assert "api29-requested" in script and "api21_batch_" not in script
     assert 'command -v timeout >/dev/null 2>&1' in script
     assert re.findall(r"timeout --signal=TERM --kill-after=10s (\d+)s", script) == [
         "600", "600", "1500", "2400", "1800", "1800", "1800", "1800"
@@ -590,8 +590,8 @@ def test_fresh_emulator_runtime_shards_are_ledger_derived_and_preserve_remaining
     assert "focused-runtime-ledger-v1.json" in assertion
     assert "object_pairs_hook=reject_duplicate_keys" in assertion
     assert "canonical={(class_name,method)" in assertion
-    assert "expected_sizes={'21:mixed':1,'21:remaining':162,'35:all':163,'36:account-dashboard':30,'36:first-run-setup':19,'36:sibling-routes':47,'36:status-routes':67}" in assertion
-    assert '"21:remaining": 161' in script
+    assert "expected_sizes={'29:mixed':1,'29:remaining':162,'35:all':163,'36:account-dashboard':30,'36:first-run-setup':19,'36:sibling-routes':47,'36:status-routes':67}" in assertion
+    assert '"29:remaining": 161' in script
     assert "io.silentsuite.sync.ui.ColorParityRuntimeTest" in ledger["shards"]["36:status-routes"]
     assert "com.android.internal.systemui.navbar.gestural" in navigation_wrapper
     assert "com.android.internal.systemui.navbar.threebutton" in navigation_wrapper

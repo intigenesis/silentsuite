@@ -118,7 +118,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - api-level: '21'
+          - api-level: '29'
             arch: x86
           - api-level: '36'
             arch: x86_64
@@ -351,8 +351,8 @@ jobs:
           [[ ${#release_apks[@]} -eq 1 ]] || { echo "expected exactly one unsigned release APK, found ${#release_apks[@]}" >&2; exit 1; }
           for apk in "${debug_apks[@]}" "${release_apks[@]}"; do
             badging="$("$aapt" dump badging "$apk")"
-            [[ $(grep -Fxc "sdkVersion:'21'" <<<"$badging" || true) -eq 1 ]] || {
-              echo "$apk does not report exactly one min SDK 21 entry" >&2
+            [[ $(grep -Fxc "sdkVersion:'29'" <<<"$badging" || true) -eq 1 ]] || {
+              echo "$apk does not report exactly one min SDK 29 entry" >&2
               exit 1
             }
             [[ $(grep -Fxc "targetSdkVersion:'36'" <<<"$badging" || true) -eq 1 ]] || {
@@ -477,10 +477,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - api-level: 21
+          - api-level: 29
             arch: x86
             shard: mixed
-          - api-level: 21
+          - api-level: 29
             arch: x86
             shard: remaining
           - api-level: 35
@@ -630,13 +630,13 @@ jobs:
           if raw != canonical_bytes: raise SystemExit('focused runtime ledger is not canonical compact sorted UTF-8/LF JSON')
           if ledger.get('schema') != 1: raise SystemExit('unsupported focused runtime ledger schema')
           canonical={(class_name,method) for class_name,methods in ledger['classes'].items() for method in methods}
-          mixed={tuple(pair) for pair in ledger['shards']['21:mixed']}
+          mixed={tuple(pair) for pair in ledger['shards']['29:mixed']}
           shard='${{ matrix.shard }}'
           api='${{ matrix.api-level }}'
           key=f'{api}:{shard}'
-          if key == '21:mixed':
+          if key == '29:mixed':
             expected=mixed
-          elif key == '21:remaining':
+          elif key == '29:remaining':
             expected=canonical-mixed
           elif key == '35:all':
             expected=canonical
@@ -645,7 +645,7 @@ jobs:
             expected={pair for pair in canonical if pair[0] in owners}
           else:
             raise SystemExit(f'unsupported API/shard {key}')
-          expected_sizes={'21:mixed':1,'21:remaining':162,'35:all':163,'36:account-dashboard':30,'36:first-run-setup':19,'36:sibling-routes':47,'36:status-routes':67}
+          expected_sizes={'29:mixed':1,'29:remaining':162,'35:all':163,'36:account-dashboard':30,'36:first-run-setup':19,'36:sibling-routes':47,'36:status-routes':67}
           if len(canonical) != 163 or len(expected) != expected_sizes[key]:
             raise SystemExit(f'bad expected ledger size for {key}: canonical={len(canonical)} expected={len(expected)}')
           seen=[]
@@ -814,7 +814,7 @@ jobs:
       matrix:
         include:
           - arch: x86
-            api-level: 21
+            api-level: 29
             image-required: true
           - arch: x86_64
             api-level: 34

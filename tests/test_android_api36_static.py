@@ -108,7 +108,7 @@ def test_unsigned_apk_sdk_inspection_uses_pinned_build_tools_aapt():
     assert '"$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION/aapt"' in unsigned_build
     assert 'aapt dump badging' not in unsigned_build  # command is invoked through the pinned path
     assert '"$aapt" dump badging "$apk"' in unsigned_build
-    assert "sdkVersion:'21'" in unsigned_build
+    assert "sdkVersion:'29'" in unsigned_build
     assert "targetSdkVersion:'36'" in unsigned_build
     assert 'grep -Fxc "sdkVersion:' in unsigned_build
     assert 'grep -Fxc "targetSdkVersion:' in unsigned_build

@@ -163,7 +163,7 @@ class LoginLifecycleContractTest {
         val runnerReference = Regex("ReactiveCircus/android-emulator-runner@([0-9a-f]{40})").find(job)
 
         assertTrue(job.contains("contents: read"))
-        assertEquals(2, Regex("""api-level: 21\n\s+arch: x86""").findAll(job).count())
+        assertEquals(2, Regex("""api-level: 29\n\s+arch: x86""").findAll(job).count())
         assertEquals(1, Regex("""api-level: 35\n\s+arch: x86_64""").findAll(job).count())
         assertEquals(1, Regex("""api-level: 36\n\s+arch: x86_64\n\s+shard: account-dashboard""").findAll(job).count())
         assertEquals(1, Regex("""api-level: 36\n\s+arch: x86_64\n\s+shard: first-run-setup""").findAll(job).count())
@@ -264,11 +264,11 @@ class LoginLifecycleContractTest {
         assertTrue(runtimeScript.contains("focused-runtime-ledger-v1.json"))
         assertTrue(runtimeScript.contains("if len(tests) != 163 or len(set(tests)) != 163"))
         listOf(
-            "\"21:mixed\": 1", "\"21:requested\": 1", "\"21:remaining\": 161",
+            "\"29:mixed\": 1", "\"29:requested\": 1", "\"29:remaining\": 161",
             "\"35:all\": 163", "\"36:account-dashboard\": 30",
             "\"36:first-run-setup\": 19", "\"36:sibling-routes\": 47", "\"36:status-routes\": 67",
         ).forEach { assertTrue(runtimeScript.contains(it)) }
-        assertTrue(runtimeScript.contains("remaining_selectors=\"\$(ledger_selectors '21:remaining')\""))
+        assertTrue(runtimeScript.contains("remaining_selectors=\"\$(ledger_selectors '29:remaining')\""))
         assertTrue(runtimeScript.contains("all_selectors=\"\$(ledger_selectors '35:all')\""))
         assertFalse(runtimeScript.contains("other77_selectors"))
         assertFalse(runtimeScript.contains("focused_classes="))
@@ -281,7 +281,7 @@ class LoginLifecycleContractTest {
         assertTrue(runtimeScript.indexOf("\n  save_requested_results",
             runtimeScript.indexOf("""class="${'$'}{requested_selector}""")) <
             runtimeScript.indexOf("""class="${'$'}{remaining_selectors}""""))
-        assertTrue(runtimeScript.contains("connected/api21-requested"))
+        assertTrue(runtimeScript.contains("connected/api29-requested"))
         assertFalse(runtimeScript.contains("api21_batch_"))
         assertTrue(runtimeScript.contains("""if [[ "${'$'}{status}" -eq 0 && "${'$'}{restore_status}" -ne 0 ]]"""))
     }
