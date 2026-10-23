@@ -112,3 +112,8 @@ docker run --rm --entrypoint sh "$web_id" -c 'grep -rlq "Installation password" 
 docker restart silentsuite_server_1 >/dev/null
 python3.12 "$root/scripts/umbrel-candidate-probe.py" --after-restart
 test "$(docker inspect -f '{{.Image}}' silentsuite_server_1)" = "$server_id"
+router_id="$(docker inspect -f '{{.Image}}' silentsuite_router_1)"
+python3.12 "$root/scripts/umbrel-candidate-privacy.py" \
+  --server-image "$server_id" --router-image "$router_id" \
+  --startup "$work/data/bootstrap/server-start.sh" \
+  --router-config "$work/data/router/default.conf" --work-dir "$work/privacy"

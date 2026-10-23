@@ -366,6 +366,39 @@ def paired_identity_fixture():
     return tag, source, server, text
 
 
+@pytest.mark.parametrize(
+    "baseline,backend,proxy,valid",
+    [
+        (True, "privacy fixture warning retained accept reject", "failure", True),
+        (True, "privacy fixture warning retained reject", "failure", False),
+        (True, "privacy fixture warning retained accept", "failure", False),
+        (True, "privacy fixture warning retained accept reject", "", False),
+        (False, "privacy fixture warning retained", "", True),
+        (False, "privacy fixture warning retained accept", "", False),
+        (False, "privacy fixture warning retained", "failure", False),
+        (False, "", "", False),
+    ],
+)
+def test_privacy_canary_requires_real_witnesses_and_retained_safe_diagnostics(baseline, backend, proxy, valid):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("privacy_canary", ROOT / "scripts/umbrel-candidate-privacy.py")
+    privacy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(privacy)
+    if valid:
+        privacy.check_logs(baseline, backend, proxy, ["accept", "reject", "failure"])
+    else:
+        with pytest.raises(RuntimeError):
+            privacy.check_logs(baseline, backend, proxy, ["accept", "reject", "failure"])
+
+
+def test_native_smoke_runs_privacy_canary_against_the_actual_image_pair():
+    smoke = (ROOT / "scripts/umbrel-candidate-smoke.sh").read_text(encoding="utf-8")
+    assert 'python3.12 "$root/scripts/umbrel-candidate-privacy.py"' in smoke
+    assert '--server-image "$server_id" --router-image "$router_id"' in smoke
+    assert '--startup "$work/data/bootstrap/server-start.sh"' in smoke
+    assert '--router-config "$work/data/router/default.conf"' in smoke
+
+
 def test_paired_identity_binds_server_native_images_and_build_arguments():
     from umbrel_release_contract import BUILD_ARGS, verify
     tag, source, server, text = paired_identity_fixture()
