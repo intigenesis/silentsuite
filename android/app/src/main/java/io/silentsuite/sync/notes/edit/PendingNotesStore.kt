@@ -1,5 +1,6 @@
 package io.silentsuite.sync.notes.edit
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.system.ErrnoException
 import android.system.Os
@@ -11,6 +12,10 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.lang.ref.WeakReference
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.NoSuchFileException
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
@@ -25,12 +30,20 @@ import java.util.concurrent.ConcurrentHashMap
  * identity. Every operation runs under it. Callers must never hold the Etebase cache monitor or the
  * cache's write fence (EtebaseLocalCache.writeIfCurrent) while calling in, and transforms passed to
  * [update] must not take either.
+ *
+ * Whether a file is there is decided by a read that worked, a listing that worked, or a presence check
+ * ([Presence]) that answers absent only when the system says the path does not exist. File.exists()
+ * decides nothing here: it answers false for a check that failed as well, and a file taken for absent
+ * that way could be written over, skipped by a removal that then reports success, or left out of what a
+ * run reports.
  */
 internal class PendingNotesStore private constructor(
     val dir: File,
     private val syncDirectory: (File) -> Unit,
     /** Replaces the target in one step or throws; the committed file is never deleted first. */
     private val rename: (File, File) -> Unit,
+    /** Whether a path is there, without following a link; [Presence.UNKNOWN] when the check fails. */
+    private val presence: (File) -> Presence,
 ) {
     private val lock = Any()
     private var closed = false
@@ -84,6 +97,13 @@ internal class PendingNotesStore private constructor(
         /** [notebookUid] is known when the entry's own header read fine and only the rest did not. */
         data class Unreadable(val file: String, val reason: String, val notebookUid: String? = null) : Read()
     }
+
+    /**
+     * What a check of whether one path is there answered. Only [ABSENT] says it is not: the system answered
+     * that the path does not exist (ENOENT). A check that failed in any other way is [UNKNOWN], which the
+     * store never takes for absent.
+     */
+    enum class Presence { PRESENT, ABSENT, UNKNOWN }
 
     sealed class Change {
         object Keep : Change()
@@ -149,7 +169,10 @@ internal class PendingNotesStore private constructor(
 
     fun read(noteUid: String): Read = locked { readEntry(noteUid) }
 
-    /** Lists every entry. A committed file that cannot be read is reported in [Scan.unreadable], never deleted. */
+    /**
+     * Lists every entry. A committed file that cannot be read is reported in [Scan.unreadable], never deleted.
+     * A listing that fails throws IOException: read as an empty store, it would hide every waiting change.
+     */
     fun scan(): Scan = locked { scanOf(files(NOTE)) }
 
     private fun scanOf(noteFiles: List<File>): Scan {
@@ -173,7 +196,7 @@ internal class PendingNotesStore private constructor(
      * header was written counts by its header here, and is found by whatever reads the whole entry (the
      * notebook's own screen, the viewer, a push). A kept entry that fails its full read is reported with
      * the notebook its header names. [keep] runs under the store lock and must not take the Etebase
-     * cache monitor or the cache's write fence.
+     * cache monitor or the cache's write fence. A listing that fails throws IOException, as in [scan].
      */
     fun snapshot(keep: (EntryHeader) -> Boolean): Snapshot = locked {
         val headers = mutableListOf<EntryHeader>()
@@ -197,14 +220,15 @@ internal class PendingNotesStore private constructor(
             }
         }
         unreadable += currentRecoveryProblems(headers.mapTo(HashSet()) { it.noteUid })
-        Snapshot(headers.sortedBy { it.noteUid }, kept, unreadable.sortedBy { it.file }, currentSequence())
+        Snapshot(headers.sortedBy { it.noteUid }, kept, unreadable.sortedBy { it.file },
+            currentSequence(strict = false))
     }
 
     /**
      * One note's entry with the store-wide sequence at the same moment. A load carries the sequence, so
      * an editor can drop any load older than its last save whether or not an entry existed.
      */
-    fun observe(noteUid: String): Observed = locked { Observed(readEntry(noteUid), currentSequence()) }
+    fun observe(noteUid: String): Observed = locked { Observed(readEntry(noteUid), currentSequence(strict = false)) }
 
     // ---- the one primitive every change goes through ----
 
@@ -311,10 +335,10 @@ internal class PendingNotesStore private constructor(
      * Neither is the copy, for as long as it carries its origin link. The link in the copy's own file is
      * the only record that the original was replaced. A copy that landed would be dropped together with
      * it, the original would then read as an ordinary pending edit, and its next 409 would make another
-     * copy. Recovery clears the link as soon as the original is gone, so the copy waits only while the
-     * removal keeps failing, the original cannot be read, or the write that clears the link fails
-     * (design 3.4). Each send refused for this reason has recovery look again before the next operation,
-     * since an original that could not be read leaves no failed step behind to do that.
+     * copy. Recovery clears the link as soon as the original is shown gone, so the copy waits only while
+     * the removal keeps failing, the original cannot be read or cannot be shown gone, or the write that
+     * clears the link fails (design 3.4). Each send refused for this reason has recovery look again before
+     * the next operation, since an original that could not be read leaves no failed step behind to do that.
      */
     fun beginSend(noteUid: String): PendingEntry? = (startSend(noteUid) as? SendStart.Ready)?.entry
 
@@ -500,7 +524,7 @@ internal class PendingNotesStore private constructor(
 
     /**
      * The user's explicit discard of held or unreadable text. Throws, and discards nothing, when the text
-     * is a conflict copy whose original is still there and cannot be removed or read ([removeReplacedOriginal]).
+     * is a conflict copy whose original is not shown gone and cannot be removed or read ([removeReplacedOriginal]).
      */
     fun discard(noteUid: String): Unit = locked {
         (readEntry(noteUid) as? Read.Present)?.entry?.let { removeReplacedOriginal(it) }
@@ -515,7 +539,7 @@ internal class PendingNotesStore private constructor(
      * replaced goes first. The link is the only record of the replacement: with the copy gone, the
      * original would read as an ordinary pending edit again, be sent, get the same 409, and bring back
      * as another copy the text the user just removed. Throws, leaving the copy and its link in place,
-     * when the original cannot be removed or cannot be read.
+     * when the original cannot be removed, cannot be read, or cannot be shown gone.
      */
     private fun removeReplacedOriginal(copy: PendingEntry) {
         val origin = copy.origin ?: return
@@ -557,8 +581,9 @@ internal class PendingNotesStore private constructor(
             } catch (failed: IOException) {
                 // The call fails, the original still owns the text, and the next run resolves the conflict
                 // again. A complete write left behind would be committed by a later recovery, as a second
-                // copy next to the one that run makes.
-                if (!copyFile.exists()) File(dir, copyFile.name + NEW).delete()
+                // copy next to the one that run makes. A copy that was committed has no write left beside
+                // it, so this asks nothing about the copy itself.
+                File(dir, copyFile.name + NEW).delete()
                 throw failed
             }
             moveEditors(originalUid, copy.noteUid)
@@ -610,23 +635,39 @@ internal class PendingNotesStore private constructor(
 
     fun putNotebook(notebookUid: String, blob: ByteArray): Unit = locked { putNotebookLocked(notebookUid, blob) }
 
+    /**
+     * The notebook's stored copy, or null when there is none or it does not decode. Throws when the copy
+     * cannot be read, or cannot be shown not to be there ([readIfPresent]).
+     */
     fun notebook(notebookUid: String): ByteArray? = locked {
-        val file = notebookFile(notebookUid)
-        if (!file.exists()) null else (PendingCodec.decodeNotebook(file.readBytes()) as? PendingCodec.Decoded.Ok)?.value?.second
+        val bytes = readIfPresent(notebookFile(notebookUid)) ?: return@locked null
+        (PendingCodec.decodeNotebook(bytes) as? PendingCodec.Decoded.Ok)?.value?.second
     }
 
     /**
-     * Removes notebook copies no entry references. Skipped entirely while anything is unreadable,
-     * since its notebook is unknown and its copy may be the only way to decrypt it. A listing that
-     * fails throws and removes nothing: read as an empty store, it would leave every copy unreferenced.
+     * Removes notebook copies no entry references, decided from one listing: a listing that reads as
+     * empty then has no copy to remove either. Skipped entirely while anything is unreadable, since its
+     * notebook is unknown and its copy may be the only way to decrypt it, and while the listing holds a
+     * first write that is not committed yet ("<uid>.note.new"), which may be the only copy of a note
+     * whose notebook no committed entry names. A listing that fails throws, as every listing of the store
+     * does, and nothing is removed.
+     *
+     * It runs no recovery: while one is owed, it lists and removes nothing and returns at once. The runner
+     * only logs a prune that fails, so a recovery that failed here would be logged and nothing more. The
+     * next other call runs it instead, at the latest the snapshot of the next run, where a failure counts.
      */
-    fun pruneNotebooks(): List<String> = locked {
-        val scan = scanOf(listedFiles(NOTE))
-        if (scan.unreadable.isNotEmpty()) return@locked emptyList()
-        val referenced = scan.entries.map { it.notebookUid }.toSet()
-        listedFiles(NOTEBOOK).map { it.name.removeSuffix(NOTEBOOK) }
-            .filter { it !in referenced }
-            .onEach { remove(notebookFile(it)) }
+    fun pruneNotebooks(): List<String> = synchronized(lock) {
+        check(!closed) { "the pending store was cleared" }
+        if (!recovered) emptyList() else locked {
+            val listed = listing()
+            if (listed.any { it.name.endsWith(NOTE + NEW) }) return@locked emptyList()
+            val scan = scanOf(withSuffix(listed, NOTE))
+            if (scan.unreadable.isNotEmpty()) return@locked emptyList()
+            val referenced = scan.entries.map { it.notebookUid }.toSet()
+            withSuffix(listed, NOTEBOOK).filter { it.isFile }.map { it.name.removeSuffix(NOTEBOOK) }
+                .filter { it !in referenced }
+                .onEach { remove(notebookFile(it)) }
+        }
     }
 
     /**
@@ -634,23 +675,41 @@ internal class PendingNotesStore private constructor(
      * the process, so a late save that opens the store again gets this instance and is refused instead
      * of recreating the directory. The identity (account generation) never comes back after sign-out. A
      * call after a failed one tries the deletion again, so a sign-out cleanup retry does real work.
+     *
+     * It returns only once the directory is shown gone by two checks that agree: its presence check answers
+     * [Presence.ABSENT], and the nearest directory above it that can be listed does not hold the next name
+     * on the way down to it ([knownAbsent]). A listing alone is no proof, since File.listFiles can return
+     * what it read so far when reading a directory fails partway. Otherwise it throws IOException, whatever
+     * the deletion answered, since the deletion counts a file it could not remove as gone when File.exists()
+     * says so, and that answers false for a check that failed as well. A caller may rely on a clear only
+     * when it returned.
      */
     fun clearAll() {
         synchronized(lock) {
             closed = true
             beforeClearForTesting?.invoke()
-            if (dir.exists() && !dir.deleteRecursively()) throw IOException("could not clear the pending store")
+            dir.deleteRecursively()
+            if (presenceOf(dir) != Presence.ABSENT || !knownAbsent(dir)) {
+                throw IOException("could not clear the pending store")
+            }
         }
     }
 
     // ---- internals ----
 
     /**
-     * Every public operation: refuse after [clearAll], and finish any interrupted work first. Recovery
-     * runs again before the next operation for as long as anything in it did not work out, including a
-     * write or removal inside recovery itself.
+     * Every public operation except [clearAll] and [pruneNotebooks]: refuse after [clearAll], and finish
+     * any interrupted work first. Recovery runs again before the next operation for as long as anything in
+     * it did not work out, including a write or removal inside recovery itself, or a listing it works
+     * from. A recovery whose listing fails throws, so the operation fails with it and the recovery is not
+     * taken for done: a first write it did not see may be the only copy of a note's text, and an original
+     * it did not see may still wait for its conflict copy.
      *
-     * It runs once per operation, at its start. An operation that calls another one under the lock (a
+     * [pruneNotebooks] refuses after [clearAll] as well, but runs no recovery: while one is owed it does
+     * nothing, and it comes here only when none is, so no recovery runs inside a prune, where a failure
+     * would show only as a log line.
+     *
+     * Recovery runs once per operation, at its start. An operation that calls another one under the lock (a
      * save through a handle, anything that goes through [update]) does not recover again in between:
      * recovery can remove an original and move editors, and what the outer call read or decided before
      * the inner one must still hold when the inner one writes.
@@ -680,79 +739,226 @@ internal class PendingNotesStore private constructor(
         return entry.copy(isCreate = false).withSent(landed.revision)
     }
 
+    /** Null when there is no landed record or it does not decode; throws as [readIfPresent] does. */
     private fun readLanded(noteUid: String): LandedRecord? {
-        val file = landedFile(noteUid)
-        if (!file.exists()) return null
-        return (PendingCodec.decodeLanded(file.readBytes()) as? PendingCodec.Decoded.Ok)?.value
+        val bytes = readIfPresent(landedFile(noteUid)) ?: return null
+        return (PendingCodec.decodeLanded(bytes) as? PendingCodec.Decoded.Ok)?.value
     }
 
     private fun putNotebookLocked(notebookUid: String, blob: ByteArray) {
         writeAtomically(notebookFile(notebookUid), PendingCodec.encodeNotebook(notebookUid, blob))
     }
 
-    /** The next value of the store-wide counter, persisted before it is handed out. */
+    /**
+     * The next value of the store-wide counter, persisted before it is handed out. A counter that does not
+     * read is rebuilt strictly ([highestVersion]): while a version on disk cannot be read, or a file there
+     * may hold one this build cannot read (a counter written in full in a layout it does not know, a file
+     * of a kind it does not know), it throws, and nothing is written, the counter included. A version that
+     * is not above all of them could be one an entry already holds, and a drop or a rebase that checks the
+     * version would then take the newer text for the older.
+     */
     private fun nextVersion(): Long {
-        val next = currentSequence() + 1
+        val next = currentSequence(strict = true) + 1
         writeAtomically(File(dir, SEQUENCE), PendingCodec.encodeSequence(next))
         return next
     }
 
-    /** The last version handed out. A lost or damaged counter restarts above every version still on disk. */
-    private fun currentSequence(): Long {
-        val file = File(dir, SEQUENCE)
-        val stored = if (file.exists()) (PendingCodec.decodeSequence(file.readBytes()) as? PendingCodec.Decoded.Ok)?.value else null
-        return stored ?: (files(NOTE).mapNotNull { (decodeFile(it) as? Read.Present)?.entry?.version } +
-            files(LANDED).mapNotNull { (PendingCodec.decodeLanded(it.readBytes()) as? PendingCodec.Decoded.Ok)?.value?.version }).maxOrNull() ?: 0L
+    /**
+     * The last version handed out. A counter that is lost, cut short or fails its checksum is rebuilt as
+     * the highest version still on disk ([highestVersion]) and is not written back here; [nextVersion]
+     * hands out the one above it. A counter written in full in a layout this build does not know (a newer
+     * build's after a downgrade, or an older one this build no longer reads) comes from a build that may
+     * have handed out versions above every file here, so nothing is rebuilt over it: with [strict], which
+     * is for [nextVersion], it throws, as a version on disk that cannot be read does. A counter file that
+     * cannot be read at all throws, and so does one that cannot be shown not to be there ([readIfPresent]):
+     * of a counter whose read fails, only one shown to be missing is rebuilt. The readers ([snapshot],
+     * [observe]) take the highest version they can read instead: the value is only compared, never
+     * written, and a push needs no new version, so one file that cannot be read does not stop a run from
+     * pushing the others.
+     *
+     * The counter shares [PendingCodec.RECORD_FORMAT_VERSION] with landed records and notebook copies, and
+     * the codec reads no other format version, an earlier one included. A build that raises it must keep
+     * decoding every earlier counter layout: otherwise, after the upgrade, every write that needs a new
+     * version fails here, since [versionOf] takes an intact counter it cannot decode for one that may hold
+     * versions it cannot read.
+     */
+    private fun currentSequence(strict: Boolean): Long {
+        val stored = readIfPresent(File(dir, SEQUENCE))?.let { PendingCodec.decodeSequence(it) }
+        return (stored as? PendingCodec.Decoded.Ok)?.value ?: highestVersion(strict)
     }
 
     /**
-     * Recovery problems that still stand: the file is still there and is not an entry that now reads
-     * fine (a failed step of a conflict copy is recorded under the copy's own name). Without this a
-     * problem would outlive its file until the process restarts, and a readable entry would count twice.
+     * The highest version on disk, from one [listing]: each entry's, read from its header alone, which
+     * checks its own CRC and reads no blob, each landed record's, the counter's when the listing shows
+     * one that reads, and those of intact writes not committed yet ("<uid>.note.new", "<uid>.landed.new",
+     * "sequence.new"), since recovery may still commit one. A write that was cut short holds none: it was
+     * never reported saved, and recovery drops it. Neither does a counter that is cut short or fails its
+     * checksum, which is what is rebuilt here, nor a notebook copy. A listing that fails throws. With
+     * [strict], so does a version that cannot be read (a damaged header, a newer format after a
+     * downgrade, a landed record that does not decode, a counter written in full in a layout this build
+     * does not know), and so does a file of a kind this build does not know, which may hold one;
+     * otherwise that file is passed over.
      */
-    private fun currentRecoveryProblems(presentUids: Set<String>): List<Read.Unreadable> =
-        recoveryProblems.filter { File(dir, it.file).exists() && it.file.removeSuffix(NOTE) !in presentUids }
+    private fun highestVersion(strict: Boolean): Long {
+        var highest = 0L
+        for (file in listing()) {
+            val version = try {
+                versionOf(file)
+            } catch (e: IOException) {
+                if (strict) throw e
+                null
+            }
+            if (version != null && version > highest) highest = version
+        }
+        return highest
+    }
 
     /**
+     * The version [file] holds, or null for a file that holds none (a notebook copy, a write or a counter
+     * that was cut short or fails its checksum). Throws when it holds one that cannot be read, and for a
+     * file of a kind this build does not know, which may hold one.
+     */
+    private fun versionOf(file: File): Long? {
+        val name = file.name
+        val version = when {
+            name.endsWith(NOTE) -> readHeader(file)?.version
+            name.endsWith(LANDED) -> landedVersion(file.readBytes())
+            name.endsWith(NOTEBOOK) || name.endsWith(NOTEBOOK + NEW) -> return null
+            name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) || name == SEQUENCE || name == SEQUENCE + NEW -> {
+                val bytes = file.readBytes()
+                if (!PendingCodec.isIntact(bytes)) return null
+                when {
+                    name.endsWith(LANDED + NEW) -> landedVersion(bytes)
+                    name.endsWith(NOTE + NEW) -> entryVersion(bytes)
+                    else -> (PendingCodec.decodeSequence(bytes) as? PendingCodec.Decoded.Ok)?.value
+                }
+            }
+            else -> throw IOException("$name is of a kind this build does not know")
+        }
+        return version ?: throw IOException("the version in $name cannot be read")
+    }
+
+    private fun entryVersion(bytes: ByteArray): Long? =
+        (PendingCodec.decodeEntryHeader(bytes) as? PendingCodec.Decoded.Ok)?.value?.version
+
+    private fun landedVersion(bytes: ByteArray): Long? =
+        (PendingCodec.decodeLanded(bytes) as? PendingCodec.Decoded.Ok)?.value?.version
+
+    /**
+     * A write this build makes, which recovery may finish or drop: the "<name>.new" of an entry, a landed record, a
+     * notebook copy or the counter.
+     */
+    private fun isKnownWrite(name: String): Boolean =
+        name.endsWith(NOTE + NEW) || name.endsWith(LANDED + NEW) || name.endsWith(NOTEBOOK + NEW) ||
+            name == SEQUENCE + NEW
+
+    /**
+     * Recovery problems that still stand: the file is not shown to be gone, and is not an entry that now
+     * reads fine (a failed step of a conflict copy is recorded under the copy's own name). Without this a
+     * problem would outlive its file until the process restarts, and a readable entry would count twice.
+     * A file whose presence cannot be told keeps its problem: dropped, a recovery that has not finished
+     * would show in no report, and a run could record success while its file still waits.
+     */
+    private fun currentRecoveryProblems(presentUids: Set<String>): List<Read.Unreadable> = recoveryProblems.filter {
+        presenceOf(File(dir, it.file)) != Presence.ABSENT && it.file.removeSuffix(NOTE) !in presentUids
+    }
+
+    /**
+     * Missing only when neither the entry nor a first write of it is there, as each is shown not to be. The
+     * entry is read first, and its presence is asked only when that read fails. An entry, or a first write,
+     * that is there but cannot be read, or whose presence cannot be told, reads as unreadable: taken for
+     * missing, a save would write a new entry over it, and a run would not report it.
+     *
      * A leftover "<uid>.note.new" with no committed file is one that recovery could not finish; it may
      * be the only copy of the text, so the note reads as unreadable, which keeps every save from
      * writing through the same path over it. Recovery tries it again before the next operation.
      */
     private fun readEntry(noteUid: String): Read {
         val file = noteFile(noteUid)
-        if (file.exists()) return decodeFile(file)
+        val bytes = try {
+            readIfPresent(file)
+        } catch (e: IOException) {
+            return Read.Unreadable(file.name, e.message ?: "unreadable")
+        }
+        if (bytes != null) return decodeEntry(file.name, bytes)
         val stranded = File(dir, file.name + NEW)
-        return if (stranded.exists()) Read.Unreadable(stranded.name, "an interrupted write is not recovered yet") else Read.Missing
+        val interrupted = try {
+            isPresent(stranded)
+        } catch (e: IOException) {
+            return Read.Unreadable(stranded.name, e.message ?: "unreadable")
+        }
+        if (!interrupted) return Read.Missing
+        return Read.Unreadable(stranded.name, "an interrupted write is not recovered yet")
     }
 
+    /** A listed entry file, read whole: a read that fails is reported, as the listing shows the file is there. */
     private fun decodeFile(file: File): Read = try {
-        when (val decoded = PendingCodec.decodeEntry(file.readBytes())) {
-            is PendingCodec.Decoded.Ok -> Read.Present(decoded.value)
-            is PendingCodec.Decoded.Bad -> Read.Unreadable(file.name, decoded.reason)
-        }
+        decodeEntry(file.name, file.readBytes())
     } catch (e: IOException) {
         Read.Unreadable(file.name, e.message ?: "unreadable")
     }
+
+    private fun decodeEntry(name: String, bytes: ByteArray): Read =
+        when (val decoded = PendingCodec.decodeEntry(bytes)) {
+            is PendingCodec.Decoded.Ok -> Read.Present(decoded.value)
+            is PendingCodec.Decoded.Bad -> Read.Unreadable(name, decoded.reason)
+        }
+
+    /**
+     * The bytes of [file], or null when it is shown not to be there. It is read first, and its presence is
+     * asked only when the read fails, since FileNotFoundException stands for a file that is not there and
+     * for one that cannot be opened alike. A read that fails on a file that is there throws, and so does
+     * one on a file whose presence cannot be told ([isPresent]).
+     */
+    private fun readIfPresent(file: File): ByteArray? = try {
+        file.readBytes()
+    } catch (e: IOException) {
+        if (isPresent(file)) throw e
+        null
+    }
+
+    /**
+     * Whether [file] is there: false only when it is shown not to be ([Presence.ABSENT]). A check that
+     * fails throws IOException, so nothing that may still be there is passed over as absent.
+     */
+    private fun isPresent(file: File): Boolean = when (presenceOf(file)) {
+        Presence.PRESENT -> true
+        Presence.ABSENT -> false
+        Presence.UNKNOWN -> throw IOException("could not tell whether ${file.name} is there")
+    }
+
+    private fun presenceOf(file: File): Presence = presenceForTesting?.invoke(file) ?: presence(file)
 
     /** Finishes interrupted writes and conflict copies, and drops unused landed records. One bad file never stops the others. */
     private fun recoverLocked(): List<Read.Unreadable> {
         val problems = mutableListOf<Read.Unreadable>()
         val unfinished = HashSet<String>()
-        // 1. A leftover "<name>.new" was never committed. While "<name>" exists that write never reported
-        // success, so it goes, unread. Without a committed file it is the first write of that file,
-        // stopped before its rename. One that is cut short or fails its checksum goes as well. Any other
-        // is committed under its own name, in the order a write commits (content synced, renamed in one
-        // step, the rename synced), whether or not this build can read its layout (a newer format
-        // after a downgrade, a held reason added later), so nothing a build wrote in full is thrown away
-        // (design 3.1). An entry file this build cannot read is then reported like every committed entry
-        // that cannot be read. The other kinds are kept for a build that can read them but not reported,
-        // and not for long: a landed record goes in step 2 unless an editor is open, a notebook copy
-        // lasts until a run prunes or rewrites it, and a counter that cannot be read restarts above
-        // every version on disk.
-        for (tmp in listDirectory()?.filter { it.name.endsWith(NEW) }.orEmpty()) {
+        // 1. A leftover "<name>.new" of a kind this build writes was never committed. While "<name>" exists
+        // that write never reported success, so it goes, unread. Without a committed file it is the first
+        // write of that file, stopped before its rename. One that is cut short or fails its checksum goes as
+        // well. Any other is committed under its own name, in the order a write commits (content synced,
+        // renamed in one step, the rename synced), whether or not this build can read its layout (a newer
+        // format after a downgrade, a held reason added later), so nothing a build wrote in full is thrown
+        // away (design 3.1). An entry file this build cannot read is then reported like every committed
+        // entry that cannot be read. The other kinds are kept for a build that can read them but not
+        // reported. A landed record goes in step 2 unless an editor is open, and a notebook copy lasts until
+        // a run prunes or rewrites it. A counter this build cannot read stays as it is, and every write that
+        // needs a new version fails while it does: the build that wrote it may have handed out higher ones.
+        // A ".new" of any other kind is left as it is: not deleted, not committed and not reported, since
+        // this build cannot judge it and a newer build may keep versions in it. With the counter lost, the
+        // version rebuild ([versionOf]) then takes it for a file of a kind this build does not know.
+        // "<name>" is there when the same listing shows it. A listing can come back short, since
+        // File.listFiles can return what it read so far when reading the directory fails partway, so a
+        // "<name>" that the listing leaves out is checked on its own ([isPresent]), and only a check that
+        // shows it absent lets the write be committed: a write that never reported success never replaces
+        // the committed file. A check that fails throws, so the write is reported, both files stay, and the
+        // next recovery decides again.
+        val listed = listing()
+        val names = listed.mapTo(HashSet()) { it.name }
+        for (tmp in listed.filter { isKnownWrite(it.name) }) {
             try {
                 val target = File(dir, tmp.name.removeSuffix(NEW))
-                if (target.exists() || !PendingCodec.isIntact(tmp.readBytes())) {
+                if (target.name in names || isPresent(target) || !PendingCodec.isIntact(tmp.readBytes())) {
                     if (!tmp.delete()) throw IOException("could not remove ${tmp.name}")
                 } else {
                     FileOutputStream(tmp, true).use { it.fd.sync() }
@@ -765,8 +971,9 @@ internal class PendingNotesStore private constructor(
         }
         // 2. A landed record only matters while an editor for its note is open. Any other is left from an
         // editor that closed without clearing it, or from an earlier process (no editor survives one),
-        // and would otherwise keep a full copy of the note on the device.
-        for (file in files(LANDED).filter { !hasEditor(it.name.removeSuffix(LANDED)) }) {
+        // and would otherwise keep a full copy of the note on the device. Only regular files are removed,
+        // as in [pruneNotebooks].
+        for (file in files(LANDED).filter { it.isFile && !hasEditor(it.name.removeSuffix(LANDED)) }) {
             try {
                 remove(file)
             } catch (e: IOException) {
@@ -809,19 +1016,48 @@ internal class PendingNotesStore private constructor(
         return problems
     }
 
-    private fun files(suffix: String): List<File> = withSuffix(listDirectory().orEmpty(), suffix)
+    /** The files with [suffix], from [listing]: a listing that fails throws. */
+    private fun files(suffix: String): List<File> = withSuffix(listing(), suffix)
 
-    /** [files], except that a listing that fails throws. Only a directory that was never created lists as empty. */
-    private fun listedFiles(suffix: String): List<File> {
-        val listed = listDirectory() ?: if (dir.exists()) throw IOException("could not list the pending store") else emptyArray()
-        return withSuffix(listed, suffix)
+    /**
+     * The files in [listed] with [suffix], chosen by name alone. File.isFile also answers false when its
+     * check fails, and an entry dropped for that would be neither reported nor pushed, its version would
+     * be passed over, and its notebook copy would look unreferenced. A caller that removes what it lists
+     * keeps only regular files on top, since there a shorter list can only keep more.
+     */
+    private fun withSuffix(listed: Array<out File>, suffix: String): List<File> =
+        listed.filter { it.name.endsWith(suffix) }.sortedBy { it.name }
+
+    /**
+     * Everything in the store's directory. A listing that fails throws IOException, so nothing reads it
+     * as an empty store: only a directory shown not to be there ([knownAbsent]), such as one that was
+     * never created, lists as empty. File.exists() is not asked: it answers false for a check that
+     * failed as well as for a directory that is not there.
+     */
+    private fun listing(): Array<File> =
+        listDirectory() ?: if (knownAbsent(dir)) emptyArray() else throw IOException("could not list the pending store")
+
+    /**
+     * Whether [d] is shown not to be there: the nearest directory above it that can be listed does not
+     * hold the next name on the way down to it. When that directory does hold the name, or no directory
+     * above can be listed, it is unknown. File.exists() is not asked, for the reason [listing] gives.
+     */
+    private fun knownAbsent(d: File): Boolean {
+        var below = d
+        while (true) {
+            val above = below.parentFile ?: return false
+            val names = listDirectory(above)?.map { it.name }
+            if (names != null) return below.name !in names
+            below = above
+        }
     }
 
-    private fun withSuffix(listed: Array<out File>, suffix: String): List<File> =
-        listed.filter { it.isFile && it.name.endsWith(suffix) }.sortedBy { it.name }
-
-    /** The directory's files, or null when the listing fails, as File.listFiles answers. */
-    private fun listDirectory(): Array<File>? = listFilesForTesting.let { if (it != null) it(dir) else dir.listFiles() }
+    /**
+     * The files in [d], or null when the listing fails, as File.listFiles answers: [d] is not there, is
+     * not a directory, or the check failed.
+     */
+    private fun listDirectory(d: File = dir): Array<File>? =
+        listFilesForTesting.let { if (it != null) it(d) else d.listFiles() }
 
     private fun noteFile(uid: String) = File(dir, checkedUid(uid) + NOTE)
     private fun landedFile(uid: String) = File(dir, checkedUid(uid) + LANDED)
@@ -855,10 +1091,15 @@ internal class PendingNotesStore private constructor(
      * Creates the store's directory and any missing parent, one level at a time, and syncs the parent of
      * each new level, so a file committed in it cannot outlive, after a power loss, the entries that
      * lead to it.
+     *
+     * A level whose check fails is made like a missing one: mkdir, or a directory that is there already,
+     * decides, and a level that was there costs one more sync of its parent. Taken for there, a missing
+     * level would be neither made nor synced.
      */
     private fun createDirectory() {
-        if (!dir.exists()) {
-            for (level in generateSequence(dir) { it.parentFile }.takeWhile { !it.exists() }.toList().asReversed()) {
+        if (presenceOf(dir) != Presence.PRESENT) {
+            val levels = generateSequence(dir) { it.parentFile }.takeWhile { presenceOf(it) != Presence.PRESENT }
+            for (level in levels.toList().asReversed()) {
                 if (!level.mkdir() && !level.isDirectory) throw IOException("could not create the pending store")
                 unsyncedLevels += level
             }
@@ -869,13 +1110,18 @@ internal class PendingNotesStore private constructor(
         }
     }
 
-    /** Removes a committed file together with any leftover ".new" beside it, and makes the removal stick. */
+    /**
+     * Removes a committed file together with any leftover ".new" beside it, and makes the removal stick. A
+     * file is passed over only when it is shown not to be there: one whose presence cannot be told throws
+     * ([isPresent]), as a deletion that fails does, so a removal never reports success over a file that
+     * may still be there.
+     */
     private fun remove(file: File) {
         try {
             beforeRemoveForTesting?.invoke(file)
             val tmp = File(dir, file.name + NEW)
-            if (tmp.exists() && !tmp.delete()) throw IOException("could not remove ${tmp.name}")
-            if (file.exists()) {
+            if (isPresent(tmp) && !tmp.delete()) throw IOException("could not remove ${tmp.name}")
+            if (isPresent(file)) {
                 if (!file.delete()) throw IOException("could not remove ${file.name}")
                 syncDirectory(dir)
             }
@@ -914,12 +1160,55 @@ internal class PendingNotesStore private constructor(
         private val UID = Regex("^[A-Za-z0-9_-]{1,128}$")
         private val registry = ConcurrentHashMap<String, PendingNotesStore>()
 
-        /** Test seams: crash points inside the write, conflict, and sign-out sequences, and the directory listing. */
+        /** Test seams: crash points inside the write, conflict, and sign-out sequences. */
         @Volatile internal var beforeOriginalRemovedForTesting: (() -> Unit)? = null
         @Volatile internal var beforeRenameForTesting: ((File) -> Unit)? = null
         @Volatile internal var beforeRemoveForTesting: ((File) -> Unit)? = null
         @Volatile internal var beforeClearForTesting: (() -> Unit)? = null
+
+        /**
+         * Test seam: what a listing of the directory it is given answers in place of File.listFiles();
+         * null is a listing that failed. It answers every listing the store makes itself: of its own
+         * directory, and of the directories above it that [knownAbsent] lists after a listing of it fails.
+         * It answers the listing in the check of [clearAll] that the directory is gone, but not the deletion.
+         */
         @Volatile internal var listFilesForTesting: ((File) -> Array<File>?)? = null
+
+        /**
+         * Test seam: what a check of whether the path it is given is there answers in place of the store's
+         * own [Presence] check; null leaves the answer to that check. [Presence.UNKNOWN] is a check that failed.
+         */
+        @Volatile internal var presenceForTesting: ((File) -> Presence?)? = null
+
+        /**
+         * lstat(2) through java.nio, for the JVM tests, which cannot call [Os]: NoSuchFileException is ENOENT,
+         * and any other failure is unknown. Android has java.nio.file only from API 26, so a store on a device
+         * gets [lstatPresence] through [forIdentity].
+         */
+        @SuppressLint("NewApi")
+        private val nioPresence: (File) -> Presence = { path ->
+            try {
+                Files.readAttributes(path.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                Presence.PRESENT
+            } catch (e: NoSuchFileException) {
+                Presence.ABSENT
+            } catch (e: IOException) {
+                Presence.UNKNOWN
+            }
+        }
+
+        /**
+         * lstat(2), which does not follow a link, so a link whose target is gone is still there, as a listing
+         * shows it. ENOENT is the only answer that a path is not there; any other errno is unknown.
+         */
+        private val lstatPresence: (File) -> Presence = { path ->
+            try {
+                Os.lstat(path.path)
+                Presence.PRESENT
+            } catch (e: ErrnoException) {
+                if (e.errno == OsConstants.ENOENT) Presence.ABSENT else Presence.UNKNOWN
+            }
+        }
 
         /** rename(2) through File.renameTo: on Android and Linux it replaces the target in one step. */
         private val renameTo: (File, File) -> Unit = { from, to ->
@@ -937,10 +1226,16 @@ internal class PendingNotesStore private constructor(
 
         /**
          * The single instance for [dir] in this process, so every caller shares its lock. [rename] must
-         * replace an existing target in one step; JVM tests on Windows pass a java.nio atomic move.
+         * replace an existing target in one step; JVM tests on Windows pass a java.nio atomic move. The
+         * default [presence] is for the JVM tests; a store on a device is opened through [forIdentity].
          */
-        fun open(dir: File, syncDirectory: (File) -> Unit = {}, rename: (File, File) -> Unit = renameTo): PendingNotesStore =
-            registry.computeIfAbsent(dir.canonicalPath) { PendingNotesStore(File(it), syncDirectory, rename) }
+        fun open(
+            dir: File,
+            syncDirectory: (File) -> Unit = {},
+            rename: (File, File) -> Unit = renameTo,
+            presence: (File) -> Presence = nioPresence,
+        ): PendingNotesStore =
+            registry.computeIfAbsent(dir.canonicalPath) { PendingNotesStore(File(it), syncDirectory, rename, presence) }
 
         /** Test seam: forget every instance, as a process restart would. */
         internal fun resetForTesting() = registry.clear()
@@ -991,7 +1286,9 @@ internal class PendingNotesStore private constructor(
         private val androidDirectorySync = directorySync(fsyncDirectory) { it == OsConstants.EINVAL || it == OsConstants.ENOTSUP }
 
         /** Outside backup and device transfer, and outside the Etebase cache's per-username directories. */
-        fun forIdentity(context: Context, accountType: String, accountName: String, creationId: String) =
-            open(identityDir(context.noBackupFilesDir, accountType, accountName, creationId), androidDirectorySync, androidRename)
+        fun forIdentity(context: Context, accountType: String, accountName: String, creationId: String) = open(
+            identityDir(context.noBackupFilesDir, accountType, accountName, creationId),
+            androidDirectorySync, androidRename, lstatPresence,
+        )
     }
 }
