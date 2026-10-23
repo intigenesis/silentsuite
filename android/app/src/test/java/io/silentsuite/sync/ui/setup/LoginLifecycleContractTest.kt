@@ -192,7 +192,7 @@ class LoginLifecycleContractTest {
         assertFalse(job.contains("secrets."))
         assertTrue(unsignedBuild.contains("ANDROID_BUILD_TOOLS_VERSION: '36.0.0'"))
         assertTrue(unsignedBuild.contains("\"\$ANDROID_HOME/build-tools/\$ANDROID_BUILD_TOOLS_VERSION/aapt\""))
-        assertTrue(unsignedBuild.contains("sdkVersion:'21'"))
+        assertTrue(unsignedBuild.contains("sdkVersion:'29'"))
         assertTrue(unsignedBuild.contains("targetSdkVersion:'36'"))
         assertTrue(unsignedBuild.contains("grep -Fxc \"sdkVersion:"))
         assertTrue(unsignedBuild.contains("grep -Fxc \"targetSdkVersion:"))
