@@ -89,15 +89,15 @@ describe('Umbrel candidate smoke and probe failure behavior', () => {
 })
 
 describe('Umbrel candidate archive delivery', () => {
-  it('uploads the development archive with hidden files included and the unchanged scoped path', () => {
+  it('uploads the development archive with hidden files included and the architecture-scoped path', () => {
     const workflow = parse(readRequired(workflowPath)) as Record<string, any>
     const steps = (workflow.jobs?.candidate?.steps ?? []) as Record<string, any>[]
     const upload = steps.find((step) => String(step.uses ?? '').startsWith('actions/upload-artifact@'))
     expect(upload, 'upload-artifact step').toBeDefined()
     const inputs = (upload?.with ?? {}) as Record<string, unknown>
     expect(inputs['include-hidden-files'], 'hidden files must be delivered').toBe(true)
-    expect(inputs.path, 'upload path stays scoped to the candidate dir').toBe('${{ runner.temp }}/umbrel-candidate')
-    expect(inputs.name).toBe('umbrel-development-candidate-${{ github.event.pull_request.head.sha }}')
+    expect(inputs.path, 'upload path stays scoped to the candidate dir').toBe('${{ runner.temp }}/umbrel-candidate-${{ matrix.arch }}')
+    expect(inputs.name).toBe('umbrel-development-candidate-${{ github.event.pull_request.head.sha }}-${{ matrix.arch }}')
     expect(inputs['if-no-files-found']).toBe('error')
     expect(inputs['retention-days']).toBe(7)
   })

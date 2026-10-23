@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 PACKAGE = ROOT / "self-host" / "umbrel" / "silentsuite"
 RENDERER = ROOT / "scripts" / "umbrel-candidate-effective-compose.py"
 SOURCE_SHA = "a" * 40
@@ -351,3 +352,97 @@ elif args[0] == "compose" and "up" in args:
     assert not list(runner.iterdir()), "owned fixture was not removed"
     assert credential.read_text() == '{"auths":{"ghcr.io":{"auth":"fixture-canary"}}}'
     assert "fixture-canary" not in result.stdout + result.stderr
+
+
+def paired_identity_fixture():
+    from selfhost_release_contract import ReleaseIdentity, render_manifest
+    from umbrel_release_contract import render
+    tag = "v1.2.3"
+    source = "a" * 40
+    server = render_manifest(ReleaseIdentity(
+        tag, source, "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "3" * 64,
+    ))
+    text = render(tag, source, server, "sha256:" + "4" * 64, "sha256:" + "5" * 64, "sha256:" + "6" * 64)
+    return tag, source, server, text
+
+
+def test_paired_identity_binds_server_native_images_and_build_arguments():
+    from umbrel_release_contract import BUILD_ARGS, verify
+    tag, source, server, text = paired_identity_fixture()
+    document = verify(text, tag, source, server)
+    assert document["sourceCommit"] == document["web"]["expectedRevision"] == source
+    assert document["server"]["indexDigest"] == json.loads(server)["indexDigest"]
+    assert document["platforms"] == ["linux/amd64", "linux/arm64"]
+    assert document["buildArgs"] == BUILD_ARGS
+
+
+@pytest.mark.parametrize("mutation", [
+    "source", "platform", "server", "repository", "arguments", "children", "revision", "controller",
+])
+def test_paired_identity_rejects_mismatches(mutation):
+    from selfhost_release_contract import ContractError
+    from umbrel_release_contract import verify
+    tag, source, server, text = paired_identity_fixture()
+    document = json.loads(text)
+    if mutation == "source":
+        document["sourceCommit"] = "b" * 40
+    elif mutation == "platform":
+        document["platforms"] = ["linux/arm64", "linux/amd64"]
+    elif mutation == "server":
+        document["server"]["indexDigest"] = "sha256:" + "9" * 64
+    elif mutation == "repository":
+        document["web"]["imageRepository"] = "ghcr.io/silent-suite/silentsuite-web"
+    elif mutation == "arguments":
+        document["buildArgs"]["NEXT_PUBLIC_ETEBASE_SERVER_URL"] = "https://server.silentsuite.io"
+    elif mutation == "children":
+        document["web"]["arm64Digest"] = document["web"]["amd64Digest"]
+    elif mutation == "revision":
+        document["web"]["expectedRevision"] = "b" * 40
+    else:
+        document["controllerCommit"] = "b" * 40
+    with pytest.raises(ContractError):
+        verify(json.dumps(document), tag, source, server)
+
+
+def test_redispatch_after_controller_advance_is_identical_and_never_clobbers(tmp_path, monkeypatch):
+    from selfhost_release_contract import ContractError
+    from umbrel_release_contract import render, write_or_verify
+    tag, source, server, first = paired_identity_fixture()
+    path = tmp_path / "umbrel-images.json"
+    write_or_verify(path, first, write=True)
+    before = path.stat()
+    monkeypatch.setenv("GITHUB_SHA", "b" * 40)
+    monkeypatch.setenv("GITHUB_RUN_ID", "987")
+    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
+    repeated = render(tag, source, server, "sha256:" + "4" * 64, "sha256:" + "5" * 64, "sha256:" + "6" * 64)
+    assert repeated == first
+    write_or_verify(path, repeated, write=True)
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    changed = render(tag, source, server, "sha256:" + "9" * 64, "sha256:" + "5" * 64, "sha256:" + "6" * 64)
+    with pytest.raises(ContractError, match="different bytes"):
+        write_or_verify(path, changed, write=True)
+    assert path.read_bytes() == first.encode("utf-8")
+
+
+@pytest.mark.parametrize("mutation", ["none", "logout", "credentials", "dependency", "owner-flag"])
+def test_publication_boundary_rejects_credential_and_admission_drift(mutation):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("paired_boundary", ROOT / "scripts/check-android-signing-boundary.py")
+    boundary = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(boundary)
+    document = yaml.load((ROOT / ".github/workflows/release-server-image.yml").read_text(), Loader=yaml.BaseLoader)
+    web = document["jobs"]["build-web"]
+    named = {step["name"]: step for step in web["steps"]}
+    smoke = named["Pull pair and smoke without registry credentials"]
+    if mutation == "logout":
+        smoke["run"] = smoke["run"].replace("\ndocker logout ghcr.io", "\ntrue")
+    elif mutation == "credentials":
+        smoke["env"]["GITHUB_TOKEN"] = "${{ secrets.GITHUB_TOKEN }}"
+    elif mutation == "dependency":
+        document["jobs"]["publish-index"]["needs"] = ["build"]
+    elif mutation == "owner-flag":
+        build = named["Build and push owner-enabled web by digest"]["with"]
+        build["build-args"] = build["build-args"].replace("NEXT_PUBLIC_OWNER_REGISTRATION=true", "NEXT_PUBLIC_OWNER_REGISTRATION=false")
+    violations = []
+    boundary.check_umbrel_publication(document, violations)
+    assert bool(violations) == (mutation != "none"), violations

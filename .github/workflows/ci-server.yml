@@ -11,6 +11,8 @@ on:
       - '.dockerignore'
       - 'self-host/**'
       - 'contracts/self-host-server-image.schema.json'
+      - 'contracts/umbrel-images.schema.json'
+      - 'scripts/umbrel_release_contract.py'
       - 'docs/self-hosting/**'
       - 'apps/docs/self-hosting/**'
       - 'scripts/build-self-host-bundle.py'
@@ -49,6 +51,8 @@ on:
       - '.dockerignore'
       - 'self-host/**'
       - 'contracts/self-host-server-image.schema.json'
+      - 'contracts/umbrel-images.schema.json'
+      - 'scripts/umbrel_release_contract.py'
       - 'docs/self-hosting/**'
       - 'apps/docs/self-hosting/**'
       - 'scripts/build-self-host-bundle.py'
@@ -229,6 +233,7 @@ jobs:
             scripts/lock-server-requirements.py \
             scripts/selfhost_release_contract.py \
             scripts/umbrella_release_contract.py \
+            scripts/umbrel_release_contract.py \
             scripts/verify-umbrella-release-readiness.py \
             scripts/umbrel-candidate-effective-compose.py \
             scripts/umbrel-candidate-probe.py
