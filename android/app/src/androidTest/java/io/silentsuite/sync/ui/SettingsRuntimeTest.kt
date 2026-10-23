@@ -701,8 +701,8 @@ class SettingsRuntimeTest {
         var previous = read()
         repeat(20) {
             Thread.sleep(250)
-            val current = read()
             val initialized = authorities.all { android.content.ContentResolver.getIsSyncable(account, it) >= 0 }
+            val current = read()
             if (initialized && current == previous) return current
             previous = current
         }
