@@ -97,8 +97,9 @@ def full_probe():
         check("router reaches migrated server (is_etebase)", False)
         return
     check("router reaches migrated server (is_etebase)", True)
-    status, _, _ = request("GET", "/signup")
+    status, headers, _ = request("GET", "/signup")
     check("router serves standalone web /signup", status == 200)
+    check("self-host web does not apply hosted CSP", "content-security-policy" not in headers)
 
     status, headers, _ = owner_login(OWNER_PASSWORD, origin=None)
     check("owner login without Origin is refused", status == 403)

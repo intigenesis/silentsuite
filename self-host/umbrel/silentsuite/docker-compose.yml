@@ -11,7 +11,7 @@ services:
       PROXY_AUTH_BLACKLIST: "/api/v1/owner/,/api/v1/owner/*,/admin/,/admin/*"
 
   router:
-    image: nginxinc/nginx-unprivileged@sha256:15c994d10d6d78658721c3bcafff14cb281fba2a4bdf9d5ba92c416a472516e3
+    image: nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:15c994d10d6d78658721c3bcafff14cb281fba2a4bdf9d5ba92c416a472516e3
     restart: on-failure
     volumes:
       - ${APP_DATA_DIR}/data/router:/etc/nginx/conf.d:ro

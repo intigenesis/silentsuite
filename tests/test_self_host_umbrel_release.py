@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -38,7 +39,7 @@ def candidate(tmp_path):
     return package, document
 
 
-def render(candidate):
+def render(candidate, mode="smoke"):
     package, document = candidate
     source = package / "docker-compose.yml"
     source.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
@@ -53,9 +54,13 @@ def render(candidate):
         "APP_SILENTSUITE_WEB_IMAGE": WEB_IMAGE,
         "APP_SILENTSUITE_SERVER_IMAGE": SERVER_IMAGE,
     }
-    # Match the current smoke caller: source, destination and router port only.
+    # Exercise the explicit interface shared by smoke and archive producers.
     result = subprocess.run(
-        [sys.executable, str(RENDERER), str(source), str(destination), "18080"],
+        [
+            sys.executable, str(RENDERER), str(source), str(destination), "18080",
+            "--web-image", WEB_IMAGE, "--server-image", SERVER_IMAGE,
+            "--app-data-dir", str(package), "--mode", mode,
+        ],
         cwd=ROOT,
         env=environment,
         capture_output=True,
@@ -89,11 +94,12 @@ def test_valid_canonical_package_preserves_the_smoke_stack(candidate):
 
 
 @pytest.mark.parametrize("literal_pins", [False, True], ids=["canonical", "poisoned-pins"])
-def test_smoke_uses_exact_just_built_image_pair(candidate, literal_pins):
+@pytest.mark.parametrize("mode", ["smoke", "archive"])
+def test_smoke_uses_exact_just_built_image_pair(candidate, literal_pins, mode):
     if literal_pins:
         for service, image in POISONED_IMAGES.items():
             candidate[1]["services"][service]["image"] = image
-    result, destination = render(candidate)
+    result, destination = render(candidate, mode)
     assert result.returncode == 0, result.stderr
     services = yaml.safe_load(destination.read_text(encoding="utf-8"))["services"]
     actual = {service: services[service]["image"] for service in EXPECTED_IMAGES}
@@ -143,11 +149,12 @@ def test_smoke_uses_exact_just_built_image_pair(candidate, literal_pins):
         ),
     ],
 )
-def test_renderer_rejects_candidate_host_access(candidate, service, patch):
+@pytest.mark.parametrize("mode", ["smoke", "archive"])
+def test_renderer_rejects_candidate_host_access(candidate, service, patch, mode):
     document = candidate[1]
     target = document if service is None else document["services"][service]
     target.update(patch)
-    result, destination = render(candidate)
+    result, destination = render(candidate, mode)
     assert result.returncode != 0, f"unsafe Compose input was accepted: {patch}"
     assert not destination.exists(), "rejected input must not produce runnable Compose"
 
@@ -161,18 +168,20 @@ def test_renderer_rejects_candidate_host_access(candidate, service, patch):
     ],
     ids=["parent-escape", "outside-data-root", "data-prefix-lookalike"],
 )
-def test_renderer_rejects_bind_path_escape(candidate, source):
+@pytest.mark.parametrize("mode", ["smoke", "archive"])
+def test_renderer_rejects_bind_path_escape(candidate, source, mode):
     package, document = candidate
     host_path = Path(source.replace("${APP_DATA_DIR}", str(package)))
     host_path.mkdir(parents=True, exist_ok=True)
     document["services"]["server"]["volumes"][0] = f"{source}:/data"
-    result, destination = render(candidate)
+    result, destination = render(candidate, mode)
     assert result.returncode != 0, f"escaping bind source was accepted: {source}"
     assert not destination.exists()
 
 
 @pytest.mark.parametrize("kind", ["directory", "bootstrap-file"])
-def test_renderer_rejects_bind_source_symlink_escape(candidate, kind):
+@pytest.mark.parametrize("mode", ["smoke", "archive"])
+def test_renderer_rejects_bind_source_symlink_escape(candidate, kind, mode):
     package, _ = candidate
     outside = package.parent / "outside"
     outside.mkdir()
@@ -186,6 +195,159 @@ def test_renderer_rejects_bind_source_symlink_escape(candidate, kind):
         link = package / "data" / "bootstrap" / "init.sh"
         link.unlink()
         link.symlink_to(target)
-    result, destination = render(candidate)
+    result, destination = render(candidate, mode)
     assert result.returncode != 0, f"escaping {kind} symlink was accepted"
     assert not destination.exists()
+
+
+def test_archive_preserves_umbrel_wiring_and_has_no_smoke_publication(candidate):
+    result, destination = render(candidate, "archive")
+    assert result.returncode == 0, result.stderr
+    document = yaml.safe_load(destination.read_text(encoding="utf-8"))
+    original = candidate[1]
+    assert set(document["services"]) == set(original["services"])
+    assert document["services"]["app_proxy"] == original["services"]["app_proxy"]
+    for name, service in document["services"].items():
+        assert "ports" not in service and "container_name" not in service
+        if name not in EXPECTED_IMAGES:
+            assert service == original["services"][name]
+
+
+@pytest.mark.parametrize("mode", ["smoke", "archive"])
+@pytest.mark.parametrize("service", ["web", "server", "init", "postgres"])
+def test_renderer_rejects_extra_environment_interpolation(candidate, mode, service):
+    candidate[1]["services"][service].setdefault("environment", {})["RUNNER_SECRET"] = "${GITHUB_TOKEN}"
+    result, destination = render(candidate, mode)
+    assert result.returncode != 0, "runner environment interpolation was accepted"
+    assert not destination.exists()
+
+
+def test_candidate_workflow_uses_native_images_and_shared_archive_renderer():
+    document = yaml.load(
+        (ROOT / ".github/workflows/ci-umbrel-candidate.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    assert document["permissions"] == {"contents": "read"}
+    job = document["jobs"]["candidate"]
+    assert {(entry["platform"], entry["runner"]) for entry in job["strategy"]["matrix"]["include"]} == {
+        ("linux/amd64", "ubuntu-24.04"), ("linux/arm64", "ubuntu-24.04-arm"),
+    }
+    steps = {step["name"]: step for step in job["steps"]}
+    for name in ("Build owner-enabled self-host web image", "Build server image"):
+        settings = steps[name]["with"]
+        assert settings["platforms"] == "${{ matrix.platform }}"
+        assert settings["load"] == "true" and settings["push"] == "false"
+    args = steps["Build owner-enabled self-host web image"]["with"]["build-args"].splitlines()
+    for setting in (
+        "NEXT_PUBLIC_SELF_HOSTED=true", "NEXT_PUBLIC_ETEBASE_SERVER_URL=",
+        "NEXT_PUBLIC_OWNER_REGISTRATION=true", "NEXT_PUBLIC_BTCPAY_CHECKOUT_ENABLED=false",
+        "NEXT_PUBLIC_SIGNUP_ANALYTICS_ENABLED=false", "NEXT_PUBLIC_LOCAL_CACHE_ENABLED=false",
+    ):
+        assert setting in args
+    assembly = steps["Assemble development package archive"]["run"]
+    assert "umbrel-candidate-effective-compose.py" in assembly and "--mode archive" in assembly
+    assert '--web-image "$WEB_IMAGE" --server-image "$SERVER_IMAGE"' in assembly
+    assert "sed " not in assembly
+    assert '"platform": env["PLATFORM"]' in assembly
+    assert '"id": env["WEB_ID"]' in assembly and '"id": env["SERVER_ID"]' in assembly
+    assert "sha256sum --check SHA256SUMS" in assembly
+    upload = steps["Upload development candidate archive"]["with"]
+    assert upload["name"].endswith("-${{ matrix.arch }}")
+    assert upload["include-hidden-files"] == "true"
+    assert "env -i" in steps["Effective-stack smoke test"]["run"]
+
+
+@pytest.mark.parametrize("outcome", ["failure", "signal"])
+def test_smoke_removes_credentials_and_cleans_only_its_fixture(tmp_path, outcome):
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    caller_config = tmp_path / "caller-docker"
+    caller_config.mkdir()
+    credential = caller_config / "config.json"
+    credential.write_text('{"auths":{"ghcr.io":{"auth":"fixture-canary"}}}', encoding="utf-8")
+    log = tmp_path / "docker-calls.jsonl"
+
+    def executable(name, body):
+        path = tools / name
+        path.write_text(f"#!{sys.executable}\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+
+    # Replace external tools, not application modules; execute the real renderer.
+    executable("python3.12", f"""
+import os
+from pathlib import Path
+import sys
+if sys.argv[1:3] == ["-m", "venv"]:
+    binary = Path(sys.argv[3]) / "bin"
+    binary.mkdir(parents=True)
+    for name, body in (
+        ("pip", "import sys\\nsys.exit(0)\\n"),
+        ("python", "import os, sys\\nos.execv(" + repr({sys.executable!r}) + ", [" + repr({sys.executable!r}) + "] + sys.argv[1:])\\n"),
+    ):
+        path = binary / name
+        path.write_text("#!" + {sys.executable!r} + "\\n" + body)
+        path.chmod(0o755)
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
+""")
+    executable("sudo", f"""
+from pathlib import Path
+import shutil
+import sys
+assert sys.argv[1:4] == ["rm", "-rf", "--"]
+target = Path(sys.argv[4])
+assert target.parent == Path({str(runner)!r}) and target.name.startswith("umbrel-candidate.")
+shutil.rmtree(target)
+""")
+    executable("docker", f"""
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+args = sys.argv[1:]
+config = Path(os.environ["DOCKER_CONFIG"])
+with Path({str(log)!r}).open("a") as output:
+    output.write(json.dumps({{
+        "args": args,
+        "credentials": [key for key in ("GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "AWS_SECRET_ACCESS_KEY") if key in os.environ],
+        "config": str(config),
+        "config_files": [path.name for path in config.iterdir()],
+    }}) + "\\n")
+if args[:2] == ["image", "inspect"]:
+    template, reference = args[3], args[4]
+    if ".Os" in template:
+        print("linux/amd64")
+    elif "revision" in template:
+        print({SOURCE_SHA!r})
+    else:
+        print("sha256:" + ("a" if reference in ({WEB_IMAGE!r}, "sha256:" + "a" * 64) else "b") * 64)
+elif args[0] == "compose" and "up" in args:
+    if {outcome!r} == "signal":
+        os.kill(os.getppid(), signal.SIGTERM)
+    sys.exit(42)
+""")
+    result = subprocess.run(
+        ["bash", str(ROOT / "scripts/umbrel-candidate-smoke.sh"), WEB_IMAGE, SERVER_IMAGE,
+         "--platform", "linux/amd64", "--expect-revision", SOURCE_SHA],
+        env={
+            "PATH": str(tools) + os.pathsep + os.environ.get("PATH", os.defpath),
+            "RUNNER_TEMP": str(runner),
+            "DOCKER_CONFIG": str(caller_config),
+            "GITHUB_TOKEN": "fixture-canary",
+            "ACTIONS_RUNTIME_TOKEN": "fixture-canary",
+            "AWS_SECRET_ACCESS_KEY": "fixture-canary",
+        },
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    assert result.returncode == (42 if outcome == "failure" else 130), result.stderr
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert any("up" in call["args"] for call in calls), "fixture never reached container launch"
+    assert any("down" in call["args"] for call in calls), "cleanup did not stop the owned project"
+    assert all(not call["credentials"] and not call["config_files"] for call in calls)
+    assert all(Path(call["config"]).is_relative_to(runner) for call in calls)
+    assert not list(runner.iterdir()), "owned fixture was not removed"
+    assert credential.read_text() == '{"auths":{"ghcr.io":{"auth":"fixture-canary"}}}'
+    assert "fixture-canary" not in result.stdout + result.stderr
