@@ -1077,9 +1077,85 @@ class SiblingRoutesRuntimeTest {
 
     @Test
     fun invitationRejectCompletionUpdatesListAndReturnsForExactGeneration() {
-        val context=InstrumentationRegistry.getInstrumentation().targetContext;val manager=AccountManager.get(context);val account=addAccount(manager,"ac41-reject","ac41-reject-generation");val rows=AtomicReference(listOf(RuntimeInvitation("invite-r","bob",com.etebase.client.CollectionAccessLevel.ReadOnly,"CC:DD")));val calls=AtomicInteger()
-        invitationsOverride={rows.get()};invitationActionOverride={ _,id,key,action -> assertEquals(account,id.account);assertEquals("ac41-reject-generation",id.creationId);assertEquals("invite-r",key);assertEquals(RuntimeInvitationAction.REJECT,action);rows.set(emptyList());calls.incrementAndGet();Result.success(Unit) }
-        try { ActivityScenario.launchActivityForResult<InvitationsActivity>(InvitationsActivity.newIntent(context,account,"ac41-reject-generation")).use { s -> s.recreate();waitUntil("invitation row laid out") {var ok=false;s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as? InvitationsListFragment;ok=f?.listAdapter?.count==1&&f.listView.getChildAt(0)!=null };ok};s.onActivity {val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as InvitationsListFragment;assertEquals("ac41-reject-generation",f.arguments!!.getString("invitation.identity.creationId"));f.onItemClick(f.listView,requireNotNull(f.listView.getChildAt(0)),0,0)};onView(withText("CC:DD")).inRoot(isDialog()).check(matches(isDisplayed()));onView(withText(R.string.invitations_reject)).inRoot(isDialog()).perform(click());waitUntil("rendered rejection") {var ok=false;s.onActivity {val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as? InvitationsListFragment;ok=calls.get()==1&&f?.listAdapter?.count==0};ok};s.onActivity {val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as InvitationsListFragment;assertEquals(0,f.listAdapter!!.count);assertEquals(Lifecycle.State.RESUMED,it.lifecycle.currentState);it.onBackPressedDispatcher.onBackPressed()};waitUntil("reject return") {s.state==Lifecycle.State.DESTROYED};assertEquals(Lifecycle.State.DESTROYED,s.state);assertEquals(android.app.Activity.RESULT_CANCELED,s.result.resultCode)}} finally {invitationActionOverride=null;invitationsOverride=null;removeAccountAndWait(manager,account)}
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val account = addAccount(manager, "ac41-reject", "ac41-reject-generation")
+        val rows = AtomicReference(listOf(RuntimeInvitation("invite-r", "bob",
+            com.etebase.client.CollectionAccessLevel.ReadOnly, "CC:DD")))
+        val calls = AtomicInteger()
+        invitationsOverride = { rows.get() }
+        invitationActionOverride = { _, identity, key, action ->
+            assertEquals(account, identity.account)
+            assertEquals("ac41-reject-generation", identity.creationId)
+            assertEquals("invite-r", key)
+            assertEquals(RuntimeInvitationAction.REJECT, action)
+            rows.set(emptyList())
+            calls.incrementAndGet()
+            Result.success(Unit)
+        }
+        try {
+            ActivityScenario.launchActivityForResult<InvitationsActivity>(
+                InvitationsActivity.newIntent(context, account, "ac41-reject-generation")
+            ).use { scenario ->
+                scenario.recreate()
+                waitUntil("invitation row laid out") {
+                    var ready = false
+                    scenario.onActivity { activity ->
+                        val fragment = activity.supportFragmentManager.findFragmentById(R.id.fragment_container)
+                            as? InvitationsListFragment
+                        ready = fragment?.listAdapter?.count == 1 && fragment.listView.getChildAt(0) != null
+                    }
+                    ready
+                }
+                scenario.onActivity { activity ->
+                    val fragment = activity.supportFragmentManager.findFragmentById(R.id.fragment_container)
+                        as InvitationsListFragment
+                    assertEquals("ac41-reject-generation", fragment.arguments!!.getString("invitation.identity.creationId"))
+                    fragment.onItemClick(fragment.listView, requireNotNull(fragment.listView.getChildAt(0)), 0, 0)
+                }
+                onView(withText("CC:DD")).inRoot(isDialog()).check(matches(isDisplayed()))
+                // This tests action completion, not touch injection during window recreation.
+                // Activate the actual dialog button and witness its listener, never invoke the
+                // invitation override directly or dismiss the dialog on the fixture's behalf.
+                onView(withText(R.string.invitations_reject)).inRoot(isDialog())
+                    .perform(object : androidx.test.espresso.ViewAction {
+                        override fun getConstraints(): org.hamcrest.Matcher<View> = isDisplayed()
+                        override fun getDescription() = "activate the real Reject dialog button"
+                        override fun perform(controller: androidx.test.espresso.UiController, view: View) {
+                            assertEquals(android.R.id.button2, view.id)
+                            assertTrue("Reject button must be enabled", view.isEnabled)
+                            assertTrue("Reject button must handle the click", view.performClick())
+                            controller.loopMainThreadUntilIdle()
+                        }
+                    })
+                onView(withText("CC:DD"))
+                    .check(androidx.test.espresso.assertion.ViewAssertions.doesNotExist())
+                waitUntil("rendered rejection") {
+                    var rendered = false
+                    scenario.onActivity { activity ->
+                        val fragment = activity.supportFragmentManager.findFragmentById(R.id.fragment_container)
+                            as? InvitationsListFragment
+                        rendered = calls.get() == 1 && fragment?.listAdapter?.count == 0
+                    }
+                    rendered
+                }
+                scenario.onActivity { activity ->
+                    val fragment = activity.supportFragmentManager.findFragmentById(R.id.fragment_container)
+                        as InvitationsListFragment
+                    assertEquals(0, fragment.listAdapter!!.count)
+                    assertEquals(Lifecycle.State.RESUMED, activity.lifecycle.currentState)
+                    activity.onBackPressedDispatcher.onBackPressed()
+                }
+                waitUntil("reject return") { scenario.state == Lifecycle.State.DESTROYED }
+                assertEquals(1, calls.get())
+                assertEquals(Lifecycle.State.DESTROYED, scenario.state)
+                assertEquals(android.app.Activity.RESULT_CANCELED, scenario.result.resultCode)
+            }
+        } finally {
+            invitationActionOverride = null
+            invitationsOverride = null
+            removeAccountAndWait(manager, account)
+        }
     }
 
     // ---- Contacts native-store repopulation ----
