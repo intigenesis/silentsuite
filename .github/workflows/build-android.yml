@@ -288,7 +288,7 @@ jobs:
       - name: Run debug unit tests, lint, and assemble instrumentation APKs
         # Assemble each Android module's androidTest APK so AGP merges and
         # validates its instrumentation manifest. Runtime coverage stays
-        # focused on the app test below (API 21, API 35, and API 36).
+        # focused on the app test below (API 29, API 35, and API 36).
         run: >-
           ./gradlew
           app:testDebugUnitTest
