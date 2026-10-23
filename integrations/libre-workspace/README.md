@@ -4,10 +4,13 @@ A basic [Libre Workspace](https://docs.libre-workspace.org/modules/addons.html)
 add-on that runs the SilentSuite sync server and its PostgreSQL database on a
 Libre Workspace server and serves it at `https://silentsuite.<your domain>`.
 
-> **Status: not yet tested on a real Libre Workspace server.** The scripts are
-> covered by fixture tests (see [Testing](#testing)), but installation,
-> removal, the portal buttons, Caddy and DNS on a live system are unverified.
-> Do not use it for production data yet.
+> **Status: reported working on a real Libre Workspace server.** On October 23,
+> 2026 the maintainer reports a real Libre Workspace installation fully working
+> through this packaged add-on. That is reported real-world acceptance, not an
+> independently operated portal or client test. The scripts remain covered by
+> the fixture tests (see [Testing](#testing)). Removal on that installation,
+> ARM64 and cross-version upgrades are unverified. Back up and test before
+> using it with production data.
 
 ## What it does and does not do
 
@@ -296,9 +299,10 @@ It checks:
 - remove keeps the volumes and restores the Caddyfile byte-for-byte;
 - a reinstall over the kept data is refused.
 
-The Libre Workspace portal is not installed there. The Addon Center, task
-queue, dashboard tile, icon, hosts and DNS entries, and a public certificate
-are untested. Neither test replaces an install on a real Libre Workspace
+The CI runtime smoke remains a separate credential-free amd64 Docker/Caddy run
+without the Libre Workspace portal, so it does not demonstrate portal behavior.
+The maintainer's report above is real-world acceptance, not an independently
+operated portal or client test. Neither replaces a backed-up trial on your own
 server.
 
 ## License
