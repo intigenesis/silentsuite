@@ -2053,13 +2053,13 @@ class PendingNotesStoreTest {
         assertEquals(2, Regex("""\.filter \{ it\.isFile\b""").findAll(code).count())
         assertEquals(1, Regex("""\bisDirectory\b""").findAll(code).count())
         assertEquals(1, Regex("""!level\.mkdir\(\) && !level\.isDirectory\)""").findAll(code).count())
-        // The presence check is asked only where a check that failed cannot pass for an absence: isPresent,
-        // which throws on UNKNOWN, two decisions that need ABSENT (a recovery problem stays; shownGone, for a
-        // clear and for a count of nothing), and createDirectory, which makes a level not shown PRESENT and
+        // The presence check is asked only where a check that failed cannot pass for an absence: isPresent and
+        // syncRemoval, which throw on UNKNOWN, two decisions that need ABSENT (a recovery problem stays; shownGone,
+        // for a clear and for a count of nothing), and createDirectory, which makes a level not shown PRESENT and
         // lets mkdir decide.
         assertFalse(Regex("""==\s*Presence\.PRESENT\b|\bPresence\.PRESENT\s*==""").containsMatchIn(code))
-        assertEquals(6, Regex("""\bpresenceOf\(""").findAll(code).count())
-        assertEquals(1, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
+        assertEquals(7, Regex("""\bpresenceOf\(""").findAll(code).count())
+        assertEquals(2, Regex("""\bwhen \(presenceOf\(""").findAll(code).count())
         assertEquals(2, Regex("""\) != Presence\.ABSENT\b""").findAll(code).count())
         assertEquals(2, Regex("""\) != Presence\.PRESENT\b""").findAll(code).count())
         // A clear returns only on its own check that the directory is gone, never on what the deletion answered.
@@ -2444,10 +2444,14 @@ class PendingNotesStoreTest {
 
     /**
      * A store in the app's layout, opened as forIdentity opens one: notes-pending/<digest> in a no-backup
-     * directory of its own, with its permits in notes-discard beside notes-pending.
+     * directory of its own, with its permits in notes-discard beside notes-pending. [syncDirectory] syncs for both.
      */
-    private fun identityStore(noBackup: File = tmp.newFolder("no_backup"), creationId: String = "gen-1") =
-        PendingNotesStore.forNoBackup(noBackup, "io.silentsuite", "alice@example.invalid", creationId, {}, atomicMove)
+    private fun identityStore(
+        noBackup: File = tmp.newFolder("no_backup"),
+        creationId: String = "gen-1",
+        syncDirectory: (File) -> Unit = {},
+    ) = PendingNotesStore.forNoBackup(noBackup, "io.silentsuite", "alice@example.invalid", creationId, syncDirectory,
+        atomicMove)
 
     /**
      * Stand-ins for lstat's inode numbers, which the JVM cannot read on every platform these tests run on: one
@@ -2738,6 +2742,156 @@ class PendingNotesStoreTest {
         assertEquals("the permit stays", counted, permitsOf(store).read(dir.name))
         assertEquals(DiscardOutcome.Done, store.discardStore(null))
         assertNull(permitsOf(store).read(dir.name))
+    }
+
+    /** Each directory sync asked, by the directory's name, and each removal of a discard permit, in order. */
+    private val steps = ArrayList<String>()
+
+    /** Whether a sync of notes-pending, the directory that holds a store in the app's layout, fails. */
+    private var parentSyncFails = false
+
+    /**
+     * A sync for [identityStore] that records each one in [steps]. It fails for a directory that is not there, as
+     * fsync(2)'s open does on a device, and for notes-pending while [parentSyncFails].
+     */
+    private val recordingSync: (File) -> Unit = { d ->
+        steps += "sync ${d.name}"
+        if (!d.isDirectory) throw java.io.IOException("${d.name} is not there")
+        if (parentSyncFails && d.name == "notes-pending") throw java.io.IOException("the sync fails")
+    }
+
+    /** Records each removal of a discard permit in [steps], before it. */
+    private fun recordPermitRemovals() {
+        PendingNotesDiscardPermits.beforeDeleteForTesting = { f ->
+            if (f.name.endsWith(".permit")) steps += "remove permit"
+        }
+    }
+
+    @Test fun `a discard whose removal of the directory is not synced is not finished, and keeps its permit`() {
+        val s = identityStore(syncDirectory = recordingSync)
+        s.saveLocal("n1", "b1", "r1", blob("discarded"), isCreate = false)
+        val shown = s.unsynced()
+        val permit = File(permitsOf(s).root, s.dir.name + ".permit")
+        val recorded = PendingCodec.encodePermit(s.dir.name, shown)
+        recordPermitRemovals()
+        parentSyncFails = true
+        steps.clear()
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        assertFalse("the directory went", s.dir.exists())
+        assertEquals("its removal is not synced", "sync notes-pending", steps.last())
+        assertFalse("and the permit was not removed", "remove permit" in steps)
+        assertArrayEquals("the permit stays, byte for byte", recorded, permit.readBytes())
+        assertThrows("nor is the instance dropped", IllegalStateException::class.java) { s.unregister() }
+
+        // A retry finds the directory gone and removes nothing. It is not finished while the sync still fails.
+        val kept = permitsOf(s).read(s.dir.name)!!
+        steps.clear()
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(kept))
+        assertEquals(listOf("sync notes-pending"), steps)
+        assertArrayEquals(recorded, permit.readBytes())
+        parentSyncFails = false
+        steps.clear()
+        assertEquals(DiscardOutcome.Done, s.discardStore(kept))
+        assertEquals("the removal is synced before the permit goes",
+            listOf("sync notes-pending", "remove permit", "sync notes-discard"), steps)
+        assertFalse(permit.exists())
+        s.unregister()
+    }
+
+    @Test fun `after a restart, a discard that finds the directory gone syncs its removal before the permit goes`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup, syncDirectory = recordingSync)
+        s.saveLocal("n1", "b1", "r1", blob("discarded"), isCreate = false)
+        val shown = s.unsynced()
+        val permit = File(permitsOf(s).root, s.dir.name + ".permit")
+        val recorded = PendingCodec.encodePermit(s.dir.name, shown)
+        parentSyncFails = true
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        assertFalse(s.dir.exists())
+        assertEquals("the permit stays", shown, permitsOf(s).read(s.dir.name))
+
+        // New instances, as after a restart, go on under the permit on disk. Each lists first, which withdraws the
+        // store's acknowledgement and syncs notes-discard.
+        recordPermitRemovals()
+        PendingNotesStore.resetForTesting()
+        val next = identityStore(noBackup, syncDirectory = recordingSync)
+        val kept = permitsOf(next).read(next.dir.name)!!
+        assertEquals(shown, kept)
+        steps.clear()
+        assertEquals("while the sync still fails", DiscardOutcome.NotFinished, next.discardStore(kept))
+        assertEquals(listOf("sync notes-discard", "sync notes-pending"), steps)
+        assertArrayEquals("the permit stays, byte for byte", recorded, permit.readBytes())
+
+        parentSyncFails = false
+        PendingNotesStore.resetForTesting()
+        val last = identityStore(noBackup, syncDirectory = recordingSync)
+        steps.clear()
+        assertEquals(DiscardOutcome.Done, last.discardStore(kept))
+        assertEquals("the removal is synced before the permit goes",
+            listOf("sync notes-discard", "sync notes-pending", "remove permit", "sync notes-discard"), steps)
+        assertFalse(permit.exists())
+        assertFalse(last.dir.exists())
+    }
+
+    @Test fun `after a restart, a save syncs the removal of a discarded directory before its permit goes`() {
+        val noBackup = tmp.newFolder("no_backup")
+        val s = identityStore(noBackup, syncDirectory = recordingSync)
+        s.saveLocal("n1", "b1", "r1", blob("discarded"), isCreate = false)
+        val shown = s.unsynced()
+        val permit = File(permitsOf(s).root, s.dir.name + ".permit")
+        val recorded = PendingCodec.encodePermit(s.dir.name, shown)
+        parentSyncFails = true
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        assertFalse(s.dir.exists())
+
+        // A new instance, as after a restart, takes a save before any retry of the discard. Its first new version
+        // retires the permit, and that waits until the removal of the old directory is synced.
+        recordPermitRemovals()
+        PendingNotesStore.resetForTesting()
+        val next = identityStore(noBackup, syncDirectory = recordingSync)
+        steps.clear()
+        assertThrows("while the sync fails, the save fails", java.io.IOException::class.java) {
+            next.saveLocal("n2", "b1", "r1", blob("new"), isCreate = false)
+        }
+        assertFalse("and the permit was not removed", "remove permit" in steps)
+        assertArrayEquals("it stays, byte for byte", recorded, permit.readBytes())
+        parentSyncFails = false
+        steps.clear()
+        next.saveLocal("n2", "b1", "r1", blob("new"), isCreate = false)
+        assertTrue("the removal is synced before the permit goes: $steps",
+            steps.indexOf("sync notes-pending") in 0 until steps.indexOf("remove permit"))
+        assertFalse(permit.exists())
+    }
+
+    @Test fun `a discard syncs the nearest directory above that is there, never one that is not`() {
+        // A store never made, on a device where no store was: notes-pending is not there either, so the directory
+        // above it holds the highest level that is gone. A sync of notes-pending would fail.
+        val noBackup = tmp.newFolder("no_backup")
+        val never = identityStore(noBackup, syncDirectory = recordingSync)
+        assertEquals(UnsyncedNotes.NOTHING, never.unsynced())
+        steps.clear()
+        assertEquals(DiscardOutcome.Done, never.discardStore(null))
+        assertEquals(listOf("sync no_backup"), steps)
+        assertFalse("and it makes nothing", File(noBackup, "notes-pending").exists())
+    }
+
+    @Test fun `a discard is not finished while the check of the directory above fails, and keeps its permit`() {
+        val s = identityStore(syncDirectory = recordingSync)
+        s.saveLocal("n1", "b1", "r1", blob("discarded"), isCreate = false)
+        val shown = s.unsynced()
+        recordPermitRemovals()
+        // Which directory held the store cannot be told while notes-pending's own check fails.
+        checksFailFor("notes-pending")
+        steps.clear()
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        assertFalse("the directory went", s.dir.exists())
+        assertFalse("notes-pending was not synced", "sync notes-pending" in steps)
+        assertFalse("and the permit was not removed", "remove permit" in steps)
+        assertEquals("the permit stays", shown, permitsOf(s).read(s.dir.name))
+        PendingNotesStore.presenceForTesting = null
+        steps.clear()
+        assertEquals(DiscardOutcome.Done, s.discardStore(null))
+        assertEquals(listOf("sync notes-pending", "remove permit", "sync notes-discard"), steps)
     }
 
     @Test fun `a note a short listing left out of the count is not deleted under that confirmation`() {

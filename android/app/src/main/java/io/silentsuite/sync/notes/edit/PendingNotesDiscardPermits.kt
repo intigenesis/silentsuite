@@ -77,6 +77,13 @@ internal class PendingNotesDiscardPermits(
     fun remove(store: String) = delete(file(store), "the discard permit of $store")
 
     /**
+     * Whether a permit of the store in directory [store] may be there: false only when its presence check shows
+     * it not there, so a check that fails answers true. It reads nothing and covers nothing; the store asks it
+     * only to decide whether to make its directory's removal durable before the permit goes.
+     */
+    fun mayHold(store: String): Boolean = presenceOf(file(store)) != PendingNotesStore.Presence.ABSENT
+
+    /**
      * The acknowledgement of the store in directory [store]: the identity its directory had when it was
      * recorded, or null when there is none. One that is cut short, fails its checksum, is in a newer format,
      * names another store or cannot be read is none. Whether it still holds is the store's to say

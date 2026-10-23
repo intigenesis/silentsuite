@@ -87,7 +87,7 @@ internal class PendingNotesStore private constructor(
     /** Whether this instance has shown its store's acknowledgement gone since it last recorded one. */
     private var acknowledgementWithdrawn = false
 
-    /** Set once [discardStore] has shown the directory gone. */
+    /** Set once [discardStore] has shown the directory gone and synced its removal ([syncRemoval]). */
     private var discarded = false
 
     /** Set by [unregister]: another instance may own the directory now. */
@@ -844,7 +844,10 @@ internal class PendingNotesStore private constructor(
     }
 
     sealed class DiscardOutcome {
-        /** The directory is shown gone. Its permit was removed, or is left for a new version to withdraw. */
+        /**
+         * The directory is shown gone, and its removal is synced. Its permit was removed, or is left for a new
+         * version to withdraw.
+         */
         object Done : DiscardOutcome()
 
         /**
@@ -861,9 +864,9 @@ internal class PendingNotesStore private constructor(
         object PermitNotRecorded : DiscardOutcome()
 
         /**
-         * The deletion stopped, or the directory is not shown gone. A permit recorded for it stays. While it
-         * still covers what is left (step 5 of [discardStore]), a later call can finish; otherwise that call
-         * gives [Changed], and the user is asked again.
+         * The deletion stopped, the directory is not shown gone, or its removal could not be synced (step 6 of
+         * [discardStore]). A permit recorded for it stays. While it still covers what is left (step 5), a later
+         * call can finish; otherwise that call gives [Changed], and the user is asked again.
          */
         object NotFinished : DiscardOutcome()
 
@@ -927,11 +930,13 @@ internal class PendingNotesStore private constructor(
      *    and, in a new instance after a restart, can fall, and an answer that could not be counted can become a
      *    counted one once the file that stopped the count is gone. The permit then no longer covers the store:
      *    the next call gives [DiscardOutcome.Changed], and the user is asked again. So does a note that a short
-     *    listing left out of the count and a later listing shows, since the confirmation does not name it.
-     * 6. [DiscardOutcome.Done] only once the directory is shown gone by two checks that agree ([shownGone]),
-     *    and then the permit is removed; a removal that fails then is logged, and the permit is left for the
-     *    next new version to withdraw. Otherwise, a failed removal included, the permit stays
-     *    ([DiscardOutcome.NotFinished]).
+     *    listing left out of the count and a later listing shows, since the confirmation does not name it. The
+     *    removal of the directory is synced in step 6, not here, since a later call finds it gone.
+     * 6. [DiscardOutcome.Done] only once the directory is shown gone by two checks that agree ([shownGone]) and
+     *    its removal is synced into the directory above it ([syncRemoval]), whether this call removed it or an
+     *    earlier one did and failed at that sync: until then a power loss can undo the removal. Only then is the
+     *    permit removed; a removal that fails then is logged, and the permit is left for the next new version to
+     *    withdraw. Otherwise, a failed removal or sync included, the permit stays ([DiscardOutcome.NotFinished]).
      */
     fun discardStore(confirmed: UnsyncedNotes?): DiscardOutcome = synchronized(lock) {
         checkNotDropped()
@@ -968,10 +973,11 @@ internal class PendingNotesStore private constructor(
         try {
             beforeClearForTesting?.invoke()
             deleteAll(names)
+            if (!shownGone(dir)) return@synchronized DiscardOutcome.NotFinished
+            syncRemoval()
         } catch (e: IOException) {
             return@synchronized DiscardOutcome.NotFinished
         }
-        if (!shownGone(dir)) return@synchronized DiscardOutcome.NotFinished
         discarded = true
         try {
             permits.remove(dir.name)
@@ -991,6 +997,10 @@ internal class PendingNotesStore private constructor(
      * otherwise this throws and they stay. Two listings that come back short the same way still get past it. A file
      * the listings did not hold, other than a write beside a listed file of a kind this build writes, keeps the
      * directory, which is then not shown gone.
+     *
+     * The removal of the directory is not synced here, since this call finds the directory already gone when an
+     * earlier one removed it and then failed at that sync: [discardStore] syncs it once the directory is shown
+     * gone, whoever removed it ([syncRemoval]).
      */
     private fun deleteAll(listed: List<String>) {
         val held = listed.toHashSet()
@@ -1004,7 +1014,7 @@ internal class PendingNotesStore private constructor(
             throw IOException("${it.name} is in the store after its notes went")
         }
         for (name in others.filter { it != SEQUENCE } + others.filter { it == SEQUENCE }) removeListed(name, held)
-        if (dir.delete()) dir.parentFile?.let(syncDirectory)
+        dir.delete()
     }
 
     /**
@@ -1181,9 +1191,16 @@ internal class PendingNotesStore private constructor(
      * sequence and compare only files, by number and name ([uncountedSequence]). A removal that cannot be
      * shown throws before the counter or the entry is written. Once shown, it is
      * not asked again by this instance until a [discardStore], which may leave a permit behind.
+     *
+     * While a permit may be there ([PendingNotesDiscardPermits.mayHold]), the directory above the store is
+     * synced first ([syncRemoval]): the discard it was for, in this process or before a restart, may have
+     * removed the store's directory and stopped before that sync, and a permit retired first could leave the
+     * discarded text to come back after a power loss with no permit. A sync that fails throws, and the permit
+     * stays. With no permit there, nothing is synced here.
      */
     private fun withdrawPermit() {
         if (permitWithdrawn) return
+        if (permits.mayHold(dir.name)) syncRemoval()
         permits.remove(dir.name)
         permitWithdrawn = true
     }
@@ -1560,6 +1577,28 @@ internal class PendingNotesStore private constructor(
             syncDirectory(unsyncedLevels.first().parentFile)
             unsyncedLevels.removeAt(0)
         }
+    }
+
+    /**
+     * Makes the removal of the store's directory survive a power loss, whether this instance removed it or an
+     * earlier attempt did and failed at this step: before [discardStore] reports the directory gone ([shownGone])
+     * and before a permit goes ([withdrawPermit]). [createDirectory] in reverse: it syncs the nearest directory
+     * above the store that is there, notes-pending, or the directory above notes-pending while that is not there
+     * either, as for a store
+     * never made on a device where no store was, since a sync of a directory that is not there fails. A level is
+     * passed on the way up only when its check shows it not there ([Presence.ABSENT]). A level whose check fails
+     * throws, as a sync that fails does: which directory to sync cannot be told then.
+     */
+    private fun syncRemoval() {
+        var above = dir.parentFile
+        while (above != null) {
+            when (presenceOf(above)) {
+                Presence.PRESENT -> return syncDirectory(above)
+                Presence.ABSENT -> above = above.parentFile
+                Presence.UNKNOWN -> throw IOException("could not tell whether ${above.name} is there")
+            }
+        }
+        throw IOException("no directory above the pending store is there")
     }
 
     /**
