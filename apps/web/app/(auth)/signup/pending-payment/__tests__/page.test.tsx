@@ -425,6 +425,79 @@ describe('PendingPaymentPage anonymous payment-session recovery', () => {
     await waitFor(() => expect(dialogAlert()).toBe('Cancellation is not confirmed yet. Retry cancellation or stay with this payment. Do not start another payment.'))
   })
 
+  // C1 review CR-2, pending-recovery parent: a refusal is bound to the request
+  // capability that sent it. Request A is still unresolved when the capability
+  // changes and B's dialog opens; A's late 429 must neither block B nor
+  // replace B's own live deadline.
+  describe('late refusal for an earlier recovery capability', () => {
+    const otherKey = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+    const otherToken = 'B'.repeat(43)
+    const UNCONFIRMED = 'Cancellation is not confirmed yet. Retry cancellation or stay with this payment. Do not start another payment.'
+
+    async function openReplacementWhileFirstIsPending(replacementReply: () => Response) {
+      let releaseFirst!: (response: Response) => void
+      const firstReply = new Promise<Response>(resolve => { releaseFirst = resolve })
+      const cancels: Record<string, unknown>[] = []
+      vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+        if (String(url).endsWith('/cancel')) {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          cancels.push(body)
+          return body.requestKey === paymentSessionRequestKey ? firstReply : replacementReply()
+        }
+        return new Response(JSON.stringify(openWithoutContinuation('btcpay')))
+      }))
+      const { rerender } = render(<PendingPaymentPage />)
+      fireEvent.click(await screen.findByRole('button', { name: 'Back' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel and go back' }))
+      await waitFor(() => expect(cancels).toHaveLength(1))
+      authState.pendingSignup = anonymousRecoverySignup({ paymentSessionRequestKey: otherKey, paymentSessionToken: otherToken })
+      rerender(<PendingPaymentPage />)
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+      const back = await screen.findByRole('button', { name: 'Back' })
+      await waitFor(() => expect(back).toBeEnabled())
+      fireEvent.click(back)
+      expect(screen.getByRole('button', { name: 'Cancel and go back' })).toBeEnabled()
+      expect(dialogAlert()).toBeNull()
+      // Settles the first request and gives its rejection time to propagate.
+      const settleFirst = (response: Response) => act(async () => {
+        releaseFirst(response)
+        await new Promise(resolve => setTimeout(resolve, 50))
+      })
+      return { cancels, settleFirst }
+    }
+
+    it('does not block the replacement capability with the earlier capability\'s late 429', async () => {
+      const { cancels, settleFirst } = await openReplacementWhileFirstIsPending(() => new Response(JSON.stringify(openWithoutContinuation('btcpay'))))
+      await settleFirst(tooManyCancels(FINE_429))
+      expect(dialogAlert()).toBeNull()
+      expect(screen.getByRole('button', { name: 'Cancel and go back' })).toBeEnabled()
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel and go back' }))
+      await waitFor(() => expect(cancels).toHaveLength(2))
+      expect(cancels[1]).toMatchObject({ requestKey: otherKey, recoverySecret: otherToken, confirmNoBitcoinSent: true })
+      await waitFor(() => expect(dialogAlert()).toBe(UNCONFIRMED))
+      expect(authState.clearPendingSignupPaymentRecovery).not.toHaveBeenCalled()
+    })
+
+    it('keeps the replacement capability\'s own deadline when the earlier capability\'s late 429 arrives', async () => {
+      const { cancels, settleFirst } = await openReplacementWhileFirstIsPending(() => tooManyCancels(FINE_429))
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel and go back' }))
+      await waitFor(() => expect(dialogAlert()).toBe(COOLDOWN_2))
+      expect(cancels).toHaveLength(2)
+      await settleFirst(new Response(JSON.stringify(COARSE_429), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '600' } }))
+      expect(dialogAlert()).toBe(COOLDOWN_2)
+      expect(cancelControl()).toBeDisabled()
+      // The replacement's own deadline also survives Stay → reopen.
+      fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+      const back = await screen.findByRole('button', { name: 'Back' })
+      await waitFor(() => expect(back).toBeEnabled())
+      fireEvent.click(back)
+      await waitFor(() => expect(dialogAlert()).toBe(COOLDOWN_2))
+      expect(document.body).not.toHaveTextContent(/Wait 10 minutes/)
+      expect(cancels).toHaveLength(2)
+      expect(authState.clearPendingSignupPaymentRecovery).not.toHaveBeenCalled()
+    })
+  })
+
   it('restores the exact payable Bitcoin continuation without creating or reconciling another invoice', async () => {
     const pending = anonymousRecoverySignup()
     authState.pendingSignup = pending

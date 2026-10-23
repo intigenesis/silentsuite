@@ -1698,15 +1698,20 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
       if (!pending) console.error('pendingSignup not set after createEtebaseAccount')
       if (pending) {
         useAuthStore.setState({
-          pendingSignup: { ...pending, wantsProductUpdates },
+          pendingSignup: { ...pending, wantsProductUpdates: false },
         })
       }
+      setWantsProductUpdates(false)
       setUsingSelfHostedServer(true)
       setStep('selfhost')
       return
     }
 
-    prepareSignupDraft(identifier, wantsProductUpdates, rememberDevice)
+    // The form offers no product-updates opt-in, so a submission is always an
+    // explicit false. A restored historical preference stays on its own
+    // lineage and never carries into this fresh signup.
+    setWantsProductUpdates(false)
+    prepareSignupDraft(identifier, false, rememberDevice)
     setClientSecret(null)
     setCardDisclosure(null)
     setCryptoPaymentSession(null)
@@ -1717,7 +1722,7 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
     const context: EmailProofContext = {
       email: identifier,
       requestId,
-      wantsProductUpdates,
+      wantsProductUpdates: false,
       rememberDevice,
       returnTo,
       expiresAt: Date.now() + 15 * 60_000,
@@ -1740,7 +1745,7 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
     } finally {
       if (mountedRef.current && sentRequestRef.current === requestId) setSendingEmail(false)
     }
-  }, [createEtebaseAccount, prepareSignupDraft, rememberDevice, returnTo, serverUrl, wantsProductUpdates])
+  }, [createEtebaseAccount, prepareSignupDraft, rememberDevice, returnTo, serverUrl])
 
   const handleSelfHostChoice = useCallback(async () => {
     try {
@@ -2349,7 +2354,11 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
         )}
         {step === 'plan' && paymentSwitch && <PaymentBackModal provider={paymentSwitch} restoreFocusTo={paymentBackOpener.current}
           cooldownUntil={cancelCooldown && cancelCooldown.identity === useAuthStore.getState().pendingSignup?.paymentSessionRequestKey ? cancelCooldown.until : undefined}
-          onRateLimited={(until, identity) => setCancelCooldown({ identity, until })}
+          onRateLimited={(until, identity) => {
+            // A late reply for a capability that is no longer current neither
+            // applies to nor replaces the current capability's deadline.
+            if (identity === useAuthStore.getState().pendingSignup?.paymentSessionRequestKey) setCancelCooldown({ identity, until })
+          }}
           onStay={() => setPaymentSwitch(null)}
           onReleased={() => {
             setCancelCooldown(null)

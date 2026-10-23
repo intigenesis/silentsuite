@@ -63,6 +63,9 @@ function dialogAlert() {
 function cancelControl() {
   return screen.getByRole('button', { name: /^(Retry cancellation|Cancel and go back)$/ })
 }
+function tooManyCancels(body: unknown, retryAfter: string) {
+  return new Response(JSON.stringify(body), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': retryAfter } })
+}
 vi.mock('@/app/stores/use-etebase-store', () => ({ normalizeServerUrl: (value: string) => value }))
 vi.mock('@/app/lib/config', () => ({ BILLING_API_URL: 'https://billing.test' }))
 vi.mock('@/app/lib/self-hosted', () => ({ isSelfHosted: false, isCustomServer: () => false }))
@@ -524,6 +527,59 @@ describe('email-link seven-day no-card continuation', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  // C1 review CR-2, plan-step parent: a refusal belongs to the capability that
+  // sent it. A late 429 for an earlier capability must not replace the current
+  // capability's own live deadline (single-flight locks the dialog while a
+  // request is open, so the late reply arrives with the same dialog open).
+  it('keeps the current capability deadline when a late 429 for another capability arrives on the plan step', async () => {
+    const otherKey = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+    await reachPlanScreen()
+    ownPayment('btcpay')
+    authState.startAnnualSignupPayment.mockResolvedValue({ cryptoCheckoutUrl: 'https://btcpay.silentsuite.io/i/retained', cryptoInvoiceId: 'retained', cryptoInvoiceLookupToken: 'lookup' })
+    const cancelKeys: string[] = []
+    let releaseOther!: (response: Response) => void
+    const otherReply = new Promise<Response>(resolve => { releaseOther = resolve })
+    const prior = vi.mocked(fetch).getMockImplementation()!
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/payment-methods')) return new Response(JSON.stringify({ paymentMethods: [{ id: 'BTC', address: 'test-address', qrValue: 'bitcoin:test-address' }] }))
+      if (String(input).endsWith('/invoice/retained')) return new Response(JSON.stringify({ status: 'new' }))
+      if (String(input).endsWith('/cancel')) {
+        const { requestKey } = JSON.parse(String(init?.body)) as { requestKey: string }
+        cancelKeys.push(requestKey)
+        return requestKey === otherKey ? otherReply : tooManyCancels(FINE_429, '120')
+      }
+      return prior(input, init)
+    }))
+    await choosePaymentMethod('btcpay')
+    await screen.findByText('Copy payment details')
+    fireEvent.click(screen.getByRole('button', { name: /^back$/i }))
+    await screen.findByRole('dialog', { name: 'Cancel this cryptocurrency payment?' })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel and go back' }))
+    await waitFor(() => expect(dialogAlert()).toBe(COOLDOWN_2))
+    // The browser's capability changes; the other capability is not blocked by this deadline.
+    fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+    storeState.pendingSignup = { ...storeState.pendingSignup, paymentSessionRequestKey: otherKey, paymentSessionToken: 's'.repeat(43) }
+    fireEvent.click(screen.getByRole('button', { name: /^back$/i }))
+    await screen.findByRole('dialog', { name: 'Cancel this cryptocurrency payment?' })
+    expect(screen.getByRole('button', { name: 'Cancel and go back' })).toBeEnabled()
+    expect(dialogAlert()).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel and go back' }))
+    await waitFor(() => expect(cancelKeys).toEqual([requestId, otherKey]))
+    // While that request is unresolved, the capability returns to the first one,
+    // whose deadline is still live; the other capability's refusal arrives late.
+    storeState.pendingSignup = { ...storeState.pendingSignup, paymentSessionRequestKey: requestId, paymentSessionToken: 'r'.repeat(43) }
+    await act(async () => { releaseOther(tooManyCancels(COARSE_429, '600')) })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stay' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Stay' }))
+    fireEvent.click(screen.getByRole('button', { name: /^back$/i }))
+    await screen.findByRole('dialog', { name: 'Cancel this cryptocurrency payment?' })
+    await waitFor(() => expect(dialogAlert()).toBe(COOLDOWN_2))
+    expect(cancelControl()).toBeDisabled()
+    fireEvent.click(cancelControl())
+    expect(cancelKeys).toHaveLength(2)
+    expect(document.body).not.toHaveTextContent(/Wait 10 minutes/)
   })
 
   // C1 W3 (requested): the product-updates opt-in is removed; a new draft

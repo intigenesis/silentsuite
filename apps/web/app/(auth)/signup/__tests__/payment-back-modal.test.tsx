@@ -140,6 +140,21 @@ describe('PaymentBackModal unconfirmed and rate-limited cancellation', () => {
     expect(dialogAlert()).toBeNull()
   })
 
+  // C1 review CR-4 parity: a zero wait is immediately retryable in the modal too.
+  it.each([
+    ['retry-after: 0', () => '0'],
+    ['a past HTTP date', () => new Date(Date.now() - 60_000).toUTCString()],
+  ] as const)('treats a %s 429 as immediately retryable with the unconfirmed copy', async (_label, header) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(COARSE), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': header() } })))
+    render(<Parent onRateLimited={vi.fn()} onReleased={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel and go back' }))
+    await waitFor(() => expect(dialogAlert()).toBe(UNCONFIRMED))
+    expect(screen.queryByText(/Wait \d+ minutes/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry cancellation' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry cancellation' }))
+    await waitFor(() => expect(cancelCount()).toBe(2))
+  })
+
   // B9: the existing single-flight guard still holds.
   it('sends one request for duplicate clicks', async () => {
     let resolve!: (response: Response) => void

@@ -660,6 +660,91 @@ describe('PaymentChoicePanel rate-limited cancellation', () => {
   })
 })
 
+// C1 review CR-4: a zero wait (Retry-After: 0 or a past HTTP date) is
+// immediately retryable; it must not show or keep a "Wait n minutes" message.
+describe('PaymentChoicePanel zero-delay rate-limited cancellation', () => {
+  it.each([
+    ['retry-after: 0', () => '0'],
+    ['a past HTTP date', () => new Date(Date.now() - 60_000).toUTCString()],
+  ] as const)('keeps cancel immediately retryable with truthful fixed copy for %s', async (_label, header) => {
+    const cancelReplies: Array<() => Response> = [
+      () => new Response(JSON.stringify({ type: 'https://api.silentsuite.io/errors/rate-limit-exceeded', title: 'Too Many Requests', status: 429, detail: 'Rate limit exceeded for account:secret-id' }), { status: 429, headers: { 'content-type': 'application/json', 'retry-after': header() } }),
+      () => response({}, false, 503),
+    ]
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      if (path === '/subscription/payment-flows/current') return response({ flow: null })
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      if (path === '/subscription/offers/v2/activate') return activation(cardDisclosure())
+      if (path === '/subscription/payment-flows/v2') return response({ contractVersion: 2, kind: 'stripe', authorityId: serverFlowId, clientSecret: 'pi_secret' })
+      if (path === '/subscription/payment-flows/cancel') return cancelReplies.shift()!()
+      return response({}, false)
+    })
+    const onCancel = renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
+    expect(await screen.findByTestId('stripe-payment-form')).toBeInTheDocument()
+    const cancelButtons = () => screen.getAllByRole('button', { name: 'Cancel card payment' })
+
+    fireEvent.click(cancelButtons()[0]!)
+    expect(await screen.findByText('Could not cancel the pending payment flow.')).toBeInTheDocument()
+    expect(screen.queryByText(/Wait \d+ minutes/)).not.toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/Rate limit exceeded|Too Many Requests|secret-id/)
+    await waitFor(() => { for (const button of cancelButtons()) expect(button).toBeEnabled() })
+    expect(screen.getByTestId('stripe-payment-form')).toBeInTheDocument()
+
+    fireEvent.click(cancelButtons()[0]!)
+    await waitFor(() => expect(called('/subscription/payment-flows/cancel')).toHaveLength(2))
+    expect(called('/subscription/payment-flows/cancel').map(([, init]) => JSON.parse(String(init!.body))))
+      .toEqual([{ expectedAuthorityId: serverFlowId }, { expectedAuthorityId: serverFlowId }])
+    expect(screen.queryByText(/Wait \d+ minutes/)).not.toBeInTheDocument()
+    expect(called('/subscription/payment-flows/v2')).toHaveLength(1)
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+})
+
+// C1 review CR-3: explicit close is safe only once Billing has proved a literal
+// `flow: null` after the cancellation. A failed reproof or one that finds an
+// active authority keeps the chooser open with that state visible. Covers the
+// superseded #854 200 no_active_flow reply as well as an ordinary receipt.
+describe('PaymentChoicePanel explicit dismissal after cancellation', () => {
+  const cancelReplies = [
+    ['a cancelled receipt', () => response({ cancelled: true, flowKind: 'stripe_pay_now' })],
+    ['a 200 no_active_flow reply', () => response({ cancelled: false, reason: 'no_active_flow' })],
+  ] as const
+  const reproofs = [
+    ['a failed reproof', () => response({}, false), false, 'Could not verify whether a payment is already in progress. Retry before starting another payment.'],
+    ['a reproof that finds another active authority', () => response({ flow: { ...activeFlow, authorityId: serverFlowId, disclosure: cardDisclosure() } }), false, 'Payment already in progress'],
+    ['a literal flow: null reproof', () => response({ flow: null }), true, null],
+  ] as const
+  const cases = cancelReplies.flatMap(([cancelLabel, cancelReply]) => reproofs.map(([reproofLabel, reproof, dismisses, visible]) => [cancelLabel, reproofLabel, cancelReply, reproof, dismisses, visible] as const))
+
+  it.each(cases)('after %s and %s, closes only on a proven flow: null', async (_cancelLabel, _reproofLabel, cancelReply, reproof, dismisses, visible) => {
+    let currentReads = 0
+    vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
+      const { path, preview } = route(input)
+      // The first status read fails, so only the explicit cancellation path can close the chooser.
+      if (path === '/subscription/payment-flows/current') return ++currentReads === 1 ? response({}, false) : reproof()
+      if (path === '/subscription/offers/v2') return response(preview ? previewOffer : annualOffer)
+      if (path === '/subscription/payment-flows/cancel') return cancelReply()
+      return response({}, false)
+    })
+    const onCancel = renderPanel()
+    expect(await screen.findByRole('button', { name: /retry payment status/i })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel any payment in progress and close' }))
+    await waitFor(() => expect(called('/subscription/payment-flows/cancel')).toHaveLength(1))
+    await waitFor(() => expect(called('/subscription/payment-flows/current')).toHaveLength(2))
+
+    if (dismisses) {
+      await waitFor(() => expect(onCancel).toHaveBeenCalledTimes(1))
+      return
+    }
+    await waitFor(() => expect(screen.queryByText('Cancelling payment flow...')).not.toBeInTheDocument())
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)) })
+    expect(onCancel).not.toHaveBeenCalled()
+    expect(screen.getByText(visible!)).toBeInTheDocument()
+  })
+})
+
 describe('PaymentChoicePanel cancellation safety', () => {
   it('clears rejected activation consent before showing a renewed offer', async () => {
     let offerReads = 0
