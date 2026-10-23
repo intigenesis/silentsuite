@@ -23,9 +23,11 @@ tags carry none. Checking out `main` afterwards cannot change the jobs,
 permissions, or secret references that were already loaded. The lane therefore
 uses exactly one trigger:
 
-- **`schedule`** (`17 */6 * * *` UTC). Scheduled runs are loaded from the
-  default branch; `github.sha` is that branch head and is the revision that
-  supplied the definition.
+- **`schedule`** (`17 */6 * * *` UTC, six-hourly). Scheduled runs are loaded
+  from the default branch; `github.sha` is that branch head and is the revision
+  that supplied the definition. (The temporary hourly commissioning cadence
+  ended after the scheduled rehearsal passed; the owner approved restoring
+  six-hourly on 2026-10-03.)
 
 Admission proves this every run, from the run's own context and never from a
 value the lane fabricates: `GITHUB_EVENT_NAME=schedule`,
@@ -47,6 +49,18 @@ frozen in that run's candidate list, the same event, the same protected
 revision and the same environment gate. It needs repository write access and
 cannot select a ref. There is no `repository_dispatch`, `workflow_dispatch`,
 `release` or tag-PATCH retry.
+
+**Owner-retired historical failures.** Three release-specific CDN/publication
+failures were retired by the owner on 2026-10-13 as superseded history and
+their issues were closed as not planned (`v0.5.2-beta` 375729540, `v0.5.3-beta`
+376457006, `v0.5.11-beta` 403051319). Retirement binds the exact release id
+**and** tag: they are omitted from the candidate list with that reason, never
+assessed, and frozen failure evidence for them never opens an issue again —
+including from an older candidate list or an expired artifact. Retirement is
+not a repair: those relay/CDN objects stay as they are and no old release is
+published. Retirement is unconditional: a retired tuple is omitted even when
+the listing marks it the newest eligible release, which then leaves no
+publishable candidate — no alternate is ever promoted.
 
 **Accepted first-version scope.** The owner has accepted two reduced-scope
 limitations for this first version. Acceptance of scope is not proof of
@@ -76,18 +90,23 @@ retry job would relax those gates, and Python tests cannot be run on this
 machine. Rejected.
 
 **Why not `workflow_dispatch`.** It loads the definition from the selected ref,
-and the owner has ruled it out as a second control plane.
+and the owner has ruled it out as a second control plane for this definition.
+The scheduled workflow still declares and admits `schedule` only. The single
+owner-authorized exception (2026-10-05) is a separate definition file,
+`zapstore-manual-publish.yml`, with its own main-only admission bound to the
+workflow commit and to one exact, owner-approved release; see section 10. It is
+not an arbitrary-release or historical-release trigger.
 
 ### 1.2 Job graph (one protected revision, one secret step)
 
 | Job | Permissions / environment | What it does |
 |-----|---------------------------|--------------|
 | `admit` | `{}` | Proves trigger and definition provenance (1.1); exports `active`, `rehearsal`, `revision`. |
-| `enumerate` | `contents: read` | Lists published releases by exact id (bounded pages), classifies eligibility, always keeps the **single newest** eligible tag as the one `publishable` candidate, keeps verify-only history inside the 45-day window; uploads `candidates.json`. |
+| `enumerate` | `contents: read` | Lists published releases by exact id (bounded pages), classifies eligibility, always keeps the **single newest** eligible tag as the one `publishable` candidate, keeps verify-only history inside the 45-day window, omits owner-retired historical releases by exact id+tag with that reason even when that is the newest eligible tag (then no publishable candidate is chosen); uploads `candidates.json`. |
 | `assess` (matrix, `max-parallel: 1`, `fail-fast: false`) | `contents: read`, no environment, no secrets | Per candidate: bind exact release/tag commit/assets, identity helper, download APK and check three digests, `apksigner`, unsigned offline `zsp` expected events, relay reconciliation, CDN verification when the relay set is complete. Records `assessment.json` and uploads `zapstore-assessment-<id>`. |
 | `plan` | `{}` | Downloads all assessments, requires one per enumerated candidate, emits the publish matrix (candidates whose action is `publish`; at most the newest). |
 | `publish` (matrix over the plan) | `contents: read`, environment `zapstore-production` | Fresh runner: repeats bind, digests, `apksigner`, prepare and reconciliation, checks nothing drifted from the assessment, revalidates identity, then one secret step: NIP-46 read-only account preflight, then `zsp` live. Read-back and CDN verification follow every attempt. Records `result.json`, uploads `zapstore-result-<id>`. |
-| `notify` | `issues: write` | Downloads candidates, assessments and results; opens one issue per candidate whose recorded status is a failure or whose evidence is missing. Successes are never reported. |
+| `notify` | `issues: write` | Downloads candidates, assessments and results; opens one issue per candidate whose recorded status is a failure or whose evidence is missing. Successes are never reported. Retired historical evidence (exact id+tag, even when stale evidence still marks it publishable) is reported in the summary but opens no issue, so a closed historical failure is not recreated. |
 
 Only the `publish` job binds the environment, so the owner is asked to approve
 only when a publication is actually pending, never for a verification pass.
@@ -106,7 +125,7 @@ evidence that signing occurred. Do not approve or retry merely to clear the issu
 | S2 | Revision binding | `admit` exports the revision; every job runs `checkout-guard`; the manifest records it | `cli.mjs` |
 | S3 | Activation switch | Repository variable `ZAPSTORE_AUTOMATION_ENABLED` must equal `enabled`; absent today | `admit` |
 | S4 | Eligibility | `vX.Y.Z` or `vX.Y.Z-beta`; drafts refused; GitHub `prerelease=true` allowed only with `-beta`; only the newest eligible tag may be published | `lib/eligibility.mjs` |
-| S5 | Exact binding | Release id, tag, dereferenced tag commit, APK asset id, GitHub digest, sidecar, `SHA256SUMS.txt` | `lib/github.mjs`, `lib/binding.mjs` |
+| S5 | Exact binding | Release id, tag, dereferenced tag commit, APK asset id, GitHub digest, Android `-installer.sha256` sidecar | `lib/github.mjs`, `lib/binding.mjs` |
 | S6 | Source admission | Trusted `scripts/verify-release-identity.sh` from the protected checkout with the real `GITHUB_REF` | `lib/identity.mjs` |
 | S7 | APK verification | Three digests, `apksigner verify --print-certs -v` with only the direct-release certificate, identity facts from official `zsp` offline output, `versionName`/`versionCode` literals from the tag's `build.gradle` | `lib/apksigner.mjs`, `lib/zsp.mjs`, `lib/source-metadata.mjs` |
 | S8 | Store metadata | Trusted template at the protected revision; media bytes hashed; six approved screenshots in order; copy byte-identical to `zapstore.yaml` | `release-template.json`, `lib/metadata.mjs` |
@@ -123,6 +142,7 @@ Sibling paths:
 |------|-----------|
 | Activation variable absent or not `enabled` | `admit` reports `DISABLED`; nothing after it runs except in `rehearsal`. |
 | `release`, `repository_dispatch`, `workflow_dispatch`, `push` | Not declared; admission refuses any event but `schedule`. |
+| `workflow_dispatch` of `zapstore-manual-publish.yml` | A separate definition with its own admission (section 10); the scheduled `admit` refuses it, and it refuses `schedule`. |
 | Schedule with `GITHUB_REF`/`GITHUB_WORKFLOW_REF` not protected main, or `GITHUB_WORKFLOW_SHA != GITHUB_SHA` | Refused. |
 | Job checkout `HEAD` differs from the admitted revision | `checkout-guard` fails the job. |
 | Draft, `-rc`, `-alpha`, nightly, stable with `prerelease=true` | Ineligible, listed as omitted with a reason. |
@@ -132,12 +152,13 @@ Sibling paths:
 | Relay: nothing for this version, app metadata absent or exactly equal to the template | `absent` → publish (newest only). |
 | Relay: nothing for this version, app metadata differs from the template | `app-drift` → fail closed; the template must be updated by a reviewed change, or the listing reviewed by hand. |
 | Relay: exact lane set present | `complete-match` → skip, CDN verified. |
-| Relay: pre-lane set (APK without `commit` tag) whose identity tuple matches and whose release e-links it | `legacy-complete` → skip, CDN verified, never rewritten; same-hash duplicate APK events from earlier manual publications are tolerated. |
+| Relay: pre-lane set (APK without `commit` tag) whose identity tuple matches and whose release e-links it | `legacy-complete` → skip (newest or not), CDN verified, never rewritten; same-hash duplicate APK events from earlier manual publications are tolerated. The identity tuple is exact (one value each) except the release `c` tag, which is the zsp release channel, not a commit: a `vX.Y.Z-beta` release published by hand on channel `beta` (0.5.0-beta, 0.5.3-beta) matches the lane's `main`. No other channel, version shape, or cardinality is accepted, and lane-owned sets or a release without its APK still compare `c` exactly. |
 | Relay: release (and app) present and equal to the expected tuples, **no APK event** for this version, no newer `version_code` | `partial`, recoverable → one publisher run completes the set (newest candidate only); read-back must be `complete-match`. This is the state a failed asset publish leaves, because upstream publishes app, release, then asset. |
 | Relay: a matching APK event present without its release, or without app metadata | `partial`, unrecoverable → fail closed with the exact preserved ids; see 5.2. |
 | Relay: same version with a different hash, extra e-links, extra APK references, tuple differences | `conflict` → fail closed. |
 | Relay: nothing for this version and a newer `version_code` exists | `superseded` → skip. |
-| Relay timeout, close, `CLOSED`, or result at the subscription limit | `incomplete` → fail; never treated as absent. |
+| Relay timeout (no EOSE), socket error or close before EOSE | Read-only query retried on a fresh socket and subscription, 3 attempts 5 s apart (at most 70 s); a partial answer is discarded. Still failing: `incomplete` → fail; never treated as absent. Before any signer/upload attempt the issue is titled `Zapstore relay verification incomplete`, not a publication failure. |
+| Relay `CLOSED`, a malformed frame, or result at the subscription limit | `incomplete` → fail at once, not retried; never treated as absent. |
 | Bunker unreachable, needs interactive approval, or returns another account | Fails before any signature or upload. |
 | `zsp` exits nonzero | Read-back still runs; publication is reported as `unknown` unless read-back proves otherwise. |
 | CDN bytes differ or are missing after `complete-match`/`legacy-complete` | Candidate status `failure`, phase `cdn`; issue opened even though nothing was signed. |
@@ -149,21 +170,31 @@ Sibling paths:
 Expected events are the unsigned offline `zsp` output for the exact APK, trusted
 template and bound changelog. Observed events must match **content and the full
 ordered tag list**, tuple by tuple. Permitted differences are exactly `id`,
-`sig`, `created_at`, and the release `e` tuple, which must be
-`["e", <observed matching APK id>, "wss://relay.zapstore.dev"]`. This covers the
+`sig`, `created_at`, the release `e` tuple, which must be
+`["e", <observed matching APK id>, "wss://relay.zapstore.dev"]`, and the
+relative order of the platform `f` tuples among themselves: the pinned
+publisher collects them in a Go map (upstream `internal/apk/parser.go`
+`extractArchitectures`), so their order changes per invocation. The set of `f`
+values, their count and the positions the `f` tuples occupy must still match.
+This covers the
 app `h` community tag, `icon`, ordered `image`, ordered `t`, `f`, `url`,
 `repository`, `license`; the APK `i`, `x`, `version`, `version_code`, `url`,
 `m`, `size`, `f`, `min_platform_version`, `target_platform_version`,
 `filename`, `commit`, `apk_certificate_hash` and empty content; the release
 `i`, `version`, `d`, `c`, `f`, `e` and changelog content. Any extra tag, missing
-tag, reordered tag, or extra tuple element is a difference.
+tag, reordered tag (other than `f` tuples among their own positions), or extra
+tuple element is a difference. The same `f` canonicalisation applies to the
+assessment-to-publication `drift` check.
 
 Legacy mode applies only to observed APK events that carry no `commit` tag:
 `i`, `x`, `version`, `version_code`, `size`, `m`, `apk_certificate_hash` must
 match exactly once, and the CDN `url` must be among the observed `url` tags
 (hand publications from a GitHub source also carry the original download URL);
-the release must carry `i`, `version`, `d`, `c` equal to expected and exactly
-one `e` pointing at a matching APK. Legacy sets are never rewritten.
+the release must carry exactly one matching `i`, `version` and `d`, and exactly
+one `c` equal to expected except that a numeric `X.Y.Z-beta` version on channel
+`beta` may match the lane's `main`. Exactly one `e` must point at a matching APK.
+Legacy sets are never rewritten; lane-owned and orphan releases retain exact
+channel comparison.
 
 ### 1.5 Invariants
 
@@ -179,7 +210,8 @@ one `e` pointing at a matching APK. Legacy sets are never rewritten.
 5. The identity private key never enters CI; only a `bunker://` URL and a
    NIP-46 client key do.
 6. Successes are silent; every failure and every missing piece of evidence is an
-   issue with the exact phase.
+   issue with the exact phase — except the owner-retired historical tuples
+   (1.1), which are reported as suppressed and never open an issue.
 
 ## 2. Rollback
 
@@ -192,20 +224,37 @@ one `e` pointing at a matching APK. Legacy sets are never rewritten.
 
 ## 3. Regression and CI coverage
 
+Android checksum authority is the exact release's `-installer.sha256` sidecar,
+which must contain one well-formed line naming the bound APK. Its hash must
+equal both the GitHub asset digest and the locally computed APK hash; size and
+signing-certificate checks remain mandatory. `SHA256SUMS.txt` is the Bridge
+manifest and is neither required nor fetched for Android assessment/publication.
+Both jobs exercise the same `fetch-apk` command. The transport regression covers
+a Bridge-only manifest, wrong filenames/hashes, malformed or duplicate sidecar
+lines, and corrupt downloaded bytes.
+
 `pnpm run check:zapstore-automation` (pull requests, no secrets) runs:
 
 - `lane.test.mjs`: eligibility and newest-only marking; schedule-only admission
   including refusal of `release`; real `GITHUB_REF` pass-through to the identity
   helper; binding, digests, `apksigner`, template, media, changelog, `zsp`
-  invocation, relay subscription semantics, signature verification on real
+  invocation, relay subscription semantics (including bounded transport
+  retries against a local relay through Node's WebSocket client: fresh socket
+  and subscription, partial answers discarded, exhaustion fail-closed, no
+  retry of `CLOSED`, malformed or truncated answers), signature verification on real
   relay events, and every reconciliation outcome: exact match, legacy match on
   the recorded 0.5.4-beta and duplicate-APK 0.5.0-beta history, `app-drift`,
   outcome-aware issue guidance (stop, not re-run, for unrecoverable `partial`,
   `conflict` and `app-drift`),
   recoverable `partial` (stranded release, no APK event) through to an exact
   read-back and its guards, unrecoverable `partial` fail-closed, the newest
-  release staying an exact candidate outside the window, conflicts on `h`, APK content,
-  `min_allowed_version_code`, e-link relay hint, superseded, incomplete.
+  release staying an exact candidate outside the window, owner-retired
+  historical releases omitted by exact id+tag in preference to the window and
+  without promoting an alternate, conflicts on `h`, APK content,
+  `min_allowed_version_code`, e-link relay hint, superseded, incomplete;
+  platform `f` tag order: every rotation matches (app, release, APK, recorded
+  relay history, `drift`), while a replaced, removed, added or relocated `f`
+  value is still a difference.
 - `protocol.test.mjs`: NIP-44 v2 against the published test vectors; NIP-46
   `connect`/`get_public_key` round trip against an in-process responder that
   implements the same protocol, mismatch refusal, error and timeout handling,
@@ -215,11 +264,30 @@ one `e` pointing at a matching APK. Legacy sets are never rewritten.
   `record-result` status/phase derivation; `plan` selection and missing
   evidence; `notify` end to end against a local fake GitHub API: a successful
   sibling opens nothing, a CDN failure on an already-complete candidate opens an
-  issue, missing evidence opens an issue, open issues are deduplicated.
+  issue, missing evidence opens an issue, open issues are deduplicated, an
+  exhausted pre-signing relay read opens a deduplicated verification issue, retired
+  historical evidence opens no issue even when stale evidence marks it
+  publishable, while a mismatched id+tag pair, the current release and a
+  lane-level failure still notify.
 - `workflow-boundary.test.mjs`: schedule-only trigger, every checkout is
   `${{ github.sha }}`, no `refs/heads/main` or tag checkout, exactly one secret
   step in the environment-bound job, assess job carries no environment or
-  secret, notify holds only `issues: write`, pinned actions and publisher.
+  secret, notify holds only `issues: write`, pinned actions and publisher; for
+  the manual rehearsal (section 8): `workflow_dispatch` only with no inputs,
+  three jobs, no environment, no secret but `GITHUB_TOKEN`, no publish, plan,
+  notify or issue write, `enumerate`/`assess` identical to production, distinct
+  artifact names. `lane.test.mjs` and `orchestration.test.mjs` cover
+  `requireManualRehearsal` and `admit-rehearsal` refusals.
+
+- `manual-publish.test.mjs` (section 10), through the CLI against a local fake
+  GitHub API and a recording stand-in for the identity helper: manual admission
+  and its refusals, the input grammar including unsafe integers, the
+  `expected_workflow_sha` binding, newest-only selection in the candidate file
+  and matrix, the four-way approved binding, activation states, and the
+  freshness refusal when a newer release appears during approval or before a
+  failed-job re-run. `workflow-boundary.test.mjs` additionally requires the
+  parsed manual definition to equal the parsed scheduled definition after an
+  exact allowlist of differences, with no duplicate keys, anchors or merges.
 
 CI only (cannot run on this machine): the Python signing-boundary checker and
 self-host workflow tests still parse this workflow; real `apksigner`; live
@@ -233,13 +301,19 @@ protocol, not a specific signer product.
 
 1. `admit` summary states `ENABLED` and the protected revision.
 2. `enumerate` table: every release in the window with candidate/omitted and the
-   one `publishable` tag.
+   one `publishable` tag. Retired historical releases appear as omitted with
+   their retirement reason.
 3. `assess` per candidate: binding line, digest line, apksigner line,
    reconciliation outcome and action, CDN line.
 4. `plan`: publish matrix (usually empty; one entry after a new release).
+   A failed historical assessment remains a failure but does not suppress a
+   verified newest release selected by a successful plan. Publication still
+   requires successful admission and planning, active automation, a non-empty
+   matrix and a run that has not been cancelled.
 5. `publish` (approval required): drift check, revalidation, preflight
    `signing account verified`, `zsp` exit, read-back `complete-match`, CDN.
-6. `notify`: `No failure issue required` or the issue numbers.
+6. `notify`: `No failure issue required` or the issue numbers. Retired
+   historical evidence is named in the summary without opening an issue.
 
 ## 5. Manual retry and recovery
 
@@ -252,8 +326,13 @@ For transient failures (relay `incomplete`, a download or signer timeout), open
 the failed scheduled run and choose **Re-run failed jobs**; it is expected to
 replay the release id frozen in that run (see the open limitations in 1.1).
 Publication still waits for environment approval. Without any action, the next
-schedule (at most six hours) retries the same exact newest release. To retry
-with a code fix, merge the fix to `main` and wait for the next schedule. After
+six-hourly schedule retries the same exact newest release. GitHub may delay or
+drop scheduled runs; this is not a maximum retry-time guarantee. To retry
+with a code fix, merge the fix to `main` and wait for the next schedule. When
+merging a workflow-condition fix, re-running an older run does not use the fix:
+GitHub retains that run's original workflow revision. Do not add another
+manual publication trigger, widen the reviewed one in section 10, or bypass the
+environment/signing gates to expedite it. After
 any publication attempt whose outcome is `unknown`, do not re-run blindly: wait
 for the next scheduled reconciliation to read the relay first.
 
@@ -269,7 +348,7 @@ for the next scheduled reconciliation to read the relay first.
 | `partial` (`partial-unrecoverable`) | A matching APK event exists without its release or app | **Stop; no automatic recovery exists.** Accepted limitation: see 5.3. The issue names the preserved event ids. |
 | `partial` (`partial-not-newest`) | Recoverable state on a release that is no longer the newest | Nothing is published; a newer release is the publishable one. |
 | `conflict` | Same version, different bytes or tuples | Manual relay review. Never overwrite. |
-| `incomplete` | Relay did not finish answering | Re-run later. |
+| `incomplete` | Relay did not finish answering, after the bounded read-only retries for transport failures | Re-run later. Without a signer/upload attempt nothing was published by the run; it is not evidence of absence. |
 | `unknown` publication after a nonzero `zsp` exit | Read-back did not prove the set | Treat as possibly published; the next schedule reconciles. |
 
 ### 5.3 Accepted limitation: APK event present, release or app missing
@@ -333,3 +412,223 @@ not fix them and a hand-run publisher would make them worse.
   `actions/setup-node@820762786026740c76f36085b0efc47a31fe5020`,
   `actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`,
   `actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c`.
+
+## 8. Manual assessment rehearsal
+
+`.github/workflows/zapstore-rehearsal.yml` lets the owner run the read-only half
+of the lane on demand (for the signer, see section 9). It is a separate workflow file, not a mode of
+`zapstore-publish.yml`, and it does not change the scheduled lane's trigger,
+cron, admission, environment, secret step or publication path.
+
+What it runs: `admit` (via `cli.mjs admit-rehearsal`), then the production
+`enumerate` and `assess` jobs verbatim — exact release binding, the three APK
+digests, `apksigner`, `prepare` with the pinned `zsp` (unsigned), relay
+reconciliation, CDN verification and `record-result`. Evidence is uploaded as
+this run's own artifacts `zapstore-rehearsal-candidates` and
+`zapstore-rehearsal-assessment-<release id>`.
+
+What it cannot do: there is no `plan`, `publish` or `notify` job, no
+environment, no signer secret, no activation variable, and no issue write. Its
+only token is the read-only `GITHUB_TOKEN` (`contents: read`). It cannot sign,
+upload a blob, write a relay event, or touch a GitHub release. The workflow
+boundary tests enforce each of these and require the `enumerate` steps and
+`assess` job to stay textually identical to the production ones apart from
+artifact names.
+
+Admission (`requireManualRehearsal`, fail closed, real run context only):
+
+- `GITHUB_EVENT_NAME` is `workflow_dispatch`; `schedule` and every other event
+  is refused, so the rehearsal never presents itself as a scheduled run.
+- `GITHUB_REF` is `refs/heads/main`. **Main only:** a branch or tag dispatch is
+  refused, because the release identity helper reused by `bind` refuses any
+  other `GITHUB_REF`, and because only main carries protected provenance.
+- `GITHUB_WORKFLOW_REF` is exactly
+  `<repository>/.github/workflows/zapstore-rehearsal.yml@refs/heads/main`.
+- `GITHUB_SHA` is 40-hex and `GITHUB_WORKFLOW_SHA` equals it; the admit
+  checkout and every later job's checkout must be that commit.
+- `admit-rehearsal` emits only `revision`. The scheduled `admit` still refuses
+  `workflow_dispatch`, and refuses this file's workflow ref even if the event
+  were `schedule`.
+
+Running it: GitHub only offers `workflow_dispatch` for a workflow file present on
+the default branch, so the first rehearsal is possible only after this file is
+merged. Then run it from the Actions tab (branch `main`, no inputs) or
+`gh workflow run zapstore-rehearsal.yml --ref main`. If the `admit` step fails
+on `GITHUB_WORKFLOW_SHA`, record the observed value; do not relax the check
+without review.
+
+### 8.1 What each kind of evidence proves
+
+| Evidence | Proves | Does not prove |
+|---|---|---|
+| Manual rehearsal run | The assessment code at the dispatched protected-main commit behaves as expected against live releases, the relay and the CDN | That the schedule fires or is admitted; activation; that the signer, bunker or environment work; that anything may be published |
+| Scheduled run (`zapstore-publish.yml`, including `ZAPSTORE_AUTOMATION_ENABLED=rehearsal`) | Scheduler triggering and protected-main admission of the production definition | Signing, unless the environment-bound `publish` job ran |
+| Signing rehearsal (`zapstore-signing-rehearsal.yml`, section 9) | Environment secrets reach the hosted job; the signer connection binds the approved account; the signer grants kinds 24242, 32267, 30063 and 3063 for this client key; the signed events match the exact-release metadata | Upload, relay publication, CDN serving, scheduler admission, or unattended signer availability |
+| `publish` job of a scheduled run | Signing-account preflight, signing, upload and read-back | — (only source of publication proof) |
+
+An `action` of `publish` in a rehearsal `reconcile.json` or `assessment.json` is
+the decision the scheduled lane *would* reach; it is not publication
+authorization and nothing consumes it. A green rehearsal does not tick any item
+in section 6.
+
+## 9. Signing rehearsal (environment-gated, no publication)
+
+`.github/workflows/zapstore-signing-rehearsal.yml` exercises the signer from a
+hosted runner without publishing. It is a separate workflow file; it does not
+change the scheduled lane's trigger, admission, activation variable or publish
+job, and the assessment rehearsal (section 8) stays secret-free.
+
+**New authority, owner-approved 2026-10-03.** (a) A second workflow binds
+`zapstore-production` and reads its two secrets, in exactly one step. (b) The
+lane's own NIP-46 client, otherwise read-only, may send `sign_event` for one
+shape only: kind 24242, tags exactly `t=upload`, one `x` hash and an
+`expiration` at most 120 s after `created_at` (`requireUploadAuthTemplate`).
+(c) The pinned publisher runs with the bunker in `--offline` mode, which yields
+real, publishable signed release events inside the runner.
+
+Admission (`requireManualSigningRehearsal`): `workflow_dispatch` of exactly
+`<repository>/.github/workflows/zapstore-signing-rehearsal.yml@refs/heads/main`,
+`GITHUB_WORKFLOW_SHA == GITHUB_SHA`, checkout bound to it. The one input,
+`release_id`, must equal the single newest eligible release from a fresh
+enumeration (`select-signing-release`); it is then bound by exact id, its APK
+digests and `apksigner` are verified and `prepare` builds the unsigned expected
+events, exactly as in assessment.
+
+The `sign-rehearsal` step reports four phases separately in
+`signing-rehearsal.json` (artifact `zapstore-signing-rehearsal`, counters only):
+
+| Phase | What happens | Network |
+|---|---|---|
+| `connection` | `connect` + `get_public_key` must return the approved publisher | encrypted kind 24133 on the bunker relay |
+| `uploadAuthorization` | one kind-24242 signature for `sha256` of 32 random bytes that are zeroed at once (nobody can upload that blob), expiring in 120 s; id, signature, account and every tag verified, then dropped | same signer relay only; no Blossom request exists in the code |
+| `releaseSigning` | pinned `zsp` 0.4.17 `--offline` with the bunker on the prepared local config; exactly 3 events, each id/signature valid, signed by the publisher, and equal to the prepared events except timestamp-dependent identities | signer relay; `--offline` uploads and publishes nothing |
+| `relayPostCheck` | read-only REQ for the signed ids on `wss://relay.zapstore.dev`; must observe 0 | read-only |
+
+`unattended` is always `false`: environment approval gates the run, and whether
+Amber prompted is not observable. A success here proves connection, upload
+authorization and release signing permissions for this client key at that
+moment, nothing more.
+
+Containment: the publisher's raw stdout/stderr (signed events) and the client
+key file live only under `$RUNNER_TEMP/signing/signer`; the CLI zero-fills and
+unlinks them right after the run, the step trap and a separate `always()` step
+remove the directory, and the artifact lists explicit paths outside it. The
+summary and verdict hold no event content, signature, bunker URL or key.
+
+Running it: after merge, the owner dispatches from `main` with the newest
+eligible release id (`gh workflow run zapstore-signing-rehearsal.yml --ref main
+-f release_id=<id>`), approves the `zapstore-production` deployment, and keeps
+Amber at hand: setup takes several minutes before the first signer request, and
+the publisher may wait up to 20 minutes for approval. The run shares the
+publication concurrency group, so it waits for (or is queued behind) a
+scheduled run. Do not re-dispatch to "retry" a failed phase without reading the
+verdict first.
+
+## 10. Manual publication of one exact approved release
+
+`.github/workflows/zapstore-manual-publish.yml` lets the owner publish one
+exact, already-published release on demand. It is a separate workflow file with
+its own admission; the scheduled lane's trigger, cron, admission and jobs are
+unchanged, and neither rehearsal is affected.
+
+**New authority, owner-approved 2026-10-05.** A third workflow binds
+`zapstore-production` and can reach the one signing step. It grants no new
+secret, token permission, signing key or environment change. It does not
+rebuild anything: it publishes the APK bytes already attached to the GitHub
+release, and the listing, release notes and media come from the same trusted
+template and bound source commit as the scheduled lane. No input can alter
+them.
+
+### 10.1 Request
+
+Five required string inputs, no defaults, matched exactly with no trimming:
+
+| Input | Grammar |
+|---|---|
+| `release_id` | positive decimal, at most 16 digits, within the safe integer range |
+| `expected_source_sha` | 40 lowercase hex: the release tag's commit |
+| `expected_apk_asset_id` | positive decimal, as `release_id` |
+| `expected_apk_sha256` | 64 lowercase hex: the APK asset digest |
+| `expected_workflow_sha` | 40 lowercase hex: the protected-main commit the run must load and execute |
+
+Inputs are untrusted text. Only the `admit` step reads them, as environment
+data; it validates them and re-exports them as job outputs, and every later job
+reads those outputs through its environment and validates them again. No input
+is interpolated into shell code. Numeric identifiers stay canonical strings and
+are bounded before any numeric conversion.
+
+### 10.2 Checks, in order
+
+1. **Admission** (`admit-manual-publish`, `requireManualPublish`):
+   `workflow_dispatch` of exactly
+   `<repository>/.github/workflows/zapstore-manual-publish.yml@refs/heads/main`,
+   `GITHUB_REF=refs/heads/main`, `GITHUB_WORKFLOW_SHA == GITHUB_SHA`,
+   `expected_workflow_sha == GITHUB_SHA`, checkout bound to it. The activation
+   variable applies as in the scheduled lane: `enabled` may publish,
+   `rehearsal` assesses only, anything else runs nothing.
+2. **Selection** (`enumerate-manual`): a fresh enumeration must mark the
+   requested release as the single newest eligible release. The candidate file
+   and matrix then hold only that release; history is listed as omitted and is
+   neither assessed nor published by this workflow.
+3. **Approved binding** (`bind-approved`, in `assess` and again in `publish`):
+   the bound release id, tag commit, APK asset id and APK digest must all equal
+   the request. A refusal is recorded as the `bind` phase.
+4. Every scheduled-lane check, unchanged: three digests, `apksigner`, prepared
+   expected events, relay reconciliation, plan, drift, environment approval.
+5. **Freshness** (`revalidate-manual`), the step immediately before the signer
+   step: a fresh release listing must still select the request as the newest
+   eligible release and the binding must still be the approved one; then the
+   scheduled lane's revalidation runs as before.
+6. Signing-account preflight, the pinned publisher, read-back and CDN
+   verification, unchanged. Publication is complete only when read-back is
+   `complete-match` (every event id and signature verified) and the CDN bytes
+   verify.
+
+### 10.3 Running it
+
+GitHub offers the dispatch only once the file is on the default branch, after a
+protected-main pull request with CI and independent code review. Then, from
+`main`:
+
+```
+gh workflow run zapstore-manual-publish.yml --ref main \
+  -f release_id=<id> -f expected_source_sha=<sha> \
+  -f expected_apk_asset_id=<id> -f expected_apk_sha256=<sha256> \
+  -f expected_workflow_sha=<main commit>
+```
+
+The values are the ones the owner approved for that release, plus the current
+`main` commit. Approving the `zapstore-production` deployment and the signer
+request remain owner actions; a dispatch alone publishes nothing.
+
+### 10.4 Retry, failure and limits
+
+- **Re-run failed jobs** replays the frozen request. The `publish` job binds
+  and checks freshness against live state again, so a request that is no longer
+  the newest eligible release, or whose release, tag or asset changed, refuses
+  before the signer step. **Re-run all jobs** re-enumerates and refuses at
+  selection in the same case. Either way the scheduled lane's ordinary
+  reconciliation remains the follow-up: after an attempt whose outcome is
+  `unknown`, do not re-dispatch blindly (5.1).
+- **Freshness is not atomic.** The check is the step adjacent to signing, not a
+  server-side selection: a release published after it and before signing is not
+  seen by that run. The next scheduled reconciliation then treats the older
+  version as verify-only or superseded.
+- **Activation is a snapshot.** `ZAPSTORE_AUTOMATION_ENABLED` is shared with
+  the scheduled lane and read once at admission. Changing it stops future
+  scheduled and manual admissions alike and does not stop a run already
+  admitted as active; that needs the run cancelled or the environment approval
+  rejected. Disabling this workflow or reverting it leaves the schedule alone.
+- **Concurrency.** The run shares the single publication concurrency group.
+  GitHub keeps one pending run per group, so a queued scheduled run and a
+  queued manual run can displace one another; re-dispatch if the manual run was
+  dropped. The group serializes running jobs. It is not by itself proof against
+  double publication: that rests on reconciliation immediately before signing,
+  the drift check, revalidation and read-back.
+- **Listing identity.** The pinned publisher emits the app, release and APK
+  events together. The listing content and tags must equal the reviewed
+  template (otherwise `app-drift` refuses), but the app event is signed anew
+  with a new id and timestamp. Signed relay events cannot be withdrawn by this
+  workflow (section 2).
+- A rejected environment approval leaves no result artifact and is reported as
+  `evidence-missing`, exactly as in 1.2.

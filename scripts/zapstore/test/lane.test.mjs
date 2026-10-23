@@ -9,15 +9,19 @@ import { mkdtempSync, readFileSync, statSync, existsSync, writeFileSync } from '
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createServer } from 'node:http'
+import { createHash } from 'node:crypto'
 
-import { classifyRelease, compareTags, markPublishable, selectScheduleCandidates } from '../lib/eligibility.mjs'
-import { activationState, admitTrigger, requireProtectedRef, requireProtectedSchedule, requireProtectedWorkflow } from '../lib/dispatch.mjs'
+import { classifyRelease, compareTags, markPublishable, RETIRED_HISTORICAL_FAILURES, retiredHistoricalReason, selectScheduleCandidates } from '../lib/eligibility.mjs'
+import { activationState, admitTrigger, requireManualRehearsal, requireProtectedRef, requireProtectedSchedule, requireProtectedWorkflow } from '../lib/dispatch.mjs'
 import { bindReleaseAssets, createGitHubClient, EnumerationIncomplete, hashFromChecksumText } from '../lib/github.mjs'
 import { buildBinding, revalidateBinding, verifyApkHashes } from '../lib/binding.mjs'
 import { parseApksignerOutput, requireSignedBy } from '../lib/apksigner.mjs'
 import { generateConfig, loadTemplate, parseZapstoreYaml, resolveChangelog, stageMedia } from '../lib/metadata.mjs'
-import { eventId, InvalidRelayEvent, loadSchnorr, queryRelay, RelayIncomplete, verifyEvent } from '../lib/nostr.mjs'
-import { assessRelayState, compareApk, compareApp, compareRelease, expectedSet, publicationAction } from '../lib/reconcile.mjs'
+import * as nostr from '../lib/nostr.mjs'
+import { eventId, InvalidRelayEvent, loadSchnorr, queryRelay, RelayIncomplete, tagValues, verifyEvent } from '../lib/nostr.mjs'
+import { collectFailures, recordResult } from '../lib/results.mjs'
+import { assessRelayState, canonicalTags, compareApk, compareApp, compareRelease, expectedSet, legacyChannelAccepted, publicationAction, requireReadbackComplete } from '../lib/reconcile.mjs'
 import { apkFactsFromEvent, parseEventsJsonl, requireApkIdentity, zspArgs, zspEnv, ZSP } from '../lib/zsp.mjs'
 import { materializeClientKey } from '../lib/bunker-key.mjs'
 import { redact } from '../lib/redact.mjs'
@@ -37,6 +41,7 @@ const APK_SHA = '3007b51474f8d646c652576b924aef540e46a200b1db2b283d3b772cd309fdd
 const CERT = '8035a4ff1511e2045c579c905d26e93af6009b239e741ef78542ae04e7a7ca79'
 const WORKFLOW_REF = 'silent-suite/silentsuite/.github/workflows/zapstore-publish.yml@refs/heads/main'
 const passIdentity = async () => true
+const { RELAY_READ_ATTEMPTS, RELAY_RETRY_DELAY_MS } = nostr
 
 const release = (over = {}) => ({ id: 383603104, tag_name: 'v0.5.6-beta', draft: false, prerelease: false, published_at: '2026-09-06T10:00:00Z', assets: [
   { id: 547273876, name: 'silentsuite-android-v0.5.6-beta.apk', size: 26916361, digest: `sha256:${APK_SHA}` },
@@ -87,6 +92,68 @@ test('schedule candidates are bounded to the window, every omission carries a re
   assert.deepEqual(markPublishable([]), [])
 })
 
+test('retired historical failures are omitted by exact id and tag with an auditable reason, and never change which release is publishable', () => {
+  const now = Date.parse('2026-10-01T00:00:00Z')
+  const current = release({ id: 407577541, tag_name: 'v0.5.13-beta', published_at: '2026-10-05T00:00:00Z' })
+  const { candidates, omitted } = selectScheduleCandidates([
+    release({ id: 375729540, tag_name: 'v0.5.2-beta', published_at: '2025-05-20T00:00:00Z' }),
+    release({ id: 376457006, tag_name: 'v0.5.3-beta', published_at: '2025-05-28T00:00:00Z' }),
+    release({ id: 399999999, tag_name: 'v0.5.12-beta', published_at: '2026-09-25T00:00:00Z' }),
+    release({ id: 403051319, tag_name: 'v0.5.11-beta', published_at: '2026-09-30T00:00:00Z' }),
+    current,
+  ], { now })
+  assert.deepEqual(candidates.map((c) => [c.releaseId, c.tag, c.publishable]), [[399999999, 'v0.5.12-beta', false], [407577541, 'v0.5.13-beta', true]])
+  for (const retiredId of [375729540, 376457006, 403051319]) {
+    const entry = omitted.find((o) => o.releaseId === retiredId)
+    assert.ok(entry, `release ${retiredId} is omitted`)
+    assert.match(entry.reason, /retired historical failure/, `release ${retiredId} carries the retirement reason`)
+  }
+  // Even inside the 45-day window a retired release is omitted for retirement,
+  // not for age (v0.5.11-beta above is recent and still omitted).
+  // Retirement is unconditional: a retired tuple is omitted even when the full
+  // listing fixes it as the newest eligible release — the older non-retired
+  // release stays verify-only and no alternate publishable candidate is chosen.
+  const retiredNewest = selectScheduleCandidates([
+    release({ id: 403051319, tag_name: 'v0.5.11-beta', published_at: '2026-09-30T00:00:00Z' }),
+    release({ id: 383603104, tag_name: 'v0.5.6-beta', published_at: '2026-09-25T00:00:00Z' }),
+  ], { now })
+  assert.deepEqual(retiredNewest.candidates.map((c) => [c.releaseId, c.publishable]), [[383603104, false]])
+  const retiredNewestEntry = retiredNewest.omitted.find((o) => o.releaseId === 403051319)
+  assert.ok(retiredNewestEntry, 'the retired newest tuple is omitted')
+  assert.match(retiredNewestEntry.reason, /retired historical failure/)
+  assert.equal(retiredNewest.candidates.some((c) => c.publishable === true), false, 'no replacement publishable candidate is chosen')
+  // An all-retired listing leaves no candidates at all.
+  const allRetired = selectScheduleCandidates([
+    release({ id: 375729540, tag_name: 'v0.5.2-beta', published_at: '2026-09-20T00:00:00Z' }),
+    release({ id: 376457006, tag_name: 'v0.5.3-beta', published_at: '2026-09-21T00:00:00Z' }),
+    release({ id: 403051319, tag_name: 'v0.5.11-beta', published_at: '2026-09-30T00:00:00Z' }),
+  ], { now })
+  assert.deepEqual(allRetired.candidates, [])
+  assert.deepEqual(allRetired.omitted.map((o) => o.releaseId).sort((a, b) => a - b), [375729540, 376457006, 403051319])
+  assert.ok(allRetired.omitted.every((o) => /retired historical failure/.test(o.reason)))
+  // Exact pair only: a retired id carrying a different tag is a different
+  // release and is judged by the normal rules.
+  const mismatched = selectScheduleCandidates([
+    release({ id: 376457006, tag_name: 'v0.5.4-beta', published_at: '2026-09-28T00:00:00Z' }),
+    current,
+  ], { now })
+  assert.deepEqual(mismatched.candidates.map((c) => [c.releaseId, c.tag, c.publishable]), [[376457006, 'v0.5.4-beta', false], [407577541, 'v0.5.13-beta', true]])
+  assert.deepEqual(mismatched.omitted, [])
+  assert.deepEqual(RETIRED_HISTORICAL_FAILURES.map((entry) => [entry.releaseId, entry.tag]), [
+    [375729540, 'v0.5.2-beta'],
+    [376457006, 'v0.5.3-beta'],
+    [403051319, 'v0.5.11-beta'],
+  ])
+  assert.match(retiredHistoricalReason(376457006, 'v0.5.3-beta'), /retired historical failure/)
+  assert.match(retiredHistoricalReason('403051319', 'v0.5.11-beta'), /retired historical failure/, 'the canonical decimal string form used in CLI and matrix output matches')
+  assert.equal(retiredHistoricalReason(376457006, 'v0.5.4-beta'), null, 'the exact tag is required')
+  assert.equal(retiredHistoricalReason(999999, 'v0.5.3-beta'), null, 'the exact id is required')
+  assert.equal(retiredHistoricalReason('0376457006', 'v0.5.3-beta'), null, 'a leading zero is not the canonical id')
+  for (const malformed of [' 376457006', '376457006 ', '+376457006', '376457006.0', 376457006.5, -376457006, null, undefined, {}, ['376457006']]) {
+    assert.equal(retiredHistoricalReason(malformed, 'v0.5.3-beta'), null, `malformed id ${JSON.stringify(malformed)} is not the retired release`)
+  }
+})
+
 test('admission: only a protected-main schedule bound to its own definition revision; release and dispatch events are refused', () => {
   assert.throws(() => requireProtectedRef('refs/heads/feature'), /not refs\/heads\/main/)
   assert.throws(() => requireProtectedRef('refs/tags/v0.5.6-beta'))
@@ -106,6 +173,28 @@ test('admission: only a protected-main schedule bound to its own definition revi
   assert.equal(activationState('rehearsal').active, false)
   assert.equal(activationState('rehearsal').rehearsal, true)
   assert.equal(activationState('enabled').active, true)
+})
+
+test('manual rehearsal admission: only a workflow_dispatch of the rehearsal file on protected main; the scheduled admission refuses it', () => {
+  const REHEARSAL_REF = 'silent-suite/silentsuite/.github/workflows/zapstore-rehearsal.yml@refs/heads/main'
+  const context = { eventName: 'workflow_dispatch', ref: 'refs/heads/main', workflowRef: REHEARSAL_REF, sha: SHA, workflowSha: SHA, repository: 'silent-suite/silentsuite' }
+  assert.deepEqual(requireManualRehearsal(context), { revision: SHA })
+  for (const eventName of ['schedule', 'release', 'repository_dispatch', 'push', 'pull_request', undefined]) assert.throws(() => requireManualRehearsal({ ...context, eventName }), /is not workflow_dispatch/, String(eventName))
+  for (const ref of ['refs/heads/feat', 'refs/tags/v0.5.6-beta', undefined]) assert.throws(() => requireManualRehearsal({ ...context, ref }), /is not refs\/heads\/main/, String(ref))
+  for (const workflowRef of [
+    WORKFLOW_REF,
+    REHEARSAL_REF.replace('refs/heads/main', 'refs/heads/feat'),
+    REHEARSAL_REF.replace('refs/heads/main', 'refs/tags/v0.5.6-beta'),
+    'other/repo/.github/workflows/zapstore-rehearsal.yml@refs/heads/main',
+    'silent-suite/silentsuite/nested/.github/workflows/zapstore-rehearsal.yml@refs/heads/main',
+    undefined,
+  ]) assert.throws(() => requireManualRehearsal({ ...context, workflowRef }), /GITHUB_WORKFLOW_REF/, String(workflowRef))
+  for (const repository of [undefined, '', 'silent-suite']) assert.throws(() => requireManualRehearsal({ ...context, repository }), /GITHUB_REPOSITORY/, String(repository))
+  for (const workflowSha of ['a'.repeat(40), undefined, '']) assert.throws(() => requireManualRehearsal({ ...context, workflowSha }), /GITHUB_WORKFLOW_SHA/, String(workflowSha))
+  assert.throws(() => requireManualRehearsal({ ...context, sha: 'main', workflowSha: 'main' }), /GITHUB_SHA/)
+  assert.throws(() => admitTrigger('workflow_dispatch'), /unsupported event/)
+  assert.throws(() => requireProtectedSchedule(context), /unsupported event workflow_dispatch/)
+  assert.throws(() => requireProtectedSchedule({ ...context, eventName: 'schedule' }), /is not \.github\/workflows\/zapstore-publish\.yml/)
 })
 
 test('the identity helper sees the real GITHUB_REF and is never handed a fabricated one', () => {
@@ -173,19 +262,20 @@ test('source build.gradle literals bind version name and code; interpolations ar
 
 test('asset binding refuses missing assets, ambiguous names and missing digests', () => {
   assert.throws(() => bindReleaseAssets(release({ assets: release().assets.filter((a) => !a.name.endsWith('.apk')) }), 'v0.5.6-beta'), /exactly one asset named silentsuite-android-v0.5.6-beta.apk, found 0/)
-  assert.throws(() => bindReleaseAssets(release({ assets: release().assets.filter((a) => a.name !== 'SHA256SUMS.txt') }), 'v0.5.6-beta'), /SHA256SUMS.txt/)
+  assert.ok(bindReleaseAssets(release({ assets: release().assets.filter((a) => a.name !== 'SHA256SUMS.txt') }), 'v0.5.6-beta'))
+  assert.throws(() => bindReleaseAssets(release({ assets: release().assets.filter((a) => !a.name.endsWith('-installer.sha256')) }), 'v0.5.6-beta'), /installer.sha256/)
   assert.throws(() => bindReleaseAssets(release({ assets: release().assets.map((a) => ({ ...a, digest: undefined })) }), 'v0.5.6-beta'), /no sha256 digest/)
   assert.equal(hashFromChecksumText(`${APK_SHA}  silentsuite-android-v0.5.6-beta.apk\n`), APK_SHA)
   assert.equal(hashFromChecksumText(`${'b'.repeat(64)}  other.aab\n${APK_SHA}  silentsuite-android-v0.5.6-beta.apk\n`, { fileName: 'silentsuite-android-v0.5.6-beta.apk' }), APK_SHA)
   assert.throws(() => hashFromChecksumText('nothing here'), /found 0/)
 })
 
-test('APK hash binding requires local bytes, GitHub digest, sidecar and manifest to agree', () => {
+test('APK hash binding requires local bytes, GitHub digest and Android sidecar to agree', () => {
   const binding = { assets: { apk: { sha256: APK_SHA, size: 26916361 } } }
-  assert.ok(verifyApkHashes({ binding, localSha256: APK_SHA, localSize: 26916361, sidecarSha256: APK_SHA, sumsSha256: APK_SHA }))
-  assert.throws(() => verifyApkHashes({ binding, localSha256: 'c'.repeat(64), localSize: 26916361, sidecarSha256: APK_SHA, sumsSha256: APK_SHA }), /local bytes/)
-  assert.throws(() => verifyApkHashes({ binding, localSha256: APK_SHA, localSize: 1, sidecarSha256: APK_SHA, sumsSha256: APK_SHA }), /size/)
-  assert.throws(() => verifyApkHashes({ binding, localSha256: APK_SHA, localSize: 26916361, sidecarSha256: 'c'.repeat(64), sumsSha256: APK_SHA }), /sidecar/)
+  assert.ok(verifyApkHashes({ binding, localSha256: APK_SHA, localSize: 26916361, sidecarSha256: APK_SHA }))
+  assert.throws(() => verifyApkHashes({ binding, localSha256: 'c'.repeat(64), localSize: 26916361, sidecarSha256: APK_SHA }), /local bytes/)
+  assert.throws(() => verifyApkHashes({ binding, localSha256: APK_SHA, localSize: 1, sidecarSha256: APK_SHA }), /size/)
+  assert.throws(() => verifyApkHashes({ binding, localSha256: APK_SHA, localSize: 26916361, sidecarSha256: 'c'.repeat(64) }), /sidecar/)
 })
 
 test('release enumeration paginates with a bound and fails instead of truncating', async () => {
@@ -316,8 +406,8 @@ test('relay subscription completes only on EOSE; timeout, close and truncation a
   const filters = [{ kinds: [3063] }]
   const complete = await queryRelay({ filters, WebSocketImpl: fakeSocketFactory((sub) => [['EVENT', sub, observed[0]], ['EOSE', sub]]) })
   assert.equal(complete.events.length, 1)
-  await assert.rejects(queryRelay({ filters, timeoutMs: 50, WebSocketImpl: fakeSocketFactory((sub) => [['EVENT', sub, observed[0]], 'HANG']) }), RelayIncomplete)
-  await assert.rejects(queryRelay({ filters, WebSocketImpl: fakeSocketFactory(() => ['CLOSE']) }), /closed before EOSE/)
+  await assert.rejects(queryRelay({ filters, timeoutMs: 50, retryDelayMs: 0, WebSocketImpl: fakeSocketFactory((sub) => [['EVENT', sub, observed[0]], 'HANG']) }), RelayIncomplete)
+  await assert.rejects(queryRelay({ filters, retryDelayMs: 0, WebSocketImpl: fakeSocketFactory(() => ['CLOSE']) }), /closed before EOSE/)
   await assert.rejects(queryRelay({ filters, limit: 1, WebSocketImpl: fakeSocketFactory((sub) => [['EVENT', sub, observed[0]], ['EOSE', sub]]) }), /truncated/)
   await assert.rejects(queryRelay({ filters, WebSocketImpl: fakeSocketFactory((sub) => [['CLOSED', sub, 'auth-required']]) }), /closed the subscription/)
   assert.equal(publicationAction({ assessment: { outcome: 'incomplete', detail: 'no EOSE' }, publishable: true }).action, 'fail')
@@ -336,6 +426,159 @@ async function signedCopies(mutate = (e) => e) {
   const expected = { app: { ...unsigned.app, pubkey: pub }, release: { ...unsigned.release, pubkey: pub }, apk: { ...unsigned.apk, pubkey: pub } }
   return { expected, apk, release: rel, app, pub, sign }
 }
+
+// A minimal local relay speaking real RFC 6455 framing over node:http, so relay
+// reads run through Node's own WebSocket client. Each connection is a fresh
+// socket; `perConnection` scripts the answer by connection index.
+async function localRelay(perConnection) {
+  const connections = []
+  const sockets = new Set()
+  const server = createServer((_, response) => { response.writeHead(426); response.end() })
+  server.on('upgrade', (request, socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+    socket.on('error', () => {})
+    const accept = createHash('sha1').update(`${request.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+    const index = connections.length
+    const record = { subscriptions: [] }
+    connections.push(record)
+    const send = (frame) => {
+      const payload = Buffer.from(typeof frame === 'string' ? frame : JSON.stringify(frame))
+      let header
+      if (payload.length < 126) header = Buffer.from([0x81, payload.length])
+      else if (payload.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(payload.length, 2) }
+      else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(payload.length), 2) }
+      socket.write(Buffer.concat([header, payload]))
+    }
+    let buffer = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      while (buffer.length >= 2) {
+        const opcode = buffer[0] & 0x0f
+        let length = buffer[1] & 0x7f
+        let offset = 2
+        if (length === 126) { if (buffer.length < 4) return; length = buffer.readUInt16BE(2); offset = 4 }
+        else if (length === 127) { if (buffer.length < 10) return; length = Number(buffer.readBigUInt64BE(2)); offset = 10 }
+        if (buffer.length < offset + 4 + length) return
+        const mask = buffer.subarray(offset, offset + 4)
+        const payload = Buffer.from(buffer.subarray(offset + 4, offset + 4 + length)).map((byte, i) => byte ^ mask[i % 4])
+        buffer = buffer.subarray(offset + 4 + length)
+        if (opcode === 8) { socket.destroy(); return }
+        if (opcode !== 1) continue
+        const [type, sub] = JSON.parse(payload.toString('utf8'))
+        if (type !== 'REQ') continue
+        record.subscriptions.push(sub)
+        perConnection(index, { sub, send, drop: () => socket.destroy() })
+      }
+    })
+  })
+  await new Promise((resolveListen) => server.listen(0, '127.0.0.1', resolveListen))
+  return {
+    url: `ws://127.0.0.1:${server.address().port}`,
+    connections,
+    close: () => new Promise((resolveClose) => { for (const socket of sockets) socket.destroy(); server.close(resolveClose) }),
+  }
+}
+
+test('relay reads retry an EOSE timeout or dropped socket on a fresh socket and subscription, discard the partial answer, and recover without a false absence or issue (local relay, real WebSocket client)', async () => {
+  const { expected, apk, release: rel, app, sign } = await signedCopies()
+  const stray = sign({ ...unsigned.apk, created_at: unsigned.apk.created_at + 60 })
+  const filters = [{ kinds: [3063] }]
+  const full = ({ sub, send }) => { for (const event of [app, rel, apk]) send(['EVENT', sub, event]); send(['EOSE', sub]) }
+  for (const [name, firstAttempt] of [
+    // The #857 shape: events arrive, EOSE never does.
+    ['EOSE timeout', ({ sub, send }) => { send(['EVENT', sub, stray]); send(['EVENT', sub, apk]) }],
+    ['dropped socket', ({ sub, send, drop }) => { send(['EVENT', sub, stray]); setTimeout(drop, 20) }],
+  ]) {
+    const relay = await localRelay((index, io) => (index === 0 ? firstAttempt(io) : full(io)))
+    try {
+      const started = Date.now()
+      const result = await queryRelay({ url: relay.url, filters, timeoutMs: 300, retryDelayMs: 50 })
+      assert.equal(relay.connections.length, 2, `${name}: exactly one retry on a new socket`)
+      const [first, second] = relay.connections.map((c) => c.subscriptions)
+      assert.equal(first.length, 1, name)
+      assert.equal(second.length, 1, name)
+      assert.notEqual(first[0], second[0], `${name}: the retry uses a fresh subscription id`)
+      assert.deepEqual(result.events.map((e) => e.id), [app.id, rel.id, apk.id], `${name}: first-attempt partial events never leak into the retry`)
+      assert.ok(Date.now() - started >= 50, `${name}: the fixed delay is applied before retrying`)
+      // Fed to the real consumers: a complete match, skipped with CDN check, no failure evidence.
+      const assessment = assessRelayState({ expected, observed: result.events, schnorr })
+      assert.equal(assessment.outcome, 'complete-match', `${name}: a leaked stray APK would have been a conflict`)
+      const decision = publicationAction({ assessment, publishable: true })
+      assert.deepEqual(decision, { action: 'skip', reason: 'complete-match', verifyCdn: true })
+      const evidence = recordResult({ job: 'assess', phases: { checkout: 'success', bind: 'success', apk: 'success', apksigner: 'success', prepare: 'success', reconcile: 'success', cdn: 'success' }, binding: { releaseId: 418222556, tag: 'v0.5.14-beta', sourceSha: SHA }, reconcile: { ...assessment, ...decision }, cdn: { status: 'success' } })
+      assert.equal(evidence.status, 'success')
+      assert.equal(evidence.publication, 'already-published')
+      assert.deepEqual(collectFailures({ candidates: [{ releaseId: 418222556, tag: 'v0.5.14-beta', publishable: true }], assessments: [evidence], jobs: { enumerate: 'success', assess: 'success' } }), [], `${name}: no issue`)
+    } finally {
+      await relay.close()
+    }
+  }
+})
+
+test('relay read retries are bounded and fail closed: exhausted transport failures stay incomplete, never absent, and name the attempts', async () => {
+  const { apk } = await signedCopies()
+  const filters = [{ kinds: [3063] }]
+  const relay = await localRelay((index, { sub, send }) => send(['EVENT', sub, apk]))
+  try {
+    const started = Date.now()
+    const error = await queryRelay({ url: relay.url, filters, timeoutMs: 150, retryDelayMs: 30 }).then(() => null, (e) => e)
+    const elapsed = Date.now() - started
+    assert.ok(error instanceof RelayIncomplete, 'exhaustion is RelayIncomplete')
+    assert.match(error.message, /did not send EOSE within 150 ms/)
+    assert.match(error.message, /3 of 3 read-only attempts/)
+    assert.equal(relay.connections.length, RELAY_READ_ATTEMPTS, 'no attempt beyond the fixed budget')
+    assert.ok(elapsed < 3 * 150 + 2 * 30 + 1500, `bounded wall time (${elapsed} ms)`)
+    // The CLI maps the rejection to `incomplete`, which fails and is never absence.
+    assert.deepEqual(publicationAction({ assessment: { outcome: 'incomplete', detail: error.message }, publishable: true }), { action: 'fail', reason: 'incomplete', verifyCdn: false })
+  } finally {
+    await relay.close()
+  }
+  // Fixed production budget: 3 attempts, 5 s apart, each bounded by the 20 s EOSE timeout.
+  assert.equal(RELAY_READ_ATTEMPTS, 3)
+  assert.equal(RELAY_RETRY_DELAY_MS, 5000)
+  assert.ok(RELAY_READ_ATTEMPTS * 20000 + (RELAY_READ_ATTEMPTS - 1) * RELAY_RETRY_DELAY_MS <= 70000)
+})
+
+test('relay protocol refusals, malformed frames, truncation, invalid events and conflicts are not retried or hidden', async () => {
+  const { expected, apk, release: rel, app, sign } = await signedCopies()
+  const filters = [{ kinds: [3063] }]
+  for (const [name, script, pattern] of [
+    ['CLOSED refusal', ({ sub, send }) => send(['CLOSED', sub, 'auth-required: sign in']), /closed the subscription: auth-required/],
+    ['non-JSON frame', ({ send }) => send('not json'), /non-JSON frame/],
+    ['non-array frame', ({ send }) => send({ EVENT: 1 }), /non-array frame/],
+    ['truncated', ({ sub, send }) => { send(['EVENT', sub, apk]); send(['EOSE', sub]) }, /truncated/],
+  ]) {
+    const relay = await localRelay((index, io) => script(io))
+    try {
+      await assert.rejects(queryRelay({ url: relay.url, filters, limit: 1, timeoutMs: 300, retryDelayMs: 10 }), pattern, name)
+      assert.equal(relay.connections.length, 1, `${name}: a single attempt, no retry`)
+    } finally {
+      await relay.close()
+    }
+  }
+  // A complete answer is never retried; its security and semantic checks still decide.
+  const tampered = { ...apk, content: 'tampered' }
+  const duplicate = sign({ ...unsigned.apk, created_at: unsigned.apk.created_at + 60 })
+  for (const [name, events, check] of [
+    ['invalid signature', [app, rel, tampered], (result) => assert.throws(() => assessRelayState({ expected, observed: result.events, schnorr }), InvalidRelayEvent)],
+    ['conflict', [app, rel, apk, duplicate], (result) => assert.equal(assessRelayState({ expected, observed: result.events, schnorr }).outcome, 'conflict')],
+    ['absent', [], (result) => assert.equal(assessRelayState({ expected, observed: result.events, schnorr }).outcome, 'absent')],
+  ]) {
+    const relay = await localRelay((index, { sub, send }) => { for (const event of events) send(['EVENT', sub, event]); send(['EOSE', sub]) })
+    try {
+      check(await queryRelay({ url: relay.url, filters, timeoutMs: 300, retryDelayMs: 10 }))
+      assert.equal(relay.connections.length, 1, `${name}: a complete answer is used once`)
+    } finally {
+      await relay.close()
+    }
+  }
+  // The relay module never reaches signing, upload or publication code.
+  const source = readFileSync(join(here, '..', 'lib', 'nostr.mjs'), 'utf8')
+  assert.doesNotMatch(source, /from '\.\/(nip46|nip44|publish|upload-auth|zsp|bunker-key|signing-rehearsal)\.mjs'|child_process/)
+  assert.doesNotMatch(source, /send\(JSON\.stringify\(\[\s*'(EVENT|AUTH)'/, 'only REQ frames are ever sent')
+})
 
 test('reconciliation outcomes: absent, complete-match, partial (never recovered), conflict, superseded, invalid signatures', async () => {
   const { expected, apk, release: rel, app, sign } = await signedCopies()
@@ -468,6 +711,92 @@ test('exact comparison covers content, every tag tuple, ordering and the release
   assert.match(extraUrlState.detail, /extra \["url"/)
 })
 
+// The pinned publisher collects native architectures in a Go map, so two runs
+// over one APK emit the four platform `f` tags in different orders. Rotating
+// them among their own positions covers every order a run can produce for a
+// given starting point; the mutations below must still be differences.
+const ROTATIONS = [0, 1, 2, 3]
+function rotateF(tags, k) {
+  const platforms = tags.filter((t) => t[0] === 'f')
+  let next = 0
+  return tags.map((t) => (t[0] === 'f' ? [...platforms[(next++ + k) % platforms.length]] : [...t]))
+}
+const F_MUTATIONS = {
+  replaced: (tags) => tags.map((t) => (t[0] === 'f' && t[1] === 'android-x86' ? ['f', 'android-riscv64'] : t)),
+  removed: (tags) => tags.filter((t) => !(t[0] === 'f' && t[1] === 'android-x86')),
+  added: (tags) => { const last = tags.findLastIndex((t) => t[0] === 'f'); return [...tags.slice(0, last + 1), ['f', 'android-riscv64'], ...tags.slice(last + 1)] },
+  duplicated: (tags) => { const last = tags.findLastIndex((t) => t[0] === 'f'); return [...tags.slice(0, last + 1), [...tags[last]], ...tags.slice(last + 1)] },
+  // One `f` tuple leaves the block: after `license` on the app, at the end otherwise.
+  relocated: (tags) => {
+    const first = tags.findIndex((t) => t[0] === 'f')
+    const rest = tags.filter((_, i) => i !== first)
+    const license = rest.findIndex((t) => t[0] === 'license')
+    const at = license >= 0 ? license + 1 : rest.length
+    return [...rest.slice(0, at), tags[first], ...rest.slice(at)]
+  },
+}
+
+test('platform f tag order is not significant; which f values exist, how many, and where the block sits still are', () => {
+  const apkId = 'a'.repeat(64)
+  const linked = unsigned.release.tags.map((t) => (t[0] === 'e' ? ['e', apkId, t[2]] : [...t]))
+  for (const event of [unsigned.app, unsigned.release, unsigned.apk]) assert.equal(event.tags.filter((t) => t[0] === 'f').length, 4, `kind ${event.kind} carries four platforms`)
+  for (const k of ROTATIONS) {
+    assert.deepEqual(compareApp(unsigned.app, { ...unsigned.app, tags: rotateF(unsigned.app.tags, k) }), [], `app rotation ${k}`)
+    assert.deepEqual(compareApp({ ...unsigned.app, tags: rotateF(unsigned.app.tags, k) }, unsigned.app), [], `app rotation ${k}, expected side`)
+    assert.deepEqual(compareRelease(unsigned.release, { ...unsigned.release, tags: rotateF(linked, k) }, apkId), [], `release rotation ${k}`)
+    assert.deepEqual(compareApk(unsigned.apk, { ...unsigned.apk, tags: rotateF(unsigned.apk.tags, k) }), [], `apk rotation ${k}`)
+    const canonical = canonicalTags(rotateF(unsigned.app.tags, k))
+    assert.deepEqual(canonical.map((t) => t[0]), unsigned.app.tags.map((t) => t[0]), 'positions are kept')
+    assert.deepEqual(canonical.filter((t) => t[0] !== 'f'), unsigned.app.tags.filter((t) => t[0] !== 'f'), 'every other tuple is untouched')
+    for (const [name, mutate] of Object.entries(F_MUTATIONS)) {
+      assert.notDeepEqual(compareApp(unsigned.app, { ...unsigned.app, tags: mutate(rotateF(unsigned.app.tags, k)) }), [], `app ${name}, rotation ${k}`)
+      assert.notDeepEqual(compareRelease(unsigned.release, { ...unsigned.release, tags: mutate(rotateF(linked, k)) }, apkId), [], `release ${name}, rotation ${k}`)
+      assert.notDeepEqual(compareApk(unsigned.apk, { ...unsigned.apk, tags: mutate(rotateF(unsigned.apk.tags, k)) }), [], `apk ${name}, rotation ${k}`)
+    }
+  }
+  assert.match(compareApk(unsigned.apk, { ...unsigned.apk, tags: F_MUTATIONS.replaced(unsigned.apk.tags) }).join('; '), /android-riscv64/)
+})
+
+test('relay state: a set signed with another f order is complete; a differing f value is drift or conflict', async () => {
+  const rotate = (kinds, k) => (event, kind) => (kinds.includes(kind) ? { ...event, tags: rotateF(event.tags, k) } : event)
+  for (const k of ROTATIONS) {
+    const all = await signedCopies(rotate(['app', 'release', 'apk'], k))
+    const complete = assessRelayState({ expected: all.expected, observed: [all.app, all.release, all.apk], schnorr })
+    assert.equal(complete.outcome, 'complete-match', `rotation ${k}: ${complete.detail}`)
+    assert.deepEqual(publicationAction({ assessment: complete, publishable: true }), { action: 'skip', reason: 'complete-match', verifyCdn: true })
+    assert.ok(requireReadbackComplete(complete), 'post-publication read-back accepts the publisher order')
+    const appOnly = await signedCopies(rotate(['app'], k))
+    const absent = assessRelayState({ expected: appOnly.expected, observed: [appOnly.app], schnorr })
+    assert.equal(absent.outcome, 'absent', `app-only rotation ${k}: ${absent.detail}`)
+    assert.deepEqual(publicationAction({ assessment: absent, publishable: true }), { action: 'publish', reason: 'absent', verifyCdn: false })
+  }
+  for (const [name, mutate] of Object.entries(F_MUTATIONS)) {
+    const change = (kind) => (event, eventKind) => (eventKind === kind ? { ...event, tags: mutate(rotateF(event.tags, 1)) } : event)
+    const app = await signedCopies(change('app'))
+    assert.equal(assessRelayState({ expected: app.expected, observed: [app.app], schnorr }).outcome, 'app-drift', `app ${name}`)
+    assert.equal(assessRelayState({ expected: app.expected, observed: [app.app, app.release, app.apk], schnorr }).outcome, 'app-drift', `app ${name} with release and APK`)
+    for (const kind of ['release', 'apk']) {
+      const lane = await signedCopies(change(kind))
+      const state = assessRelayState({ expected: lane.expected, observed: [lane.app, lane.release, lane.apk], schnorr })
+      assert.equal(state.outcome, 'conflict', `${kind} ${name}: ${state.detail}`)
+      assert.equal(publicationAction({ assessment: state, publishable: true }).action, 'fail')
+    }
+  }
+})
+
+test('recorded relay history: the newest candidate is absent and published whatever f order the publisher emits', () => {
+  for (const k of ROTATIONS) {
+    const expected = { app: { ...unsigned.app, tags: rotateF(unsigned.app.tags, k) }, release: { ...unsigned.release, tags: rotateF(unsigned.release.tags, k) }, apk: { ...unsigned.apk, tags: rotateF(unsigned.apk.tags, k) } }
+    const state = assessRelayState({ expected, observed, schnorr })
+    assert.equal(state.outcome, 'absent', `rotation ${k}: ${state.detail}`)
+    assert.equal(publicationAction({ assessment: state, publishable: true }).action, 'publish')
+    for (const [name, mutate] of Object.entries(F_MUTATIONS)) {
+      const drifted = assessRelayState({ expected: { ...expected, app: { ...expected.app, tags: mutate(expected.app.tags) } }, observed, schnorr })
+      assert.equal(drifted.outcome, 'app-drift', `rotation ${k}, ${name}`)
+    }
+  }
+})
+
 // The recorded relay history was published by hand before this lane existed:
 // no commit tags, and several versions with duplicate same-hash APK events.
 function historicalExpected(version) {
@@ -504,6 +833,72 @@ test('historical relay state (no commit tags, duplicate APK events) is legacy-co
   const superseded = assessRelayState({ expected: olderMissing, observed, schnorr })
   assert.equal(superseded.outcome, 'superseded', 'a never-published older version is skipped, not backfilled')
   assert.equal(publicationAction({ assessment: superseded, publishable: false }).action, 'skip')
+})
+
+// historicalExpected reuses the relay's own release, so it cannot see the
+// channel: the lane always writes `c` = main (zspArgs --channel main), while
+// 0.5.0-beta and 0.5.3-beta were published by hand on channel beta.
+function laneExpected(version, channel = 'main') {
+  const set = historicalExpected(version)
+  return { ...set, release: { ...set.release, tags: set.release.tags.map((t) => (t[0] === 'c' ? ['c', channel] : t)) } }
+}
+
+test('pre-lane beta-channel releases are legacy-complete against the lane main-channel candidate, and nowhere else', () => {
+  for (const [version, apkId] of [['0.5.3-beta', 'e569ce28e3f8647fa98e665185a96b267cf933370dc3481f4d40b2f5c9fb01db'], ['0.5.0-beta', '23ccc69f5815a25a179f05de4fc263808e574684fca2b83bfc985ed6aca4b955']]) {
+    const state = assessRelayState({ expected: laneExpected(version), observed, schnorr })
+    assert.equal(state.outcome, 'legacy-complete', `${version}: ${state.detail}`)
+    assert.equal(state.channel, 'beta')
+    assert.equal(state.present.apk, apkId)
+    for (const publishable of [true, false]) assert.deepEqual(publicationAction({ assessment: state, publishable }), { action: 'skip', reason: 'legacy-complete', verifyCdn: true }, 'never an overwrite candidate, newest or not')
+  }
+  assert.equal(assessRelayState({ expected: laneExpected('0.5.4-beta'), observed, schnorr }).outcome, 'legacy-complete', 'a main-channel pre-lane release still matches')
+  for (const channel of ['beta', 'nightly', 'dev']) {
+    const state = assessRelayState({ expected: laneExpected('0.5.4-beta', channel), observed, schnorr })
+    assert.equal(state.outcome, 'conflict', `relay main vs expected ${channel}`)
+    assert.match(state.detail, /pre-lane release identity differs: release\.c/)
+  }
+  for (const channel of ['nightly', 'dev', 'beta ']) {
+    const state = assessRelayState({ expected: laneExpected('0.5.3-beta', channel), observed, schnorr })
+    assert.equal(state.outcome, 'conflict', `relay beta vs expected ${JSON.stringify(channel)}`)
+  }
+  const tampered = laneExpected('0.5.3-beta')
+  tampered.apk = { ...tampered.apk, tags: tampered.apk.tags.map((t) => (t[0] === 'size' ? ['size', '1'] : t)) }
+  assert.equal(assessRelayState({ expected: tampered, observed, schnorr }).outcome, 'conflict', 'the channel exception does not relax APK identity')
+  const orphaned = observed.filter((e) => e.id !== 'e569ce28e3f8647fa98e665185a96b267cf933370dc3481f4d40b2f5c9fb01db')
+  const orphan = assessRelayState({ expected: laneExpected('0.5.3-beta'), observed: orphaned, schnorr })
+  assert.equal(orphan.outcome, 'conflict', 'a beta-channel release without its APK is never a recovery candidate')
+  assert.match(orphan.detail, /release\.tags\[\d+\] expected \["c","main"\] observed \["c","beta"\]/)
+  const rel53 = observed.find((e) => e.id.startsWith('cf7cf99a650e'))
+  assert.ok(compareRelease(laneExpected('0.5.3-beta').release, rel53, 'e569ce28e3f8647fa98e665185a96b267cf933370dc3481f4d40b2f5c9fb01db').some((d) => d.includes('"c"')), 'lane-path exact comparison still rejects a channel difference')
+  assert.equal(legacyChannelAccepted('main', 'beta', '0.5.3-beta'), true)
+  for (const [e, o, v] of [['main', 'beta', '0.5.3'], ['main', 'beta', '0.5.3-beta.1'], ['main', 'nightly', '0.5.3-beta'], ['beta', 'main', '0.5.3-beta'], ['main', 'Beta', '0.5.3-beta'], ['main', undefined, '0.5.3-beta']]) {
+    assert.equal(legacyChannelAccepted(e, o, v), false, `${e}/${o}/${v}`)
+  }
+})
+
+test('signed end to end: the channel exception needs a commit-less APK and exactly one beta c tag, and only ever skips', async () => {
+  const preLane = (channels) => (e, kind) => {
+    if (kind === 'apk') return { ...e, tags: e.tags.filter((t) => t[0] !== 'commit') }
+    if (kind === 'release') return { ...e, tags: e.tags.flatMap((t) => (t[0] === 'c' ? channels.map((c) => ['c', c]) : [t])) }
+    return e
+  }
+  const beta = await signedCopies(preLane(['beta']))
+  assert.equal(tagValues(beta.apk, 'commit').length, 0)
+  const state = assessRelayState({ expected: beta.expected, observed: [beta.app, beta.release, beta.apk], schnorr })
+  assert.equal(state.outcome, 'legacy-complete', state.detail)
+  assert.equal(state.channel, 'beta')
+  for (const publishable of [true, false]) assert.deepEqual(publicationAction({ assessment: state, publishable }), { action: 'skip', reason: 'legacy-complete', verifyCdn: true })
+  for (const channels of [[], ['beta', 'beta'], ['main', 'beta']]) {
+    const s = await signedCopies(preLane(channels))
+    const out = assessRelayState({ expected: s.expected, observed: [s.app, s.release, s.apk], schnorr })
+    assert.equal(out.outcome, 'conflict', `c tags ${JSON.stringify(channels)}`)
+    assert.match(out.detail, /release\.c\.cardinality/)
+  }
+  const lane = await signedCopies((e, kind) => (kind === 'release' ? { ...e, tags: e.tags.map((t) => (t[0] === 'c' ? ['c', 'beta'] : t)) } : e))
+  assert.equal(tagValues(lane.apk, 'commit').length, 1)
+  const laneState = assessRelayState({ expected: lane.expected, observed: [lane.app, lane.release, lane.apk], schnorr })
+  assert.equal(laneState.outcome, 'conflict', 'a lane-owned (commit-tagged) set on channel beta is not legacy')
+  assert.match(laneState.detail, /published release differs.*\["c","beta"\]/)
 })
 
 test('CDN read-back fetches every referenced blob and compares hashes', async () => {
@@ -588,6 +983,49 @@ test('failure issue is structured, quotes untrusted text safely, names the re-ru
     return { status: 201, json: async () => ({ number: 8 }) }
   }
   await assert.rejects(createIssueWithReadback({ fetchImpl: drift, token: 't', issue }), /different content/)
+})
+
+test('an exhausted pre-sign read-only relay check is reported as incomplete verification, not a publication failure, with a deterministic per-release title', () => {
+  const base = { releaseId: '418222556', tag: 'v0.5.14-beta', sourceSha: 'a91fcdb7e99bf00a1f2305f08d94e8d76c631ce5', runUrl: 'https://github.com/silent-suite/silentsuite/actions/runs/39902659420/attempts/1', phase: 'reconcile', outcome: 'incomplete', reason: 'incomplete', publication: 'not-attempted', detail: 'relay wss://relay.zapstore.dev did not send EOSE within 20000 ms (3 of 3 read-only attempts)' }
+  const issue = buildIssue(base)
+  assert.equal(issue.title, 'Zapstore relay verification incomplete: v0.5.14-beta (release 418222556)')
+  assert.match(issue.body, /^## Zapstore relay verification did not complete\n/)
+  assert.doesNotMatch(issue.body, /publication did not complete|publication failed/i)
+  assert.match(issue.body, /No signer\/upload attempt ran for this candidate/)
+  assert.match(issue.body, /not evidence that the release is absent or unpublished/)
+  assert.match(issue.body, /- Outcome: incomplete/)
+  assert.match(issue.body, /- Publication claim: not-attempted/)
+  assert.match(issue.body, /### Exact retry/)
+  assert.match(issue.body, /GitHub release id 418222556/)
+  assert.equal(buildIssue(base).title, issue.title, 'repeated failures of the same release share one title and dedupe')
+  assert.notEqual(buildIssue({ ...base, releaseId: '407577541', tag: 'v0.5.13-beta' }).title, issue.title, 'the title stays exact per release')
+  // After any signer/upload attempt an incomplete read-back is a publication failure with unknown state.
+  for (const publication of ['unknown', 'partial', undefined]) {
+    const readback = buildIssue({ ...base, phase: 'readback', publication })
+    assert.equal(readback.title, 'Zapstore publication failed: v0.5.14-beta (release 418222556)', String(publication))
+    assert.match(readback.body, /^## Zapstore publication did not complete/, String(publication))
+  }
+  // Other refusals and failures keep the publication title.
+  for (const [outcome, reason] of [['conflict', 'conflict'], ['app-drift', 'app-drift'], ['partial', 'partial-unrecoverable'], ['evidence-missing', undefined]]) {
+    assert.match(buildIssue({ ...base, outcome, reason }).title, /^Zapstore publication failed: v0\.5\.14-beta \(release 418222556\)$/, outcome)
+  }
+  assert.equal(buildIssue({ ...base, releaseId: 'x', tag: 'bad tag' }).title, 'Zapstore lane failed: reconcile', 'lane-level titles are unchanged')
+})
+
+test('a pre-sign incomplete that was never retried (refusal, malformed, truncated, invalid event) makes no retry claim', () => {
+  const base = { releaseId: '418222556', tag: 'v0.5.14-beta', sourceSha: 'a91fcdb7e99bf00a1f2305f08d94e8d76c631ce5', runUrl: 'https://github.com/silent-suite/silentsuite/actions/runs/39902659420/attempts/1', phase: 'reconcile', outcome: 'incomplete', reason: 'incomplete', publication: 'not-attempted' }
+  for (const detail of [
+    'relay closed the subscription: auth-required: sign in',
+    'relay sent a non-JSON frame',
+    'relay returned 500 events, reaching the limit; result may be truncated',
+    `event ${'a'.repeat(64)} carries an invalid signature`,
+  ]) {
+    const issue = buildIssue({ ...base, detail })
+    assert.equal(issue.title, 'Zapstore relay verification incomplete: v0.5.14-beta (release 418222556)', detail)
+    assert.doesNotMatch(issue.body, /bounded retries|after (its|the) .*retr/i, `${detail}: no false retry claim`)
+    assert.match(issue.body, /not evidence that the release is absent or unpublished/, detail)
+    assert.ok(issue.body.includes(detail), `${detail}: the real error is preserved`)
+  }
 })
 
 test('issues for states a re-run cannot fix say stop, preserve the event ids, and never advise a re-run or a hand-run publisher as the remedy', () => {

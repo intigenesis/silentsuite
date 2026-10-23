@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.Bundle
+import androidx.preference.Preference
 import androidx.preference.PreferenceManager
 import androidx.preference.SwitchPreferenceCompat
 import androidx.test.core.app.ActivityScenario
@@ -25,9 +26,13 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+
+/** Preference key of the approved Settings → Recover deleted contacts entry. */
+private const val RECOVER_DELETED_CONTACTS_KEY = "recover_deleted_contacts"
 
 @RunWith(AndroidJUnit4::class)
 class SettingsRuntimeTest {
@@ -207,6 +212,183 @@ class SettingsRuntimeTest {
     }
 
     @Test
+    fun recoverDeletedContactsEntryOpensExactAccountDestinationAndRejectsStaleRoute() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val active = Account("settings-recovery-active-${System.nanoTime()}@example.invalid", App.accountType)
+        val selected = Account("settings-recovery-selected-${System.nanoTime()}@example.invalid", App.accountType)
+        val selectedGeneration = "recovery-selected"
+        listOf(active to "recovery-active", selected to selectedGeneration).forEach { (account, generation) ->
+            check(manager.addAccountExplicitly(account, null, null))
+            AccountSettings.setUserData(manager, account, URI("https://example.invalid/"), account.name)
+            check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
+        }
+        // A different active account proves the stale explicit route below does not fall back to it.
+        check(ActiveAccountManager.setActiveAccount(context, active))
+        val exactIntent = AppSettingsActivity.newIntent(context, selected, selectedGeneration)
+        fun shown(activity: AppSettingsActivity) =
+            activity.supportFragmentManager.findFragmentById(android.R.id.content)
+        fun recoveryEntry(activity: AppSettingsActivity): Preference? {
+            activity.supportFragmentManager.executePendingTransactions()
+            val home = shown(activity) as AppSettingsActivity.HomeFragment
+            return home.findPreference(RECOVER_DELETED_CONTACTS_KEY)
+        }
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val listed = java.util.Collections.synchronizedList(mutableListOf<Pair<Account, String>>())
+        AppSettingsActivity.recoveryAddressBooksOverride = { _, account, creationId ->
+            listed += account to creationId
+            listOf(RecoveryAddressBook("recovery-book-a", "Recovery book A"),
+                RecoveryAddressBook("recovery-book-b", "Recovery book B"))
+        }
+        val collectionClass = io.silentsuite.sync.ui.etebase.CollectionActivity::class.java.name
+        var started: Intent? = null
+        // Inspecting a started intent needs API 26; older lanes can only count the blocked launch.
+        val launches = if (android.os.Build.VERSION.SDK_INT >= 26)
+            object : android.app.Instrumentation.ActivityMonitor() {
+                override fun onStartActivity(intent: Intent): android.app.Instrumentation.ActivityResult? {
+                    if (intent.component?.className != collectionClass) return null
+                    started = intent
+                    return android.app.Instrumentation.ActivityResult(0, null)
+                }
+            }
+        else android.app.Instrumentation.ActivityMonitor(collectionClass, null, true)
+        fun awaitBook(scenario: ActivityScenario<AppSettingsActivity>, uid: String, owner: Account = selected): Preference {
+            var found: Preference? = null
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (found == null && System.nanoTime() < deadline) {
+                scenario.onActivity { activity ->
+                    activity.supportFragmentManager.executePendingTransactions()
+                    found = (shown(activity) as? androidx.preference.PreferenceFragmentCompat)
+                        ?.findPreference(recoveryAddressBookKey(owner, uid))
+                }
+                if (found == null) Thread.sleep(50)
+            }
+            assertNotNull("Recovery picker must list address book $uid of ${owner.name}", found)
+            return found!!
+        }
+
+        try {
+            instrumentation.addMonitor(launches)
+            ActivityScenario.launch<AppSettingsActivity>(Intent(exactIntent)).use { scenario ->
+                var destination: Class<*>? = null
+                scenario.onActivity { activity ->
+                    val entry = recoveryEntry(activity)
+                    assertNotNull("Settings home must offer Recover deleted contacts", entry)
+                    assertTrue(entry!!.isEnabled)
+                    entry.performClick()
+                    activity.supportFragmentManager.executePendingTransactions()
+                    val opened = shown(activity)
+                    assertNotNull(opened)
+                    assertFalse(opened is AppSettingsActivity.HomeFragment)
+                    assertFalse(activity.isFinishing)
+                    assertEquals(selected, activity.selectedAccount)
+                    assertEquals(selectedGeneration, activity.selectedCreationId)
+                    destination = opened!!.javaClass
+                }
+                // The picker lists the routed account's address books only, never the active account's.
+                awaitBook(scenario, "recovery-book-a")
+                val book = awaitBook(scenario, "recovery-book-b")
+                assertEquals(setOf(selected to selectedGeneration), listed.toSet())
+                scenario.onActivity { activity ->
+                    val picker = shown(activity) as androidx.preference.PreferenceFragmentCompat
+                    assertEquals(null, picker.findPreference<Preference>(recoveryAddressBookKey(active, "recovery-book-a")))
+                    assertEquals(null, picker.findPreference<Preference>(RECOVERY_NONE_KEY))
+                    book.performClick()
+                }
+                instrumentation.waitForIdleSync()
+                assertEquals(1, launches.hits)
+                if (android.os.Build.VERSION.SDK_INT >= 26) {
+                    val intent = started!!
+                    // Only identifiers are routed: no address-book name or contact content.
+                    assertEquals(setOf(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_ACCOUNT,
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_CREATION_ID,
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_COLLECTION_UID,
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_RECOVER_DELETED_CONTACTS
+                    ), intent.extras!!.keySet())
+                    assertEquals(selected, intent.getParcelableExtra<Account>(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_ACCOUNT))
+                    assertEquals(selectedGeneration, intent.getStringExtra(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_CREATION_ID))
+                    assertEquals("recovery-book-b", intent.getStringExtra(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_COLLECTION_UID))
+                    assertTrue(intent.getBooleanExtra(
+                        io.silentsuite.sync.ui.etebase.CollectionActivity.EXTRA_RECOVER_DELETED_CONTACTS, false))
+                }
+                scenario.recreate()
+                awaitBook(scenario, "recovery-book-b")
+                scenario.onActivity { activity ->
+                    assertEquals(selected, activity.selectedAccount)
+                    assertEquals(selectedGeneration, activity.selectedCreationId)
+                    assertEquals(destination, shown(activity)?.javaClass)
+                    assertTrue(activity.supportFragmentManager.popBackStackImmediate())
+                    assertTrue(shown(activity) is AppSettingsActivity.HomeFragment)
+                    assertEquals(SettingsCategory.HOME, activity.currentCategory)
+                }
+
+                // A picker left open across a same-name replacement opens nothing for the new generation.
+                scenario.onActivity { activity -> recoveryEntry(activity)!!.performClick() }
+                val stalePick = awaitBook(scenario, "recovery-book-a")
+                removeAccountAndWait(manager, selected)
+                check(manager.addAccountExplicitly(selected, null, Bundle().apply {
+                    putString(AccountSettings.KEY_CREATION_ID, "recovery-replacement")
+                }))
+                scenario.onActivity { activity ->
+                    stalePick.performClick()
+                    assertTrue(activity.isFinishing)
+                }
+                instrumentation.waitForIdleSync()
+                assertEquals(1, launches.hits)
+            }
+
+            ActivityScenario.launch<AppSettingsActivity>(Intent(exactIntent)).use { scenario ->
+                scenario.onActivity { activity ->
+                    assertEquals(null, activity.selectedAccount)
+                    val entry = recoveryEntry(activity)
+                    assertNotNull(entry)
+                    assertFalse(entry!!.isEnabled)
+                    entry.performClick()
+                    activity.supportFragmentManager.executePendingTransactions()
+                    assertTrue(shown(activity) is AppSettingsActivity.HomeFragment)
+                }
+            }
+
+            // Global Settings offers every current account, each under its own heading and with its
+            // current generation, and lists them again after recreation.
+            listed.clear()
+            ActivityScenario.launch<AppSettingsActivity>(AppSettingsActivity.newIntent(context)).use { scenario ->
+                scenario.onActivity { activity ->
+                    val entry = recoveryEntry(activity)
+                    assertTrue(entry!!.isEnabled)
+                    entry.performClick()
+                }
+                repeat(2) { pass ->
+                    if (pass == 1) scenario.recreate()
+                    listOf(active, selected).forEach { owner -> awaitBook(scenario, "recovery-book-a", owner) }
+                    scenario.onActivity { activity ->
+                        val picker = shown(activity) as androidx.preference.PreferenceFragmentCompat
+                        listOf(active, selected).forEach { owner ->
+                            val heading = picker.findPreference<Preference>(recoveryAddressBookKey(owner, "recovery-book-b"))!!.parent
+                            assertTrue(heading is androidx.preference.PreferenceCategory)
+                            assertEquals(owner.name, heading!!.title.toString())
+                        }
+                    }
+                }
+                assertTrue(listed.containsAll(listOf(active to "recovery-active", selected to "recovery-replacement")))
+                assertFalse(listed.any { it == selected to selectedGeneration })
+            }
+        } finally {
+            instrumentation.removeMonitor(launches)
+            AppSettingsActivity.recoveryAddressBooksOverride = null
+            listOf(active, selected).forEach { account ->
+                if (manager.getAccountsByType(account.type).any { it == account })
+                    removeAccountAndWait(manager, account)
+            }
+            ActiveAccountManager.clearActiveAccount(context)
+        }
+    }
+
+    @Test
     fun proxyPortPreferenceAcceptsBoundsAndPreservesPriorValueOnInvalidInput() {
         withEmptyPreferenceStores { _, _ ->
             val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -319,6 +501,228 @@ class SettingsRuntimeTest {
             assertTrue(app.getBoolean(AppPreferences.KEY_OVERRIDE_PROXY, false))
             assertTrue(app.getBoolean(AppPreferences.KEY_MIGRATION_COMPLETE, false))
         }
+    }
+
+    @Test
+    fun schedulingDiagnosticsFromAdvancedSettingsAreBoundedContentFreeAndReadOnly() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val manager = AccountManager.get(context)
+        val account = Account("scheduling-marker-${System.nanoTime()}@example.invalid", App.accountType)
+        val creationId = "scheduling-marker-generation"
+        val requestId = java.util.UUID.randomUUID().toString()
+        val monitor = android.app.Instrumentation.ActivityMonitor(DebugInfoActivity::class.java.name, null, false)
+        var chooserIntent: Intent? = null
+        // Inspecting a started intent needs API 26; older lanes can only count the blocked chooser.
+        val chooser = if (android.os.Build.VERSION.SDK_INT >= 26)
+            object : android.app.Instrumentation.ActivityMonitor() {
+                override fun onStartActivity(intent: Intent): android.app.Instrumentation.ActivityResult? {
+                    if (intent.action != Intent.ACTION_CHOOSER) return null
+                    chooserIntent = intent
+                    return android.app.Instrumentation.ActivityResult(0, null)
+                }
+            }
+        else
+            android.app.Instrumentation.ActivityMonitor(
+                android.content.IntentFilter(Intent.ACTION_CHOOSER),
+                android.app.Instrumentation.ActivityResult(0, null),
+                true
+            )
+        check(manager.addAccountExplicitly(account, null, null))
+        try {
+            AccountSettings.setUserData(manager, account, URI("https://example.invalid/"), account.name)
+            check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, creationId))
+            instrumentation.addMonitor(monitor)
+            val store = io.silentsuite.sync.syncadapter.SyncStatusStore(context)
+            check(store.recordRequested(
+                account,
+                setOf(io.silentsuite.sync.syncadapter.SyncStatusStore.Service.CALENDAR),
+                requestId,
+                System.currentTimeMillis() - 5 * 60_000L
+            ))
+            val before = settledSchedulingEvidence { schedulingEvidence(context, manager, account, store) }
+            var shown = ""
+            var shared = ""
+            var opened = false
+            for (category in SettingsCategory.values()) {
+                if (opened) break
+                ActivityScenario.launch<AppSettingsActivity>(AppSettingsActivity.newIntent(context, category)).use { scenario ->
+                    scenario.onActivity { activity ->
+                        activity.supportFragmentManager.executePendingTransactions()
+                        val fragment = activity.supportFragmentManager.findFragmentById(android.R.id.content)
+                            as? AppSettingsActivity.CategoryFragment
+                        val preference = fragment?.findPreference<androidx.preference.Preference>("show_scheduling_diagnostics")
+                        if (preference != null) {
+                            preference.performClick()
+                            opened = true
+                        }
+                    }
+                    if (opened) {
+                        val debugInfo = monitor.waitForActivityWithTimeout(10_000) as DebugInfoActivity
+                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+                        while (System.nanoTime() < deadline && !shown.contains("--- END SCHEDULING DIAGNOSTICS ---")) {
+                            Thread.sleep(100)
+                            instrumentation.runOnMainSync {
+                                runCatching { shown = debugInfo.tvReport.text.toString() }
+                            }
+                        }
+                        assertTrue(shown.contains("--- END SCHEDULING DIAGNOSTICS ---"))
+                        instrumentation.addMonitor(chooser)
+                        try {
+                            instrumentation.runOnMainSync {
+                                debugInfo.onShare(android.widget.PopupMenu(debugInfo, debugInfo.tvReport).menu.add("share"))
+                            }
+                            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                                val send = chooserIntent!!.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)!!
+                                assertEquals(Intent.ACTION_SEND, send.action)
+                                assertEquals("text/plain", send.type)
+                                assertEquals(setOf(Intent.EXTRA_TEXT), send.extras!!.keySet())
+                                assertEquals(null, send.data)
+                                assertEquals(null, send.clipData)
+                                shared = send.getStringExtra(Intent.EXTRA_TEXT)!!
+                            } else {
+                                assertEquals(1, chooser.hits)
+                                shared = shown
+                            }
+                        } finally {
+                            instrumentation.removeMonitor(chooser)
+                            instrumentation.runOnMainSync { debugInfo.finish() }
+                        }
+                    }
+                }
+            }
+
+            assertTrue(opened)
+            assertEquals(shown, shared)
+            assertSchedulingReportIsContentFree(shared, creationId, requestId)
+            assertTrue(shared.contains("Battery optimization exemption: "))
+            assertTrue(shared.contains("\nNETWORK\n"))
+            assertTrue(shared.contains("\nMAIN ACCOUNTS\n"))
+            assertTrue(shared.contains("Account #1"))
+            assertTrue(shared.contains("recorded request: open age=1m_to_15m"))
+            assertTrue(shared.contains("not associated with a main account"))
+            assertEquals(before, schedulingEvidence(context, manager, account, store))
+        } finally {
+            instrumentation.removeMonitor(monitor)
+            removeAccountAndWait(manager, account)
+            ActiveAccountManager.clearActiveAccount(context)
+        }
+    }
+
+    @Test
+    fun schedulingDiagnosticsSurviveAccountReplacementAndUnavailableServices() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val account = Account("scheduling-marker-${System.nanoTime()}@example.invalid", App.accountType)
+        val requestId = java.util.UUID.randomUUID().toString()
+        val app = context.getSharedPreferences(AppPreferences.PREFERENCES_NAME, Context.MODE_PRIVATE)
+        val defaults = PreferenceManager.getDefaultSharedPreferences(context)
+        check(manager.addAccountExplicitly(account, null, Bundle().apply {
+            putString(AccountSettings.KEY_CREATION_ID, "scheduling-marker-old")
+        }))
+        try {
+            val store = io.silentsuite.sync.syncadapter.SyncStatusStore(context)
+            check(store.recordRequested(
+                account,
+                setOf(
+                    io.silentsuite.sync.syncadapter.SyncStatusStore.Service.CONTACTS,
+                    io.silentsuite.sync.syncadapter.SyncStatusStore.Service.TASKS
+                ),
+                requestId,
+                System.currentTimeMillis() - 5 * 60_000L
+            ))
+            fun evidence() = schedulingEvidence(context, manager, account, store) +
+                listOf(app.all.toMap(), defaults.all.toMap())
+            fun readOnlyReport(): String {
+                val before = settledSchedulingEvidence(::evidence)
+                val report = SchedulingDiagnostics.report(context)
+                assertEquals(before, evidence())
+                assertSchedulingReportIsContentFree(report, requestId, "scheduling-marker-old", "scheduling-marker-new")
+                return report
+            }
+
+            assertTrue(readOnlyReport().contains("recorded request: open age=1m_to_15m"))
+
+            removeAccountAndWait(manager, account)
+            assertSchedulingReportIsContentFree(SchedulingDiagnostics.report(context), requestId)
+
+            check(manager.addAccountExplicitly(account, null, Bundle().apply {
+                putString(AccountSettings.KEY_CREATION_ID, "scheduling-marker-new")
+            }))
+            assertTrue(readOnlyReport().contains("Account #1"))
+
+            val standby = "Standby bucket: " + if (android.os.Build.VERSION.SDK_INT >= 28) "unknown" else "unavailable"
+            listOf<(String) -> Any?>(
+                { null },
+                { throw SecurityException("scheduling-marker-denied") }
+            ).forEach { systemService ->
+                val restricted = object : android.content.ContextWrapper(context) {
+                    override fun getApplicationContext(): Context = this
+                    override fun getSystemService(name: String): Any? = systemService(name)
+                }
+                val before = settledSchedulingEvidence(::evidence)
+                val report = SchedulingDiagnostics.report(restricted)
+                assertEquals(before, evidence())
+                assertSchedulingReportIsContentFree(report, requestId)
+                listOf(
+                    "Battery optimization exemption: unavailable", "Battery saver: unavailable",
+                    "Background restricted: unavailable", standby, "Active network: unavailable",
+                    "Validated: unavailable", "Metered: unavailable", "VPN: unavailable",
+                    "Data Saver: unavailable", "\nMAIN ACCOUNTS\nCount: unknown\n"
+                ).forEach { assertTrue(it, report.contains(it)) }
+                assertFalse(report.contains("Account #"))
+            }
+        } finally {
+            if (manager.getAccountsByType(account.type).any { it == account })
+                removeAccountAndWait(manager, account)
+            ActiveAccountManager.clearActiveAccount(context)
+        }
+    }
+
+    private fun schedulingEvidence(
+        context: Context,
+        manager: AccountManager,
+        account: Account,
+        store: io.silentsuite.sync.syncadapter.SyncStatusStore
+    ): List<Any?> = listOf(
+        context.getSharedPreferences("sync_status_v1", Context.MODE_PRIVATE).all.toMap(),
+        manager.getAccountsByType(account.type).firstOrNull { it == account }
+            ?.let { manager.getUserData(it, AccountSettings.KEY_CREATION_ID) },
+        io.silentsuite.sync.syncadapter.SyncStatusStore.Service.values().map { store.status(account, it) },
+        listOf(android.provider.CalendarContract.AUTHORITY, App.addressBooksAuthority).map {
+            android.content.ContentResolver.getSyncAutomatically(account, it) to
+                android.content.ContentResolver.getIsSyncable(account, it)
+        }
+    )
+
+    /** Waits out the app's own asynchronous account bookkeeping before a read-only comparison. */
+    private fun settledSchedulingEvidence(read: () -> List<Any?>): List<Any?> {
+        var previous = read()
+        repeat(20) {
+            Thread.sleep(250)
+            val current = read()
+            if (current == previous) return current
+            previous = current
+        }
+        return previous
+    }
+
+    private fun assertSchedulingReportIsContentFree(report: String, vararg markers: String) {
+        assertTrue(report.startsWith("--- BEGIN SCHEDULING DIAGNOSTICS ---\n"))
+        assertTrue(report.endsWith("--- END SCHEDULING DIAGNOSTICS ---\n"))
+        (markers.toList() + listOf(
+            "scheduling-marker", "example.invalid", "@", "Exception", "DEBUG INFO",
+            "SOFTWARE INFORMATION", "SYSTEM INFORMATION", "Android version", "Device:", "permission:"
+        )).forEach { assertFalse(it, report.contains(it)) }
+        // Build.UNKNOWN ("unknown") is the platform placeholder for an unset field, e.g. MANUFACTURER on the
+        // API 21 emulator. It identifies nothing and is also one of the report's fixed category values.
+        listOf(android.os.Build.MODEL, android.os.Build.DEVICE, android.os.Build.DISPLAY, android.os.Build.MANUFACTURER)
+            .filter { it.length >= 4 && !it.equals(android.os.Build.UNKNOWN, ignoreCase = true) }
+            .forEach { assertFalse(it, report.contains(it, ignoreCase = true)) }
+        assertFalse(Regex("[0-9]{5,}").containsMatchIn(report))
+        assertFalse(Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-").containsMatchIn(report))
+        val line = Regex("[A-Za-z0-9 #:=_.,;()/-]*")
+        report.lines().forEach { assertTrue(it.length <= 160 && line.matches(it)) }
     }
 
     private fun withEmptyPreferenceStores(block: (SharedPreferences, SharedPreferences) -> Unit) {

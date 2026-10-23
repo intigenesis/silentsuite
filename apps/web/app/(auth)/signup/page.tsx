@@ -15,7 +15,7 @@ import {
 import { Button } from '@silentsuite/ui'
 import { Input } from '@silentsuite/ui'
 import { useAuthStore } from '@/app/stores/use-auth-store'
-import { normalizeServerUrl } from '@/app/stores/use-etebase-store'
+import { normalizeServerUrl } from '@/app/lib/server-url'
 import { isSelfHosted, isCustomServer } from '@/app/lib/self-hosted'
 import { BILLING_API_URL } from '@/app/lib/config'
 import { DISPLAY_VERSION } from '@/app/lib/constants'
@@ -165,6 +165,12 @@ function stripEmailVerificationTokenFromUrl() {
   window.history.replaceState({}, '', `${cleaned.pathname}${cleaned.search}${cleaned.hash}`)
 }
 
+/**
+ * Installation-owner registration (default off). Only a self-host build that also sets
+ * NEXT_PUBLIC_OWNER_REGISTRATION=true asks for the installation password at signup.
+ */
+const OWNER_REGISTRATION_ENABLED = isSelfHosted && process.env.NEXT_PUBLIC_OWNER_REGISTRATION === 'true'
+
 const StripePaymentForm = dynamic(() => import('@/app/components/stripe-payment-form'), {
   loading: () => (
     <div className="flex flex-col items-center justify-center py-8">
@@ -299,7 +305,7 @@ function StepCreateAccount({
   rememberDevice,
   onRememberDeviceChange,
 }: {
-  onNext: (data: SignupFormData) => Promise<void>
+  onNext: (data: SignupFormData, ownerPassword?: string) => Promise<void>
   serverUrl: string
   setServerUrl: (url: string) => void
   initialData?: SignupFormData | null
@@ -312,6 +318,9 @@ function StepCreateAccount({
   const [isSubmitting, setIsSubmitting] = useState(false)
   const submittingRef = useRef(false)
   const needsPassword = isSelfHosted || isCustomServer(serverUrl.trim() ? normalizeServerUrl(serverUrl) : undefined)
+  // Operation-only installation password: kept out of the form data and cleared after each attempt.
+  const [ownerPassword, setOwnerPassword] = useState('')
+  useEffect(() => { setOwnerPassword('') }, [serverUrl])
 
   const {
     register,
@@ -346,9 +355,12 @@ function StepCreateAccount({
         submittingRef.current = true
         setSubmitError(null)
         setIsSubmitting(true)
+        const owner = OWNER_REGISTRATION_ENABLED ? ownerPassword : undefined
+        setOwnerPassword('')
         try {
-          await onNext(needsPassword ? data : { email: data.email, confirmEmail: data.email, password: '', confirmPassword: '' })
+          await onNext(needsPassword ? data : { email: data.email, confirmEmail: data.email, password: '', confirmPassword: '' }, owner)
         } catch (err: unknown) {
+          if ((err as { name?: unknown } | null)?.name === 'AbortError') return
           const message = err instanceof Error ? err.message : 'Account creation failed. Please try again.'
           setSubmitError(message)
         } finally {
@@ -445,6 +457,27 @@ function StepCreateAccount({
           )}
         </div>
 
+        {OWNER_REGISTRATION_ENABLED && <div className="space-y-2">
+          <label
+            htmlFor="ownerPassword"
+            className="block text-sm font-medium text-[rgb(var(--foreground))]/80"
+          >
+            Installation password
+          </label>
+          <Input
+            id="ownerPassword"
+            type="password"
+            autoComplete="off"
+            aria-describedby="signup-owner-password-hint"
+            value={ownerPassword}
+            onChange={(e) => setOwnerPassword(e.target.value)}
+            className="bg-[rgb(var(--surface))] text-[rgb(var(--foreground))] border-[rgb(var(--border))]"
+          />
+          <p id="signup-owner-password-hint" className="text-xs text-[rgb(var(--muted))]">
+            The password for this SilentSuite installation. It is separate from your account password.
+          </p>
+        </div>}
+
         </>}
 
         {/* Product updates opt-in */}
@@ -503,7 +536,7 @@ function StepCreateAccount({
           </div>
         )}
 
-        <Button type="submit" disabled={!isValid || isSubmitting} className="w-full">
+        <Button type="submit" disabled={!isValid || isSubmitting || (OWNER_REGISTRATION_ENABLED && !ownerPassword)} className="w-full">
           {isSubmitting ? (
             <span className="flex items-center justify-center gap-2">
               <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
@@ -546,6 +579,7 @@ function CryptoPaymentPanel({
   onBack,
   disclosure,
   onConfirm,
+  onRecover,
   provisioning = false,
   provisionError,
   onPaymentComplete,
@@ -554,6 +588,7 @@ function CryptoPaymentPanel({
   session: CryptoPaymentSession | null
   disclosure: AnnualCheckoutActivation['disclosure']
   onConfirm?: () => void
+  onRecover?: () => void
   provisioning?: boolean
   provisionError?: string | null
   onBack: () => void
@@ -682,9 +717,15 @@ function CryptoPaymentPanel({
       {!session && <AnnualTermsSummary disclosure={disclosure} />}
       {provisionError && <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-sm text-red-600 dark:text-red-400">{provisionError}</div>}
       {!session ? (
-        <Button type="button" className="w-full" disabled={provisioning} onClick={onConfirm}>
-          {provisioning ? 'Starting…' : annualRetryAction(disclosure)}
-        </Button>
+        <>
+          <Button type="button" className="w-full" disabled={provisioning} onClick={onConfirm}>
+            {provisioning ? 'Starting…' : annualRetryAction(disclosure)}
+          </Button>
+          {/* A dispatched start may already own an invoice; its existing recovery reads the current state. */}
+          {onRecover && <button type="button" disabled={provisioning} onClick={onRecover} className="block w-full text-center text-sm underline disabled:opacity-60">
+            Check this payment&apos;s status
+          </button>}
+        </>
       ) : status === 'settled' ? (
         <div className="space-y-4 text-center">
           <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-700 dark:text-emerald-300">
@@ -787,6 +828,7 @@ function StepChoosePlan({
   cryptoPaymentSession,
   pendingAnnualClaim,
   onConfirmAnnualClaim,
+  onRecoverPayment,
 }: {
   annualOffer: AnnualOfferResponse
   onSelectFree: () => void
@@ -805,6 +847,7 @@ function StepChoosePlan({
   cryptoPaymentSession: CryptoPaymentSession | null
   pendingAnnualClaim: PendingAnnualClaim | null
   onConfirmAnnualClaim: () => void
+  onRecoverPayment?: () => void
 }) {
   const contentRef = useRef<HTMLDivElement>(null)
   const [selectedTrial, setSelectedTrial] = useState<TrialPath>('30day')
@@ -865,7 +908,7 @@ function StepChoosePlan({
     const disclosure = pendingAnnualClaim.activation.disclosure
     if (pendingAnnualClaim.provider === 'btcpay') return <CryptoPaymentPanel
       annualOffer={annualOfferDetails} session={null} disclosure={disclosure}
-      onConfirm={onConfirmAnnualClaim} provisioning={provisioning} provisionError={provisionError}
+      onConfirm={onConfirmAnnualClaim} onRecover={onRecoverPayment} provisioning={provisioning} provisionError={provisionError}
       onBack={onBack} onPaymentComplete={onPaymentComplete} />
     if (pendingAnnualClaim.provider === 'none') {
       // The password-loss acknowledgement is the only gate before the no-card
@@ -1478,6 +1521,8 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
   // Keep this bounded UI pre-claim; partial/uncertain creation keeps its continuation.
   const paymentBackOpener = useRef<HTMLElement | null>(null)
   const [paymentReceiptReceived, setPaymentReceiptReceived] = useState(false)
+  // Selects the existing in-document payment recovery; it grants no authority.
+  const [paymentRecoveryRequested, setPaymentRecoveryRequested] = useState(false)
   const [paymentNeedsVerification, setPaymentNeedsVerification] = useState(false)
   const [emailOwnershipExpiresAt, setEmailOwnershipExpiresAt] = useState<string | null>(null)
   const [paymentSwitch, setPaymentSwitch] = useState<'stripe' | 'btcpay' | null>(null)
@@ -1502,6 +1547,10 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
   const [requestingEmailProof, setRequestingEmailProof] = useState(false)
   const resendBusyRef = useRef(false)
   const mountedRef = useRef(false)
+  const ownerAbortRef = useRef<AbortController | null>(null)
+  // Navigation away or an endpoint change cancels a pending installation-owner request.
+  useEffect(() => () => { ownerAbortRef.current?.abort() }, [])
+  useEffect(() => { ownerAbortRef.current?.abort() }, [serverUrl])
   const [emailProofAttempt, setEmailProofAttempt] = useState(0)
   const emailContinuationRef = useRef<{
     context: EmailProofContext
@@ -1678,7 +1727,7 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
     }
   }, [])
 
-  const handleAccountComplete = useCallback(async (data: SignupFormData) => {
+  const handleAccountComplete = useCallback(async (data: SignupFormData, ownerPassword?: string) => {
     emailContinuationRef.current = null
     setEmailProofError(null)
     setEmailOwnershipToken(null)
@@ -1695,7 +1744,19 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
     const selfHosted = isSelfHosted || isCustomServer(normalizedUrl)
 
     if (selfHosted) {
-      await createEtebaseAccount(identifier, data.password, normalizedUrl)
+      // A fresh attempt supersedes any pending installation-owner request.
+      ownerAbortRef.current?.abort()
+      const controller = ownerPassword === undefined ? null : new AbortController()
+      ownerAbortRef.current = controller
+      try {
+        if (controller && ownerPassword !== undefined) {
+          await createEtebaseAccount(identifier, data.password, normalizedUrl, { ownerPassword, signal: controller.signal })
+        } else {
+          await createEtebaseAccount(identifier, data.password, normalizedUrl)
+        }
+      } finally {
+        if (ownerAbortRef.current === controller) ownerAbortRef.current = null
+      }
 
       const pending = useAuthStore.getState().pendingSignup
       if (!pending) console.error('pendingSignup not set after createEtebaseAccount')
@@ -2234,6 +2295,7 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
   // pending-payment continuation restores its capability and controls itself.
   const handleRecoveredPaymentRelease = () => {
     setPaymentReceiptReceived(true)
+    setPaymentRecoveryRequested(false)
     navigation.clear({ retirePayment: true })
     setClientSecret(null)
     setCardDisclosure(null)
@@ -2248,7 +2310,7 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
       setPlanView('method')
     } else setPaymentNeedsVerification(true)
   }
-  if (!paymentReceiptReceived && (initialPaymentRecovery || navigation.recovery === 'payment')) return <PendingPaymentPage onReleased={handleRecoveredPaymentRelease} />
+  if (paymentRecoveryRequested || (!paymentReceiptReceived && (initialPaymentRecovery || navigation.recovery === 'payment'))) return <PendingPaymentPage onReleased={handleRecoveredPaymentRelease} />
   if (paymentNeedsVerification) return <div className="space-y-4">
     <h1 className="text-xl font-semibold">Verify email to choose a payment method</h1>
     <p>Payment cancelled. This browser no longer has valid email verification and signed signup terms. Verify your email again to load payment choices.</p>
@@ -2392,6 +2454,7 @@ function SignupJourney({ initialPaymentRecovery = false }: { initialPaymentRecov
             cryptoPaymentSession={cryptoPaymentSession}
             pendingAnnualClaim={pendingAnnualClaim}
             onConfirmAnnualClaim={handleConfirmAnnualClaim}
+            onRecoverPayment={claimAttemptedRef.current ? () => { if (!operationRef.current) setPaymentRecoveryRequested(true) } : undefined}
           /> : <div role="alert" className="rounded-lg border border-red-500/20 bg-red-500/5 p-3 text-sm text-red-600 dark:text-red-400">
             <p>{provisionError ?? 'Your annual offer is unavailable. Verify your email to request a new offer.'}</p>
             {annualOfferRequestId && recoveredSignupEmail && (

@@ -13,6 +13,8 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentManager
 import androidx.fragment.app.FragmentPagerAdapter
 import androidx.fragment.app.activityViewModels
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.ViewModel
 import androidx.viewpager.widget.ViewPager
 import at.bitfire.ical4android.Event
 import at.bitfire.ical4android.InvalidCalendarException
@@ -27,6 +29,7 @@ import io.silentsuite.sync.resource.*
 import io.silentsuite.sync.ui.BaseActivity
 import io.silentsuite.sync.utils.EventEmailInvitation
 import io.silentsuite.sync.utils.TaskProviderHandling
+import com.etebase.client.CollectionAccessLevel
 import com.google.android.material.tabs.TabLayout
 import ezvcard.util.PartialDate
 import androidx.lifecycle.lifecycleScope
@@ -39,25 +42,52 @@ import java.io.StringReader
 import java.text.SimpleDateFormat
 import java.util.*
 
+/** Holds the opened entry across configuration changes, in process memory only. */
+class CollectionItemContentViewModel : ViewModel() {
+    var item: CachedItem? = null
+}
+
 class CollectionItemFragment : Fragment() {
     private val model: AccountViewModel by activityViewModels()
     private val collectionModel: CollectionViewModel by activityViewModels()
+
+    private val retained: CollectionItemContentViewModel by viewModels()
 
     private lateinit var cachedItem: CachedItem
 
     private var emailInvitationEvent: Event? = null
     private var emailInvitationEventString: String? = null
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // The entry stays in process memory only: a rotation gets it back from the retained model,
+        // and a screen restored without it returns to the list instead of showing nothing.
+        if (::cachedItem.isInitialized) retained.item = cachedItem
+        else retained.item?.let { cachedItem = it }
+        if (!::cachedItem.isInitialized) {
+            parentFragmentManager.popBackStack()
+            return
+        }
+        if (savedInstanceState != null && childFragmentManager.fragments.isNotEmpty()) {
+            // The restored tabs lost their in-memory entry; they are built again from the retained one.
+            childFragmentManager.beginTransaction().apply {
+                childFragmentManager.fragments.forEach { remove(it) }
+            }.commitNowAllowingStateLoss()
+        }
+    }
+
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
         val ret = inflater.inflate(R.layout.journal_item_activity, container, false)
         setHasOptionsMenu(true)
 
-        if (savedInstanceState == null) {
+        if (::cachedItem.isInitialized) {
             collectionModel.observe(this) {
                 (activity as? BaseActivity?)?.supportActionBar?.title = it.meta.name
                 if (container != null) {
                     initUi(inflater, ret, it)
                 }
+                // Restore depends on the collection type, which is only known once it loads.
+                activity?.invalidateOptionsMenu()
             }
         }
 
@@ -83,6 +113,14 @@ class CollectionItemFragment : Fragment() {
     override fun onCreateOptionsMenu(menu: Menu, inflater: MenuInflater) {
         inflater.inflate(R.menu.collection_item_fragment, menu)
         menu.setGroupVisible(R.id.journal_item_menu_event_invite, emailInvitationEvent != null)
+        // Only calendars, tasks, and contacts have a local provider to restore into; notes do not.
+        // A read-only address book cannot take a restored contact, and an entry screen the
+        // framework recreated has no entry content left to restore.
+        val cachedCol = collectionModel.value
+        val readOnlyContacts = cachedCol != null && cachedCol.collectionType == Constants.ETEBASE_TYPE_ADDRESS_BOOK &&
+            cachedCol.col.accessLevel == CollectionAccessLevel.ReadOnly
+        menu.setGroupVisible(R.id.journal_item_menu_restore,
+            cachedCol?.collectionType in RESTORABLE_TYPES && !readOnlyContacts && ::cachedItem.isInitialized)
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
@@ -96,10 +134,26 @@ class CollectionItemFragment : Fragment() {
                 intent?.let(::startActivity)
             }
             R.id.on_restore_item -> {
-                restoreItem(accountHolder)
+                if (collectionModel.value?.collectionType == Constants.ETEBASE_TYPE_ADDRESS_BOOK)
+                    confirmContactRestore(accountHolder)
+                else
+                    restoreItem(accountHolder)
             }
         }
         return super.onOptionsItemSelected(item)
+    }
+
+    /** A contact is only written back after the user confirms; cancelling writes nothing. */
+    private fun confirmContactRestore(accountHolder: AccountHolder) {
+        MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.journal_item_restore_action)
+                .setIcon(R.drawable.ic_restore_black)
+                .setMessage(R.string.contact_restore_confirm_body)
+                .setPositiveButton(R.string.journal_item_restore_action) { _, _ ->
+                    if (isAdded) restoreItem(accountHolder)
+                }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
     }
 
     fun restoreItem(accountHolder: AccountHolder) {
@@ -107,7 +161,8 @@ class CollectionItemFragment : Fragment() {
         val context = requireContext()
         val account = accountHolder.account
         val cachedCol = collectionModel.value!!
-        when (cachedCol.collectionType) {
+        if (!::cachedItem.isInitialized) return
+        val restored = when (cachedCol.collectionType) {
             Constants.ETEBASE_TYPE_CALENDAR -> {
                 val provider = context.contentResolver.acquireContentProviderClient(CalendarContract.CONTENT_URI)
                         ?: return
@@ -122,6 +177,7 @@ class CollectionItemFragment : Fragment() {
                         localEvent = LocalEvent(localCalendar, event, event.uid, null)
                         localEvent.addAsDirty()
                     }
+                    true
                 } finally {
                     provider.release()
                 }
@@ -141,34 +197,30 @@ class CollectionItemFragment : Fragment() {
                             localTask = LocalTask(localTaskList, task, task.uid, null)
                             localTask.addAsDirty()
                         }
+                        true
                     } finally {
                         provider.close()
                     }
-                }
+                } ?: false
             }
             Constants.ETEBASE_TYPE_ADDRESS_BOOK -> {
-                val provider = context.contentResolver.acquireContentProviderClient(ContactsContract.RawContacts.CONTENT_URI)
-                        ?: return
-                try {
-                    val localAddressBook = LocalAddressBook.findByUid(context, provider, account, cachedCol.col.uid)
-                            ?: return
-                    val contact = Contact.fromReader(StringReader(cachedItem.content), null)[0]
-                    if (contact.group) {
-                        // FIXME: not currently supported
-                    } else {
-                        var localContact = localAddressBook.findByUid(contact.uid!!) as LocalContact?
-                        if (localContact != null) {
-                            localContact.updateAsDirty(contact)
-                        } else {
-                            localContact = LocalContact(localAddressBook, contact, contact.uid, null)
-                            localContact.createAsDirty()
-                        }
-                    }
-                } finally {
-                    provider.release()
+                val identity = CollectionLifecycleIdentity.from(arguments)
+                if (cachedCol.col.accessLevel == CollectionAccessLevel.ReadOnly) {
+                    MaterialAlertDialogBuilder(context)
+                            .setIcon(R.drawable.ic_info_dark)
+                            .setTitle(R.string.not_allowed_title)
+                            .setMessage(R.string.contact_restore_read_only)
+                            .setPositiveButton(android.R.string.ok, null)
+                            .show()
+                    return
                 }
+                if (identity?.account != account) return
+                restoreContact(context, identity, cachedCol, cachedItem.content)
             }
+            else -> false
         }
+        // Report success only for a restore that happened; the menu hides Restore for other types.
+        if (!restored) return
 
         val dialog = MaterialAlertDialogBuilder(context)
                 .setTitle(R.string.journal_item_restore_action)
@@ -182,10 +234,67 @@ class CollectionItemFragment : Fragment() {
     }
 
     companion object {
-        fun newInstance(cachedItem: CachedItem): CollectionItemFragment {
+        private val RESTORABLE_TYPES = setOf(
+            Constants.ETEBASE_TYPE_CALENDAR,
+            Constants.ETEBASE_TYPE_TASKS,
+            Constants.ETEBASE_TYPE_ADDRESS_BOOK,
+        )
+
+        /** [identity] holds identifiers only; the entry content never goes into arguments. */
+        fun newInstance(cachedItem: CachedItem, identity: CollectionLifecycleIdentity? = null): CollectionItemFragment {
             val ret = CollectionItemFragment()
             ret.cachedItem = cachedItem
+            ret.arguments = identity?.toBundle()
             return ret
+        }
+
+        /**
+         * Writes [vcard] back into the exact local address book of [cachedCollection] as a dirty
+         * contact for the next upload. Nothing is written for another collection, a collection the
+         * cached access level or the local address book marks read-only, or an account generation
+         * that was replaced, which is checked again right before the write. The destination must be
+         * the child address book recorded for this exact parent generation; one a previous
+         * generation left behind, or one without a recorded owner, is never written.
+         */
+        internal fun restoreContact(
+            context: Context,
+            identity: CollectionLifecycleIdentity?,
+            cachedCollection: CachedCollection,
+            vcard: String
+        ): Boolean {
+            val addressBookUid = cachedCollection.col.uid
+            if (identity == null || cachedCollection.collectionType != Constants.ETEBASE_TYPE_ADDRESS_BOOK ||
+                identity.collectionType != Constants.ETEBASE_TYPE_ADDRESS_BOOK || identity.collectionUid != addressBookUid ||
+                cachedCollection.col.accessLevel == CollectionAccessLevel.ReadOnly || !identity.validate(context)) return false
+            val provider = context.contentResolver.acquireContentProviderClient(ContactsContract.RawContacts.CONTENT_URI)
+                    ?: return false
+            try {
+                val manager = android.accounts.AccountManager.get(context)
+                val owner = io.silentsuite.sync.syncadapter.SyncStatusStore(context)
+                    .identity(identity.account, identity.creationId).storageKey
+                fun exactChild(book: LocalAddressBook): Boolean = runCatching {
+                    book.url == addressBookUid && book.mainAccountOrNull == identity.account &&
+                        manager.getUserData(book.androidAccount, LocalAddressBook.USER_DATA_MAIN_ACCOUNT_IDENTITY) == owner
+                }.getOrDefault(false)
+                val localAddressBook = manager.getAccountsByType(io.silentsuite.sync.App.addressBookAccountType)
+                    .map { LocalAddressBook(context, it, provider) }
+                    .singleOrNull { exactChild(it) } ?: return false
+                if (localAddressBook.readOnly) return false
+                val contact = Contact.fromReader(StringReader(vcard), null).firstOrNull() ?: return false
+                // FIXME: restoring a contact group is not currently supported
+                if (contact.group) return false
+                if (!identity.validate(context) || !exactChild(localAddressBook) || localAddressBook.readOnly) return false
+                var localContact = localAddressBook.findByUid(contact.uid!!) as LocalContact?
+                if (localContact != null) {
+                    localContact.updateAsDirty(contact)
+                } else {
+                    localContact = LocalContact(localAddressBook, contact, contact.uid, null)
+                    localContact.createAsDirty()
+                }
+                return true
+            } finally {
+                provider.release()
+            }
         }
     }
 }
@@ -250,8 +359,8 @@ class PrettyFragment : Fragment() {
 
         when (cachedCollection.collectionType) {
             Constants.ETEBASE_TYPE_ADDRESS_BOOK -> {
+                // Filled in onViewCreated, once this view is the fragment's view.
                 v = inflater.inflate(R.layout.contact_info, container, false)
-                asyncTask = loadContactTask(v)
             }
             Constants.ETEBASE_TYPE_CALENDAR -> {
                 v = inflater.inflate(R.layout.event_info, container, false)
@@ -261,9 +370,20 @@ class PrettyFragment : Fragment() {
                 v = inflater.inflate(R.layout.task_info, container, false)
                 asyncTask = loadTaskTask(v)
             }
+            Constants.ETEBASE_TYPE_NOTES -> {
+                // A note is Markdown text; show it as written rather than a blank tab.
+                v = inflater.inflate(R.layout.text_fragment, container, false)
+                v.findViewById<TextView>(R.id.content).text = content
+            }
         }
 
         return v
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        if (cachedCollection.collectionType == Constants.ETEBASE_TYPE_ADDRESS_BOOK)
+            asyncTask = loadContactTask(view)
     }
 
     override fun onDestroyView() {
@@ -390,8 +510,12 @@ class PrettyFragment : Fragment() {
         }
     }
 
+    /**
+     * Renders the contact into [view] only. The parse can finish before the coroutine first
+     * suspends, so it may render right away; the view lifecycle scope cancels it with that view.
+     */
     private fun loadContactTask(view: View): Job {
-        return lifecycleScope.launch {
+        return viewLifecycleOwner.lifecycleScope.launch {
             val contact = withContext(Dispatchers.IO) {
                 var result: Contact? = null
                 val reader = StringReader(content)
@@ -414,18 +538,16 @@ class PrettyFragment : Fragment() {
                     tv.text = contact.displayName
 
                     if (contact.group) {
-                        showGroup(contact)
+                        showGroup(view, contact)
                     } else {
-                        showContact(contact)
+                        showContact(view, contact)
                     }
             }
         }
     }
 
 
-    private fun showGroup(contact: Contact) {
-        val view = requireView()
-
+    private fun showGroup(view: View, contact: Contact) {
         val mainCard = view.findViewById<View>(R.id.main_card) as ViewGroup
 
         addInfoItem(view.context, mainCard, getString(R.string.journal_item_member_count), null, contact.members.size.toString())
@@ -436,8 +558,7 @@ class PrettyFragment : Fragment() {
     }
 
 
-    private fun showContact(contact: Contact) {
-        val view = requireView()
+    private fun showContact(view: View, contact: Contact) {
         val mainCard = view.findViewById<View>(R.id.main_card) as ViewGroup
         val aboutCard = view.findViewById<View>(R.id.about_card) as ViewGroup
         aboutCard.findViewById<View>(R.id.title_container).visibility = View.VISIBLE

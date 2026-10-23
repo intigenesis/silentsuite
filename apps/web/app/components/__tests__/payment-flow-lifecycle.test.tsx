@@ -45,15 +45,14 @@ vi.mock('@/app/lib/config', () => ({ BILLING_API_URL: 'https://billing.example.t
 
 vi.mock('next-themes', () => ({ useTheme: () => ({ resolvedTheme: 'dark' }) }))
 
-vi.mock('@/app/stores/use-auth-store', () => ({
-  useAuthStore: {
-    getState: () => ({
+vi.mock('@/app/stores/use-auth-store', () => {
+  const state = {
       pendingSignup: null,
       user: { email: 'person@example.test' },
       saveSignupStateForRedirect: vi.fn(),
-    }),
-  },
-}))
+  }
+  return { useAuthStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), { getState: () => state }) }
+})
 
 vi.mock('@stripe/stripe-js/pure', () => ({
   loadStripe: async () => ({ confirmPayment: stripeMocks.confirmPayment, confirmSetup: stripeMocks.confirmSetup }),
@@ -84,16 +83,24 @@ const annualOffer = {
   },
 }
 
-const activation = {
-  contractVersion: 2,
-  checkoutIntentToken,
-  expiresAt: '2026-08-10T12:05:00Z',
-  disclosure: {
-    kind: 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: 3600,
-    monthlyEquivalentMinor: 300, currency: 'EUR', trialEndsAt: null, firstChargeAt: null, cancelBy: null,
-    cancelByInclusive: false, autoRenew: true, prepaid: false, refundWindowDays: 30, bonusDays: 14,
-    periodEndRule: 'confirmation_bonus_then_1_utc_calendar_year', renewalAt: null, entitlementEndsAt: null,
-  },
+// Billing mints the payment flow id server-side; it never equals the offer requestId.
+const serverFlowId = '6d1f0a94-8c52-4b7e-9f31-2a5d6e8b0c47'
+
+// The account panel previews the exact signed terms per provider before the
+// choice; activation must sign exactly those terms before payment starts.
+const PROFILE = 'account_confirmation_rules_v1'
+function accountTerms(provider: string) {
+  const prepaid = provider === 'btcpay'
+  return {
+    kind: prepaid ? 'prepaid' : 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: prepaid ? null : 3600,
+    monthlyEquivalentMinor: 300, currency: 'EUR', trialEndsAt: null, firstChargeAt: null, cancelBy: null, cancelByInclusive: false,
+    autoRenew: !prepaid, prepaid, refundWindowDays: 30, bonusDays: 0, periodEndRule: PROFILE, renewalAt: null, entitlementEndsAt: null,
+  }
+}
+const previewOffer = { ...annualOffer, accountTermsProfile: PROFILE, accountDisclosures: { stripe: accountTerms('stripe'), btcpay: accountTerms('btcpay') } }
+
+function activation(provider: string) {
+  return { contractVersion: 2, checkoutIntentToken, expiresAt: '2026-08-10T12:05:00Z', disclosure: accountTerms(provider) }
 }
 
 function response(body: unknown, ok = true, status = ok ? 200 : 500) {
@@ -101,13 +108,14 @@ function response(body: unknown, ok = true, status = ok ? 200 : 500) {
 }
 
 function mockBilling(cancel?: () => Promise<Response>, paymentFlow?: () => Promise<Response>) {
-  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL) => {
-    const url = String(input)
+  vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const parsed = new URL(String(input))
+    const url = parsed.pathname
     if (url.endsWith('/subscription/payment-flows/current')) return response({ flow: null })
-    if (url.endsWith('/subscription/offers/v2')) return response(annualOffer)
-    if (url.endsWith('/subscription/offers/v2/activate')) return response(activation)
+    if (url.endsWith('/subscription/offers/v2')) return response(parsed.searchParams.get('preview') === '1' ? previewOffer : annualOffer)
+    if (url.endsWith('/subscription/offers/v2/activate')) return response(activation(JSON.parse(String(init?.body)).provider))
     if (url.endsWith('/subscription/payment-flows/v2')) {
-      return paymentFlow?.() ?? response({ contractVersion: 2, kind: 'stripe', authorityId: annualOffer.requestId, clientSecret: 'pi_secret_value' })
+      return paymentFlow?.() ?? response({ contractVersion: 2, kind: 'stripe', authorityId: serverFlowId, clientSecret: 'pi_secret_value' })
     }
     if (url.endsWith('/subscription/payment-flows/cancel')) return cancel?.() ?? response({ cancelled: true, flowKind: 'stripe_pay_now' })
     if (url.includes('/subscription/crypto/invoice/')) {
@@ -122,8 +130,8 @@ function mockBilling(cancel?: () => Promise<Response>, paymentFlow?: () => Promi
 
 async function openCardAuthority() {
   const view = render(<PaymentChoicePanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
+  // Terms were shown before the choice; the choice goes straight to the card form.
   fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
-  fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
   await screen.findByTestId('stripe-payment-form')
   return view
 }
@@ -170,12 +178,11 @@ describe('payment lifecycle never cancels an authority implicitly', () => {
 
   it('makes no cancellation request when a Bitcoin authority is unmounted or the page is hidden', async () => {
     mockBilling(undefined, async () => response({
-      contractVersion: 2, kind: 'btcpay', authorityId: annualOffer.requestId,
+      contractVersion: 2, kind: 'btcpay', authorityId: serverFlowId,
       checkoutUrl: 'https://btcpay.test/i/abc123', invoiceId: 'invoice-1', invoiceLookupToken: 'B'.repeat(43),
     }))
     const view = render(<PaymentChoicePanel onSuccess={vi.fn()} onCancel={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: /pay .* with bitcoin, lightning and monero for/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
     await screen.findByRole('heading', { name: /pay .* annual with bitcoin/i })
 
     await act(async () => { window.dispatchEvent(new Event('pagehide')) })

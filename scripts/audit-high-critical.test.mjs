@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import test from 'node:test'
-import { runAudit } from './audit-high-critical.mjs'
+import { bracesRemediation, runAudit } from './audit-high-critical.mjs'
 
 const fixtures = resolve(import.meta.dirname, 'test-fixtures/audit-high-critical')
 const quiet = { log: () => {}, error: () => {} }
+// A root with no patch, lock or install: the braces remediation cannot be verified there. The
+// default root is this repository, whose verified patched install the other cases rely on.
+const unverifiedRoot = mkdtempSync(join(tmpdir(), 'braces-unverified-root-'))
+test.after(() => rmSync(unverifiedRoot, { recursive: true, force: true }))
 
 function report(name) {
   return readFileSync(resolve(fixtures, name), 'utf8')
@@ -48,6 +53,147 @@ test('fails closed for malformed metadata, advisory identity, severity, and high
 test('fails closed for unknown high and critical advisories', () => {
   assert.equal(runAudit({ spawn: fakeResult({ status: 1, stdout: report('unknown-high.json') }), ...quiet }), 1)
   assert.equal(runAudit({ spawn: fakeResult({ status: 1, stdout: report('unknown-critical.json') }), ...quiet }), 1)
+})
+
+const oldExpiry = Date.parse('2026-10-14T00:00:00Z')
+
+function bracesReport(mutate = () => {}) {
+  const parsed = JSON.parse(report('braces-excepted.json'))
+  mutate(parsed, parsed.advisories['1240992'])
+  return JSON.stringify(parsed)
+}
+
+function auditBraces(stdout, root) {
+  return runAudit({ spawn: fakeResult({ status: 1, stdout }), root, ...quiet })
+}
+
+test('accepts the exact braces 3.0.3 tooling advisory only with verified patched code', () => {
+  assert.equal(auditBraces(bracesReport()), 0)
+  assert.equal(auditBraces(bracesReport(), unverifiedRoot), 1)
+})
+
+test('binds the disposition to the no-patched-release marker and the eight reviewed paths, without an expiry', () => {
+  assert.equal(bracesRemediation.patchedVersions, '<0.0.0')
+  assert.equal(bracesRemediation.paths.size, 8)
+  assert.equal(Object.hasOwn(bracesRemediation, 'expiresAt'), false)
+})
+
+test('decides by verification, not the clock, before, at and after the old expiry', (t) => {
+  for (const instant of [oldExpiry - 1, oldExpiry, oldExpiry + 1]) {
+    t.mock.timers.enable({ apis: ['Date'], now: instant })
+    assert.equal(Date.now(), instant)
+    assert.equal(auditBraces(bracesReport()), 0, `verified at ${instant}`)
+    assert.equal(auditBraces(bracesReport(), unverifiedRoot), 1, `unverified at ${instant}`)
+    t.mock.timers.reset()
+  }
+})
+
+test('prints the raw high count and names the verified local remediation', () => {
+  const lines = []
+  const exitCode = runAudit({ spawn: fakeResult({ status: 1, stdout: bracesReport() }), log: (line) => lines.push(line), error: () => {} })
+  assert.equal(exitCode, 0)
+  assert.equal(lines[0], 'Dependency audit summary: 0 critical, 1 high, 0 moderate, 0 low.')
+  assert.match(lines[1], /^Raw finding locally remediated by the verified patch \(still counted above\): high: braces@3\.0\.3 — GHSA-vfj7-8cjw-p6xm$/)
+})
+
+test('fails closed when the remediation cannot be verified, even for a clean report', () => {
+  assert.equal(runAudit({ spawn: fakeResult({ stdout: report('clean.json') }), root: unverifiedRoot, ...quiet }), 1)
+})
+
+test('fails closed unless the braces finding reports exactly the reviewed tooling path set', () => {
+  for (const [name, mutate] of [
+    ['path subset', (parsed, advisory) => { advisory.findings[0].paths = advisory.findings[0].paths.slice(0, 1) }],
+    ['duplicate path replacing a reviewed path', (parsed, advisory) => {
+      advisory.findings[0].paths[1] = advisory.findings[0].paths[0]
+    }],
+    ['duplicate path appended', (parsed, advisory) => { advisory.findings[0].paths.push(advisory.findings[0].paths[0]) }],
+    ['second finding', (parsed, advisory) => {
+      advisory.findings.push({ ...advisory.findings[0] })
+      parsed.metadata.vulnerabilities.high = 2
+    }],
+  ]) {
+    assert.equal(auditBraces(bracesReport(mutate)), 1, name)
+  }
+})
+
+test('reconciles pnpm 10.6.5 policy-severity counts with advisory findings before remediating braces', () => {
+  for (const [name, mutate] of [
+    ['excess high count', (parsed) => { parsed.metadata.vulnerabilities.high = 2 }],
+    ['excess critical count', (parsed) => { parsed.metadata.vulnerabilities.critical = 1 }],
+    ['negative high count', (parsed) => { parsed.metadata.vulnerabilities.high = -1 }],
+    ['high record without findings beside braces', (parsed) => {
+      parsed.advisories['2'] = JSON.parse(report('unknown-high.json')).advisories['1']
+      parsed.metadata.vulnerabilities.high = 2
+    }],
+    ['high record with findings and a short count', (parsed) => {
+      parsed.advisories['2'] = {
+        ...JSON.parse(report('unknown-high.json')).advisories['1'],
+        findings: [{ version: '1.0.0', paths: ['apps/web > unexpected-package@1.0.0'] }],
+      }
+    }],
+    ['duplicate finding versions', (parsed, advisory) => {
+      advisory.findings.push({ version: '3.0.3', paths: ['apps/web > tailwindcss@3.4.19 > micromatch@4.0.8 > braces@3.0.3'] })
+      parsed.metadata.vulnerabilities.high = 2
+    }],
+  ]) {
+    assert.equal(auditBraces(bracesReport(mutate)), 1, name)
+  }
+  assert.equal(auditBraces(bracesReport((parsed) => { parsed.metadata.vulnerabilities.moderate = 3 })), 0)
+})
+
+test('does not remediate other braces advisories, versions, packages, severities, ranges or patched-version markers', () => {
+  for (const [name, mutate] of [
+    ['older braces advisory', (parsed, advisory) => {
+      advisory.github_advisory_id = 'GHSA-grv7-fg5c-xmjg'
+      advisory.url = 'https://github.com/advisories/GHSA-grv7-fg5c-xmjg'
+      advisory.vulnerable_versions = '<3.0.3'
+    }],
+    ['mismatched url', (parsed, advisory) => { advisory.url = 'https://github.com/advisories/GHSA-grv7-fg5c-xmjg' }],
+    ['missing advisory id', (parsed, advisory) => { delete advisory.github_advisory_id }],
+    ['other braces version', (parsed, advisory) => {
+      advisory.findings[0].version = '3.0.2'
+      advisory.findings[0].paths = advisory.findings[0].paths.map((path) => path.replace('braces@3.0.3', 'braces@3.0.2'))
+    }],
+    ['other package', (parsed, advisory) => { advisory.module_name = 'micromatch' }],
+    ['critical severity', (parsed, advisory) => {
+      advisory.severity = 'critical'
+      parsed.metadata.vulnerabilities = { critical: 1, high: 0, moderate: 0, low: 0 }
+    }],
+    ['widened range', (parsed, advisory) => { advisory.vulnerable_versions = '<=3.0.4' }],
+    ['malformed marker', (parsed, advisory) => { advisory.patched_versions = '<0.0.0>' }],
+    ['published fix', (parsed, advisory) => { advisory.patched_versions = '>=3.0.4' }],
+    ['missing marker', (parsed, advisory) => { delete advisory.patched_versions }],
+    ['missing findings', (parsed, advisory) => { delete advisory.findings }],
+    ['empty findings', (parsed, advisory) => { advisory.findings = [] }],
+    ['empty paths', (parsed, advisory) => { advisory.findings[0].paths = [] }],
+    ['malformed finding', (parsed, advisory) => { advisory.findings = ['3.0.3'] }],
+  ]) {
+    assert.equal(auditBraces(bracesReport(mutate)), 1, name)
+  }
+})
+
+test('fails closed when braces 3.0.3 gains a dependency edge outside the reviewed tooling paths', () => {
+  for (const path of [
+    'apps/web > next@15.5.24 > micromatch@4.0.8 > braces@3.0.3',
+    'packages/core > micromatch@4.0.8 > braces@3.0.3',
+    'apps/web > tailwindcss@3.4.20 > micromatch@4.0.8 > braces@3.0.3',
+    'apps/web > @ducanh2912/next-pwa@10.2.9 > fast-glob@3.3.2 > micromatch@4.0.8 > braces@3.0.3 > extra',
+  ]) {
+    assert.equal(auditBraces(bracesReport((parsed, advisory) => { advisory.findings[0].paths.push(path) })), 1, path)
+  }
+})
+
+test('keeps blocking unknown high/critical advisories and malformed reports beside the verified braces finding', () => {
+  assert.equal(auditBraces(bracesReport((parsed) => {
+    parsed.advisories['2'] = JSON.parse(report('unknown-high.json')).advisories['1']
+  })), 1)
+  assert.equal(auditBraces(bracesReport((parsed) => {
+    parsed.advisories['2'] = JSON.parse(report('unknown-critical.json')).advisories['1']
+    parsed.metadata.vulnerabilities.critical = 1
+  })), 1)
+  assert.equal(auditBraces(bracesReport((parsed) => { parsed.metadata.vulnerabilities.high = 0 })), 1)
+  assert.equal(auditBraces(bracesReport((parsed) => { parsed.error = { code: 'ENOTFOUND' } })), 1)
+  assert.equal(runAudit({ spawn: fakeResult({ status: 2, stdout: bracesReport() }), ...quiet }), 1)
 })
 
 test('fails closed for spawn errors, signals, and unexpected statuses', () => {

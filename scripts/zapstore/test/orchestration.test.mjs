@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createServer } from 'node:http'
+import { createHash } from 'node:crypto'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -77,6 +78,50 @@ test('cli admit: only a protected-main schedule with workflow_sha == sha is admi
   assert.match(wrongCheckout.stderr, /not the admitted protected revision/)
 })
 
+test('cli admit-rehearsal: only a main workflow_dispatch of the rehearsal file bound to its checkout; no activation state; the scheduled admit refuses it', () => {
+  const { dir, head } = tempRepo()
+  const REHEARSAL_REF = 'silent-suite/silentsuite/.github/workflows/zapstore-rehearsal.yml@refs/heads/main'
+  const base = { GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/main', GITHUB_REPOSITORY: 'silent-suite/silentsuite', GITHUB_WORKFLOW_REF: REHEARSAL_REF, GITHUB_SHA: head, GITHUB_WORKFLOW_SHA: head }
+  const ok = run('admit-rehearsal', ['--workspace', dir], { ...base, ZAPSTORE_AUTOMATION_ENABLED: 'enabled' })
+  assert.equal(ok.status, 0, ok.stderr)
+  assert.equal(ok.outputs, `revision=${head}\n`, 'only the revision; never active or rehearsal, even with the activation variable set')
+  assert.match(ok.summary, /ASSESSMENT ONLY/)
+  assert.match(ok.summary, /cannot sign, upload or publish anything/)
+  assert.match(ok.summary, /action of publish is not authorization/)
+  assert.match(ok.summary, /not evidence that the scheduled lane triggers, and not signing proof/)
+  const cases = [
+    ['schedule', { GITHUB_EVENT_NAME: 'schedule' }, /is not workflow_dispatch/],
+    ['schedule with the production definition', { GITHUB_EVENT_NAME: 'schedule', GITHUB_WORKFLOW_REF: WORKFLOW_REF }, /is not workflow_dispatch/],
+    ['repository_dispatch', { GITHUB_EVENT_NAME: 'repository_dispatch' }, /is not workflow_dispatch/],
+    ['missing event', { GITHUB_EVENT_NAME: '' }, /is not workflow_dispatch/],
+    ['production definition', { GITHUB_WORKFLOW_REF: WORKFLOW_REF }, /GITHUB_WORKFLOW_REF/],
+    ['feature branch', { GITHUB_REF: 'refs/heads/feat', GITHUB_WORKFLOW_REF: REHEARSAL_REF.replace('refs/heads/main', 'refs/heads/feat') }, /is not refs\/heads\/main/],
+    ['tag', { GITHUB_REF: 'refs/tags/v0.5.6-beta', GITHUB_WORKFLOW_REF: REHEARSAL_REF.replace('refs/heads/main', 'refs/tags/v0.5.6-beta') }, /is not refs\/heads\/main/],
+    ['definition from another ref', { GITHUB_WORKFLOW_REF: REHEARSAL_REF.replace('refs/heads/main', 'refs/heads/feat') }, /GITHUB_WORKFLOW_REF/],
+    ['definition drift', { GITHUB_WORKFLOW_SHA: 'a'.repeat(40) }, /GITHUB_WORKFLOW_SHA .* is not the run commit/],
+    ['missing definition sha', { GITHUB_WORKFLOW_SHA: '' }, /GITHUB_WORKFLOW_SHA/],
+    ['wrong checkout', { GITHUB_SHA: 'b'.repeat(40), GITHUB_WORKFLOW_SHA: 'b'.repeat(40) }, /not the admitted protected revision/],
+  ]
+  for (const [label, env, pattern] of cases) {
+    const refused = run('admit-rehearsal', ['--workspace', dir], { ...base, ...env })
+    assert.notEqual(refused.status, 0, label)
+    assert.match(refused.stderr, pattern, label)
+    assert.equal(refused.outputs, '', `${label} emits nothing`)
+  }
+  const noWorkspace = run('admit-rehearsal', [], base)
+  assert.notEqual(noWorkspace.status, 0)
+  assert.match(noWorkspace.stderr, /requires --workspace/)
+  assert.equal(noWorkspace.outputs, '')
+  const scheduled = run('admit', ['--workspace', dir], { ...base, ZAPSTORE_AUTOMATION_ENABLED: 'enabled' })
+  assert.notEqual(scheduled.status, 0)
+  assert.match(scheduled.stderr, /unsupported event workflow_dispatch/)
+  assert.equal(scheduled.outputs, '')
+  const spoofed = run('admit', ['--workspace', dir], { ...base, GITHUB_EVENT_NAME: 'schedule', ZAPSTORE_AUTOMATION_ENABLED: 'enabled' })
+  assert.notEqual(spoofed.status, 0)
+  assert.match(spoofed.stderr, /is not \.github\/workflows\/zapstore-publish\.yml/)
+  assert.equal(spoofed.outputs, '')
+})
+
 test('cli checkout-guard binds a job to the admitted revision', () => {
   const { dir, head } = tempRepo()
   assert.equal(run('checkout-guard', ['--workspace', dir, '--revision', head]).status, 0)
@@ -112,12 +157,30 @@ test('cli drift accepts regenerated event identities but rejects changed publica
   }
   const ok = invoke(regenerated)
   assert.equal(ok.status, 0, ok.stderr)
+  // The publisher emits platform `f` tags in Go map order, so a regenerated
+  // set may carry them in another order; the APK id and the release link follow.
+  for (const k of [1, 2, 3]) {
+    const rotated = structuredClone(regenerated)
+    for (const event of rotated) {
+      const platforms = event.tags.filter((t) => t[0] === 'f')
+      let next = 0
+      event.tags = event.tags.map((t) => (t[0] === 'f' ? platforms[(next++ + k) % platforms.length] : t))
+    }
+    const rotatedApk = rotated.find((e) => e.kind === 3063)
+    rotatedApk.id = eventId(rotatedApk)
+    rotated.find((e) => e.kind === 30063).tags.find((t) => t[0] === 'e')[1] = rotatedApk.id
+    for (const event of rotated) event.id = eventId(event)
+    const accepted = invoke(rotated)
+    assert.equal(accepted.status, 0, `rotation ${k}: ${accepted.stderr}`)
+  }
   for (const mutate of [
     (es) => { es.find((e) => e.kind === 30063).content += 'changed' },
     (es) => { es.find((e) => e.kind === 3063).tags.find((t) => t[0] === 'x')[1] = 'b'.repeat(64) },
     (es) => { es.find((e) => e.kind === 30063).tags.find((t) => t[0] === 'e')[2] = 'wss://other.example' },
     (es) => { es.find((e) => e.kind === 30063).tags.find((t) => t[0] === 'e')[1] = 'c'.repeat(64) },
     (es) => { es.find((e) => e.kind === 30063).tags.push(['e', apk.id, 'wss://relay.zapstore.dev']) },
+    (es) => { es.find((e) => e.kind === 32267).tags.find((t) => t[0] === 'f' && t[1] === 'android-x86')[1] = 'android-riscv64' },
+    (es) => { const app = es.find((e) => e.kind === 32267); app.tags = app.tags.filter((t) => !(t[0] === 'f' && t[1] === 'android-x86')) },
   ]) {
     const changed = structuredClone(regenerated)
     mutate(changed)
@@ -254,6 +317,45 @@ test('collectFailures reports failures and missing evidence only, never successf
   assert.equal(enumerateFailed[0].phase, 'enumerate')
 })
 
+test('fetch-apk verifies the Android sidecar and GitHub digest without relying on the Bridge manifest', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zapstore-checksums-'))
+  const bytes = Buffer.from('synthetic APK bytes for checksum transport regression')
+  const sha = createHash('sha256').update(bytes).digest('hex')
+  const name = 'silentsuite-android-v0.5.9-beta.apk'
+  const bindingPath = join(dir, 'binding.json')
+  writeFileSync(bindingPath, JSON.stringify({ assets: { apk: { id: 1, name, sha256: sha, size: bytes.length }, sidecar: { id: 2, name: 'silentsuite-android-v0.5.9-beta-installer.sha256' }, sums: { id: 3, name: 'SHA256SUMS.txt' } } }))
+  let sidecar = `${sha}  ${name}\n`
+  let apk = bytes
+  const requests = []
+  const server = createServer((request, response) => {
+    requests.push(request.url)
+    const id = request.url.split('/').at(-1)
+    if (id === '1') response.end(apk)
+    else if (id === '2') response.end(sidecar)
+    else if (id === '3') response.end(`${'b'.repeat(64)}  silentsuite-bridge-linux-arm64\n`)
+    else { response.writeHead(404); response.end() }
+  })
+  await new Promise((resolvePromise) => server.listen(0, '127.0.0.1', resolvePromise))
+  const invoke = () => runAsync('fetch-apk', ['--binding', bindingPath, '--out-dir', join(dir, 'apk')], { GITHUB_API_URL: `http://127.0.0.1:${server.address().port}` })
+  try {
+    const ok = await invoke()
+    assert.equal(ok.status, 0, ok.stderr)
+    assert.ok(!requests.some((url) => url.endsWith('/3')), 'Bridge manifest is not Android authority')
+    assert.deepEqual(readFileSync(join(dir, 'apk', name)), bytes)
+    for (const invalid of [`${'c'.repeat(64)}  ${name}\n`, `${sha}  other.apk\n`, `${sha}\n`, `${sidecar}${sidecar}`, `${sidecar}malformed checksum\n`]) {
+      sidecar = invalid
+      const refused = await invoke()
+      assert.notEqual(refused.status, 0, 'invalid or mismatched sidecar must fail')
+      assert.equal(refused.outputs, '', 'failed verification must not emit an APK path')
+    }
+    sidecar = `${sha}  ${name}\n`
+    apk = Buffer.from('corrupted artifact')
+    const corrupted = await invoke()
+    assert.notEqual(corrupted.status, 0)
+    assert.match(corrupted.stderr, /local bytes/)
+  } finally { await new Promise((resolvePromise) => server.close(resolvePromise)) }
+})
+
 function fakeGitHub() {
   const issues = []
   const requests = []
@@ -277,10 +379,10 @@ function fakeGitHub() {
   return new Promise((resolvePromise) => server.listen(0, '127.0.0.1', () => resolvePromise({ server, issues, requests, apiBase: `http://127.0.0.1:${server.address().port}` })))
 }
 
-function evidenceDir({ assessments = [], results = [], plan = null }) {
+function evidenceDir({ assessments = [], results = [], plan = null, candidateList = candidates }) {
   const dir = mkdtempSync(join(tmpdir(), 'zapstore-evidence-'))
   mkdirSync(join(dir, 'zapstore-candidates'))
-  writeFileSync(join(dir, 'zapstore-candidates', 'candidates.json'), JSON.stringify({ candidates, omitted: [] }))
+  writeFileSync(join(dir, 'zapstore-candidates', 'candidates.json'), JSON.stringify({ candidates: candidateList, omitted: [] }))
   for (const a of assessments) { mkdirSync(join(dir, `zapstore-assessment-${a.releaseId}`)); writeFileSync(join(dir, `zapstore-assessment-${a.releaseId}`, 'assessment.json'), JSON.stringify(a)) }
   for (const r of results) { mkdirSync(join(dir, `zapstore-result-${r.releaseId}`)); writeFileSync(join(dir, `zapstore-result-${r.releaseId}`, 'result.json'), JSON.stringify(r)) }
   if (plan) { mkdirSync(join(dir, 'zapstore-plan')); writeFileSync(join(dir, 'zapstore-plan', 'plan.json'), JSON.stringify(plan)) }
@@ -353,6 +455,88 @@ test('cli plan and notify: successful siblings are silent; CDN failure on an alr
     const enumerateDown = await runAsync('notify', ['--candidates', '/nonexistent/candidates.json', '--assessments-dir', '/nonexistent', '--results-dir', '/nonexistent'], { ...env, JOB_ENUMERATE: 'failure', JOB_ASSESS: 'skipped', JOB_PLAN: 'skipped', JOB_PUBLISH: 'skipped' })
     assert.equal(enumerateDown.status, 0, enumerateDown.stderr)
     assert.equal(gh.issues.at(-1).title, 'Zapstore lane failed: enumerate')
+  } finally {
+    gh.server.close()
+  }
+})
+
+test('cli notify: an exhausted pre-sign relay read opens one deduplicated verification issue, not a publication-failed one; retired tuples stay suppressed', async () => {
+  const gh = await fakeGitHub()
+  try {
+    const env = { GITHUB_API_URL: gh.apiBase, GITHUB_TOKEN: 't', RUN_URL: runUrl, JOB_ENUMERATE: 'success', JOB_ASSESS: 'failure', JOB_PLAN: 'success', JOB_PUBLISH: 'skipped' }
+    const incomplete = (id, tag) => recordResult({ job: 'assess', phases: { checkout: 'success', bind: 'success', apk: 'success', apksigner: 'success', prepare: 'success', reconcile: 'failure', cdn: 'skipped' }, binding: binding(id, tag), reconcile: { outcome: 'incomplete', action: 'fail', reason: 'incomplete', verifyCdn: false, detail: 'relay wss://relay.zapstore.dev did not send EOSE within 20000 ms (3 of 3 read-only attempts)' } })
+    const current = incomplete(418222556, 'v0.5.14-beta')
+    assert.equal(current.publication, 'not-attempted')
+    const list = [{ releaseId: 418222556, tag: 'v0.5.14-beta', publishable: true }]
+    const first = await runAsync('notify', notifyArgs(evidenceDir({ assessments: [current], candidateList: list, plan: { publish: [], missing: [], count: 0 } })), env)
+    assert.equal(first.status, 0, first.stderr)
+    assert.equal(gh.issues.length, 1)
+    assert.equal(gh.issues[0].title, 'Zapstore relay verification incomplete: v0.5.14-beta (release 418222556)')
+    assert.match(gh.issues[0].body, /No signer\/upload attempt ran/)
+    assert.match(gh.issues[0].body, /3 of 3 read-only attempts/)
+    const again = await runAsync('notify', notifyArgs(evidenceDir({ assessments: [current], candidateList: list, plan: { publish: [], missing: [], count: 0 } })), env)
+    assert.equal(again.status, 0, again.stderr)
+    assert.match(again.summary, /Reused open issue #1/)
+    assert.equal(gh.issues.length, 1, 'the same release and failure class dedupe on the exact title')
+    const retired = await runAsync('notify', notifyArgs(evidenceDir({ assessments: [incomplete(403051319, 'v0.5.11-beta')], candidateList: [{ releaseId: 403051319, tag: 'v0.5.11-beta', publishable: true }] })), env)
+    assert.equal(retired.status, 0, retired.stderr)
+    assert.equal(gh.issues.length, 1, 'retired historical tuples stay suppressed')
+    assert.match(retired.summary, /retired historical failure\(s\) suppressed/)
+  } finally {
+    gh.server.close()
+  }
+})
+
+test('cli notify: retired historical failure evidence opens no issue even in stale evidence, while mismatched pairs, the current release and lane failures still notify', async () => {
+  const gh = await fakeGitHub()
+  try {
+    const env = { GITHUB_API_URL: gh.apiBase, GITHUB_TOKEN: 't', RUN_URL: runUrl, JOB_ENUMERATE: 'success', JOB_ASSESS: 'success', JOB_PLAN: 'success', JOB_PUBLISH: 'success' }
+    const posts = () => gh.requests.filter((request) => request.method === 'POST').length
+    const assessFailed = (id, tag) => recordResult({ job: 'assess', phases: { checkout: 'success', bind: 'success', apk: 'success', apksigner: 'success', prepare: 'success', reconcile: 'success', cdn: 'failure' }, binding: binding(id, tag), reconcile: reconcileSkip, cdn: { status: 'failure', detail: `CDN bytes for ${tag} hash to y` } })
+
+    // Evidence frozen while these releases were still enumerated: each one would
+    // open an issue, because a closed issue is not deduplicated, and the stale
+    // list still marks the then-newest v0.5.11-beta publishable. A stale flag
+    // cannot make a permanently owner-retired identity current again.
+    const retired = [assessFailed(375729540, 'v0.5.2-beta'), assessFailed(376457006, 'v0.5.3-beta'), assessFailed(403051319, 'v0.5.11-beta')]
+    const staleList = [
+      { releaseId: 375729540, tag: 'v0.5.2-beta', publishable: false },
+      { releaseId: 376457006, tag: 'v0.5.3-beta', publishable: false },
+      { releaseId: 403051319, tag: 'v0.5.11-beta', publishable: true },
+    ]
+    const quiet = await runAsync('notify', notifyArgs(evidenceDir({ assessments: retired, candidateList: staleList })), { ...env, JOB_ASSESS: 'failure' })
+    assert.equal(quiet.status, 0, quiet.stderr)
+    assert.equal(posts(), 0, 'no issue POST for retired historical evidence, even when stale evidence marks it publishable')
+    assert.match(quiet.summary, /No issue for retired historical failure evidence/)
+    assert.match(quiet.summary, /v0\.5\.3-beta \(release 376457006\)/)
+    assert.match(quiet.summary, /retired historical failure\(s\) suppressed/)
+    assert.doesNotMatch(quiet.summary, /no failures and no missing evidence/, 'the summary must not claim there were no failures')
+
+    // No assessment or result artifacts at all: collectFailures records
+    // evidence-missing for each retired candidate, which is suppressed too, and
+    // the summary must not claim there was no missing evidence.
+    const expired = await runAsync('notify', notifyArgs(evidenceDir({ candidateList: staleList })), env)
+    assert.equal(expired.status, 0, expired.stderr)
+    assert.equal(posts(), 0, 'retired evidence-missing failures open no issue')
+    assert.match(expired.summary, /retired historical failure\(s\) suppressed/)
+    assert.doesNotMatch(expired.summary, /no missing evidence/)
+
+    // The guard is the exact retired id+tag pairs: a mismatched pair and the
+    // actual current release still notify.
+    const mismatched = await runAsync('notify', notifyArgs(evidenceDir({ assessments: [assessFailed(376457006, 'v0.5.4-beta')], candidateList: [{ releaseId: 376457006, tag: 'v0.5.4-beta', publishable: false }] })), { ...env, JOB_ASSESS: 'failure' })
+    assert.equal(mismatched.status, 0, mismatched.stderr)
+    assert.equal(gh.issues.length, 1)
+    assert.equal(gh.issues[0].title, 'Zapstore publication failed: v0.5.4-beta (release 376457006)')
+
+    const current = await runAsync('notify', notifyArgs(evidenceDir({ assessments: [assessFailed(407577541, 'v0.5.13-beta')], candidateList: [{ releaseId: 407577541, tag: 'v0.5.13-beta', publishable: true }] })), { ...env, JOB_ASSESS: 'failure' })
+    assert.equal(current.status, 0, current.stderr)
+    assert.equal(gh.issues.length, 2)
+    assert.equal(gh.issues[1].title, 'Zapstore publication failed: v0.5.13-beta (release 407577541)')
+
+    const enumerateDown = await runAsync('notify', ['--candidates', '/nonexistent/candidates.json', '--assessments-dir', '/nonexistent', '--results-dir', '/nonexistent'], { ...env, JOB_ENUMERATE: 'failure', JOB_ASSESS: 'skipped', JOB_PLAN: 'skipped', JOB_PUBLISH: 'skipped' })
+    assert.equal(enumerateDown.status, 0, enumerateDown.stderr)
+    assert.equal(gh.issues.length, 3)
+    assert.equal(gh.issues[2].title, 'Zapstore lane failed: enumerate')
   } finally {
     gh.server.close()
   }

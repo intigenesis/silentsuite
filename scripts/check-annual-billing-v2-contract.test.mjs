@@ -100,6 +100,13 @@ test('comments cannot satisfy the closed-flow invariant and harmless comments do
   })
 })
 
+test('the authenticated resume client cannot substitute a non-canonical endpoint', () => {
+  withSourceMutation('apps/web/app/lib/billing-v2.ts', (source) => {
+    assert.ok(source.includes("'/subscription/payment-flows/v2/resume'"))
+    return source.replace("'/subscription/payment-flows/v2/resume'", "'/subscription/payment-flows/v2/restart'")
+  }, (root) => assert.throws(() => checkAnnualBillingV2Contract(root), /canonical route \/subscription\/payment-flows\/v2\/resume/))
+})
+
 test('the route cannot disconnect the guarded recovery implementation', () => {
   withSourceMutation(pendingRoutePath, source => source.replace('<PendingPaymentRecovery />', '<div />'), root => {
     assert.throws(() => checkAnnualBillingV2Contract(root), /route must render/)

@@ -4,7 +4,7 @@ import { useEffect, useRef } from 'react'
 import * as Sentry from '@sentry/nextjs'
 import { useSyncStore } from '@/app/stores/use-sync-store'
 import { logger } from '@/app/lib/logger'
-import { keepPendingCacheRecords, useEtebaseStore } from '@/app/stores/use-etebase-store'
+import { keepPendingCacheRecords, useEtebaseStore, withoutPendingDeletes } from '@/app/stores/use-etebase-store'
 import { useTaskStore } from '@/app/stores/use-task-store'
 import { useContactStore } from '@/app/stores/use-contact-store'
 import { useCalendarStore } from '@/app/stores/use-calendar-store'
@@ -84,6 +84,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
   const etebaseIsInitialized = useEtebaseStore((s) => s.isInitialized)
 
   const didInit = useRef(false)
+  const engineWiring = useRef<{ disposed: boolean; dispose: () => void } | null>(null)
 
   // 1. Online/offline listeners (existing)
   useEffect(() => {
@@ -93,12 +94,34 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
   // 2. Initialize Etebase + load data + wire sync
   useEffect(() => {
-    if (didInit.current) return
+    if (didInit.current) {
+      // StrictMode replays the effect on the same instance: the replay owns
+      // the still-running init's handler wiring and its teardown.
+      const wiring = engineWiring.current
+      if (!wiring) return
+      wiring.disposed = false
+      return wiring.dispose
+    }
     didInit.current = true
     const accountEpoch = getAccountEpoch()
 
     let unsubChange: (() => void) | null = null
     let unsubStatus: (() => void) | null = null
+    let unwatchEngine: (() => void) | null = null
+    // Once disposed, no SyncEngine handler or engine watcher may be attached.
+    const wiring = {
+      disposed: false,
+      dispose: () => {
+        wiring.disposed = true
+        unwatchEngine?.()
+        unwatchEngine = null
+        unsubChange?.()
+        unsubChange = null
+        unsubStatus?.()
+        unsubStatus = null
+      },
+    }
+    engineWiring.current = wiring
 
     async function init() {
       const initStartedAt = markSyncTimingStart()
@@ -112,7 +135,6 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
         // before slower tasks/contacts finish. This replaces the old
         // post-initialize all-domain load, so no domain is replaced twice.
         const etebaseStartedAt = nowMs()
-        useNoteStore.setState({ isLoading: true })
         await etebaseInitialize({
           onCacheHydrate: async () => {
             const cacheStartedAt = nowMs()
@@ -121,22 +143,15 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
           onDomainLoaded: async (event) => {
             await loadDomainIntoStore(event.type)
             assertCurrentAccountEpoch(accountEpoch)
-            if (event.type === 'notes') useNoteStore.setState({ isLoading: false })
             updatePartialLoadFlag()
           },
         })
         assertCurrentAccountEpoch(accountEpoch)
-        // Every visible domain has reached a terminal state by now. Offline,
-        // collection setup fails silently and the notes callback above never
-        // fires, so clear the provider-owned flag here or the list is stuck on
-        // its skeleton. Runs after the epoch assert, so a switched account
-        // keeps its own loading state.
-        useNoteStore.setState({ isLoading: false })
         safeLogSyncTiming('etebase-initialize', etebaseStartedAt)
 
         // Wire SyncEngine change events
         const changeHandlerStartedAt = nowMs()
-        unsubChange = wireChangeHandler()
+        if (!wiring.disposed) unsubChange = wireChangeHandler()
         safeLogSyncTiming('wire-change-handler', changeHandlerStartedAt, { status: unsubChange ? 'ok' : 'skipped' })
 
         // Supporting metadata only: no passive writes and no visible restore blocking.
@@ -154,8 +169,9 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
         // Wire SyncEngine status
         const statusHandlerStartedAt = nowMs()
-        unsubStatus = wireStatusHandler()
+        if (!wiring.disposed) unsubStatus = wireStatusHandler()
         safeLogSyncTiming('wire-status-handler', statusHandlerStartedAt, { status: unsubStatus ? 'ok' : 'skipped' })
+        if (!wiring.disposed && (!unsubChange || !unsubStatus)) watchForRecoveredSyncEngine()
 
         // Drain mutations queued before this reload now that the session, item
         // maps, and change handlers are live (initializeSync runs before the
@@ -179,7 +195,6 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
         if (err instanceof AccountBoundaryChangedError) return
         safeLogSyncTiming('initial-sync-failed', initStartedAt, { errorCategory: safeTimingErrorCategory('unknown') })
         reportSyncError('init', err)
-        useNoteStore.setState({ isLoading: false })
         setSyncStatus('error')
         setError('Sync initialization failed')
       }
@@ -224,7 +239,8 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
           try {
             const contacts = contactItems.map((it) => {
               const contact = core.deserializeContact(it.content)
-              return { ...contact, id: it.itemUid, listId: it.collectionUid }
+              // The display cache holds no SDK item, so the revision is unknown (#744).
+              return { ...contact, id: it.itemUid, listId: it.collectionUid, revision: null }
             })
             useContactStore.getState().syncFromRemote(contacts)
             logger.log(`[sync-provider] Hydrated ${contacts.length} contacts from cache`)
@@ -248,10 +264,14 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
 
         if (noteItems.length > 0) {
           try {
-            const notes = noteItems.map((it) => core.deserializeNote(it.content, it.itemUid, it.collectionUid))
+            const visibleNoteItems = await withoutPendingDeletes('notes', noteItems, accountEpoch, useEtebaseStore.getState().accountFingerprint)
+            assertCurrentAccountEpoch(accountEpoch)
+            // The display cache holds no SDK item, so the revision is unknown (#744).
+            const notes = visibleNoteItems.map((it) => ({ ...core.deserializeNote(it.content, it.itemUid, it.collectionUid), revision: null }))
             useNoteStore.getState().syncFromRemote(notes)
             logger.log(`[sync-provider] Hydrated ${notes.length} notes from cache`)
           } catch (err) {
+            if (err instanceof AccountBoundaryChangedError) throw err
             logger.warn('[sync-provider] Failed to hydrate notes from cache', getSafeErrorDetails(err))
           }
         }
@@ -332,14 +352,15 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
           } else if (type === 'contacts') {
             const contacts = items.map((item) => {
               const contact = core.deserializeContact(item.content)
-              return { ...contact, id: item.uid, listId: item.collectionUid }
+              // Content and revision are paired from the same SDK item (#744).
+              return { ...contact, id: item.uid, listId: item.collectionUid, revision: item.revision }
             })
             domainItemCount = contacts.length
             useContactStore.getState().syncFromRemote(contacts)
             logger.log(`[sync-provider] Loaded ${contacts.length} contacts from server`)
             await mirrorToCache(type, items)
           } else if (type === 'notes') {
-            const notes = items.map((item) => core.noteFromEtebaseItem(item.uid, item.content, item.meta, item.collectionUid))
+            const notes = items.map((item) => ({ ...core.noteFromEtebaseItem(item.uid, item.content, item.meta, item.collectionUid), revision: item.revision }))
             domainItemCount = notes.length
             useNoteStore.getState().syncFromRemote(notes)
             logger.log(`[sync-provider] Loaded ${notes.length} notes from server`)
@@ -415,7 +436,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
               assertCurrentAccountEpoch(accountEpoch)
               const contacts = contactItems.map((item) => {
                 const contact = core.deserializeContact(item.content)
-                return { ...contact, id: item.uid, listId: item.collectionUid }
+                return { ...contact, id: item.uid, listId: item.collectionUid, revision: item.revision }
               })
               assertCurrentAccountEpoch(accountEpoch)
               useContactStore.getState().syncFromRemote(contacts)
@@ -451,7 +472,7 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
             if (useEtebaseStore.getState().domainLoadState.notes === 'loaded') {
               const noteItems = await useEtebaseStore.getState().fetchAllItems('notes', accountEpoch)
               assertCurrentAccountEpoch(accountEpoch)
-              const notes = noteItems.map((item) => core.noteFromEtebaseItem(item.uid, item.content, item.meta, item.collectionUid))
+              const notes = noteItems.map((item) => ({ ...core.noteFromEtebaseItem(item.uid, item.content, item.meta, item.collectionUid), revision: item.revision }))
               assertCurrentAccountEpoch(accountEpoch)
               useNoteStore.getState().syncFromRemote(notes)
             }
@@ -503,12 +524,24 @@ export function SyncProvider({ children }: { children: React.ReactNode }) {
       })
     }
 
+    /**
+     * Initial collection discovery can fail before the SyncEngine starts; a
+     * later successful Retry starts it. Wire the missing handlers once then.
+     */
+    function watchForRecoveredSyncEngine() {
+      unwatchEngine = useEtebaseStore.subscribe((state) => {
+        if (!state.syncEngine) return
+        unwatchEngine?.()
+        unwatchEngine = null
+        if (wiring.disposed || !isCurrentAccountEpoch(accountEpoch)) return
+        if (!unsubChange) unsubChange = wireChangeHandler()
+        if (!unsubStatus) unsubStatus = wireStatusHandler()
+      })
+    }
+
     init()
 
-    return () => {
-      if (unsubChange) unsubChange()
-      if (unsubStatus) unsubStatus()
-    }
+    return wiring.dispose
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   return <>{children}</>

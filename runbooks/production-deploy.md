@@ -42,6 +42,21 @@ Clearing or changing an approval variable affects only future workflow runs; it 
 
 Server migrations run with Compose interactive stdin and TTY attachment explicitly disabled. The SSH action supplies the deployment script through stdin; an interactive `docker compose run` can otherwise consume the remaining script, exit successfully after migration, and skip container replacement and running-image verification.
 
+## SSH server verification for the Web mutation
+
+The Web `Deploy via SSH` step runs the pinned `appleboy/ssh-action`, whose transport (drone-ssh 1.8.2) skips server host-key verification whenever its `fingerprint` input is empty, and an unprovisioned secret expands to the empty string. The step therefore binds `with.fingerprint` to the dedicated protected secret `VPS_SSH_FINGERPRINT`, and the `Require protected SSH host-key fingerprint before final authorization` step refuses a missing or malformed value immediately before the final live-main re-assertion. The reusable workflow declares the secret as required and `annual-only-public-cutover.yml` maps it explicitly.
+
+Web production dispatch, standalone or through the annual public cutover, is blocked until `VPS_SSH_FINGERPRINT` is commissioned. No value is provisioned by the change that introduced this control, and merging it is not a deployment. Before any dispatch:
+
+1. Derive the fingerprint only from independently trusted custody of the host key, re-validated out of band. Never derive the value from a fresh unauthenticated `ssh-keyscan`, from a workflow log, or from the connection being authorized.
+2. The value is exactly `SHA256:` followed by the 43-character unpadded base64 digest printed by `ssh-keygen -l -E sha256`: no key-size prefix, comment, padding, whitespace, or second line. The transport compares one fingerprint against the single host key it negotiates, and its choice can differ from OpenSSH's: against a synthetic server offering RSA, ECDSA, and Ed25519 host keys, drone-ssh 1.8.2 negotiated the ECDSA key and rejected the other two fingerprints. Confirm from the same trusted custody the fingerprint of the host-key type the server offers to this transport; a trusted known-hosts entry of another key type yields a fingerprint that fails closed.
+3. Store it as the `VPS_SSH_FINGERPRINT` secret of the `web-production` environment, which the deployment job reads in both the standalone and the reusable path. If a repository-level secret of the same name exists for the cutover caller's explicit map, it must hold the identical verified value. A names-only secret inventory does not verify the value; record who verified it, from which trusted source, and when.
+4. Refresh the exact-SHA approval and every existing prerequisite above. This control adds a prerequisite and replaces none.
+
+A host-key mismatch fails the SSH step before any remote command runs and leaves production untouched. Treat it as a possible interception or an unrecorded key rotation: stop, and do not remove, blank, or bypass the fingerprint to recover. A deliberate host-key rotation requires a separate trusted re-verification and an updated secret before the next dispatch.
+
+CI proves the pinned transport rejects a changed server key before running a command against a synthetic loopback server (`scripts/ssh-host-verification-transport.test.mjs`). That proof does not establish which key production presents or that the stored secret matches it; only the custody steps above do.
+
 ## Rollback
 
 An older ancestor is not eligible for direct dispatch because every workflow requires `expected_sha` to equal live `main`. To restore earlier behavior:
@@ -53,6 +68,21 @@ An older ancestor is not eligible for direct dispatch because every workflow req
 If an in-progress Web or Server replacement fails, its workflow restores the captured previously running image automatically. Verify the running image identity and service health before clearing the approval variable.
 
 Never place approval values, credentials, Cloudflare tokens, SSH material, or production logs in issues, PR bodies, BMAD artifacts, or chat.
+
+## Standalone Docs admission (no annual Stage A)
+
+`Deploy Docs standalone (production, no annual Stage A)` (`.github/workflows/deploy-docs-standalone.yml`) publishes a Docs component change when no Billing or Web admission is in flight. It does not read, create, or require Stage A, a private App token, or any private HMAC key, and it does not touch Billing. It reuses the `docs-production` protected environment, the Cloudflare credentials, and the `deploy-docs-production` concurrency group, so it serializes with the annual Docs deployment. Its repository approval variable is `DOCS_STANDALONE_DEPLOY_APPROVED_SHA`, separate from `DOCS_DEPLOY_APPROVED_SHA`; arming one never authorizes the other path, and the annual public cutover cannot call this workflow.
+
+A standalone Docs deployment is a component deployment, not an annual cutover; it produces no Stage A, Stage B, or final manifest and must never be cited as annual proof. It runs the same build-side guards as the annual Docs path: frozen-lockfile install, public analytics and relay checks, the billing copy guard, the Android distribution documentation test, and enabled-mode analytics verification of both the built and the downloaded bytes. A change that touches only Markdown can still alter the built bundle through the lockfile, so it is never treated as content-only.
+
+1. Confirm the reviewed commit is still the live head of `main` and required checks, including the dependency audit, are green at that exact SHA.
+2. Re-verify the `docs-production` environment and its `main`-only deployment branch policy as in the one-time environment prerequisite above.
+3. Set the repository variable `DOCS_STANDALONE_DEPLOY_APPROVED_SHA` to the exact 40-character live `main` SHA. Do not configure a same-named environment variable.
+4. Dispatch the workflow from `main` with `expected_sha` equal to the same SHA. Its secretless `admission` job reports one explicit diagnostic per unmet condition (not on `main`, malformed `expected_sha`, dispatched head mismatch, variable unarmed or armed for another SHA) and fails before any protected environment, secret, or build starts.
+5. The build job builds once and uploads `docs-standalone-production-<sha>`. The deployment job downloads that exact archive through the GitHub API, verifies its digest and analytics bytes without rebuilding, re-asserts the exact owner-approved live `main` head as the step immediately before the Wrangler deployment, and then verifies that `https://docs.silentsuite.io/deployment-identity.json` serves the exact SHA.
+6. Clear `DOCS_STANDALONE_DEPLOY_APPROVED_SHA` after the run reaches a terminal state; clearing affects only future runs.
+
+The variable is snapshotted when the workflow run is queued, so clearing it does not revoke a queued run. To withdraw approval before mutation, cancel the run before the deployment job reaches `Deploy to production Worker`; once that step has started, do not cancel it as a substitute for rollback. Docs has no automatic rollback: restore earlier content through a reviewed revert PR to `main` and a fresh standalone authorization of the resulting live `main` SHA, as described under Rollback.
 
 ## Annual-only private/public handshake
 

@@ -49,6 +49,24 @@ internal data class RuntimeCollectionMutation(
 @Volatile
 internal var collectionMutationOverride: ((Context, CollectionLifecycleIdentity, RuntimeCollectionMutation) -> String?)? = null
 
+/**
+ * Which entries a collection screen lists. Only address books change: their ordinary activity
+ * list leaves deleted contacts out, and the recovery list shows only those. Calendars, tasks and
+ * notes keep listing every entry, deleted ones included.
+ */
+internal enum class ItemPresentation {
+    ORDINARY,
+    DELETED_CONTACTS;
+
+    fun <T> select(collectionType: String, items: List<T>, isDeleted: (T) -> Boolean): List<T> {
+        val contacts = collectionType == Constants.ETEBASE_TYPE_ADDRESS_BOOK
+        return when (this) {
+            ORDINARY -> if (contacts) items.filterNot(isDeleted) else items
+            DELETED_CONTACTS -> if (contacts) items.filter(isDeleted) else emptyList()
+        }
+    }
+}
+
 class CollectionActivity() : BaseActivity() {
     private lateinit var account: Account
     private val model: AccountViewModel by viewModels()
@@ -72,6 +90,8 @@ class CollectionActivity() : BaseActivity() {
         setContentView(R.layout.etebase_fragment_activity)
         val hasRestoredFragment = supportFragmentManager.findFragmentById(R.id.fragment_container) != null
         val fixture = runtimeFixtureOverride?.invoke(this, account, route.creationId, route.collectionUid, route.collectionType)
+        // Runtime presentation fixtures have no deleted entries to recover.
+        if (fixture != null && route.recovery) { finish(); return }
         if (fixture != null) {
             if (route.collectionUid != null) {
                 if (fixture.uid != route.collectionUid) { finish(); return }
@@ -116,7 +136,12 @@ class CollectionActivity() : BaseActivity() {
         collectionModel.observe(this) { cachedCollection ->
             model.value?.let { accountHolder ->
                 if (route.collectionUid != null) {
-                    itemsModel.loadItems(this, route.account, route.creationId, route.collectionUid, accountHolder, cachedCollection)
+                    if (route.recovery && cachedCollection.collectionType != Constants.ETEBASE_TYPE_ADDRESS_BOOK) {
+                        finish()
+                        return@observe
+                    }
+                    val presentation = if (route.recovery) ItemPresentation.DELETED_CONTACTS else ItemPresentation.ORDINARY
+                    itemsModel.loadItems(this, route.account, route.creationId, route.collectionUid, accountHolder, cachedCollection, presentation)
                     if (installInitialView) {
                         installInitialView = false
                         val exactIdentity = CollectionLifecycleIdentity.existing(
@@ -126,9 +151,12 @@ class CollectionActivity() : BaseActivity() {
                             cachedCollection.collectionType
                         )
                         supportFragmentManager.commit {
-                            replace(R.id.fragment_container, ViewCollectionFragment.newInstance(exactIdentity))
+                            replace(R.id.fragment_container,
+                                if (route.recovery) ListEntriesFragment.newInstance(exactIdentity)
+                                else ViewCollectionFragment.newInstance(exactIdentity))
                         }
                     }
+                    if (route.recovery) supportActionBar?.title = getString(R.string.settings_recover_deleted_contacts)
                 }
             }
         }
@@ -148,6 +176,11 @@ class CollectionActivity() : BaseActivity() {
         internal const val EXTRA_COLLECTION_UID = "collectionUid"
         internal const val EXTRA_COLLECTION_TYPE = "collectionType"
         internal const val EXTRA_CREATION_ID = "creationId"
+        internal const val EXTRA_RECOVER_DELETED_CONTACTS = "recoverDeletedContacts"
+
+        /** Lists only the deleted contacts of one exact address book, for recovery from Settings. */
+        fun newRecoveryIntent(context: Context, account: Account, creationId: String, addressBookUid: String): Intent =
+            newIntent(context, account, creationId, addressBookUid).putExtra(EXTRA_RECOVER_DELETED_CONTACTS, true)
 
         fun newIntent(context: Context, account: Account, creationId: String, colUid: String): Intent {
             require(colUid.isNotBlank()) { "Collection UID must be nonblank" }
@@ -173,7 +206,8 @@ class CollectionActivity() : BaseActivity() {
         val account: Account,
         val creationId: String,
         val collectionUid: String?,
-        val collectionType: String?
+        val collectionType: String?,
+        val recovery: Boolean = false
     )
 
     private fun intentRoute(): CollectionRoute? {
@@ -182,9 +216,11 @@ class CollectionActivity() : BaseActivity() {
         val creationId = extras.getString(EXTRA_CREATION_ID)?.takeIf { it.isNotBlank() } ?: return null
         val uid = extras.getString(EXTRA_COLLECTION_UID)
         val type = extras.getString(EXTRA_COLLECTION_TYPE)
+        val recovery = extras.getBoolean(EXTRA_RECOVER_DELETED_CONTACTS, false)
         if ((uid == null) == (type == null)) return null
+        if (recovery && uid == null) return null
         return if (uid != null) {
-            if (uid.isBlank()) null else CollectionRoute(exactAccount, creationId, uid, null)
+            if (uid.isBlank()) null else CollectionRoute(exactAccount, creationId, uid, null, recovery)
         } else {
             runCatching {
                 CollectionLifecycleIdentity.creating(exactAccount, creationId, type!!)
@@ -288,7 +324,8 @@ class CollectionViewModel : ViewModel() {
 class ItemsViewModel : ViewModel() {
     private val cachedItems = MutableLiveData<List<CachedItem>>()
 
-    fun loadItems(context: Context, account: Account, creationId: String, collectionUid: String, accountCollectionHolder: AccountHolder, cachedCollection: CachedCollection) {
+    internal fun loadItems(context: Context, account: Account, creationId: String, collectionUid: String, accountCollectionHolder: AccountHolder, cachedCollection: CachedCollection,
+                  presentation: ItemPresentation = ItemPresentation.ORDINARY) {
         viewModelScope.launch {
             val items = withContext(Dispatchers.IO) {
                 if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null ||
@@ -297,7 +334,13 @@ class ItemsViewModel : ViewModel() {
                 val itemMgr = accountCollectionHolder.colMgr.getItemManager(col)
                 if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null ||
                     accountCollectionHolder.account != account || cachedCollection.col.uid != collectionUid) return@withContext null
-                val value = accountCollectionHolder.etebaseLocalCache.itemList(itemMgr, col.uid, withDeleted = true)
+                // Display only: an item another client wrote with metadata this client cannot decode
+                // is left out instead of crashing the screen.
+                val decoded = accountCollectionHolder.etebaseLocalCache.decodableItemList(itemMgr, col.uid, withDeleted = true) { _, error ->
+                    // The binding's message can quote a decrypted value; log only the exception class.
+                    io.silentsuite.sync.log.Logger.log.warning("Skipping an item that could not be decoded: ${error.javaClass.name}")
+                }
+                val value = presentation.select(cachedCollection.collectionType, decoded) { it.item.isDeleted }
                 if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null ||
                     accountCollectionHolder.account != account || cachedCollection.col.uid != collectionUid) null else value
             }

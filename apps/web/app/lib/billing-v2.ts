@@ -47,10 +47,22 @@ export interface AnnualDisclosure {
   prepaid: boolean
   refundWindowDays: 30 | null
   bonusDays: 0 | 14
-  periodEndRule: 'activation_plus_trial' | 'first_charge_plus_1_utc_calendar_year' | 'confirmation_plus_1_utc_calendar_year' | 'confirmation_bonus_then_1_utc_calendar_year'
+  periodEndRule: 'activation_plus_trial' | 'first_charge_plus_1_utc_calendar_year' | 'confirmation_plus_1_utc_calendar_year' | 'confirmation_bonus_then_1_utc_calendar_year' | 'account_confirmation_rules_v1'
   renewalAt: string | null
   entitlementEndsAt: string | null
 }
+
+/** Account-only terms profile. Signup readers (`assertAnnualDisclosure`) never accept it. */
+export const ACCOUNT_TERMS_PROFILE = 'account_confirmation_rules_v1'
+
+/** The account panel's opt-in offer: signed terms per offered provider, or null when Billing did not supply valid ones. */
+export interface AccountAnnualOffer {
+  offer: AnnualOfferResponse
+  accountDisclosures: Partial<Record<AnnualProvider, AnnualDisclosure>> | null
+}
+
+/** Activation returned terms other than the ones shown before the choice. */
+export class AccountTermsUnavailableError extends Error {}
 
 export interface AnnualCheckoutActivation {
   contractVersion: 2
@@ -108,10 +120,23 @@ export class BillingResponseError extends Error {
  */
 export const RENEWABLE_ANNUAL_OFFER_PROBLEM_TYPE = 'https://api.silentsuite.io/errors/plan-not-purchasable'
 
+export function classifyAnnualOfferLoadFailure(error: unknown): 'refused' | 'transient' {
+  return isRenewableAnnualOfferError(error) || error instanceof BillingResponseError && error.billingStatus === 401 ? 'refused' : 'transient'
+}
+
 export function isRenewableAnnualOfferError(error: unknown): error is BillingResponseError {
   return error instanceof BillingResponseError
     && error.billingStatus === 409
     && error.billingProblemType === RENEWABLE_ANNUAL_OFFER_PROBLEM_TYPE
+}
+
+/**
+ * Billing answers 401 for any failed authentication, so this attributes an
+ * offer failure to sign-in without implying a specific cause. It only selects
+ * copy; refusal and retry decisions stay with the classifier above.
+ */
+export function isAnnualOfferAuthenticationError(error: unknown): error is BillingResponseError {
+  return error instanceof BillingResponseError && error.billingStatus === 401
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -202,6 +227,39 @@ export function assertAnnualDisclosure(value: unknown): asserts value is AnnualD
   const chargeNow = value.kind === 'charge_now' && value.firstChargeAmountMinor === amount && value.renewalAmountMinor === amount && value.trialEndsAt === null && value.firstChargeAt === null && value.cancelBy === null && value.autoRenew && !value.prepaid && value.refundWindowDays === 30 && value.periodEndRule === confirmationRule && value.renewalAt === null && value.entitlementEndsAt === null
   const prepaid = value.kind === 'prepaid' && value.firstChargeAmountMinor === amount && value.renewalAmountMinor === null && value.trialEndsAt === null && value.firstChargeAt === null && value.cancelBy === null && !value.autoRenew && value.prepaid && value.refundWindowDays === 30 && value.periodEndRule === confirmationRule && value.renewalAt === null && value.entitlementEndsAt === null
   if (!noCard && !cardTrial && !chargeNow && !prepaid) throw new Error('Billing returned inconsistent annual terms')
+}
+
+const DISCLOSURE_KEYS = ['kind', 'annualAmountMinor', 'firstChargeAmountMinor', 'renewalAmountMinor', 'monthlyEquivalentMinor', 'currency', 'trialEndsAt', 'firstChargeAt', 'cancelBy', 'cancelByInclusive', 'autoRenew', 'prepaid', 'refundWindowDays', 'bonusDays', 'periodEndRule', 'renewalAt', 'entitlementEndsAt'] as const
+
+/** The only shape the account profile may carry: a closed check, never a substitute for Billing's terms. */
+function accountProfileDisclosure(terms: { annualAmountMinor: 3600 | 4800; monthlyEquivalentMinor: 300 | 400 }, provider: AnnualProvider): AnnualDisclosure {
+  const prepaid = provider === 'btcpay'
+  return {
+    kind: prepaid ? 'prepaid' : 'charge_now', annualAmountMinor: terms.annualAmountMinor, firstChargeAmountMinor: terms.annualAmountMinor,
+    renewalAmountMinor: prepaid ? null : terms.annualAmountMinor, monthlyEquivalentMinor: terms.monthlyEquivalentMinor, currency: 'EUR',
+    trialEndsAt: null, firstChargeAt: null, cancelBy: null, cancelByInclusive: false, autoRenew: !prepaid, prepaid,
+    refundWindowDays: 30, bonusDays: 0, periodEndRule: ACCOUNT_TERMS_PROFILE, renewalAt: null, entitlementEndsAt: null,
+  }
+}
+
+export function sameAnnualDisclosure(left: unknown, right: AnnualDisclosure): boolean {
+  return isObject(left) && hasExactKeys(left, [...DISCLOSURE_KEYS]) && DISCLOSURE_KEYS.every(key => left[key] === right[key])
+}
+
+function readAccountProfileDisclosure(value: unknown, terms: { annualAmountMinor: 3600 | 4800; monthlyEquivalentMinor: 300 | 400 }, provider: AnnualProvider): AnnualDisclosure | null {
+  const expected = accountProfileDisclosure(terms, provider)
+  return sameAnnualDisclosure(value, expected) ? expected : null
+}
+
+/** Frozen terms of an in-progress flow: historical signed terms or the account profile; anything else is not shown. */
+export function readFrozenAnnualDisclosure(value: unknown): AnnualDisclosure | null {
+  if (!isObject(value)) return null
+  if (value.periodEndRule === ACCOUNT_TERMS_PROFILE) {
+    const terms = value.annualAmountMinor === 3600 && value.monthlyEquivalentMinor === 300 ? { annualAmountMinor: 3600 as const, monthlyEquivalentMinor: 300 as const }
+      : value.annualAmountMinor === 4800 && value.monthlyEquivalentMinor === 400 ? { annualAmountMinor: 4800 as const, monthlyEquivalentMinor: 400 as const } : null
+    return terms ? readAccountProfileDisclosure(value, terms, value.prepaid === true ? 'btcpay' : 'stripe') : null
+  }
+  try { assertAnnualDisclosure(value); return value } catch { return null }
 }
 
 function assertActivation(value: unknown): asserts value is AnnualCheckoutActivation {
@@ -304,12 +362,69 @@ export async function fetchAuthenticatedAnnualOffer(params: { fetcher: BillingV2
   return body
 }
 
-export async function activateAuthenticatedAnnualCheckout(params: { fetcher: BillingV2Fetch; billingApiUrl: string; offer: AnnualOfferResponse; trialPath: AnnualTrialPath; provider: 'none' | AnnualProvider; behavior: AnnualBehavior }): Promise<AnnualCheckoutActivation> {
+/**
+ * Opt-in account offer (`?preview=1`). The base offer is read as strictly as
+ * before; the account terms are accepted only as the exact profile for every
+ * offered provider. Missing, unknown or disagreeing terms yield `null`, which
+ * the panel treats as unavailable rather than inferring terms.
+ */
+export async function fetchAuthenticatedAccountOffer(params: { fetcher: BillingV2Fetch; billingApiUrl: string }): Promise<AccountAnnualOffer> {
+  const { fetcher } = params
+  const body = await jsonOrThrow(await fetcher(api(params.billingApiUrl, '/subscription/offers/v2?preview=1'), jsonInit('GET')))
+  if (!isObject(body)) throw new Error('Billing did not return a valid annual offer')
+  const { accountTermsProfile, accountDisclosures, ...base } = body
+  assertAnnualOfferResponse(base)
+  const offer = base.offer
+  if (accountTermsProfile !== ACCOUNT_TERMS_PROFILE || !isObject(accountDisclosures) || !hasExactKeys(accountDisclosures, [...offer.providers])) {
+    return { offer: base, accountDisclosures: null }
+  }
+  const disclosures: Partial<Record<AnnualProvider, AnnualDisclosure>> = {}
+  for (const provider of offer.providers) {
+    const disclosure = readAccountProfileDisclosure(accountDisclosures[provider], offer, provider)
+    if (!disclosure) return { offer: base, accountDisclosures: null }
+    disclosures[provider] = disclosure
+  }
+  return { offer: base, accountDisclosures: disclosures }
+}
+
+export type ResumedAnnualPayment =
+  | { kind: 'stripe'; authorityId: string; clientSecret: string; disclosure: AnnualDisclosure }
+  | { kind: 'btcpay'; authorityId: string; checkoutUrl: string; invoiceId: string; invoiceLookupToken: string; disclosure: AnnualDisclosure }
+
+/**
+ * Resumes the exact owned authority Billing named on the current-flow reply.
+ * It never activates an offer or creates a provider object; the reply must
+ * name the same authority and carry its frozen signed terms.
+ */
+export async function resumeAuthenticatedAnnualPayment(params: { fetcher: BillingV2Fetch; billingApiUrl: string; authorityId: string }): Promise<ResumedAnnualPayment> {
+  const { fetcher } = params
+  if (!isUuid(params.authorityId)) throw new Error('Invalid payment authority')
+  const body = await jsonOrThrow(await fetcher(api(params.billingApiUrl, '/subscription/payment-flows/v2/resume'), jsonInit('POST', { contractVersion: 2, authorityId: params.authorityId })))
+  const invalid = () => new Error('Billing did not return a valid payment continuation')
+  if (!isObject(body) || body.contractVersion !== 2 || body.authorityId !== params.authorityId) throw invalid()
+  const disclosure = readFrozenAnnualDisclosure(body.disclosure)
+  if (!disclosure) throw invalid()
+  if (body.kind === 'stripe') {
+    if (!hasExactKeys(body, ['contractVersion', 'kind', 'authorityId', 'clientSecret', 'disclosure']) || typeof body.clientSecret !== 'string' || !body.clientSecret) throw invalid()
+    return { kind: 'stripe', authorityId: params.authorityId, clientSecret: body.clientSecret, disclosure }
+  }
+  if (body.kind !== 'btcpay' || !hasExactKeys(body, ['contractVersion', 'kind', 'authorityId', 'checkoutUrl', 'invoiceId', 'invoiceLookupToken', 'disclosure'])
+    || !isHttpsUrl(body.checkoutUrl) || typeof body.invoiceId !== 'string' || !body.invoiceId || typeof body.invoiceLookupToken !== 'string' || !body.invoiceLookupToken) throw invalid()
+  return { kind: 'btcpay', authorityId: params.authorityId, checkoutUrl: body.checkoutUrl, invoiceId: body.invoiceId, invoiceLookupToken: body.invoiceLookupToken, disclosure }
+}
+
+export async function activateAuthenticatedAnnualCheckout(params: { fetcher: BillingV2Fetch; billingApiUrl: string; offer: AnnualOfferResponse; trialPath: AnnualTrialPath; provider: 'none' | AnnualProvider; behavior: AnnualBehavior; accountTerms?: AnnualDisclosure }): Promise<AnnualCheckoutActivation> {
   const { fetcher } = params
   assertAnnualOfferResponse(params.offer)
-  const body = await jsonOrThrow(await fetcher(api(params.billingApiUrl, '/subscription/offers/v2/activate'), jsonInit('POST', { contractVersion: 2, offerToken: params.offer.offer.offerToken, requestId: params.offer.requestId, trialPath: params.trialPath, provider: params.provider, behavior: params.behavior })))
-  assertActivation(body)
-  return body
+  const body = await jsonOrThrow(await fetcher(api(params.billingApiUrl, '/subscription/offers/v2/activate'), jsonInit('POST', { contractVersion: 2, offerToken: params.offer.offer.offerToken, requestId: params.offer.requestId, trialPath: params.trialPath, provider: params.provider, behavior: params.behavior, ...(params.accountTerms ? { termsProfile: ACCOUNT_TERMS_PROFILE } : {}) })))
+  if (!params.accountTerms) {
+    assertActivation(body)
+    return body
+  }
+  if (!isObject(body) || !hasExactKeys(body, ['contractVersion', 'checkoutIntentToken', 'expiresAt', 'disclosure']) || body.contractVersion !== 2 || !isSignedAuthorityToken(body.checkoutIntentToken, 'checkout-intent') || !isUtcTimestamp(body.expiresAt)) throw new Error('Billing did not return a valid annual checkout authority')
+  // Payment starts only on exactly the terms shown before the choice.
+  if (!sameAnnualDisclosure(body.disclosure, params.accountTerms)) throw new AccountTermsUnavailableError('Billing returned annual terms other than the ones shown.')
+  return body as unknown as AnnualCheckoutActivation
 }
 
 function assertSignupPayment(value: unknown): asserts value is SignupAnnualPayment {
@@ -335,13 +450,12 @@ export async function startSignupAnnualPayment(params: { fetcher: BillingV2Fetch
   return body
 }
 
-export async function startAuthenticatedAnnualPayment(params: { fetcher: BillingV2Fetch; billingApiUrl: string; checkoutIntentToken: string; expectedAuthorityId: string; returnUrl: string }): Promise<AuthenticatedAnnualPayment> {
+export async function startAuthenticatedAnnualPayment(params: { fetcher: BillingV2Fetch; billingApiUrl: string; checkoutIntentToken: string; returnUrl: string }): Promise<AuthenticatedAnnualPayment> {
   const { fetcher } = params
-  if (!isUuid(params.expectedAuthorityId)) throw new Error('The expected annual authority is invalid')
   const returnUrl = requireAbsoluteHttpUrl(params.returnUrl)
   const body = await jsonOrThrow(await fetcher(api(params.billingApiUrl, '/subscription/payment-flows/v2'), jsonInit('POST', { contractVersion: 2, checkoutIntentToken: params.checkoutIntentToken, returnUrl })))
+  // authorityId is the server-minted payment flow id, not the offer requestId; the checkout intent token binds the flow server-side.
   assertAuthenticatedPayment(body)
-  if (body.authorityId !== params.expectedAuthorityId) throw new Error('Billing returned payment details for another annual authority')
   return body
 }
 

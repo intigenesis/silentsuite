@@ -35,7 +35,7 @@ vi.mock('lucide-react', () => ({
   Zap: ({ className }: { className?: string }) => <svg data-testid="zap-icon" className={className} />,
 }))
 
-vi.mock('@/app/lib/config', () => ({ BILLING_API_URL: 'https://billing.test' }))
+vi.mock('@/app/lib/config', () => ({ BILLING_API_URL: 'https://billing.test', ETEBASE_SERVER_URL: 'https://server.example.test' }))
 vi.mock('@/app/lib/date', () => ({
   formatDate: (date: Date) => date.toISOString().slice(0, 10),
 }))
@@ -83,18 +83,30 @@ const annualOffer = {
     offerToken: 'signed-offer', expiresAt: '2026-08-10T12:10:00Z',
   },
 }
+// The account panel reads the opt-in preview (`?preview=1`) with the exact
+// signed terms per provider; activation signs exactly the previewed card terms.
+const PROFILE = 'account_confirmation_rules_v1'
+function accountTerms(provider: string) {
+  const prepaid = provider === 'btcpay'
+  return {
+    kind: prepaid ? 'prepaid' : 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: prepaid ? null : 3600,
+    monthlyEquivalentMinor: 300, currency: 'EUR', trialEndsAt: null, firstChargeAt: null, cancelBy: null, cancelByInclusive: false,
+    autoRenew: !prepaid, prepaid, refundWindowDays: 30, bonusDays: 0, periodEndRule: PROFILE, renewalAt: null, entitlementEndsAt: null,
+  }
+}
+const previewOffer = { ...annualOffer, accountTermsProfile: PROFILE, accountDisclosures: { stripe: accountTerms('stripe'), btcpay: accountTerms('btcpay') } }
 const annualActivation = {
   contractVersion: 2,
   checkoutIntentToken: signedCheckoutIntent,
   expiresAt: '2026-08-10T12:05:00Z',
-  disclosure: {
-    kind: 'charge_now', annualAmountMinor: 3600, firstChargeAmountMinor: 3600, renewalAmountMinor: 3600,
-    monthlyEquivalentMinor: 300, currency: 'EUR', trialEndsAt: null, firstChargeAt: null,
-    cancelBy: null, cancelByInclusive: false, autoRenew: true, prepaid: false, refundWindowDays: 30,
-    bonusDays: 0, periodEndRule: 'confirmation_plus_1_utc_calendar_year', renewalAt: null, entitlementEndsAt: null,
-  },
+  disclosure: accountTerms('stripe'),
 }
-const annualStripePayment = { contractVersion: 2, kind: 'stripe', authorityId: annualOffer.requestId, clientSecret: 'cs_test' }
+/** The page's own reads use the plain path; the panel's re-proof uses the opt-in path. */
+function isCurrentFlow(url: string) {
+  return url === `https://billing.test/subscription/payment-flows/current` || url === 'https://billing.test/subscription/payment-flows/current?preview=1'
+}
+// Billing mints the payment flow id server-side; it never equals the offer requestId.
+const annualStripePayment = { contractVersion: 2, kind: 'stripe', authorityId: '6d1f0a94-8c52-4b7e-9f31-2a5d6e8b0c47', clientSecret: 'cs_test' }
 
 function mockSubscription(
   subscription: Record<string, unknown>,
@@ -105,11 +117,11 @@ function mockSubscription(
     if (url === 'https://billing.test/subscription' && !init?.method) {
       return { ok: true, json: async () => response }
     }
-    if (url === 'https://billing.test/subscription/payment-flows/current') {
+    if (isCurrentFlow(url)) {
       return { ok: true, json: async () => ({ flow: currentFlow }) }
     }
-    if (url === 'https://billing.test/subscription/offers/v2') {
-      return { ok: true, json: async () => annualOffer }
+    if (url === 'https://billing.test/subscription/offers/v2?preview=1') {
+      return { ok: true, json: async () => previewOffer }
     }
     if (url === 'https://billing.test/subscription/offers/v2/activate') {
       return { ok: true, json: async () => annualActivation }
@@ -246,7 +258,6 @@ describe('SubscriptionPage billing recovery CTAs', () => {
     render(<SubscriptionPage />)
     fireEvent.click(await screen.findByRole('button', { name: /choose payment/i }))
     fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
     fireEvent.click(await screen.findByRole('button', { name: /mock payment success/i }))
 
     await waitFor(() => expect(screen.queryByRole('dialog', { name: /continue with silentsuite\.io/i })).not.toBeInTheDocument())
@@ -269,8 +280,8 @@ describe('SubscriptionPage billing recovery CTAs', () => {
     }
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
       if (url === 'https://billing.test/subscription' && !init?.method) return { ok: true, json: async () => noCardSubscription }
-      if (url === 'https://billing.test/subscription/payment-flows/current') return { ok: false, json: async () => ({}) }
-      if (url === 'https://billing.test/subscription/offers/v2') return { ok: true, json: async () => annualOffer }
+      if (isCurrentFlow(url)) return { ok: false, json: async () => ({}) }
+      if (url === 'https://billing.test/subscription/offers/v2?preview=1') return { ok: true, json: async () => previewOffer }
       if (url === 'https://billing.test/subscription/payment-flows/cancel') return { ok: false, json: async () => ({ detail: 'Cancellation could not be confirmed.' }) }
       return { ok: false, status: 404, json: async () => ({}) }
     }))
@@ -399,8 +410,8 @@ describe('SubscriptionPage billing recovery CTAs', () => {
           capabilities: { ...baseSubscription.capabilities, canReactivate: true },
         }) }
       }
-      if (url === 'https://billing.test/subscription/payment-flows/current') return { ok: true, json: async () => ({ flow: null }) }
-      if (url === 'https://billing.test/subscription/offers/v2') return { ok: true, json: async () => annualOffer }
+      if (isCurrentFlow(url)) return { ok: true, json: async () => ({ flow: null }) }
+      if (url === 'https://billing.test/subscription/offers/v2?preview=1') return { ok: true, json: async () => previewOffer }
       if (url === 'https://billing.test/subscription/offers/v2/activate') return { ok: true, json: async () => annualActivation }
       if (url === 'https://billing.test/subscription/payment-flows/v2') {
         return { ok: false, status: 500, json: async () => ({ detail: 'Payment setup failed safely' }) }
@@ -412,10 +423,10 @@ describe('SubscriptionPage billing recovery CTAs', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /reactivate/i }))
     fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
 
     expect(await screen.findByText('Payment setup failed safely')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole('button', { name: /confirm annual terms and continue/i })).not.toBeDisabled())
+    // The loading state recovers onto the same choice; no confirmation screen exists.
+    await waitFor(() => expect(screen.getByRole('button', { name: /continue to card payment/i })).not.toBeDisabled())
   })
 
   it('suppresses retry CTA while payment confirmation is pending after client-side success', async () => {
@@ -435,8 +446,8 @@ describe('SubscriptionPage billing recovery CTAs', () => {
               capabilities: { ...baseSubscription.capabilities, canRetryPayment: true, canStartPaidSubscription: true },
             } }
       }
-      if (url === 'https://billing.test/subscription/payment-flows/current') return { ok: true, json: async () => ({ flow: null }) }
-      if (url === 'https://billing.test/subscription/offers/v2') return { ok: true, json: async () => annualOffer }
+      if (isCurrentFlow(url)) return { ok: true, json: async () => ({ flow: null }) }
+      if (url === 'https://billing.test/subscription/offers/v2?preview=1') return { ok: true, json: async () => previewOffer }
       if (url === 'https://billing.test/subscription/offers/v2/activate') return { ok: true, json: async () => annualActivation }
       if (url === 'https://billing.test/subscription/payment-flows/v2') return { ok: true, json: async () => annualStripePayment }
       return { ok: false, status: 404, json: async () => ({}) }
@@ -446,7 +457,6 @@ describe('SubscriptionPage billing recovery CTAs', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /reactivate/i }))
     fireEvent.click(await screen.findByRole('button', { name: /continue to card payment/i }))
-    fireEvent.click(await screen.findByRole('button', { name: /confirm annual terms and continue/i }))
     expect(await screen.findByText('Amount due')).toBeInTheDocument()
     expect(screen.getByText('Powered by Stripe')).toBeInTheDocument()
     vi.useFakeTimers()
@@ -611,7 +621,7 @@ describe('SubscriptionPage billing recovery CTAs', () => {
     vi.useFakeTimers()
     window.history.replaceState({}, '', '/settings/subscription?payment_intent=pi_123&redirect_status=processing')
     const fetchMock = vi.fn(async (url: string) => {
-      if (url === 'https://billing.test/subscription/payment-flows/current') {
+      if (isCurrentFlow(url)) {
         return { ok: true, json: async () => ({ flow: pendingStripeFlow }) }
       }
       if (url === 'https://billing.test/subscription/payment-options?interval=monthly') {
@@ -666,7 +676,7 @@ describe('SubscriptionPage billing recovery CTAs', () => {
   it('opens current-flow recovery after a failed Stripe redirect when subscription data is unavailable', async () => {
     window.history.replaceState({}, '', '/settings/subscription?payment_intent=pi_123&payment_intent_client_secret=secret_123&redirect_status=failed')
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
-      if (url === 'https://billing.test/subscription/payment-flows/current') {
+      if (isCurrentFlow(url)) {
         return { ok: true, json: async () => ({ flow: pendingStripeFlow }) }
       }
       if (url === 'https://billing.test/subscription/payment-options?interval=monthly') {

@@ -33,6 +33,7 @@ const canonicalPaths = {
   paymentSession: '/auth/signup/payment-session/v2',
   finalize: '/auth/signup/finalize-payment/v2',
   authenticatedPaymentFlow: '/subscription/payment-flows/v2',
+  authenticatedPaymentFlowResume: '/subscription/payment-flows/v2/resume',
   paymentSessionCurrent: '/auth/signup/payment-session/v2/current',
   paymentSessionReconcile: '/auth/signup/payment-session/v2/reconcile',
   paymentSessionCancel: '/auth/signup/payment-session/v2/cancel',
@@ -163,7 +164,7 @@ export function checkAnnualBillingV2Contract(root = process.cwd()) {
   for (const name of ['OfferRequest', 'OfferResponse', 'EmailProofRequest', 'EmailProofConsume', 'EmailProofResponse', 'ActivateRequest', 'ActivateResponse', 'ProvisionRequest', 'ProvisionResponse', 'PaymentSessionRequest', 'StripePaymentSessionResponse', 'BtcpayPaymentSessionResponse', 'FinalizeRequest', 'FinalizeResponse', 'AuthenticatedFlowRequest', 'AuthenticatedStripeFlowResponse', 'AuthenticatedBtcpayFlowResponse', 'PaymentSessionRecoveryRequest', 'PaymentSessionRecoveryResponse']) {
     assert(definitions[name]?.additionalProperties === false, `${name} must remain a closed canonical object`)
   }
-  assert(JSON.stringify(definitions.Disclosure.properties.periodEndRule.enum) === JSON.stringify(['activation_plus_trial', 'first_charge_plus_1_utc_calendar_year', 'confirmation_plus_1_utc_calendar_year', 'confirmation_bonus_then_1_utc_calendar_year']), 'Canonical disclosure period-end rules drifted')
+  assert(JSON.stringify(definitions.Disclosure.properties.periodEndRule.enum) === JSON.stringify(['activation_plus_trial', 'first_charge_plus_1_utc_calendar_year', 'confirmation_plus_1_utc_calendar_year', 'confirmation_bonus_then_1_utc_calendar_year', 'account_confirmation_rules_v1']), 'Canonical disclosure period-end rules drifted')
   assert(JSON.stringify(definitions.EmailProofResponse.required) === JSON.stringify(['contractVersion', 'emailOwnershipToken', 'expiresAt']), 'Canonical email proof response drifted')
   assert(JSON.stringify(definitions.StripePaymentSessionResponse.required) === JSON.stringify(['contractVersion', 'kind', 'clientSecret', 'paymentSessionToken']), 'Canonical Stripe session response drifted')
   assert(JSON.stringify(definitions.BtcpayPaymentSessionResponse.required) === JSON.stringify(['contractVersion', 'kind', 'cryptoCheckoutUrl', 'cryptoInvoiceId', 'cryptoInvoiceLookupToken', 'paymentSessionToken']), 'Canonical BTCPay session response drifted')

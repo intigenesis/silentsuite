@@ -45,8 +45,13 @@ export {
   updateItem,
   deleteItem,
   batchUpload,
+  savedRevisionOf,
+  fetchItemFresh,
+  updateItemIfUnchanged,
+  deleteItemIfUnchanged,
+  deleteCollectionIfUnchanged,
 } from './etebase/collections.js';
-export type { CollectionMeta, CollectionMetaUpdate, ItemListResponse } from './etebase/collections.js';
+export type { CollectionMeta, CollectionMetaUpdate, ConditionalDeleteResult, ConditionalUpdateResult, ItemListResponse } from './etebase/collections.js';
 
 // Sharing / invitations
 export {
@@ -57,6 +62,10 @@ export {
   cancelOutgoingInvitation,
   fetchUserProfile,
   inviteToCollection,
+  getPublicKeyFingerprint,
+  snapshotInvitation,
+  InvalidSharingKeyError,
+  InvalidSharingInvitationError,
   listCollectionMembers,
   removeCollectionMember,
   leaveCollection,

@@ -2,8 +2,9 @@ import { createElement } from 'react'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { useAuthStore } from '../use-auth-store'
-import { secureClear } from '@/app/lib/secure-storage'
+import { secureClear, secureSet } from '@/app/lib/secure-storage'
 import { logger } from '@/app/lib/logger'
+import { bumpAccountEpoch, getAccountEpoch } from '@/app/lib/account-epoch'
 
 // Mock fetch globally
 vi.stubGlobal('fetch', vi.fn())
@@ -17,6 +18,8 @@ const {
   taskSetState,
   contactSetState,
   noteSetState,
+  noteLifecycleReset,
+  contactLifecycleReset,
   calendarListSetState,
   taskListSetState,
   contactListSetState,
@@ -32,6 +35,8 @@ const {
   taskSetState: vi.fn(),
   contactSetState: vi.fn(),
   noteSetState: vi.fn(),
+  noteLifecycleReset: vi.fn(),
+  contactLifecycleReset: vi.fn(),
   calendarListSetState: vi.fn(),
   taskListSetState: vi.fn(),
   contactListSetState: vi.fn(),
@@ -56,6 +61,10 @@ vi.mock('@/app/lib/secure-storage', () => ({
   secureGet: vi.fn(async (key: string) => secureStore[key] ?? null),
   secureSet: vi.fn(async (key: string, value: string) => { secureStore[key] = value }),
   secureRemove: vi.fn(async (key: string) => { delete secureStore[key] }),
+  // In-memory stand-in for one IndexedDB transaction (see secure-storage.test.ts for the real one).
+  secureRemoveIfEqual: vi.fn(async (key: string, expected: string) => {
+    if (secureStore[key] === expected) delete secureStore[key]
+  }),
   secureClear: vi.fn(async () => { secureStore = {} }),
   migrateFromLocalStorage: vi.fn(async () => {}),
 }))
@@ -79,17 +88,22 @@ vi.mock('@/app/lib/self-hosted', () => ({
   isCustomServer: (serverUrl?: string) => Boolean(serverUrl && serverUrl !== 'https://server.silentsuite.io'),
 }))
 
-// Mock etebase store (used by logout)
-vi.mock('@/app/stores/use-etebase-store', () => ({
-  useEtebaseStore: {
-    getState: () => ({ destroy: vi.fn() }),
-  },
-}))
+// Mock etebase store (used by logout). Like the real destroy(), teardown
+// invalidates the account epoch and returns the token it produced.
+vi.mock('@/app/stores/use-etebase-store', async () => {
+  const { bumpAccountEpoch } = await import('@/app/lib/account-epoch')
+  return {
+    EtebaseTeardownError: class extends Error {},
+    useEtebaseStore: {
+      getState: () => ({ destroy: vi.fn(() => bumpAccountEpoch()) }),
+    },
+  }
+})
 
 vi.mock('@/app/stores/use-calendar-store', () => ({ useCalendarStore: { setState: calendarSetState } }))
 vi.mock('@/app/stores/use-task-store', () => ({ useTaskStore: { setState: taskSetState } }))
-vi.mock('@/app/stores/use-contact-store', () => ({ useContactStore: { setState: contactSetState } }))
-vi.mock('@/app/stores/use-note-store', () => ({ useNoteStore: { setState: noteSetState } }))
+vi.mock('@/app/stores/use-contact-store', () => ({ useContactStore: { setState: contactSetState }, resetContactLifecycle: contactLifecycleReset }))
+vi.mock('@/app/stores/use-note-store', () => ({ useNoteStore: { setState: noteSetState }, resetNoteLifecycle: noteLifecycleReset }))
 vi.mock('@/app/stores/use-calendar-list-store', () => ({ useCalendarListStore: { setState: calendarListSetState } }))
 vi.mock('@/app/stores/use-task-list-store', () => ({ useTaskListStore: { setState: taskListSetState } }))
 vi.mock('@/app/stores/use-contact-list-store', () => ({ useContactListStore: { setState: contactListSetState } }))
@@ -254,6 +268,78 @@ describe('useAuthStore', () => {
       email: 'recover@example.com', wantsProductUpdates: true, rememberDevice: true,
     })
     expect(secureStore.etebase_session).toBe('mock-saved-session')
+  })
+
+  describe('owner signup cancelled while the session write is pending', () => {
+    const serverUrl = 'https://sync.example.test'
+
+    // Like IndexedDB, the put is queued when issued; only its completion is deferred.
+    function deferNextSessionWrite() {
+      let started!: () => void
+      let release!: () => void
+      const writeStarted = new Promise<void>((resolve) => { started = resolve })
+      const writeDone = new Promise<void>((resolve) => { release = resolve })
+      vi.mocked(secureSet).mockImplementationOnce(async (key: string, value: string) => {
+        secureStore[key] = value
+        started()
+        await writeDone
+      })
+      return { writeStarted, release }
+    }
+
+    function startOwnerSignup(signal: AbortSignal) {
+      return useAuthStore.getState().createEtebaseAccount('owner@example.test', 'OwnerPass1', serverUrl, {
+        ownerPassword: 'installation-password', signal,
+      })
+    }
+
+    function expectNothingPublished() {
+      expect(localStorage.getItem('silentsuite-server-url')).toBeNull()
+      expect(sessionStorage.getItem('silentsuite-signup-in-progress')).toBeNull()
+      expect(useAuthStore.getState().pendingSignup).toBeNull()
+      expect(useAuthStore.getState().isLoading).toBe(false)
+    }
+
+    it('leaves no session, endpoint, signup marker or ready signup', async () => {
+      const controller = new AbortController()
+      const write = deferNextSessionWrite()
+      const signup = startOwnerSignup(controller.signal)
+      await write.writeStarted
+      controller.abort()
+      write.release()
+      await expect(signup).rejects.toMatchObject({ name: 'AbortError' })
+      expect(secureStore.etebase_session).toBeUndefined()
+      expectNothingPublished()
+    })
+
+    it('never removes or replaces a newer session written meanwhile', async () => {
+      const controller = new AbortController()
+      const write = deferNextSessionWrite()
+      const signup = startOwnerSignup(controller.signal)
+      await write.writeStarted
+      await secureSet('etebase_session', 'newer-session')
+      controller.abort()
+      write.release()
+      await expect(signup).rejects.toMatchObject({ name: 'AbortError' })
+      expect(secureStore.etebase_session).toBe('newer-session')
+      expectNothingPublished()
+    })
+
+    it('still persists and publishes when not aborted', async () => {
+      const controller = new AbortController()
+      const write = deferNextSessionWrite()
+      const signup = startOwnerSignup(controller.signal)
+      await write.writeStarted
+      expect(useAuthStore.getState().pendingSignup).toBeNull()
+      write.release()
+      await signup
+      expect(secureStore.etebase_session).toBe('mock-saved-session')
+      expect(localStorage.getItem('silentsuite-server-url')).toBe(serverUrl)
+      expect(sessionStorage.getItem('silentsuite-signup-in-progress')).toBe('true')
+      expect(useAuthStore.getState().pendingSignup).toMatchObject({
+        email: 'owner@example.test', serverUrl, etebaseAccountReady: true,
+      })
+    })
   })
 
   it('keeps custom-server signup and finalization out of hosted Billing', async () => {
@@ -1710,6 +1796,75 @@ describe('useAuthStore', () => {
   })
 
   // --- refreshSession non-destructive on transient errors ---
+  it('does not resurrect authentication while logout server deletion is still pending', async () => {
+    const user = { id: 'payment-account-a', email: 'a@example.invalid', planId: 'early_annual', rememberDevice: true }
+    useAuthStore.setState({ user, isAuthenticated: true })
+    let releaseRefresh!: (response: Response) => void
+    const refreshReply = new Promise<Response>(resolve => { releaseRefresh = resolve })
+    let releaseDelete!: () => void
+    const deleteReply = new Promise<void>(resolve => { releaseDelete = resolve })
+    let entered!: () => void
+    const refreshEntered = new Promise<void>(resolve => { entered = resolve })
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/auth/refresh')) { entered(); return refreshReply }
+      expect(init?.method).toBe('DELETE')
+      await deleteReply
+      return new Response(null, { status: 204 })
+    })
+    const refresh = useAuthStore.getState().refreshSession()
+    await refreshEntered
+    const logout = useAuthStore.getState().logout()
+    expect(useAuthStore.getState().user).toBeNull()
+    expect(useAuthStore.getState().isAuthenticated).toBe(false)
+    try {
+      releaseRefresh(new Response(JSON.stringify(user)))
+      await refresh
+      expect(useAuthStore.getState().user).toBeNull()
+      expect(useAuthStore.getState().isAuthenticated).toBe(false)
+    } finally {
+      releaseDelete()
+      await logout
+    }
+  })
+
+  // Payment recovery must use this real refresh boundary without allowing a
+  // late response to resurrect logout or overwrite a replacement identity.
+  it.each(['logout', 'replacement', 'replacement-rejection'] as const)('ignores a refresh response after %s changes the account boundary', async transition => {
+    const original = { id: 'payment-account-a', email: 'a@example.invalid', planId: 'early_annual', rememberDevice: true }
+    const replacement = { id: 'payment-account-b', email: 'b@example.invalid', planId: 'standard_annual', rememberDevice: true }
+    useAuthStore.setState({ user: original, isAuthenticated: true, subscriptionStatus: 'cancelled' })
+    let release!: (response: Response) => void
+    const pendingResponse = new Promise<Response>(resolve => { release = resolve })
+    let entered!: () => void
+    const requestEntered = new Promise<void>(resolve => { entered = resolve })
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/auth/refresh')) {
+        expect(init?.method).toBe('POST')
+        expect(init?.credentials).toBe('include')
+        entered()
+        return pendingResponse
+      }
+      return new Response(null, { status: 204 }) // existing logout/delete boundary
+    })
+    const epoch = getAccountEpoch()
+    const refresh = useAuthStore.getState().refreshSession()
+    await requestEntered
+    if (transition === 'logout') await useAuthStore.getState().logout()
+    else {
+      bumpAccountEpoch()
+      useAuthStore.setState({ user: replacement, isAuthenticated: true, subscriptionStatus: 'active' })
+    }
+    expect(getAccountEpoch()).toBeGreaterThan(epoch)
+    const afterTransition = useAuthStore.getState()
+    release(transition === 'replacement-rejection'
+      ? new Response(JSON.stringify({ type: 'invalid-access-token' }), { status: 401 })
+      : new Response(JSON.stringify({ ...original, emailVerified: true })))
+    await refresh
+    expect(useAuthStore.getState().user).toEqual(afterTransition.user)
+    expect(useAuthStore.getState().isAuthenticated).toBe(afterTransition.isAuthenticated)
+    expect(useAuthStore.getState().subscriptionStatus).toBe(afterTransition.subscriptionStatus)
+  })
+
   // Regression: the EmailVerificationBanner re-checks the session on every
   // tab focus while the user is unverified. A transient billing 5xx or a
   // network blip used to null the session, silently logging out users who

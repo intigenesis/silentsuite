@@ -15,11 +15,13 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.CalendarContract
 import android.text.TextUtils
+import androidx.annotation.VisibleForTesting
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.lifecycle.lifecycleScope
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.Preference
+import androidx.preference.PreferenceCategory
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.SwitchPreferenceCompat
 import at.bitfire.cert4android.CustomCertManager
@@ -30,6 +32,9 @@ import io.silentsuite.sync.App
 import io.silentsuite.sync.BuildConfig
 import io.silentsuite.sync.InvalidAccountException
 import io.silentsuite.sync.R
+import io.silentsuite.sync.notes.NotesSyncCoordinator
+import io.silentsuite.sync.notes.NotesSyncPolicy
+import io.silentsuite.sync.syncadapter.SyncStatusStore
 import io.silentsuite.sync.ui.settings.AppPreferences
 import io.silentsuite.sync.ui.settings.SettingsCategory
 import io.silentsuite.sync.ui.setup.ExactAccountRouting
@@ -39,6 +44,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.silentsuite.sync.ui.settings.ProxySettingsValidation
+import java.util.UUID
+
+/** An address book offered by Settings → Recover deleted contacts; identifiers and name only. */
+internal data class RecoveryAddressBook(val uid: String, val name: String)
+
+internal const val RECOVERY_NONE_KEY = "recover_deleted_contacts_none"
+
+internal fun recoveryAddressBookKey(account: Account, addressBookUid: String) =
+    "recover_deleted_contacts:${account.name}:$addressBookUid"
 
 class AppSettingsActivity : BaseActivity() {
     var selectedAccount: Account? = null
@@ -57,6 +71,20 @@ class AppSettingsActivity : BaseActivity() {
         private const val STATE_CREATION_ID = "state_creation_id"
         private const val STATE_EXPLICIT_ACCOUNT = "state_explicit_account"
         private const val STATE_CATEGORY = "state_category"
+
+        /**
+         * No-network instrumentation seam for the Notes toggle's side effect: the immediate sync
+         * after enabling, or the job cancellation after disabling. Production leaves this null.
+         */
+        @VisibleForTesting
+        @JvmField internal var notesToggleEffectOverride: ((Context, Account, String, Boolean) -> Unit)? = null
+
+        /**
+         * No-network instrumentation seam for the address books the recovery picker lists for one
+         * exact account generation. Production reads the account's local collection cache.
+         */
+        @VisibleForTesting
+        @JvmField internal var recoveryAddressBooksOverride: ((Context, Account, String) -> List<RecoveryAddressBook>)? = null
 
         /** Global settings have no account identity and intentionally carry no account extra. */
         fun newIntent(context: Context): Intent = Intent(context, AppSettingsActivity::class.java)
@@ -80,12 +108,14 @@ class AppSettingsActivity : BaseActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
         AppPreferences(this) // complete migration before any screen or process consumer reads values
+        // Restored category fragments build their account-scoped preferences while the framework
+        // recreates them inside super.onCreate, so the exact account must be resolved first.
         val accountRoute = resolveAccount(savedInstanceState)
         selectedAccount = accountRoute.account
         selectedCreationId = accountRoute.creationId
         hasExplicitAccountRoute = accountRoute.explicit
+        super.onCreate(savedInstanceState)
         currentCategory = savedInstanceState?.getString(STATE_CATEGORY)?.let(SettingsCategory::fromRoute)
             ?: SettingsCategory.fromRoute(intent.getStringExtra(EXTRA_CATEGORY))
 
@@ -140,6 +170,29 @@ class AppSettingsActivity : BaseActivity() {
         return exact
     }
 
+    /**
+     * The exact accounts whose address books the recovery picker offers: only the routed account
+     * for an explicit route, which never falls back to another account, otherwise every account.
+     */
+    internal fun recoveryAccounts(): List<Pair<Account, String>> {
+        if (hasExplicitAccountRoute) {
+            val exact = exactSelectedAccount() ?: return emptyList()
+            return listOf(exact to selectedCreationId!!)
+        }
+        val manager = AccountManager.get(this)
+        return manager.getAccountsByType(App.accountType).mapNotNull { account ->
+            val creationId = manager.getUserData(account, AccountSettings.KEY_CREATION_ID) ?: return@mapNotNull null
+            ExactAccountRouting.validate(account, creationId, App.accountType, manager)?.let { it to creationId }
+        }
+    }
+
+    internal fun canRecoverContacts(): Boolean = !hasExplicitAccountRoute || exactSelectedAccount() != null
+
+    internal fun showRecoverContacts() {
+        supportFragmentManager.beginTransaction().replace(android.R.id.content, RecoverContactsFragment())
+            .addToBackStack(RecoverContactsFragment::class.java.name).commit()
+    }
+
     internal fun showCategory(category: SettingsCategory, addToBackStack: Boolean = true) {
         currentCategory = category
         val fragment = if (category == SettingsCategory.HOME) HomeFragment() else CategoryFragment.newInstance(category)
@@ -150,6 +203,10 @@ class AppSettingsActivity : BaseActivity() {
     }
 
     private fun updateTitle() {
+        if (supportFragmentManager.findFragmentById(android.R.id.content) is RecoverContactsFragment) {
+            title = getString(R.string.settings_recover_deleted_contacts)
+            return
+        }
         title = getString(when (currentCategory) {
             SettingsCategory.HOME -> R.string.app_settings
             SettingsCategory.ACCOUNT -> R.string.settings_category_account
@@ -183,6 +240,87 @@ class AppSettingsActivity : BaseActivity() {
                     activity.showCategory(category)
                     true
                 }
+            }
+            findPreference<Preference>("recover_deleted_contacts")?.apply {
+                isEnabled = activity.canRecoverContacts()
+                setOnPreferenceClickListener {
+                    if (!activity.canRecoverContacts()) return@setOnPreferenceClickListener false
+                    activity.showRecoverContacts()
+                    true
+                }
+            }
+        }
+    }
+
+    /** Settings → Recover deleted contacts: pick an account's address book to open its deleted contacts. */
+    class RecoverContactsFragment : PreferenceFragmentCompat() {
+        private val host: AppSettingsActivity get() = requireActivity() as AppSettingsActivity
+
+        override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
+            preferenceManager.sharedPreferencesName = AppPreferences.PREFERENCES_NAME
+            val screen = preferenceManager.createPreferenceScreen(requireContext())
+            preferenceScreen = screen
+            val targets = host.recoveryAccounts()
+            val appContext = requireContext().applicationContext
+            lifecycleScope.launch {
+                val loaded = withContext(Dispatchers.IO) {
+                    targets.map { (account, creationId) -> Triple(account, creationId, loadAddressBooks(appContext, account, creationId)) }
+                }
+                if (!isAdded) return@launch
+                // Publish only generations that are still current; a replaced account shows nothing.
+                val current = loaded.filter { (account, creationId, books) ->
+                    books != null && ExactAccountRouting.validate(account, creationId, App.accountType,
+                        AccountManager.get(appContext)) != null
+                }
+                current.forEach { (account, creationId, books) ->
+                    val category = PreferenceCategory(requireContext()).apply { title = account.name }
+                    screen.addPreference(category)
+                    books!!.forEach { book ->
+                        category.addPreference(Preference(requireContext()).apply {
+                            key = recoveryAddressBookKey(account, book.uid)
+                            title = book.name
+                            isPersistent = false
+                            setOnPreferenceClickListener { open(account, creationId, book.uid) }
+                        })
+                    }
+                }
+                if (current.all { it.third.isNullOrEmpty() }) screen.addPreference(Preference(requireContext()).apply {
+                    key = RECOVERY_NONE_KEY
+                    setTitle(R.string.settings_recover_deleted_contacts_none)
+                    isEnabled = false
+                    isPersistent = false
+                })
+            }
+        }
+
+        private fun open(account: Account, creationId: String, addressBookUid: String): Boolean {
+            val context = requireContext()
+            if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null) {
+                requireActivity().finish()
+                return false
+            }
+            startActivity(io.silentsuite.sync.ui.etebase.CollectionActivity.newRecoveryIntent(context, account, creationId, addressBookUid))
+            return true
+        }
+
+        private fun loadAddressBooks(context: Context, account: Account, creationId: String): List<RecoveryAddressBook>? {
+            if (ExactAccountRouting.validate(account, creationId, App.accountType, AccountManager.get(context)) == null)
+                return null
+            if (BuildConfig.DEBUG) recoveryAddressBooksOverride?.let { return it(context, account, creationId) }
+            return try {
+                val settings = AccountSettings(context, account)
+                val cache = io.silentsuite.sync.EtebaseLocalCache.getInstance(context, account.name)
+                val httpClient = io.silentsuite.sync.HttpClient.Builder(context).setForeground(true).build().okHttpClient
+                val colMgr = io.silentsuite.sync.EtebaseLocalCache.getEtebase(context, httpClient, settings).collectionManager
+                synchronized(cache) {
+                    cache.decodableCollectionList(colMgr, io.silentsuite.sync.Constants.ETEBASE_TYPE_ADDRESS_BOOK) { _, error ->
+                        // The binding's message can quote a decrypted value; log only the exception class.
+                        io.silentsuite.sync.log.Logger.log.warning("Skipping an address book that could not be decoded: ${error.javaClass.name}")
+                    }
+                }.map { RecoveryAddressBook(it.col.uid, it.meta.name.orEmpty()) }
+            } catch (e: Exception) {
+                io.silentsuite.sync.log.Logger.log.warning("Could not list address books for recovery: ${e.javaClass.name}")
+                null
             }
         }
     }
@@ -248,6 +386,32 @@ class AppSettingsActivity : BaseActivity() {
                 setOnPreferenceClickListener {
                     val exact = exactSelectedAccount() ?: return@setOnPreferenceClickListener false
                     startActivity(AccountActivity.newIntent(requireContext(), exact, host.selectedCreationId!!))
+                    true
+                }
+            }
+            requirePreference<SwitchPreferenceCompat>("notes_enabled").apply {
+                isEnabled = account != null
+                isChecked = account != null && AccountSettings.notesEnabled(AccountManager.get(requireContext()), account)
+                setOnPreferenceChangeListener { _, value ->
+                    // Revalidate the retained generation immediately before the account-scoped write.
+                    val exact = exactSelectedAccount() ?: return@setOnPreferenceChangeListener false
+                    val creationId = host.selectedCreationId ?: return@setOnPreferenceChangeListener false
+                    val enabled = value as Boolean
+                    val appContext = requireContext().applicationContext
+                    if (!AccountSettings.writeNotesEnabled(AccountManager.get(appContext), exact, enabled))
+                        return@setOnPreferenceChangeListener false
+                    notesToggleEffectOverride?.invoke(appContext, exact, creationId, enabled) ?: run {
+                        if (enabled) {
+                            // A service that never synced would pull the dashboard to "First sync
+                            // pending", so enabling runs a Notes sync right away.
+                            val requestId = UUID.randomUUID().toString()
+                            SyncStatusStore(appContext).recordRequested(exact, setOf(SyncStatusStore.Service.NOTES),
+                                requestId, System.currentTimeMillis())
+                            NotesSyncCoordinator.request(appContext, exact, creationId, NotesSyncPolicy.Trigger.TOGGLE, requestId)
+                        } else {
+                            NotesSyncCoordinator.cancel(ExactAccountIdentity(exact.type, exact.name, creationId))
+                        }
+                    }
                     true
                 }
             }
@@ -451,6 +615,10 @@ class AppSettingsActivity : BaseActivity() {
             requirePreference<SwitchPreferenceCompat>("log_verbose").apply {
                 isChecked = appPreferences.verboseLogging
                 setOnPreferenceChangeListener { _, value -> appPreferences.verboseLogging = value as Boolean; true }
+            }
+            requirePreference<Preference>("show_scheduling_diagnostics").setOnPreferenceClickListener {
+                startActivity(DebugInfoActivity.newSchedulingIntent(requireContext()))
+                true
             }
             requirePreference<Preference>("show_debug_info").setOnPreferenceClickListener {
                 startActivity(DebugInfoActivity.newIntent(requireContext(), AppSettingsActivity::class.java.name))

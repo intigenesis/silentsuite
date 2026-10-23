@@ -2,6 +2,7 @@
 
 import { create } from 'zustand'
 import { BILLING_API_URL, ETEBASE_SERVER_URL } from '@/app/lib/config'
+import { normalizeServerUrl } from '@/app/lib/server-url'
 import type {
   CollectionAccessLevel,
   CollectionType,
@@ -10,8 +11,13 @@ import type {
 } from '@silentsuite/core'
 import {
   enqueue,
+  casStub,
   getAll as getQueuedMutations,
+  insertIfNoOutstanding,
+  isLegacyEntry,
   isOfflineError,
+  readOutstanding,
+  replaceStub,
   remove as removeQueuedMutation,
   removeItemMutations as removeQueuedItemMutations,
   type ConfirmedRemoteMutation,
@@ -35,11 +41,23 @@ import {
   deleteItem as cacheDeleteItem,
   replaceItemsForCollection as cacheReplaceItemsForCollection,
   isCacheEnabled as isLocalCacheEnabled,
+  openQueuePayload as cacheOpenQueuePayload,
+  sealQueuePayload as cacheSealQueuePayload,
+  sealedPayloadDigest as cacheSealedPayloadDigest,
   type CachedItem,
 } from '@/app/lib/data-cache'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
 import { RestoreDiagnosticsRecorder, classifySessionPersistence } from '@/app/lib/sync-restore-diagnostics'
-import { AccountBoundaryChangedError, assertCurrentAccountEpoch, bumpAccountEpoch, getAccountEpoch, isCurrentAccountEpoch } from '@/app/lib/account-epoch'
+import {
+  AccountBoundaryChangedError,
+  assertCurrentAccountEpoch,
+  bumpAccountEpoch,
+  establishLogoutGeneration,
+  getAccountEpoch,
+  isCurrentAccountEpoch,
+  readLogoutGeneration,
+  releaseLogoutGeneration,
+} from '@/app/lib/account-epoch'
 import { assertOfflineQueueAccountGuard, captureOfflineQueueAccountGuard } from '@/app/lib/offline-queue-account'
 
 /**
@@ -62,13 +80,7 @@ function isValidServerUrl(url: string): boolean {
   }
 }
 
-/** Normalize a server URL: trim, add https:// if no protocol present. */
-export function normalizeServerUrl(url: string): string {
-  const trimmed = url.trim()
-  if (!trimmed) return trimmed
-  if (!/^https?:\/\//i.test(trimmed)) return `https://${trimmed}`
-  return trimmed
-}
+export { normalizeServerUrl }
 
 /** Read the user's custom server URL from localStorage, falling back to the env default. */
 function getServerUrl(): string {
@@ -94,7 +106,8 @@ type DomainLoadState = Record<CollectionTypeKey, DomainLoadStatus>
 type CollectionMetaUpdates = { name?: string; description?: string; color?: string; mtime?: number }
 type EtebaseCore = typeof import('@silentsuite/core')
 
-type CachedContentItem = { uid: string; content: string; collectionUid: string; meta?: ItemMeta }
+/** `revision` is paired from the same SDK item as `content` by core `savedRevisionOf` (#744); null when unknown. */
+type CachedContentItem = { uid: string; content: string; collectionUid: string; meta?: ItemMeta; revision: string | null }
 
 /** One visible domain reaching a terminal state during initial restore. */
 export type InitialVisibleDomainKey = VisibleCollectionTypeKey
@@ -185,11 +198,17 @@ async function ensureCollectionsForAccount(
     preferences: [],
   }
 
-  for (const [key, colType, defaultName] of COLLECTION_DEFINITIONS) {
+  // List every type before creating anything: a default is admitted only when
+  // the whole discovery completed, never from a partial or failed listing.
+  for (const [key, colType] of COLLECTION_DEFINITIONS) {
     const existing = await core.listCollections(account, colType)
     if (accountEpoch !== undefined) assertCurrentAccountEpoch(accountEpoch)
+    collections[key] = existing
+  }
+
+  for (const [key, colType, defaultName] of COLLECTION_DEFINITIONS) {
+    const existing = collections[key]
     if (existing.length > 0) {
-      collections[key] = existing
       logger.debug(`[etebase-store] Found ${existing.length} existing ${key} collection(s)`)
     } else if (key !== 'notes') {
       if (accountEpoch !== undefined) assertCurrentAccountEpoch(accountEpoch)
@@ -201,6 +220,94 @@ async function ensureCollectionsForAccount(
   }
 
   return collections
+}
+
+/** destroy() failed after invalidating the account boundary; `epoch` is the token it produced. */
+export class EtebaseTeardownError extends Error {
+  constructor(readonly epoch: number, readonly teardownError: unknown) {
+    super('Etebase teardown failed after account invalidation')
+    this.name = 'EtebaseTeardownError'
+  }
+}
+
+/**
+ * Account epoch whose initial collection discovery failed before the
+ * SyncEngine was started. A later successful reconcile for the same epoch
+ * starts that engine once; any other epoch ignores it.
+ */
+let pendingSyncEngineStartEpoch: number | null = null
+
+/**
+ * Construct, track, and start the SyncEngine for discovered collections.
+ * Returns null (after stopping the engine) when the account boundary changed
+ * while starting.
+ */
+async function startSyncEngine(
+  core: EtebaseCore,
+  account: any,
+  serverUrl: string,
+  collections: Record<CollectionTypeKey, any[]>,
+  accountEpoch: number,
+  cacheEnabled: boolean,
+  diagnostics?: RestoreDiagnosticsRecorder,
+): Promise<any | null> {
+  const engine = new core.SyncEngine({
+    serverUrl,
+    pollIntervalMs: 30_000,
+  })
+
+  try {
+    return await trackAndStartSyncEngine(engine, account, collections, accountEpoch, cacheEnabled, diagnostics)
+  } catch (err) {
+    // A partially started engine may already hold a poll or reconnect timer.
+    engine.stop()
+    throw err
+  }
+}
+
+async function trackAndStartSyncEngine(
+  engine: any,
+  account: any,
+  collections: Record<CollectionTypeKey, any[]>,
+  accountEpoch: number,
+  cacheEnabled: boolean,
+  diagnostics?: RestoreDiagnosticsRecorder,
+): Promise<any | null> {
+  // Track all collections
+  diagnostics?.startPhase('syncEngineTrackCollections')
+  for (const [key, colType] of COLLECTION_DEFINITIONS) {
+    for (const collection of collections[key]) {
+      await trackCollectionWithSyncEngine(engine, colType, key, collection.uid, accountEpoch)
+      assertCurrentAccountEpoch(accountEpoch)
+    }
+  }
+  diagnostics?.completePhase('syncEngineTrackCollections', {
+    collectionCount: COLLECTION_DEFINITIONS.reduce((count, [key]) => count + collections[key].length, 0),
+  })
+
+  // Seed persisted stokens before starting so the first sync round
+  // pulls only deltas instead of refetching the whole vault. Wire the
+  // advance handler so subsequent stoken updates are persisted too.
+  if (cacheEnabled) {
+    engine.onStokenAdvance((event: { collectionType: string; collectionUid: string; stoken: string | null }) => {
+      if (!isCurrentAccountEpoch(accountEpoch)) return
+      const key = collectionTypeToKey(event.collectionType)
+      if (!key) return
+      void cacheSetStoken(key, event.collectionUid, event.stoken, accountEpoch).catch((err) => {
+        if (err instanceof AccountBoundaryChangedError) return
+        logger.warn('[etebase-store] Failed to persist sync cursor', getSafeErrorDetails(err))
+      })
+    })
+  }
+
+  diagnostics?.startPhase('syncEngineStart')
+  await engine.start(account)
+  if (!isCurrentAccountEpoch(accountEpoch)) {
+    engine.stop()
+    return null
+  }
+  diagnostics?.completePhase('syncEngineStart')
+  return engine
 }
 
 /**
@@ -339,7 +446,22 @@ async function writeItemToCache(
     content: await toCacheContent(type, itemUid, collectionUid, content, meta),
     lastModified: Date.now(),
   }
-  await cachePutItem(record, accountEpoch)
+  await displayCacheAfterAck(() => cachePutItem(record, accountEpoch), accountEpoch)
+}
+
+/**
+ * A display-cache write after the server acknowledged a change. The cache is
+ * never authority: a record another tab cleared or re-owned refuses the write,
+ * and that does not undo the remote change while this tab still owns its
+ * account. A boundary this tab crossed still propagates.
+ */
+async function displayCacheAfterAck(write: () => Promise<void>, accountEpoch: number): Promise<void> {
+  try {
+    await write()
+  } catch (err) {
+    if (!(err instanceof AccountBoundaryChangedError) || !isCurrentAccountEpoch(accountEpoch)) throw err
+    logger.warn('[etebase-store] Display cache refused a write after a remote change')
+  }
 }
 
 /**
@@ -395,6 +517,889 @@ export async function keepPendingCacheRecords(
 }
 
 /**
+ * When painting from the cache, hide records whose delete is still pending in
+ * the offline queue of this account. The cached copy stays for replay; a queue
+ * that cannot be read hides nothing.
+ */
+export async function withoutPendingDeletes(
+  type: CollectionTypeKey,
+  records: CachedItem[],
+  accountEpoch: number,
+  accountFingerprint: string | null,
+): Promise<CachedItem[]> {
+  if (!accountFingerprint || records.length === 0) return records
+  let entries: QueueEntry[]
+  try {
+    entries = await getQueuedMutations({ accountEpoch, accountFingerprint })
+  } catch (err) {
+    if (err instanceof AccountBoundaryChangedError) throw err
+    // A read that failed across an account change belongs to the old account.
+    assertCurrentAccountEpoch(accountEpoch)
+    logger.warn('[etebase-store] Failed to read pending deletes for cache hydration', getSafeErrorDetails(err))
+    return records
+  }
+  assertCurrentAccountEpoch(accountEpoch)
+  const deletedUids = new Set(
+    entries
+      .filter((entry) => entry.type === 'delete' && entry.status === 'pending' && entry.collectionType === type && entry.itemUid)
+      .map((entry) => entry.itemUid as string),
+  )
+  if (deletedUids.size === 0) return records
+  return records.filter((record) => !deletedUids.has(record.itemUid))
+}
+
+export type SealIntent = 'note' | 'favorite'
+
+interface SealedNotePayload {
+  v: 1
+  kind: 'note'
+  body: { content: string; meta: { name: string; mtime: number } }
+  base: { revision: string | null; digest: string }
+  prior: string[]
+}
+
+const SEALED_DIGEST = /^[0-9a-f]{64}$/
+
+function hasExactKeys(value: unknown, keys: string[]): value is Record<string, any> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const own = Object.keys(value)
+  return own.length === keys.length && keys.every((key) => own.includes(key))
+}
+
+/** Exact validation of an opened sealed note payload (#744 §2); anything else is unreadable. */
+function parseSealedNotePayload(plaintext: string): SealedNotePayload | null {
+  let value: unknown
+  try {
+    value = JSON.parse(plaintext)
+  } catch {
+    return null
+  }
+  if (!hasExactKeys(value, ['v', 'kind', 'body', 'base', 'prior'])) return null
+  if (value.v !== 1 || value.kind !== 'note') return null
+  const { body, base, prior } = value
+  if (!hasExactKeys(body, ['content', 'meta']) || typeof body.content !== 'string') return null
+  if (!hasExactKeys(body.meta, ['name', 'mtime']) || typeof body.meta.name !== 'string') return null
+  if (typeof body.meta.mtime !== 'number' || !Number.isFinite(body.meta.mtime)) return null
+  if (!hasExactKeys(base, ['revision', 'digest'])) return null
+  if (base.revision !== null && !(typeof base.revision === 'string' && base.revision.length > 0)) return null
+  if (typeof base.digest !== 'string' || !SEALED_DIGEST.test(base.digest)) return null
+  if (!Array.isArray(prior) || prior.length > 32) return null
+  if (!prior.every((digest: unknown) => typeof digest === 'string' && SEALED_DIGEST.test(digest))) return null
+  return value as SealedNotePayload
+}
+
+/** The text an edit was typed on, with the server revision it was read at (null if unknown). */
+export interface SealedEditingBase {
+  title: string
+  content: string
+  revision: string | null
+}
+
+function knownRevision(revision: unknown): revision is string {
+  return typeof revision === 'string' && revision.length > 0
+}
+
+/** Live note equality with the editing base, after the producer title normalization. */
+async function noteMatchesBase(
+  core: EtebaseCore,
+  item: any,
+  itemUid: string,
+  base: SealedEditingBase,
+  assertGuard: () => void,
+): Promise<boolean> {
+  if (!item || item.isDeleted) return false
+  const raw = await item.getContent()
+  assertGuard()
+  const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw)
+  const title = core.noteFromEtebaseItem(itemUid, '', item.getMeta()).title
+  return title === core.noteFromEtebaseItem(itemUid, '', { name: base.title }).title && text === base.content
+}
+
+/**
+ * Stub succession (#744 §4, §7 step 2). The new text may replace the note's
+ * sealed record only if that record is its single outstanding custody, opens
+ * and validates, and is the text this edit was typed on. The replacement
+ * keeps the original base proof and appends the replaced body's digest to
+ * `prior`; it never takes a cached or fetched server revision. Anything else
+ * resolves false and leaves the accepted bytes untouched.
+ */
+async function replaceNoteStubWithDescendant(
+  outstanding: QueueEntry[],
+  itemUid: string,
+  content: string,
+  meta: ItemMeta | undefined,
+  base: SealedEditingBase,
+  offlineQueueGuard: OfflineQueueAccountGuard,
+  accountEpoch: number,
+  getState: () => EtebaseState,
+): Promise<boolean> {
+  const assertGuard = () => assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  const stub = outstanding[0]
+  if (outstanding.length !== 1 || !stub || stub.type !== 'sealed-update' || !stub.sealed || typeof stub.rev !== 'number') return false
+  if (typeof meta?.name !== 'string' || typeof meta.mtime !== 'number' || !Number.isFinite(meta.mtime)) return false
+  const associatedData = `${offlineQueueGuard.accountFingerprint}|notes|${itemUid}`
+  const opened = await cacheOpenQueuePayload(stub.sealed, associatedData, accountEpoch)
+  assertGuard()
+  if (opened.kind !== 'opened') return false
+  const payload = parseSealedNotePayload(opened.plaintext)
+  if (!payload) return false
+  const core = await import('@silentsuite/core')
+  assertGuard()
+  const normTitle = (name: string) => core.noteFromEtebaseItem(itemUid, '', { name }).title
+  // The declared causal relation: this edit was typed on the stub's own text.
+  if (normTitle(payload.body.meta.name) !== normTitle(base.title) || payload.body.content !== base.content) return false
+  const replacedDigest = await cacheSealedPayloadDigest(['note', normTitle(payload.body.meta.name), payload.body.content])
+  assertGuard()
+  const successor = {
+    v: 1,
+    kind: 'note',
+    body: { content, meta: { name: meta.name, mtime: meta.mtime } },
+    base: payload.base,
+    prior: [...payload.prior, replacedDigest].slice(-32),
+  }
+  const sealed = await cacheSealQueuePayload(JSON.stringify(successor), associatedData, accountEpoch)
+  assertGuard()
+  if (!sealed) return false
+  const replaced = await replaceStub({ collectionType: 'notes', itemUid }, { id: stub.id, rev: stub.rev }, sealed, offlineQueueGuard)
+  assertGuard()
+  if (!replaced) return false
+  // Custody is durable; a failed display write does not revoke acceptance.
+  try {
+    const collectionUid = stub.collectionUid ?? ''
+    const cacheContent = await toCacheContent('notes', itemUid, collectionUid, content, meta)
+    assertGuard()
+    await cachePutItem({ itemUid, collectionType: 'notes', collectionUid, content: cacheContent, lastModified: Date.now() }, accountEpoch, { allowWithoutFeatureFlag: true })
+  } catch (displayErr) {
+    // Only a boundary this tab crossed revokes it; a display record another tab cleared does not.
+    if (displayErr instanceof AccountBoundaryChangedError && !isCurrentAccountEpoch(accountEpoch)) throw displayErr
+    logger.warn('[etebase-store] Display write after sealed succession failed', getSafeErrorDetails(displayErr))
+  }
+  assertGuard()
+  return true
+}
+
+type UpdateItemOptions = NonNullable<Parameters<EtebaseActions['updateItem']>[3]>
+
+/**
+ * A sealed-intent note save (#744 §7). It dispatches only at the captured
+ * base revision, through a clone, and never borrows the cached item's own
+ * revision. On a conflict or an unknown revision it rebinds once to a fresh,
+ * live copy that still equals the base. A known conflict is never admitted
+ * offline; any other network failure goes through checked admission.
+ */
+async function updateNoteAtCapturedBase(
+  itemUid: string,
+  content: string,
+  options: UpdateItemOptions,
+  get: () => EtebaseState,
+  set: (partial: Partial<EtebaseState>) => void,
+): Promise<'remote' | 'queued' | false> {
+  const accountEpoch = getAccountEpoch()
+  const { account, collections, itemCache, itemCollectionMap, accountFingerprint } = get()
+  const offlineQueueGuard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
+  if (!offlineQueueGuard) return false
+  const refuse = (): false => {
+    if (isCurrentAccountEpoch(accountEpoch)) options.onRefused?.()
+    return false
+  }
+  const base = options.base
+  if (!base) return refuse()
+  const knownCollectionUid = itemCollectionMap.get(itemUid) ?? options.collectionUid
+  if (!knownCollectionUid) return refuse()
+  const collection = resolveCollection(collections, 'notes', knownCollectionUid)
+  const cached = itemCache.get(itemUid)
+  const meta = options.meta
+  const assertGuard = () => assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+  let admissionRevision: string | null = knownRevision(base.revision) ? base.revision : null
+  let sawConflict = false
+  let proving = false
+  const admitOffline = async (): Promise<'queued' | false> => {
+    const queued = await queueOfflineUpdate(
+      'notes',
+      itemUid,
+      collection?.uid ?? knownCollectionUid,
+      content,
+      meta,
+      { ...options, admissionRevision },
+      offlineQueueGuard,
+      accountEpoch,
+      get,
+    )
+    return queued === 'queued' ? 'queued' : refuse()
+  }
+  // Outstanding custody comes first (§7 step 2): no dispatch or admission runs
+  // while this note has queued work, except a proved descendant of its stub.
+  let outstanding: QueueEntry[]
+  try {
+    outstanding = await readOutstanding({ collectionType: 'notes', itemUid }, offlineQueueGuard)
+    assertGuard()
+  } catch (err) {
+    if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return false
+    return refuse()
+  }
+  if (outstanding.length > 0) {
+    options.onCustodyObserved?.()
+    try {
+      const merged = await replaceNoteStubWithDescendant(
+        outstanding, itemUid, content, meta, base, offlineQueueGuard, accountEpoch, get,
+      )
+      return merged ? 'queued' : refuse()
+    } catch (err) {
+      if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return false
+      logger.warn('[etebase-store] Sealed note succession failed', getSafeErrorDetails(err))
+      return refuse()
+    }
+  }
+  // No notebook object in memory (reload while offline): only checked admission is possible.
+  // An obligated save can never be admitted offline, so it refuses.
+  if (!collection) return options.obligated ? refuse() : admitOffline()
+  try {
+    const core = await import('@silentsuite/core')
+    assertGuard()
+    const dispatch = (source: any, etag: string) => core.updateItemIfUnchanged(account, collection, source, content, meta, {
+      etagOverride: etag,
+      beforeDispatch: assertGuard,
+    })
+    const publish = async (saved: { item: any; etag: string }): Promise<'remote'> => {
+      assertGuard()
+      const nextCache = new Map(get().itemCache)
+      nextCache.set(itemUid, saved.item)
+      set({ itemCache: nextCache })
+      options.onSaved?.(saved.etag)
+      await writeItemToCache('notes', collection.uid, itemUid, content, accountEpoch, meta ?? itemMetaOf(saved.item))
+      assertGuard()
+      return 'remote'
+    }
+    // An obligated save skips the revision dispatch: it writes only after the fresh proof below.
+    if (!options.obligated && cached && admissionRevision) {
+      const first = await dispatch(cached, admissionRevision)
+      assertGuard()
+      if (first.kind === 'saved') return await publish(first)
+      sawConflict = true
+    }
+    // One rebind: a fresh, live copy that still equals the editing base.
+    proving = true
+    const fresh = await core.fetchItemFresh(account, collection, itemUid)
+    assertGuard()
+    if (!fresh || !await noteMatchesBase(core, fresh, itemUid, base, assertGuard)) return refuse()
+    const freshRevision = core.savedRevisionOf(fresh)
+    if (!freshRevision) return refuse()
+    if (!admissionRevision) admissionRevision = freshRevision
+    const second = await dispatch(fresh, freshRevision)
+    assertGuard()
+    if (second.kind === 'saved') return await publish(second)
+    return refuse()
+  } catch (err) {
+    if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return false
+    if (!isOfflineError(err)) {
+      console.error('[etebase-store] Failed to update notes item', getSafeErrorDetails(err))
+      if (sawConflict || proving) return refuse()
+      if (!options.suppressErrorToast) showErrorToast(`Failed to save ${itemSaveNoun('notes')}. Please try again.`)
+      return false
+    }
+    // A known conflict leaves reconciliation unproved; a pre-await snapshot cannot prove it.
+    // An obligated save is never sealed offline.
+    if (sawConflict || options.obligated) return refuse()
+    return admitOffline()
+  }
+}
+
+/**
+ * T2 (#744): whether a note has outstanding queue custody in the current
+ * account. An unreadable queue counts as outstanding, so the editor is obliged.
+ */
+export async function hasOutstandingNoteCustody(itemUid: string): Promise<boolean> {
+  const accountEpoch = getAccountEpoch()
+  const { account, accountFingerprint } = useEtebaseStore.getState()
+  const guard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
+  if (!guard) return false
+  try {
+    const outstanding = await readOutstanding({ collectionType: 'notes', itemUid }, guard)
+    assertOfflineQueueAccountGuard(guard, useEtebaseStore.getState())
+    return outstanding.length > 0
+  } catch (err) {
+    if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return false
+    return true
+  }
+}
+
+/**
+ * Release proof (#744 §5): a fresh live copy of the note still equals `base`
+ * (at its revision, when known) and the note has no outstanding custody,
+ * before and after the read. Anything unproved resolves false.
+ */
+export async function proveLiveNoteBase(itemUid: string, base: SealedEditingBase): Promise<boolean> {
+  const { account, accountFingerprint, collections, itemCollectionMap } = useEtebaseStore.getState()
+  const guard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
+  if (!guard) return false
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, useEtebaseStore.getState())
+  const collectionUid = itemCollectionMap.get(itemUid)
+  const collection = collectionUid ? resolveCollection(collections, 'notes', collectionUid) : null
+  if (!collection) return false
+  const noCustody = async () => {
+    const outstanding = await readOutstanding({ collectionType: 'notes', itemUid }, guard)
+    assertGuard()
+    return outstanding.length === 0
+  }
+  try {
+    if (!await noCustody()) return false
+    const core = await import('@silentsuite/core')
+    assertGuard()
+    const fresh = await core.fetchItemFresh(account, collection, itemUid)
+    assertGuard()
+    if (!fresh || !await noteMatchesBase(core, fresh, itemUid, base, assertGuard)) return false
+    if (knownRevision(base.revision) && core.savedRevisionOf(fresh) !== base.revision) return false
+    return await noCustody()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * #744 §9 proof for a destructive note path: a fresh live copy that equals
+ * `base`, returning that copy's own saved revision. Any error is not proved.
+ */
+export async function proveNoteRevision(itemUid: string, base: SealedEditingBase): Promise<string | null> {
+  const { account, accountFingerprint, collections, itemCollectionMap } = useEtebaseStore.getState()
+  const guard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
+  if (!guard) return null
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, useEtebaseStore.getState())
+  const collectionUid = itemCollectionMap.get(itemUid)
+  const collection = collectionUid ? resolveCollection(collections, 'notes', collectionUid) : null
+  if (!collection) return null
+  try {
+    const core = await import('@silentsuite/core')
+    assertGuard()
+    const fresh = await core.fetchItemFresh(account, collection, itemUid)
+    assertGuard()
+    if (!fresh || !await noteMatchesBase(core, fresh, itemUid, base, assertGuard)) return null
+    return core.savedRevisionOf(fresh)
+  } catch {
+    return null
+  }
+}
+
+/** #744 §9 editor check: the mounted editor shows exactly the shown note, saved, with nothing in flight. */
+export function noteEditorMatches(
+  editor: { isClean: () => boolean; chainIdle: () => boolean; base: () => SealedEditingBase },
+  note: { title: string; content: string; revision: string | null },
+): boolean {
+  if (!editor.isClean() || !editor.chainIdle()) return false
+  const base = editor.base()
+  return base.revision === note.revision && base.title === note.title && base.content === note.content
+}
+
+/**
+ * #744 §9 bulk clear of a notebook or address book. Only the members shown at
+ * the start are considered, each at its paired revision, so a child created
+ * later is never swept. A member with custody, an unknown revision, an
+ * obligation, a mismatched editor or a draft is protected; every other one is
+ * deleted only at its snapshot revision. Local cleanup touches only members
+ * that were deleted or queued.
+ */
+async function clearMembersConditionally(
+  type: 'notes' | 'contacts',
+  collection: any,
+  guard: OfflineQueueAccountGuard,
+  accountEpoch: number,
+  get: () => EtebaseState,
+  set: (partial: Partial<EtebaseState>) => void,
+): Promise<number> {
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, get())
+  const noteStore = type === 'notes' ? await import('@/app/stores/use-note-store') : null
+  const contactStore = type === 'contacts' ? await import('@/app/stores/use-contact-store') : null
+  assertGuard()
+  // The displayed members and their paired revisions, before any network work.
+  const shownNotes = noteStore ? noteStore.useNoteStore.getState().notes.filter((note) => note.notebookId === collection.uid) : []
+  const members: { uid: string; revision: string | null }[] = noteStore
+    ? shownNotes.map((note) => ({ uid: note.id, revision: note.revision }))
+    : contactStore!.useContactStore.getState().contacts
+      .filter((contact) => contact.listId === collection.uid)
+      .map((contact) => ({ uid: contact.id, revision: contact.revision }))
+  const core = await import('@silentsuite/core')
+  assertGuard()
+  const removed: string[] = []
+  let protectedCount = 0
+  // The editor period each member was authorized in; later typing keeps the member shown.
+  const periods = new Map<string, number | undefined>()
+  for (const member of members) {
+    assertGuard()
+    const outstanding = await readOutstanding({ collectionType: type, itemUid: member.uid }, guard)
+    assertGuard()
+    let isProtected = outstanding.length > 0 || !knownRevision(member.revision)
+    if (!isProtected && noteStore) {
+      const editor = noteStore.getMountedNoteEditor(member.uid)
+      const shown = shownNotes.find((note) => note.id === member.uid)
+      isProtected = Boolean(noteStore.getNoteObligation(member.uid))
+        || Boolean(editor && (!shown || !noteEditorMatches(editor, { ...shown, revision: member.revision })))
+      periods.set(member.uid, editor?.periodGen())
+    }
+    if (!isProtected && contactStore) isProtected = Boolean(contactStore.useContactStore.getState().contactSaveStates[member.uid])
+    const item = get().itemCache.get(member.uid)
+    if (isProtected || !item || !knownRevision(member.revision)) {
+      protectedCount += 1
+      continue
+    }
+    try {
+      const result = await core.deleteItemIfUnchanged(get().account, collection, item, { etagOverride: member.revision, beforeDispatch: assertGuard })
+      assertGuard()
+      if (result.kind === 'deleted') removed.push(member.uid)
+      else protectedCount += 1
+    } catch (err) {
+      if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return 0
+      if (!isOfflineError(err)) {
+        protectedCount += 1
+        continue
+      }
+      const inserted = await insertIfNoOutstanding(
+        { type: 'delete', collectionType: type, collectionUid: collection.uid, itemUid: member.uid, expectedEtag: member.revision },
+        guard,
+      )
+      assertGuard()
+      if (inserted) removed.push(member.uid)
+      else protectedCount += 1
+    }
+  }
+  // Typing or a draft begun on a member while the clear was in flight stays shown (#744).
+  const retired = removed.filter((uid) => {
+    if (contactStore) return !contactStore.useContactStore.getState().contactSaveStates[uid]
+    const editor = noteStore!.getMountedNoteEditor(uid)
+    return !editor || (editor.isClean() && editor.periodGen() === periods.get(uid))
+  })
+  if (retired.length > 0) {
+    const uidSet = new Set(retired)
+    const itemCache = new Map(get().itemCache)
+    const itemTypeMap = new Map(get().itemTypeMap)
+    const itemCollectionMap = new Map(get().itemCollectionMap)
+    for (const uid of uidSet) {
+      itemCache.delete(uid)
+      itemTypeMap.delete(uid)
+      itemCollectionMap.delete(uid)
+      if (isLocalCacheEnabled()) {
+        // The server deleted this member at its shown revision; the display cache is not authority.
+        await displayCacheAfterAck(() => cacheDeleteItem(uid, accountEpoch), accountEpoch)
+        assertGuard()
+      }
+    }
+    set({ itemCache, itemTypeMap, itemCollectionMap })
+    await removeItemsFromDomainStore(type, collection.uid, retired, accountEpoch)
+    assertGuard()
+  }
+  if (protectedCount > 0) {
+    showErrorToast(`Deleted ${removed.length} of ${members.length} ${collectionItemNoun(type)}. Please try again to delete the rest.`)
+  }
+  return removed.length
+}
+
+/**
+ * #744 §9 collection delete fence for a notebook or address book. Nothing local
+ * may be owed for it (queued work, an obligation, an open editor that is not
+ * clean and idle, a contact draft), and every live server child must be shown
+ * here at its paired revision. The children are listed between two reads of
+ * the collection at the same stoken S (two retries), local state is read again,
+ * and the tombstone is sent only at S and the main item's fetched revision.
+ * Anything unproved refuses; there is no unconditional or offline fallback.
+ */
+async function deleteCollectionIfProved(
+  type: 'notes' | 'contacts',
+  collectionUid: string,
+  get: () => EtebaseState,
+): Promise<boolean> {
+  const { account, accountFingerprint } = get()
+  const guard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
+  if (!guard) return false
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, get())
+  const noteStore = type === 'notes' ? await import('@/app/stores/use-note-store') : null
+  const contactStore = type === 'contacts' ? await import('@/app/stores/use-contact-store') : null
+  const core = await import('@silentsuite/core')
+  assertGuard()
+  const shownMembers = (): Map<string, string | null> => new Map(noteStore
+    ? noteStore.useNoteStore.getState().notes.filter((note) => note.notebookId === collectionUid).map((note) => [note.id, note.revision] as const)
+    : contactStore!.useContactStore.getState().contacts.filter((contact) => contact.listId === collectionUid).map((contact) => [contact.id, contact.revision] as const))
+  const localWorkOwed = async (members: Map<string, string | null>): Promise<boolean> => {
+    const entries = await getQueuedMutations(guard)
+    assertGuard()
+    if (entries.some((entry) => entry.collectionType === type && entry.collectionUid === collectionUid)) return true
+    for (const uid of members.keys()) {
+      if (noteStore) {
+        const editor = noteStore.getMountedNoteEditor(uid)
+        // An open editor must show exactly the shown note, saved and idle, not merely be clean.
+        const shown = noteStore.useNoteStore.getState().notes.find((note) => note.id === uid)
+        if (noteStore.getNoteObligation(uid) || (editor && (!shown || !noteEditorMatches(editor, shown)))) return true
+      } else if (contactStore!.useContactStore.getState().contactSaveStates[uid]) {
+        return true
+      }
+    }
+    return false
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const members = shownMembers()
+    if (await localWorkOwed(members)) return false
+    const before = await core.getCollection(account, collectionUid)
+    assertGuard()
+    const stoken = before.stoken
+    if (!stoken || before.isDeleted) return false
+    let pageToken: string | null = null
+    for (;;) {
+      const page = await core.listItems(account, before, pageToken)
+      assertGuard()
+      for (const child of page.items) {
+        if (child.isDeleted) continue
+        if (type === 'notes' && !core.isMarkdownNoteItem(itemMetaOf(child))) return false
+        const revision = members.get(child.uid)
+        if (!knownRevision(revision) || core.savedRevisionOf(child) !== revision) return false
+      }
+      if (page.done) break
+      pageToken = page.stoken
+    }
+    const after = await core.getCollection(account, collectionUid)
+    assertGuard()
+    // Something changed while the children were listed: list them again.
+    if (after.stoken !== stoken) continue
+    if (await localWorkOwed(shownMembers())) return false
+    const result = await core.deleteCollectionIfUnchanged(account, after, stoken, { beforeDispatch: assertGuard })
+    assertGuard()
+    return result.kind === 'deleted'
+  }
+  return false
+}
+
+/** The record a contact edit was made on (#744 §8): its revision (null if unknown) and complete vCard. */
+export interface ContactEditingBase {
+  revision: string | null
+  witness: string
+}
+
+interface SealedFavoritePayload {
+  v: 1
+  kind: 'favorite'
+  body: { content: string }
+  base: { revision: string | null; digest: string }
+  prior: string[]
+}
+
+/** Exact validation of an opened sealed favorite payload; anything else is unreadable. */
+function parseSealedFavoritePayload(plaintext: string): SealedFavoritePayload | null {
+  let value: unknown
+  try {
+    value = JSON.parse(plaintext)
+  } catch {
+    return null
+  }
+  if (!hasExactKeys(value, ['v', 'kind', 'body', 'base', 'prior'])) return null
+  if (value.v !== 1 || value.kind !== 'favorite') return null
+  const { body, base, prior } = value
+  if (!hasExactKeys(body, ['content']) || typeof body.content !== 'string') return null
+  if (!hasExactKeys(base, ['revision', 'digest'])) return null
+  if (base.revision !== null && !(typeof base.revision === 'string' && base.revision.length > 0)) return null
+  if (typeof base.digest !== 'string' || !SEALED_DIGEST.test(base.digest)) return null
+  if (!Array.isArray(prior) || prior.length > 32) return null
+  if (!prior.every((digest: unknown) => typeof digest === 'string' && SEALED_DIGEST.test(digest))) return null
+  return value as SealedFavoritePayload
+}
+
+/**
+ * A contact record is proved only by its complete vCard text (#744): the parsed
+ * model drops fields it does not keep, so text that differs anywhere is a
+ * different record, and a proof that cannot show equality refuses.
+ */
+function sameContact(a: string, b: string): boolean {
+  return a === b
+}
+
+async function contactMatchesWitness(item: any, witness: string, assertGuard: () => void): Promise<boolean> {
+  if (!item || item.isDeleted) return false
+  const raw = await item.getContent()
+  assertGuard()
+  return sameContact(typeof raw === 'string' ? raw : new TextDecoder().decode(raw), witness)
+}
+
+/**
+ * Favorite custody admission (#744 §8): the accepted vCard and the proof of the
+ * record it was toggled on go into one sealed payload. Admission needs the
+ * record's own revision and binds it to the item observed at the commit.
+ */
+async function queueSealedFavoriteUpdate(
+  itemUid: string,
+  collectionUid: string,
+  content: string,
+  base: ContactEditingBase,
+  guard: OfflineQueueAccountGuard,
+  accountEpoch: number,
+  getState: () => EtebaseState,
+): Promise<boolean> {
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, getState())
+  if (!knownRevision(base.revision)) return false
+  const admissionRevision = base.revision
+  await cacheEnsureFingerprint(guard.accountFingerprint, accountEpoch)
+  assertGuard()
+  if (!await cacheEnsureEncryptedEnvelope(accountEpoch)) return false
+  assertGuard()
+  const core = await import('@silentsuite/core')
+  assertGuard()
+  const payload: SealedFavoritePayload = {
+    v: 1,
+    kind: 'favorite',
+    body: { content },
+    base: { revision: admissionRevision, digest: await cacheSealedPayloadDigest(['favorite', base.witness]) },
+    prior: [],
+  }
+  assertGuard()
+  const sealed = await cacheSealQueuePayload(JSON.stringify(payload), `${guard.accountFingerprint}|contacts|${itemUid}`, accountEpoch)
+  assertGuard()
+  if (!sealed) return false
+  const admit = () => {
+    if (!isCurrentAccountEpoch(accountEpoch)) return false
+    const state = getState()
+    if (!state.account || state.accountFingerprint !== guard.accountFingerprint) return false
+    return core.savedRevisionOf(state.itemCache.get(itemUid)) === admissionRevision
+  }
+  const inserted = await insertIfNoOutstanding(
+    { type: 'sealed-update', collectionType: 'contacts', collectionUid, itemUid, sealed, rev: 1 },
+    guard,
+    admit,
+  )
+  assertGuard()
+  if (inserted) logger.warn(`[etebase-store] Queued sealed favorite for contacts/${itemUid}`)
+  return inserted
+}
+
+/**
+ * Favorite succession: a favorite may replace the contact's sealed record only
+ * if that record is its single outstanding custody, opens as a favorite, and
+ * holds the vCard this toggle was made on. The original base proof is kept.
+ */
+async function replaceFavoriteStubWithDescendant(
+  outstanding: QueueEntry[],
+  itemUid: string,
+  content: string,
+  base: ContactEditingBase,
+  guard: OfflineQueueAccountGuard,
+  accountEpoch: number,
+  getState: () => EtebaseState,
+): Promise<boolean> {
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, getState())
+  const stub = outstanding[0]
+  if (outstanding.length !== 1 || !stub || stub.type !== 'sealed-update' || !stub.sealed || typeof stub.rev !== 'number') return false
+  const associatedData = `${guard.accountFingerprint}|contacts|${itemUid}`
+  const opened = await cacheOpenQueuePayload(stub.sealed, associatedData, accountEpoch)
+  assertGuard()
+  if (opened.kind !== 'opened') return false
+  const payload = parseSealedFavoritePayload(opened.plaintext)
+  if (!payload) return false
+  if (!sameContact(payload.body.content, base.witness)) return false
+  const replacedDigest = await cacheSealedPayloadDigest(['favorite', payload.body.content])
+  assertGuard()
+  const successor: SealedFavoritePayload = {
+    v: 1,
+    kind: 'favorite',
+    body: { content },
+    base: payload.base,
+    prior: [...payload.prior, replacedDigest].slice(-32),
+  }
+  const sealed = await cacheSealQueuePayload(JSON.stringify(successor), associatedData, accountEpoch)
+  assertGuard()
+  if (!sealed) return false
+  const replaced = await replaceStub({ collectionType: 'contacts', itemUid }, { id: stub.id, rev: stub.rev }, sealed, guard)
+  assertGuard()
+  return replaced
+}
+
+/**
+ * A contact save at its captured record base (#744 §8). Outstanding custody
+ * refuses any ordinary or photo edit before anything is sent; only a favorite
+ * may succeed its own sealed record. The save dispatches at the record's
+ * revision through a clone of the item cached at dispatch, and on a conflict or
+ * an unknown revision rebinds once to a fresh live copy equal to the witness.
+ * A known conflict is never admitted offline; only a favorite is ever sealed.
+ */
+async function updateContactAtCapturedBase(
+  itemUid: string,
+  content: string,
+  options: UpdateItemOptions,
+  get: () => EtebaseState,
+  set: (partial: Partial<EtebaseState>) => void,
+): Promise<'remote' | 'queued' | false> {
+  const accountEpoch = getAccountEpoch()
+  const { account, collections, itemCollectionMap, accountFingerprint } = get()
+  const guard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
+  if (!guard) return false
+  const refuse = (): false => {
+    if (isCurrentAccountEpoch(accountEpoch)) options.onRefused?.()
+    return false
+  }
+  const base = options.contactBase
+  if (!base) return refuse()
+  const favorite = options.sealIntent === 'favorite'
+  const knownCollectionUid = itemCollectionMap.get(itemUid) ?? options.collectionUid
+  if (!knownCollectionUid) return refuse()
+  const collection = resolveCollection(collections, 'contacts', knownCollectionUid)
+  const assertGuard = () => assertOfflineQueueAccountGuard(guard, get())
+  const isBoundary = (err: unknown) => !isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError
+  let outstanding: QueueEntry[]
+  try {
+    outstanding = await readOutstanding({ collectionType: 'contacts', itemUid }, guard)
+    assertGuard()
+  } catch (err) {
+    if (isBoundary(err)) return false
+    return refuse()
+  }
+  if (outstanding.length > 0) {
+    if (!favorite) return refuse()
+    try {
+      return await replaceFavoriteStubWithDescendant(outstanding, itemUid, content, base, guard, accountEpoch, get) ? 'queued' : refuse()
+    } catch (err) {
+      if (isBoundary(err)) return false
+      logger.warn('[etebase-store] Sealed favorite succession failed', getSafeErrorDetails(err))
+      return refuse()
+    }
+  }
+  if (!collection) return refuse()
+  let sawConflict = false
+  try {
+    const core = await import('@silentsuite/core')
+    assertGuard()
+    const dispatch = (source: any, etag: string) => core.updateItemIfUnchanged(account, collection, source, content, undefined, {
+      etagOverride: etag,
+      beforeDispatch: assertGuard,
+    })
+    const publish = async (saved: { item: any; etag: string }): Promise<'remote'> => {
+      assertGuard()
+      const nextCache = new Map(get().itemCache)
+      nextCache.set(itemUid, saved.item)
+      set({ itemCache: nextCache })
+      options.onSaved?.(saved.etag)
+      await writeItemToCache('contacts', collection.uid, itemUid, content, accountEpoch, itemMetaOf(saved.item))
+      assertGuard()
+      return 'remote'
+    }
+    // The item cached at dispatch, written only at the record's own revision.
+    const cached = get().itemCache.get(itemUid)
+    if (cached && knownRevision(base.revision)) {
+      const first = await dispatch(cached, base.revision)
+      assertGuard()
+      if (first.kind === 'saved') return await publish(first)
+      sawConflict = true
+    }
+    // One rebind: a fresh, live copy that still equals the witness.
+    const fresh = await core.fetchItemFresh(account, collection, itemUid)
+    assertGuard()
+    if (!fresh || !await contactMatchesWitness(fresh, base.witness, assertGuard)) return refuse()
+    const freshRevision = core.savedRevisionOf(fresh)
+    if (!freshRevision) return refuse()
+    const second = await dispatch(fresh, freshRevision)
+    assertGuard()
+    if (second.kind === 'saved') return await publish(second)
+    return refuse()
+  } catch (err) {
+    if (isBoundary(err)) return false
+    if (isOfflineError(err) && favorite && !sawConflict) {
+      try {
+        return await queueSealedFavoriteUpdate(itemUid, collection.uid, content, base, guard, accountEpoch, get) ? 'queued' : refuse()
+      } catch (queueErr) {
+        if (isBoundary(queueErr)) return false
+        logger.warn('[etebase-store] Sealed favorite admission failed', getSafeErrorDetails(queueErr))
+        return refuse()
+      }
+    }
+    if (!isOfflineError(err)) console.error('[etebase-store] Failed to update contacts item', getSafeErrorDetails(err))
+    return refuse()
+  }
+}
+
+/**
+ * Sealed note custody admission (#744). The accepted text and the proof of
+ * the editing base it was typed on go into one AES-GCM payload in the offline
+ * queue, bound to the record identity. The queue record is the custody; the
+ * display cache is written only afterwards and is never authority.
+ */
+async function queueSealedNoteUpdate(
+  type: CollectionTypeKey,
+  itemUid: string,
+  collectionUid: string,
+  content: string,
+  meta: ItemMeta | undefined,
+  options: { sealIntent?: SealIntent; base?: SealedEditingBase; admissionRevision?: string | null },
+  offlineQueueGuard: OfflineQueueAccountGuard,
+  accountEpoch: number,
+  getState: () => EtebaseState,
+): Promise<'queued' | false> {
+  const base = options.base
+  if (type !== 'notes' || options.sealIntent !== 'note' || !base) return false
+  if (typeof meta?.name !== 'string' || typeof meta.mtime !== 'number' || !Number.isFinite(meta.mtime)) return false
+  await cacheEnsureFingerprint(offlineQueueGuard.accountFingerprint, accountEpoch)
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  if (!await cacheEnsureEncryptedEnvelope(accountEpoch)) return false
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  const core = await import('@silentsuite/core')
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  // The same title normalization every note producer applies.
+  const baseTitle = core.noteFromEtebaseItem(itemUid, '', { name: base.title }).title
+  // r*: the captured base revision, or the revision of a fresh read proved equal
+  // to the base. Never a cached or fetched revision that was not proved.
+  const admissionRevision = options.admissionRevision !== undefined
+    ? options.admissionRevision
+    : (knownRevision(base.revision) ? base.revision : null)
+  const payload = {
+    v: 1,
+    kind: 'note',
+    body: { content, meta: { name: meta.name, mtime: meta.mtime } },
+    base: {
+      revision: admissionRevision,
+      digest: await cacheSealedPayloadDigest(['note', baseTitle, base.content]),
+    },
+    prior: [] as string[],
+  }
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  const sealed = await cacheSealQueuePayload(
+    JSON.stringify(payload),
+    `${offlineQueueGuard.accountFingerprint}|${type}|${itemUid}`,
+    accountEpoch,
+  )
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  if (!sealed) return false
+  // Admission binds the observation current at the commit, not a pre-await snapshot.
+  const observed = getState().itemCache.get(itemUid)
+  if (!admissionRevision && observed !== undefined) {
+    const matches = await noteMatchesBase(core, observed, itemUid, base, () => assertOfflineQueueAccountGuard(offlineQueueGuard, getState()))
+    if (!matches) return false
+  }
+  const admit = () => {
+    if (!isCurrentAccountEpoch(accountEpoch)) return false
+    const state = getState()
+    if (!state.account || state.accountFingerprint !== offlineQueueGuard.accountFingerprint) return false
+    const current = state.itemCache.get(itemUid)
+    return admissionRevision ? core.savedRevisionOf(current) === admissionRevision : current === observed
+  }
+  const inserted = await insertIfNoOutstanding(
+    { type: 'sealed-update', collectionType: type, collectionUid, itemUid, sealed, rev: 1 },
+    offlineQueueGuard,
+    admit,
+  )
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  if (!inserted) return false
+  // Custody is durable; a failed display write does not revoke acceptance.
+  try {
+    const cacheContent = await toCacheContent(type, itemUid, collectionUid, content, meta)
+    assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+    await cachePutItem({
+      itemUid,
+      collectionType: type,
+      collectionUid,
+      content: cacheContent,
+      lastModified: Date.now(),
+    }, accountEpoch, { allowWithoutFeatureFlag: true })
+  } catch (displayErr) {
+    // Only a boundary this tab crossed revokes it; a display record another tab cleared does not.
+    if (displayErr instanceof AccountBoundaryChangedError && !isCurrentAccountEpoch(accountEpoch)) throw displayErr
+    logger.warn('[etebase-store] Display write after sealed custody failed', getSafeErrorDetails(displayErr))
+  }
+  assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+  logger.warn(`[etebase-store] Queued sealed update for ${type}/${itemUid}`)
+  return 'queued'
+}
+
+/**
  * Queues an update for replay when it cannot be applied now. With
  * `persistEncryptedOfflineContent` the body goes to the encrypted local cache
  * and the queue entry stays content free; otherwise the content rides in the
@@ -407,13 +1412,22 @@ async function queueOfflineUpdate(
   collectionUid: string,
   content: string,
   meta: ItemMeta | undefined,
-  options: { suppressErrorToast?: boolean; persistEncryptedOfflineContent?: boolean } | undefined,
+  options: {
+    suppressErrorToast?: boolean
+    persistEncryptedOfflineContent?: boolean
+    sealIntent?: SealIntent
+    base?: SealedEditingBase
+    admissionRevision?: string | null
+  } | undefined,
   offlineQueueGuard: OfflineQueueAccountGuard,
   accountEpoch: number,
   getState: () => EtebaseState,
 ): Promise<'queued' | false> {
   try {
     assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
+    if (options?.sealIntent) {
+      return await queueSealedNoteUpdate(type, itemUid, collectionUid, content, meta, options, offlineQueueGuard, accountEpoch, getState)
+    }
     if (options?.persistEncryptedOfflineContent) {
       await cacheEnsureFingerprint(offlineQueueGuard.accountFingerprint, accountEpoch)
       assertOfflineQueueAccountGuard(offlineQueueGuard, getState())
@@ -470,6 +1484,68 @@ function resolveCollection(
     return null
   }
   return typedCollections[0] ?? null
+}
+
+const SHARING_PUBLIC_KEY_LENGTH = 32
+
+export type PendingCollectionInvite = Readonly<{
+  type: CollectionTypeKey
+  collectionUid: string
+  username: string
+  accessLevel: CollectionAccessLevel
+  fingerprint: string
+}>
+
+export type IncomingInvitationView = Readonly<{
+  uid: string
+  senderName: string | null
+  accessLevel: number
+  senderFingerprint: string | null
+}>
+
+interface SharingBoundary {
+  accountEpoch: number
+  account: any
+  accountFingerprint: string | null
+}
+
+interface PendingInviteBinding extends SharingBoundary {
+  collection: any
+  pubkey: Uint8Array
+}
+
+interface IncomingInvitationBinding extends SharingBoundary {
+  invitation: any
+  confirmedFromPubkey: Uint8Array | null
+  used: boolean
+}
+
+// Key bytes and SDK objects stay module-private; React only receives frozen tokens.
+const pendingInviteBindings = new WeakMap<PendingCollectionInvite, PendingInviteBinding>()
+const incomingInvitationBindings = new WeakMap<IncomingInvitationView, IncomingInvitationBinding>()
+
+function copySharingPublicKey(value: unknown): Uint8Array | null {
+  if (!(value instanceof Uint8Array) || value.length !== SHARING_PUBLIC_KEY_LENGTH) return null
+  return value.slice()
+}
+
+/** Sharing targets must match an exact uid; unlike resolveCollection there is no default fallback. */
+function findExactSharingCollection(
+  collections: Record<CollectionTypeKey, any[]>,
+  type: CollectionTypeKey,
+  collectionUid: string,
+): any | null {
+  if (!collectionUid || collectionUid === 'default' || collectionUid === 'all') return null
+  return (collections[type] ?? []).find((collection) => collection.uid === collectionUid) ?? null
+}
+
+function isCurrentSharingBoundary(
+  boundary: SharingBoundary,
+  state: { account: any; accountFingerprint: string | null },
+): boolean {
+  return isCurrentAccountEpoch(boundary.accountEpoch)
+    && state.account === boundary.account
+    && state.accountFingerprint === boundary.accountFingerprint
 }
 
 function getCollectionName(collection: any, fallback: string): string {
@@ -584,28 +1660,34 @@ async function removeItemsFromDomainStore(type: CollectionTypeKey, collectionUid
     return removed
   }
   if (type === 'notes') {
-    const { useNoteStore } = await import('@/app/stores/use-note-store')
+    const { useNoteStore, getMountedNoteEditor, getNoteObligation } = await import('@/app/stores/use-note-store')
     if (accountEpoch !== undefined) assertCurrentAccountEpoch(accountEpoch)
     let removed = 0
     useNoteStore.setState((state) => ({
       notes: state.notes.filter((note) => {
-        const shouldRemove = itemUidSet
+        // Every removal keeps a note with unsaved typing or an owed reconciliation, read here at the
+        // removal itself, after any earlier await (#744).
+        const owned = getMountedNoteEditor(note.id)?.isClean() === false || Boolean(getNoteObligation(note.id))
+        const shouldRemove = !owned && (itemUidSet
           ? itemUidSet.has(note.id)
-          : (note.notebookId ?? 'default') === collectionUid
+          : (note.notebookId ?? 'default') === collectionUid)
         if (shouldRemove) removed++
         return !shouldRemove
       }),
     }))
     return removed
   }
-  const { useContactStore } = await import('@/app/stores/use-contact-store')
+  const { useContactStore, hasContactFieldDraft } = await import('@/app/stores/use-contact-store')
   if (accountEpoch !== undefined) assertCurrentAccountEpoch(accountEpoch)
   let removed = 0
   useContactStore.setState((state) => ({
     contacts: state.contacts.filter((contact) => {
-      const shouldRemove = itemUidSet
+      // Every removal keeps a contact with a draft or unsaved field typing, read here at the
+      // removal itself, after any earlier await (#744).
+      const owned = Boolean(state.contactSaveStates?.[contact.id]) || hasContactFieldDraft(contact.id)
+      const shouldRemove = !owned && (itemUidSet
         ? itemUidSet.has(contact.id)
-        : (contact.listId ?? 'default') === collectionUid
+        : (contact.listId ?? 'default') === collectionUid)
       if (shouldRemove) removed++
       return !shouldRemove
     }),
@@ -630,6 +1712,9 @@ async function removeQueuedMutationsForCollection(
       entry.collectionType === type
       && entry.collectionUid === collectionUid
       && (includeDeletes || entry.type !== 'delete')
+      // Sealed custody and legacy entries (#744) are never pruned with their collection.
+      && !entry.sealed
+      && !isLegacyEntry(entry)
     ))
     for (const entry of matching) {
       assertCurrentAccountEpoch(accountEpoch)
@@ -715,7 +1800,15 @@ interface EtebaseActions {
    * Returns the item UID.
    * @param tempId - optional temp ID from the domain store, used for offline queue mapping
    */
-  createItem: (type: CollectionTypeKey, content: string, tempId?: string, collectionUid?: string, meta?: ItemMeta) => Promise<string | null>
+  createItem: (
+    type: CollectionTypeKey,
+    content: string,
+    tempId?: string,
+    collectionUid?: string,
+    meta?: ItemMeta,
+    /** Receives the committed SDK item synchronously, after it is published and before the cache write (#744). */
+    onCommitted?: (item: any) => void,
+  ) => Promise<string | null>
 
   /** Execute a queued mutation remotely without ordinary offline fallback/requeue behavior. */
   replayQueuedMutation: (entry: QueueEntry, guard: OfflineQueueAccountGuard, checkpoint?: ReplayCheckpoint) => Promise<ConfirmedRemoteMutation>
@@ -741,9 +1834,9 @@ interface EtebaseActions {
   reconcileCollections: () => Promise<void>
 
   /**
-   * List pending incoming sharing invitations for the current account.
+   * List pending incoming sharing invitations as key-free views bound to private list-time snapshots.
    */
-  listIncomingInvitations: () => Promise<any[]>
+  listIncomingInvitations: () => Promise<IncomingInvitationView[]>
 
   /**
    * List pending outgoing sharing invitations for the current account.
@@ -756,19 +1849,31 @@ interface EtebaseActions {
   cancelOutgoingInvitation: (invitation: any) => Promise<boolean>
 
   /**
-   * Accept an incoming sharing invitation, then reconcile collections so the shared collection appears.
+   * Accept the list-time snapshot behind a view after the user confirmed its displayed sender fingerprint,
+   * then reconcile collections so the shared collection appears. Single-use.
    */
-  acceptInvitation: (invitation: any) => Promise<boolean>
+  acceptInvitation: (invitation: IncomingInvitationView, displayedFingerprint: string) => Promise<boolean>
 
   /**
-   * Reject an incoming sharing invitation.
+   * Reject an incoming sharing invitation. Single-use.
    */
-  rejectInvitation: (invitation: any) => Promise<boolean>
+  rejectInvitation: (invitation: IncomingInvitationView) => Promise<boolean>
 
   /**
-   * Invite another user to an existing collection.
+   * Fetch the recipient's public key once and return a frozen token carrying its fingerprint for comparison.
+   * Nothing is sent until confirmCollectionInvite.
    */
-  inviteToCollection: (type: CollectionTypeKey, collectionUid: string, username: string, accessLevel: CollectionAccessLevel) => Promise<boolean>
+  prepareCollectionInvite: (type: CollectionTypeKey, collectionUid: string, username: string, accessLevel: CollectionAccessLevel) => Promise<PendingCollectionInvite | null>
+
+  /**
+   * Send a prepared invite with the exact key captured at prepare time. Single-use.
+   */
+  confirmCollectionInvite: (pending: PendingCollectionInvite) => Promise<boolean>
+
+  /**
+   * Drop a prepared invite without sending it.
+   */
+  discardCollectionInvite: (pending: PendingCollectionInvite) => void
 
   /**
    * List members for a collection.
@@ -799,7 +1904,13 @@ interface EtebaseActions {
    * Create multiple items in a single batch upload.
    * Returns an array of item UIDs (null for any that failed).
    */
-  createItemsBatch: (type: CollectionTypeKey, contents: { content: string; tempId: string }[], collectionUid?: string) => Promise<(string | null)[]>
+  createItemsBatch: (
+    type: CollectionTypeKey,
+    contents: { content: string; tempId: string }[],
+    collectionUid?: string,
+    /** Receives each acknowledged SDK item with its temp id, after it is published (#744). */
+    onCommitted?: (tempId: string, item: any) => void,
+  ) => Promise<(string | null)[]>
 
   /**
    * Update an existing item by UID.
@@ -818,6 +1929,20 @@ interface EtebaseActions {
        * queued by UID and applied when the item can be fetched.
        */
       collectionUid?: string
+      /** The only operations that may be sealed into offline custody (#744). */
+      sealIntent?: SealIntent
+      /** The editing base the content was typed on; required with `sealIntent`. */
+      base?: SealedEditingBase
+      /** Called with the saved etag right after a conditional save is published. */
+      onSaved?: (etag: string) => void
+      /** Called when the save is refused because reconciliation is unproved. */
+      onRefused?: () => void
+      /** The note owes a reconciliation proof: write only through a proved fresh copy, never offline (#744 §7). */
+      obligated?: boolean
+      /** Called when the save gate observes outstanding custody for this note (#744 T1). */
+      onCustodyObserved?: () => void
+      /** A contact save's captured record base (#744 §8); contacts save only through it. */
+      contactBase?: ContactEditingBase
     },
   ) => Promise<'remote' | 'queued' | false>
 
@@ -825,13 +1950,38 @@ interface EtebaseActions {
    * Move an existing item to another concrete collection by recreating it there.
    * Returns the new item UID, or the original UID if the target is unchanged.
    */
-  moveItem: (type: CollectionTypeKey, itemUid: string, content: string, targetCollectionUid: string, sourceCollectionUid?: string, meta?: ItemMeta) => Promise<string | null>
+  moveItem: (
+    type: CollectionTypeKey,
+    itemUid: string,
+    content: string,
+    targetCollectionUid: string,
+    sourceCollectionUid?: string,
+    meta?: ItemMeta,
+    /**
+     * #744 §9: remove the source only at `sourceRevision`. On a conflict the copy is
+     * taken back; offline, the source delete is admitted only conditionally.
+     */
+    options?: { sourceRevision?: string; offlineAllowed?: boolean },
+  ) => Promise<string | null>
 
   /**
    * Delete an item by UID.
    */
   /** `collectionUid` names the owner when the item is not in memory; the delete is then queued by UID. */
-  deleteItem: (type: CollectionTypeKey, itemUid: string, options?: { collectionUid?: string }) => Promise<'remote' | 'queued' | false>
+  deleteItem: (
+    type: CollectionTypeKey,
+    itemUid: string,
+    options?: {
+      collectionUid?: string
+      /** #744 §9: delete only at `expectedRevision`; a conflict or an unknown revision refuses. */
+      conditional?: boolean
+      expectedRevision?: string | null
+      /** Synchronous check repeated inside the offline admission transaction. */
+      admit?: () => boolean
+      /** False when the delete may never be admitted offline (an obligated note). */
+      offlineAllowed?: boolean
+    },
+  ) => Promise<'remote' | 'queued' | false>
 
   /**
    * Fetch all items from the local cache for a collection type.
@@ -847,8 +1997,10 @@ interface EtebaseActions {
 
   /**
    * Clean up on logout -- stop sync engine, clear all state.
+   * Returns the account epoch this teardown produced (not one observed after
+   * re-entrant callbacks); throws EtebaseTeardownError carrying it on failure.
    */
-  destroy: () => void
+  destroy: () => number
 
   /**
    * Register a handler for sync change events from the SyncEngine.
@@ -884,6 +2036,8 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     })
     // Clear any stale blocked state from a prior attempt before re-trying.
     set({ restoreBlocked: false })
+    // Read before the session, so a logout elsewhere during the restore is never adopted.
+    const logoutGenerationAtStart = readLogoutGeneration()
 
     try {
       diagnostics.startPhase('sessionRead')
@@ -913,6 +2067,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       diagnostics.completePhase('restoreSession')
       assertCurrentAccountEpoch(accountEpoch)
       set({ account, accountFingerprint })
+      establishLogoutGeneration(logoutGenerationAtStart)
       logger.debug('[etebase-store] Session restored')
 
       // Local-cache fingerprint check: if a different account previously
@@ -945,7 +2100,40 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       // 2. Discover existing collections. Only core domains get automatic defaults;
       // the first Notes notebook is created by the explicit Experimental opt-in.
       diagnostics.startPhase('ensureCollections')
-      const collections = await ensureCollectionsForAccount(account, core, accountEpoch)
+      let collections: Record<CollectionTypeKey, any[]>
+      try {
+        collections = await ensureCollectionsForAccount(account, core, accountEpoch)
+      } catch (err) {
+        if (err instanceof AccountBoundaryChangedError || !isCurrentAccountEpoch(accountEpoch)) {
+          throw new AccountBoundaryChangedError()
+        }
+        // The session restored fine; only discovery failed (offline or server).
+        // Report every visible domain as failed through the per-domain contract
+        // so the existing Retry path can recover, without publishing any partial
+        // discovery or touching cached data and pending local work.
+        diagnostics.failActivePhase(err)
+        diagnostics.persist()
+        logger.warn('[etebase-store] Collection discovery failed', getSafeErrorDetails(err))
+        pendingSyncEngineStartEpoch = accountEpoch
+        const failedState: Partial<DomainLoadState> = {}
+        for (const [key] of COLLECTION_DEFINITIONS) failedState[key] = 'failed'
+        set((state) => ({
+          domainLoadState: { ...state.domainLoadState, ...failedState },
+          isInitialized: true,
+          restoreBlocked: false,
+        }))
+        for (const [key] of COLLECTION_DEFINITIONS) {
+          await options?.onDomainLoaded?.({
+            type: key,
+            status: 'failed',
+            itemCount: 0,
+            pageCount: 0,
+            collectionCount: get().collections[key].length,
+          })
+          assertCurrentAccountEpoch(accountEpoch)
+        }
+        return
+      }
       assertCurrentAccountEpoch(accountEpoch)
       diagnostics.completePhase('ensureCollections', {
         collectionCount: COLLECTION_DEFINITIONS.reduce((count, [key]) => count + collections[key].length, 0),
@@ -1026,45 +2214,14 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       logger.debug(`[etebase-store] Loaded ${totalLoadedItemCount} items into cache`)
 
       // 4. Start SyncEngine
-      const engine = new core.SyncEngine({
-        serverUrl: serverUrl,
-        pollIntervalMs: 30_000,
-      })
-
-      // Track all collections
-      diagnostics.startPhase('syncEngineTrackCollections')
-      for (const [key, colType] of COLLECTION_DEFINITIONS) {
-        for (const collection of collections[key]) {
-          await trackCollectionWithSyncEngine(engine, colType, key, collection.uid, accountEpoch)
-          assertCurrentAccountEpoch(accountEpoch)
-        }
-      }
-      diagnostics.completePhase('syncEngineTrackCollections', {
-        collectionCount: COLLECTION_DEFINITIONS.reduce((count, [key]) => count + collections[key].length, 0),
-      })
-
-      // Seed persisted stokens before starting so the first sync round
-      // pulls only deltas instead of refetching the whole vault. Wire the
-      // advance handler so subsequent stoken updates are persisted too.
-      if (cacheEnabled) {
-        engine.onStokenAdvance((event: { collectionType: string; collectionUid: string; stoken: string | null }) => {
-          if (!isCurrentAccountEpoch(accountEpoch)) return
-          const key = collectionTypeToKey(event.collectionType)
-          if (!key) return
-          void cacheSetStoken(key, event.collectionUid, event.stoken, accountEpoch).catch((err) => {
-            if (err instanceof AccountBoundaryChangedError) return
-            logger.warn('[etebase-store] Failed to persist sync cursor', getSafeErrorDetails(err))
-          })
-        })
-      }
-
-      diagnostics.startPhase('syncEngineStart')
-      await engine.start(account)
+      const engine = await startSyncEngine(core, account, serverUrl, collections, accountEpoch, cacheEnabled, diagnostics)
+      if (!engine) return
+      // The boundary can change after the helper's own check; teardown never
+      // saw this unpublished engine, so stop it here instead of publishing.
       if (!isCurrentAccountEpoch(accountEpoch)) {
         engine.stop()
         return
       }
-      diagnostics.completePhase('syncEngineStart')
       set({ syncEngine: engine, isInitialized: true })
       diagnostics.persist()
       logger.debug('[etebase-store] SyncEngine started')
@@ -1099,6 +2256,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       const colType = keyToCollectionType(type)
       const collection = await core.createCollection(account, colType, { name, color, mtime: Date.now() })
       assertCurrentAccountEpoch(accountEpoch)
@@ -1138,7 +2296,18 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
-      await core.deleteCollection(account, collection)
+      assertCurrentAccountEpoch(accountEpoch)
+      if (type === 'notes' || type === 'contacts') {
+        // #744 §9: only a proved, unchanged collection with nothing owed here is tombstoned.
+        const deleted = await deleteCollectionIfProved(type, collection.uid, get)
+        assertCurrentAccountEpoch(accountEpoch)
+        if (!deleted) {
+          showErrorToast(`Failed to delete ${collectionDisplayName(type)}. Please try again.`)
+          return false
+        }
+      } else {
+        await core.deleteCollection(account, collection)
+      }
       assertCurrentAccountEpoch(accountEpoch)
 
       const newItemCache = new Map(get().itemCache)
@@ -1164,7 +2333,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         itemCollectionMap: newItemCollectionMap,
       })
       if (isLocalCacheEnabled()) {
-        await cacheReplaceItemsForCollection(collection.uid, [], accountEpoch)
+        await displayCacheAfterAck(() => cacheReplaceItemsForCollection(collection.uid, [], accountEpoch), accountEpoch)
       }
       assertCurrentAccountEpoch(accountEpoch)
       await removeQueuedMutationsForCollection(type, collection.uid, true, accountEpoch, accountFingerprint)
@@ -1192,6 +2361,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       const currentMeta = collection?.getMeta?.() ?? {}
       const updatedMeta: CollectionMetaUpdates = {}
       if (updates.name !== undefined) updatedMeta.name = updates.name
@@ -1279,16 +2449,42 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         }
       }
 
+      // A visible type with no collections is completely discovered; types with
+      // collections reach 'loaded' through their item refresh.
+      const emptyDomainState: Partial<DomainLoadState> = {}
+      for (const [type] of COLLECTION_DEFINITIONS) {
+        if (activeCollections[type].length === 0) emptyDomainState[type] = 'loaded'
+      }
+
       assertCurrentAccountEpoch(accountEpoch)
-      set({
+      set((state) => ({
         collections: activeCollections,
         itemCache: newItemCache,
         itemTypeMap: newItemTypeMap,
         itemCollectionMap: newItemCollectionMap,
-      })
+        domainLoadState: { ...state.domainLoadState, ...emptyDomainState },
+      }))
       await Promise.all(cleanupPromises)
       assertCurrentAccountEpoch(accountEpoch)
       await hydrateListStores(activeCollections, accountEpoch)
+
+      // Initial discovery failed before the SyncEngine started: start it once
+      // now that discovery succeeded for the same account.
+      if (pendingSyncEngineStartEpoch === accountEpoch && !get().syncEngine) {
+        pendingSyncEngineStartEpoch = null
+        try {
+          const engine = await startSyncEngine(core, account, getServerUrl(), activeCollections, accountEpoch, isLocalCacheEnabled())
+          if (!engine) throw new AccountBoundaryChangedError()
+          if (!isCurrentAccountEpoch(accountEpoch)) {
+            engine.stop()
+            throw new AccountBoundaryChangedError()
+          }
+          set({ syncEngine: engine })
+        } catch (err) {
+          if (isCurrentAccountEpoch(accountEpoch) && !get().syncEngine) pendingSyncEngineStartEpoch = accountEpoch
+          throw err
+        }
+      }
       logger.debug(`[etebase-store] Reconciled collections (${removedCollectionCount} removed)`)
     } catch (err) {
       if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return
@@ -1301,14 +2497,47 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
   listIncomingInvitations: async () => {
     const accountEpoch = getAccountEpoch()
-    const { account } = get()
+    const { account, accountFingerprint } = get()
     if (!account) return []
+    const boundary: SharingBoundary = { accountEpoch, account, accountFingerprint }
 
     try {
       const core = await import('@silentsuite/core')
       const invitations = await core.listIncomingInvitations(account)
-      assertCurrentAccountEpoch(accountEpoch)
-      return invitations
+      if (!isCurrentSharingBoundary(boundary, get())) throw new AccountBoundaryChangedError()
+      return invitations.map((invitation: any) => {
+        let snapshot: any = null
+        let confirmedFromPubkey: Uint8Array | null = null
+        let senderFingerprint: string | null = null
+        try {
+          snapshot = core.snapshotInvitation(invitation)
+          confirmedFromPubkey = copySharingPublicKey(snapshot?.fromPubkey)
+          senderFingerprint = confirmedFromPubkey ? core.getPublicKeyFingerprint(confirmedFromPubkey) : null
+        } catch {
+          senderFingerprint = null
+        }
+        if (!snapshot || !confirmedFromPubkey || !senderFingerprint) {
+          // Malformed invitations stay rejectable but can never be accepted.
+          snapshot = null
+          confirmedFromPubkey = null
+          senderFingerprint = null
+        }
+        const source = snapshot ?? invitation
+        const fromUsername = typeof source?.fromUsername === 'string' ? source.fromUsername.trim() : ''
+        const view: IncomingInvitationView = Object.freeze({
+          uid: typeof source?.uid === 'string' ? source.uid : '',
+          senderName: fromUsername || null,
+          accessLevel: typeof source?.accessLevel === 'number' ? source.accessLevel : -1,
+          senderFingerprint,
+        })
+        incomingInvitationBindings.set(view, {
+          ...boundary,
+          invitation: snapshot ?? { ...invitation },
+          confirmedFromPubkey,
+          used: false,
+        })
+        return view
+      })
     } catch (err) {
       if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return []
       console.error('[etebase-store] Failed to list incoming invitations', getSafeErrorDetails(err))
@@ -1345,6 +2574,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       await core.cancelOutgoingInvitation(account, invitation)
       assertCurrentAccountEpoch(accountEpoch)
       return true
@@ -1356,17 +2586,26 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     }
   },
 
-  acceptInvitation: async (invitation: any) => {
-    const accountEpoch = getAccountEpoch()
-    const { account } = get()
-    if (!account) {
-      logger.warn('[etebase-store] Cannot accept invitation: no account')
+  acceptInvitation: async (view: IncomingInvitationView, displayedFingerprint: string) => {
+    const binding = incomingInvitationBindings.get(view)
+    if (
+      !binding || binding.used || !binding.confirmedFromPubkey
+      || !view.senderFingerprint || displayedFingerprint !== view.senderFingerprint
+    ) {
+      logger.warn('[etebase-store] Cannot accept invitation: confirmation is missing, mismatched, or already used')
       return false
     }
+    binding.used = true
+    const { accountEpoch, account } = binding
+    const confirmedFromPubkey = binding.confirmedFromPubkey
 
     try {
       const core = await import('@silentsuite/core')
-      await core.acceptInvitation(account, invitation)
+      if (core.getPublicKeyFingerprint(confirmedFromPubkey) !== view.senderFingerprint) {
+        throw new Error('Sender fingerprint changed before accept')
+      }
+      if (!isCurrentSharingBoundary(binding, get())) throw new AccountBoundaryChangedError()
+      await core.acceptInvitation(account, binding.invitation, confirmedFromPubkey)
       assertCurrentAccountEpoch(accountEpoch)
       await get().reconcileCollections()
       assertCurrentAccountEpoch(accountEpoch)
@@ -1379,17 +2618,19 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     }
   },
 
-  rejectInvitation: async (invitation: any) => {
-    const accountEpoch = getAccountEpoch()
-    const { account } = get()
-    if (!account) {
-      logger.warn('[etebase-store] Cannot reject invitation: no account')
+  rejectInvitation: async (view: IncomingInvitationView) => {
+    const binding = incomingInvitationBindings.get(view)
+    if (!binding || binding.used) {
+      logger.warn('[etebase-store] Cannot reject invitation: unknown or already used')
       return false
     }
+    binding.used = true
+    const { accountEpoch, account } = binding
 
     try {
       const core = await import('@silentsuite/core')
-      await core.rejectInvitation(account, invitation)
+      if (!isCurrentSharingBoundary(binding, get())) throw new AccountBoundaryChangedError()
+      await core.rejectInvitation(account, binding.invitation)
       assertCurrentAccountEpoch(accountEpoch)
       return true
     } catch (err) {
@@ -1400,26 +2641,73 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     }
   },
 
-  inviteToCollection: async (type: CollectionTypeKey, collectionUid: string, username: string, accessLevel: CollectionAccessLevel) => {
+  prepareCollectionInvite: async (type: CollectionTypeKey, collectionUid: string, username: string, accessLevel: CollectionAccessLevel) => {
     const accountEpoch = getAccountEpoch()
     const { account, collections, accountFingerprint } = get()
-    const collection = resolveCollection(collections, type, collectionUid)
-    if (!account || !collection) {
-      logger.warn(`[etebase-store] Cannot invite to ${type} collection ${collectionUid}: missing account or collection`)
-      return false
+    const collection = findExactSharingCollection(collections, type, collectionUid)
+    const recipient = username.trim()
+    if (!account || !collection || !recipient) {
+      logger.warn(`[etebase-store] Cannot prepare ${type} invite: missing account, exact collection, or username`)
+      return null
     }
+    const boundary: SharingBoundary = { accountEpoch, account, accountFingerprint }
+    const isCurrentTarget = () => isCurrentSharingBoundary(boundary, get())
+      && findExactSharingCollection(get().collections, type, collectionUid) === collection
 
     try {
       const core = await import('@silentsuite/core')
-      await core.inviteToCollection(account, collection, username, accessLevel)
+      if (!isCurrentTarget()) throw new AccountBoundaryChangedError()
+      const profile = await core.fetchUserProfile(account, recipient)
+      if (!isCurrentTarget()) throw new AccountBoundaryChangedError()
+      const pubkey = copySharingPublicKey(profile?.pubkey)
+      if (!pubkey) throw new Error('Recipient sharing key is missing or malformed')
+      const fingerprint = core.getPublicKeyFingerprint(pubkey)
+      const pending: PendingCollectionInvite = Object.freeze({ type, collectionUid, username: recipient, accessLevel, fingerprint })
+      pendingInviteBindings.set(pending, { ...boundary, collection, pubkey })
+      return pending
+    } catch (err) {
+      if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return null
+      console.error('[etebase-store] Failed to fetch sharing profile', getSafeErrorDetails(err))
+      showErrorToast('Could not fetch the security fingerprint for that account. Please verify the username and try again.')
+      return null
+    }
+  },
+
+  confirmCollectionInvite: async (pending: PendingCollectionInvite) => {
+    const binding = pendingInviteBindings.get(pending)
+    // Single-use: the token is spent before any await, so a second confirm can never dispatch.
+    pendingInviteBindings.delete(pending)
+    if (!binding) {
+      logger.warn('[etebase-store] Cannot send invite: confirmation is unknown, discarded, or already used')
+      return false
+    }
+    const { accountEpoch, account, collection, pubkey } = binding
+
+    try {
+      const core = await import('@silentsuite/core')
+      if (core.getPublicKeyFingerprint(pubkey) !== pending.fingerprint) {
+        throw new Error('Recipient fingerprint changed before invite')
+      }
+      const state = get()
+      if (
+        !isCurrentSharingBoundary(binding, state)
+        || findExactSharingCollection(state.collections, pending.type, pending.collectionUid) !== collection
+      ) {
+        throw new AccountBoundaryChangedError()
+      }
+      await core.inviteToCollection(account, collection, pending.username, pubkey, pending.accessLevel)
       assertCurrentAccountEpoch(accountEpoch)
       return true
     } catch (err) {
       if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return false
       console.error('[etebase-store] Failed to create sharing invitation', getSafeErrorDetails(err))
-      showErrorToast('Failed to create sharing invitation. Please verify the username and try again.')
+      showErrorToast('Failed to create sharing invitation. Invite again to fetch and compare a fresh fingerprint.')
       return false
     }
+  },
+
+  discardCollectionInvite: (pending: PendingCollectionInvite) => {
+    pendingInviteBindings.delete(pending)
   },
 
   listCollectionMembers: async (type: CollectionTypeKey, collectionUid: string) => {
@@ -1452,6 +2740,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       await core.removeCollectionMember(account, collection, username)
       assertCurrentAccountEpoch(accountEpoch)
       return true
@@ -1474,6 +2763,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       await core.leaveCollection(account, collection)
       assertCurrentAccountEpoch(accountEpoch)
       await get().reconcileCollections()
@@ -1498,6 +2788,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       await core.modifyCollectionMemberAccess(account, collection, username, accessLevel)
       assertCurrentAccountEpoch(accountEpoch)
       return true
@@ -1524,8 +2815,18 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       logger.warn(`[etebase-store] Refusing to clear ${type} collection before domain load completes`)
       return 0
     }
+    // Notes and contacts clear only proved, unprotected snapshot members (#744 §9).
+    if (type === 'notes' || type === 'contacts') {
+      try {
+        return await clearMembersConditionally(type, collection, offlineQueueGuard, accountEpoch, get, set)
+      } catch (err) {
+        if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return 0
+        throw err
+      }
+    }
 
-    const removeCachedItems = async (uids: string[]) => {
+    /** `acknowledged`: the server confirmed these deletes, so the display cache is not authority. */
+    const removeCachedItems = async (uids: string[], acknowledged: boolean) => {
       if (uids.length === 0) return
       assertCurrentAccountEpoch(accountEpoch)
       const uidSet = new Set(uids)
@@ -1537,7 +2838,8 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         newItemTypeMap.delete(uid)
         newItemCollectionMap.delete(uid)
         if (isLocalCacheEnabled()) {
-          await cacheDeleteItem(uid, accountEpoch)
+          if (acknowledged) await displayCacheAfterAck(() => cacheDeleteItem(uid, accountEpoch), accountEpoch)
+          else await cacheDeleteItem(uid, accountEpoch)
           assertCurrentAccountEpoch(accountEpoch)
         }
       }
@@ -1571,14 +2873,15 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         const batchEntries = itemEntries.slice(i, i + BATCH_SIZE)
         const batchItems = batchEntries.map(({ item }) => item)
         for (const item of batchItems) item.delete()
+        assertCurrentAccountEpoch(accountEpoch)
         await itemManager.batch(batchItems)
         assertCurrentAccountEpoch(accountEpoch)
         successfulUids.push(...batchEntries.map(({ uid }) => uid))
       }
 
-      await removeCachedItems(successfulUids)
+      await removeCachedItems(successfulUids, true)
       if (isLocalCacheEnabled()) {
-        await cacheReplaceItemsForCollection(collection.uid, [], accountEpoch)
+        await displayCacheAfterAck(() => cacheReplaceItemsForCollection(collection.uid, [], accountEpoch), accountEpoch)
         assertCurrentAccountEpoch(accountEpoch)
       }
       await removeQueuedMutationsForCollection(type, collection.uid, true, accountEpoch, accountFingerprint)
@@ -1603,7 +2906,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
               console.error('[etebase-store] Failed to enqueue collection item delete', getSafeErrorDetails(queueErr))
             }
           }
-          await removeCachedItems(itemEntries.map(({ uid }) => uid))
+          await removeCachedItems(itemEntries.map(({ uid }) => uid), false)
           if (isLocalCacheEnabled()) {
             await cacheReplaceItemsForCollection(collection.uid, [], accountEpoch)
             assertCurrentAccountEpoch(accountEpoch)
@@ -1615,7 +2918,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
         console.error(`[etebase-store] Failed to clear ${type} collection`, getSafeErrorDetails(err))
         if (successfulUids.length > 0) {
-          await removeCachedItems(successfulUids)
+          await removeCachedItems(successfulUids, true)
           await removeItemsFromDomainStore(type, collection.uid, successfulUids, accountEpoch)
           assertCurrentAccountEpoch(accountEpoch)
           showErrorToast(`Deleted ${successfulUids.length} of ${itemEntries.length} ${collectionItemNoun(type)}. Please try again to delete the rest.`)
@@ -1713,7 +3016,9 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       })
     }
 
-    const requireItem = async () => {
+    // Resolves null only after a complete listing of the live owning collection
+    // has no live item with this UID; any failed read throws.
+    const findItem = async () => {
       if (!entry.itemUid) throw new ReplayNotConfirmedError('Replay requires an item UID')
       if (!entry.collectionUid) throw new ReplayNotConfirmedError('Replay item collection ownership is unavailable')
       const cached = itemCache.get(entry.itemUid)
@@ -1727,9 +3032,14 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       // outlived the item maps: fetch the item from its owning collection.
       const collection = requireCollection(entry.collectionUid, 'owner')
       const remote = await findRemoteItemByUid(collection, entry.itemUid)
-      if (!remote) throw new ReplayNotConfirmedError('Replay item is unavailable')
+      if (!remote) return null
       publishConfirmedReplayItem(remote, entry.itemUid, collection.uid)
       return remote
+    }
+    const requireItem = async () => {
+      const item = await findItem()
+      if (!item) throw new ReplayNotConfirmedError('Replay item is unavailable')
+      return item
     }
 
     switch (entry.type) {
@@ -1771,10 +3081,185 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         assertOfflineQueueAccountGuard(guard, get())
         return { remoteMutationConfirmed: true }
       }
-      case 'delete': {
-        const collection = requireCollection(entry.collectionUid, 'owner')
-        const item = await requireItem()
+      case 'sealed-update': {
+        // #744 sealed replay (§12): write the accepted text only while the
+        // server still holds the editing base it was typed on; otherwise hold.
+        let rev = entry.rev
+        const hold = async (reason: NonNullable<QueueEntry['held']>): Promise<never> => {
+          assertOfflineQueueAccountGuard(guard, get())
+          await casStub(entry.id, rev, { held: reason }, guard)
+          assertOfflineQueueAccountGuard(guard, get())
+          throw new ReplayNotConfirmedError(`Sealed custody held: ${reason}`)
+        }
+        const itemUid = entry.itemUid
+        // Closed world: a note record carries a note payload, a contact record a favorite payload.
+        const kind = entry.collectionType === 'notes' ? 'note' : entry.collectionType === 'contacts' ? 'favorite' : null
+        if (!kind || !itemUid || !entry.collectionUid) return hold('unreadable')
+        const opened = await cacheOpenQueuePayload(
+          entry.sealed,
+          `${guard.accountFingerprint}|${entry.collectionType}|${itemUid}`,
+          guard.accountEpoch,
+        )
         assertOfflineQueueAccountGuard(guard, get())
+        if (opened.kind === 'not-ready') throw new ReplayNotConfirmedError('Sealed custody key is not ready')
+        if (opened.kind === 'unreadable') return hold('unreadable')
+        const payload: SealedNotePayload | SealedFavoritePayload | null = kind === 'note'
+          ? parseSealedNotePayload(opened.plaintext)
+          : parseSealedFavoritePayload(opened.plaintext)
+        if (!payload) return hold('unreadable')
+        const noteMeta = payload.kind === 'note' ? payload.body.meta : undefined
+        if (opened.resealed) {
+          // Old-key-only open: store the identical plaintext under the current key first.
+          const resealed = await casStub(entry.id, rev, { sealed: opened.resealed }, guard)
+          assertOfflineQueueAccountGuard(guard, get())
+          if (!resealed) throw new ReplayNotConfirmedError('Sealed custody changed during replay')
+          rev = (rev ?? 0) + 1
+        }
+        // One text's digest in this payload's own kind: a note by title and body, a
+        // contact by its complete vCard text, never a lossy parsed model.
+        const digestOf = async (text: string, meta: { name?: string } | undefined): Promise<string | null> => {
+          if (kind === 'note') return cacheSealedPayloadDigest(['note', core.noteFromEtebaseItem(itemUid, '', meta ?? {}).title, text])
+          return cacheSealedPayloadDigest(['favorite', text])
+        }
+        const bodyDigest = await digestOf(payload.body.content, noteMeta ? { name: noteMeta.name } : undefined)
+        assertOfflineQueueAccountGuard(guard, get())
+        // The child is proved against the original base only, never against a fresher revision.
+        const proves = async (child: any): Promise<boolean> => {
+          if (child.isDeleted) return false
+          if (payload.base.revision !== null && core.savedRevisionOf(child) === payload.base.revision) return true
+          const raw = await child.getContent()
+          assertOfflineQueueAccountGuard(guard, get())
+          const text = typeof raw === 'string' ? raw : new TextDecoder().decode(raw)
+          const digest = await digestOf(text, kind === 'note' ? child.getMeta() : undefined)
+          assertOfflineQueueAccountGuard(guard, get())
+          if (digest === null) return false
+          return digest === payload.base.digest || payload.prior.includes(digest) || digest === bodyDigest
+        }
+        for (let attempt = 0; attempt < 3; attempt++) {
+          let collection: any
+          try {
+            assertOfflineQueueAccountGuard(guard, get())
+            collection = await core.getCollection(account, entry.collectionUid)
+          } catch (err) {
+            if (err instanceof Error && err.name === 'NotFoundError') return hold('target-missing')
+            throw err
+          }
+          assertOfflineQueueAccountGuard(guard, get())
+          if (collection.isDeleted) return hold('target-missing')
+          let child: any = null
+          let stoken: string | null | undefined
+          do {
+            assertOfflineQueueAccountGuard(guard, get())
+            const response = await core.listItems(account, collection, stoken)
+            assertOfflineQueueAccountGuard(guard, get())
+            child = response.items.find((candidate: any) => candidate.uid === itemUid) ?? null
+            if (child || response.done) break
+            stoken = response.stoken
+          } while (true)
+          if (!child) return hold('target-missing')
+          // Deleted elsewhere: the item is gone, not changed (#744).
+          if (child.isDeleted) return hold('target-missing')
+          if (!await proves(child)) return hold('base-changed')
+          const provedRevision = core.savedRevisionOf(child)
+          if (!provedRevision) throw new ReplayNotConfirmedError('Sealed custody target revision is unknown')
+          // After the proof, right before the write: this exact record must still be the item's
+          // only, unheld custody at this revision. A successor that replaced it, or was already
+          // written and acknowledged meanwhile, is never overwritten by these older bytes.
+          const current = await readOutstanding({ collectionType: entry.collectionType, itemUid }, guard)
+          assertOfflineQueueAccountGuard(guard, get())
+          const live = current.length === 1 ? current[0] : undefined
+          if (!live?.sealed || live.id !== entry.id || live.rev !== rev || live.held) {
+            throw new ReplayNotConfirmedError('Sealed custody changed during replay')
+          }
+          const written = await core.updateItemIfUnchanged(account, collection, child, payload.body.content, noteMeta, {
+            etagOverride: provedRevision,
+            deps: [collection.item],
+            beforeDispatch: () => assertOfflineQueueAccountGuard(guard, get()),
+          })
+          assertOfflineQueueAccountGuard(guard, get())
+          // Nothing is published locally; the next refresh brings the server copy and its paired revision.
+          // A contact write obliges no note editor; once this exact record is acknowledged, its queued overlay retires.
+          if (written.kind === 'saved' && kind === 'favorite') {
+            const { contactSealedFavoriteAcknowledged } = await import('@/app/stores/use-contact-store')
+            assertOfflineQueueAccountGuard(guard, get())
+            const onAcknowledged = () => {
+              if (getAccountEpoch() === guard.accountEpoch) contactSealedFavoriteAcknowledged(itemUid)
+            }
+            return { remoteMutationConfirmed: true, acknowledgeRev: rev, onAcknowledged }
+          }
+          if (written.kind === 'saved') {
+            // T3 (#744): this context's own proved write obliges a mounted editor of
+            // the note, but only once the queue acknowledged this exact record.
+            const { noteSealedWriteAccepted } = await import('@/app/stores/use-note-store')
+            assertOfflineQueueAccountGuard(guard, get())
+            const onAcknowledged = () => {
+              if (getAccountEpoch() === guard.accountEpoch) noteSealedWriteAccepted(itemUid)
+            }
+            return { remoteMutationConfirmed: true, acknowledgeRev: rev, onAcknowledged }
+          }
+          // 409: the child or its collection changed after the proof; fetch and prove again.
+        }
+        throw new ReplayNotConfirmedError('Sealed custody target kept changing')
+      }
+      case 'delete': {
+        if (entry.expectedEtag !== undefined) {
+          // #744 §9: a conditional delete removes the item only at the revision it was authorized at.
+          if (!entry.itemUid || !entry.collectionUid) throw new ReplayNotConfirmedError('Replay delete requires an item UID')
+          const restored = (child: any) => {
+            let title: string | undefined
+            try {
+              if (entry.collectionType === 'notes' && child) title = core.noteFromEtebaseItem(child.uid, '', child.getMeta()).title
+            } catch {
+              title = undefined
+            }
+            showErrorToast(`Couldn't delete "${title ?? itemSaveNoun(entry.collectionType)}" because it changed after you deleted it. It's been restored.`)
+          }
+          if (!knownRevision(entry.expectedEtag)) {
+            restored(null)
+            return { remoteMutationConfirmed: true }
+          }
+          let owner: any
+          try {
+            assertOfflineQueueAccountGuard(guard, get())
+            owner = await core.getCollection(account, entry.collectionUid)
+          } catch (err) {
+            if (err instanceof Error && err.name === 'NotFoundError') return { remoteMutationConfirmed: true }
+            throw err
+          }
+          assertOfflineQueueAccountGuard(guard, get())
+          if (owner.isDeleted) return { remoteMutationConfirmed: true }
+          const child = await findRemoteItemByUid(owner, entry.itemUid)
+          assertOfflineQueueAccountGuard(guard, get())
+          if (!child || child.isDeleted) return { remoteMutationConfirmed: true }
+          const result = await core.deleteItemIfUnchanged(account, owner, child, {
+            etagOverride: entry.expectedEtag,
+            beforeDispatch: () => assertOfflineQueueAccountGuard(guard, get()),
+          })
+          assertOfflineQueueAccountGuard(guard, get())
+          if (result.kind === 'conflict') {
+            if (entry.collectionType === 'contacts') {
+              let name: string | undefined
+              try {
+                const raw = await child.getContent()
+                name = core.deserializeContact(typeof raw === 'string' ? raw : new TextDecoder().decode(raw)).displayName
+              } catch {
+                name = undefined
+              }
+              // The name was read across an await: it is shown only while its own account is current.
+              assertOfflineQueueAccountGuard(guard, get())
+              showErrorToast(`Couldn't delete "${name ?? itemSaveNoun(entry.collectionType)}" because it changed after you deleted it. It's been restored.`)
+            } else {
+              restored(child)
+            }
+          }
+          return { remoteMutationConfirmed: true }
+        }
+        const collection = requireCollection(entry.collectionUid, 'owner')
+        const item = await findItem()
+        assertOfflineQueueAccountGuard(guard, get())
+        // Already gone on the server (deleted elsewhere, or an earlier delete
+        // whose response was lost): the wanted end state holds.
+        if (!item) return { remoteMutationConfirmed: true }
         await core.deleteItem(account, collection, item)
         assertOfflineQueueAccountGuard(guard, get())
         return { remoteMutationConfirmed: true }
@@ -1817,7 +3302,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     }
   },
 
-  createItem: async (type: CollectionTypeKey, content: string, tempId?: string, collectionUid?: string, meta?: ItemMeta) => {
+  createItem: async (type: CollectionTypeKey, content: string, tempId?: string, collectionUid?: string, meta?: ItemMeta, onCommitted?: (item: any) => void) => {
     const accountEpoch = getAccountEpoch()
     const { account, collections, accountFingerprint } = get()
     const offlineQueueGuard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
@@ -1830,6 +3315,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       const item = await core.createItem(account, collection, content, meta)
       assertCurrentAccountEpoch(accountEpoch)
       // Cache the item for future update/delete
@@ -1840,6 +3326,9 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       itemTypeMap.set(item.uid, type)
       itemCollectionMap.set(item.uid, collection.uid)
       set({ itemCache, itemTypeMap, itemCollectionMap })
+      // The committed SDK object, still under the account the item was created in.
+      assertCurrentAccountEpoch(accountEpoch)
+      onCommitted?.(item)
       // Write through to the local persistence cache so a reload paints it.
       await writeItemToCache(type, collection.uid, item.uid, content, accountEpoch, meta ?? itemMetaOf(item))
       return item.uid
@@ -1865,7 +3354,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     }
   },
 
-  createItemsBatch: async (type: CollectionTypeKey, contents: { content: string; tempId: string }[], collectionUid?: string) => {
+  createItemsBatch: async (type: CollectionTypeKey, contents: { content: string; tempId: string }[], collectionUid?: string, onCommitted?: (tempId: string, item: any) => void) => {
     const accountEpoch = getAccountEpoch()
     const { account, collections, accountFingerprint } = get()
     const offlineQueueGuard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
@@ -1977,8 +3466,13 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       }
       assertCurrentAccountEpoch(accountEpoch)
       set({ itemCache, itemTypeMap, itemCollectionMap })
+      // Each acknowledged SDK object, still under the account the batch was created in (#744).
+      for (let i = 0; i <= lastSuccessfulItemIndex; i++) {
+        assertCurrentAccountEpoch(accountEpoch)
+        onCommitted?.(contents[i]!.tempId, items[i])
+      }
       if (isLocalCacheEnabled() && cachedRecords.length > 0) {
-        await cachePutItems(cachedRecords, accountEpoch)
+        await displayCacheAfterAck(() => cachePutItems(cachedRecords, accountEpoch), accountEpoch)
         assertCurrentAccountEpoch(accountEpoch)
       }
 
@@ -2019,6 +3513,20 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
   },
 
   updateItem: async (type: CollectionTypeKey, itemUid: string, content: string, options) => {
+    // Sealed-intent note saves dispatch only at their captured editing base (#744 §7).
+    if (options?.sealIntent === 'note') {
+      if (type !== 'notes') {
+        options.onRefused?.()
+        return false
+      }
+      return updateNoteAtCapturedBase(itemUid, content, options, get, set)
+    }
+    // Contact saves dispatch only at their captured record base (#744 §8).
+    if (type === 'contacts' && options?.contactBase) return updateContactAtCapturedBase(itemUid, content, options, get, set)
+    if (options?.sealIntent === 'favorite') {
+      options.onRefused?.()
+      return false
+    }
     const accountEpoch = getAccountEpoch()
     const { account, collections, itemCache, itemCollectionMap, accountFingerprint } = get()
     const offlineQueueGuard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
@@ -2072,7 +3580,8 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     }
   },
 
-  moveItem: async (type: CollectionTypeKey, itemUid: string, content: string, targetCollectionUid: string, sourceCollectionUid?: string, meta?: ItemMeta) => {
+  moveItem: async (type: CollectionTypeKey, itemUid: string, content: string, targetCollectionUid: string, sourceCollectionUid?: string, meta?: ItemMeta, options?: { sourceRevision?: string; offlineAllowed?: boolean }) => {
+    const sourceRevision = options?.sourceRevision
     const accountEpoch = getAccountEpoch()
     const { account, collections, itemCache, itemCollectionMap, accountFingerprint } = get()
     const offlineQueueGuard = captureOfflineQueueAccountGuard({ account, accountFingerprint })
@@ -2099,17 +3608,76 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       assertCurrentAccountEpoch(accountEpoch)
       let keepSourceUntilQueuedDelete = false
 
+      const moveFailed = (): null => {
+        showErrorToast(`Failed to move ${collectionItemNoun(type).replace(/s$/, '')}. Please try again.`)
+        return null
+      }
+      // #744 §13: a failed conditional move takes its copy back, only at the copy's own
+      // saved revision. When the server cannot confirm that, the same conditional delete
+      // is queued for this account; a copy someone changed meanwhile is never removed.
+      const takeBackCopy = async (): Promise<null> => {
+        const copyRevision = core.savedRevisionOf(created)
+        try {
+          if (!copyRevision) throw new Error('Moved copy revision is unknown')
+          const result = await core.deleteItemIfUnchanged(account, targetCollection, created, {
+            etagOverride: copyRevision,
+            beforeDispatch: () => assertOfflineQueueAccountGuard(offlineQueueGuard, get()),
+          })
+          assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+          if (result.kind === 'conflict') logger.warn(`[etebase-store] Kept moved ${type} item ${created.uid}: it changed before the rollback`)
+        } catch (rollbackErr) {
+          if (!isCurrentAccountEpoch(accountEpoch) || rollbackErr instanceof AccountBoundaryChangedError) return null
+          logger.warn(`[etebase-store] Failed to roll back moved ${type} item ${created.uid}`, getSafeErrorDetails(rollbackErr))
+          if (copyRevision) {
+            try {
+              assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+              await insertIfNoOutstanding(
+                { type: 'delete', collectionType: type, collectionUid: targetCollection.uid, itemUid: created.uid, expectedEtag: copyRevision },
+                offlineQueueGuard,
+              )
+              assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+            } catch (queueErr) {
+              if (!isCurrentAccountEpoch(accountEpoch) || queueErr instanceof AccountBoundaryChangedError) return null
+              console.error('[etebase-store] Failed to queue the rollback of a moved item', getSafeErrorDetails(queueErr))
+            }
+          }
+        }
+        return moveFailed()
+      }
       try {
-        await core.deleteItem(account, sourceCollection, item)
+        if (sourceRevision !== undefined) {
+          const removed = await core.deleteItemIfUnchanged(account, sourceCollection, item, {
+            etagOverride: sourceRevision,
+            beforeDispatch: () => assertOfflineQueueAccountGuard(offlineQueueGuard, get()),
+          })
+          assertCurrentAccountEpoch(accountEpoch)
+          // The source changed after this move was authorized: it stays, and the copy is taken back.
+          if (removed.kind === 'conflict') return await takeBackCopy()
+        } else {
+          await core.deleteItem(account, sourceCollection, item)
+        }
         assertCurrentAccountEpoch(accountEpoch)
       } catch (err) {
         if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return null
         if (isOfflineError(err)) {
           assertOfflineQueueAccountGuard(offlineQueueGuard, get())
-          await enqueue({ type: 'delete', collectionType: type, collectionUid: sourceCollection.uid, itemUid }, offlineQueueGuard)
-          assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+          if (sourceRevision !== undefined) {
+            // Offline, the source delete is admitted only at the authorized revision; refused, the source stays.
+            const admitted = options?.offlineAllowed !== false && await insertIfNoOutstanding(
+              { type: 'delete', collectionType: type, collectionUid: sourceCollection.uid, itemUid, expectedEtag: sourceRevision },
+              offlineQueueGuard,
+            )
+            assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+            if (!admitted) return await takeBackCopy()
+          } else {
+            await enqueue({ type: 'delete', collectionType: type, collectionUid: sourceCollection.uid, itemUid }, offlineQueueGuard)
+            assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+          }
           logger.warn(`[etebase-store] Offline after moving ${type}/${itemUid} - queued source delete`)
           keepSourceUntilQueuedDelete = true
+        } else if (sourceRevision !== undefined) {
+          console.error(`[etebase-store] Failed to move ${type} item`, getSafeErrorDetails(err))
+          return await takeBackCopy()
         } else {
           try {
             assertCurrentAccountEpoch(accountEpoch)
@@ -2138,7 +3706,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       assertCurrentAccountEpoch(accountEpoch)
       set({ itemCache: newCache, itemTypeMap: newTypeMap, itemCollectionMap: newCollectionMap })
       if (isLocalCacheEnabled()) {
-        if (!keepSourceUntilQueuedDelete) await cacheDeleteItem(itemUid, accountEpoch)
+        if (!keepSourceUntilQueuedDelete) await displayCacheAfterAck(() => cacheDeleteItem(itemUid, accountEpoch), accountEpoch)
         assertCurrentAccountEpoch(accountEpoch)
         await writeItemToCache(type, targetCollection.uid, created.uid, content, accountEpoch, meta ?? itemMetaOf(created))
         assertCurrentAccountEpoch(accountEpoch)
@@ -2160,6 +3728,58 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     const knownCollectionUid = itemCollectionMap.get(itemUid) ?? options?.collectionUid
     const collection = resolveCollection(collections, type, knownCollectionUid)
     const item = itemCache.get(itemUid)
+    if (options?.conditional) {
+      // #744 §9: a note or contact is deleted only at the revision this context authorized.
+      const revision = options.expectedRevision
+      if (!knownRevision(revision) || !knownCollectionUid) return false
+      const admitOffline = async (): Promise<'queued' | false> => {
+        if (options.offlineAllowed === false) return false
+        try {
+          assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+          const inserted = await insertIfNoOutstanding(
+            { type: 'delete', collectionType: type, collectionUid: collection?.uid ?? knownCollectionUid, itemUid, expectedEtag: revision },
+            offlineQueueGuard,
+            options.admit,
+          )
+          assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+          return inserted ? 'queued' : false
+        } catch (queueErr) {
+          if (!isCurrentAccountEpoch(accountEpoch) || queueErr instanceof AccountBoundaryChangedError) return false
+          console.error('[etebase-store] Failed to admit a conditional delete', getSafeErrorDetails(queueErr))
+          return false
+        }
+      }
+      // C2: a proved server uid with no SDK item in memory goes through checked admission only.
+      if (!collection || !item) return admitOffline()
+      try {
+        const core = await import('@silentsuite/core')
+        assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+        const result = await core.deleteItemIfUnchanged(account, collection, item, {
+          etagOverride: revision,
+          beforeDispatch: () => assertOfflineQueueAccountGuard(offlineQueueGuard, get()),
+        })
+        assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+        // A conflict refuses: the server holds something this context never authorized deleting.
+        if (result.kind === 'conflict') return false
+        const newCache = new Map(get().itemCache)
+        const newTypeMap = new Map(get().itemTypeMap)
+        const newCollectionMap = new Map(get().itemCollectionMap)
+        newCache.delete(itemUid)
+        newTypeMap.delete(itemUid)
+        newCollectionMap.delete(itemUid)
+        set({ itemCache: newCache, itemTypeMap: newTypeMap, itemCollectionMap: newCollectionMap })
+        if (isLocalCacheEnabled()) {
+          await displayCacheAfterAck(() => cacheDeleteItem(itemUid, accountEpoch), accountEpoch)
+          assertCurrentAccountEpoch(accountEpoch)
+        }
+        return 'remote'
+      } catch (err) {
+        if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return false
+        if (isOfflineError(err)) return admitOffline()
+        console.error(`[etebase-store] Failed to delete ${type} item`, getSafeErrorDetails(err))
+        return false
+      }
+    }
     if (!collection || !item) {
       if (!knownCollectionUid) {
         logger.warn(`[etebase-store] Cannot delete item ${itemUid}: missing collection or item`)
@@ -2182,6 +3802,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
 
     try {
       const core = await import('@silentsuite/core')
+      assertCurrentAccountEpoch(accountEpoch)
       await core.deleteItem(account, collection, item)
       assertCurrentAccountEpoch(accountEpoch)
       const newCache = new Map(get().itemCache)
@@ -2192,7 +3813,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       newCollectionMap.delete(itemUid)
       set({ itemCache: newCache, itemTypeMap: newTypeMap, itemCollectionMap: newCollectionMap })
       if (isLocalCacheEnabled()) {
-        await cacheDeleteItem(itemUid, accountEpoch)
+        await displayCacheAfterAck(() => cacheDeleteItem(itemUid, accountEpoch), accountEpoch)
         assertCurrentAccountEpoch(accountEpoch)
       }
       if (type === 'notes') {
@@ -2232,6 +3853,8 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
     assertCurrentAccountEpoch(accountEpoch)
     const { itemCache, itemTypeMap, itemCollectionMap } = get()
     const results: CachedContentItem[] = []
+    const { savedRevisionOf } = await import('@silentsuite/core')
+    assertCurrentAccountEpoch(accountEpoch)
 
     for (const [uid, item] of itemCache.entries()) {
       if (itemTypeMap.get(uid) !== type) continue
@@ -2240,7 +3863,8 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         assertCurrentAccountEpoch(accountEpoch)
         const contentStr = typeof content === 'string' ? content : new TextDecoder().decode(content)
         const collectionUid = itemCollectionMap.get(uid)
-        if (collectionUid) results.push({ uid, content: contentStr, collectionUid, meta: itemMetaOf(item) })
+        // Content and revision come from the same SDK item.
+        if (collectionUid) results.push({ uid, content: contentStr, collectionUid, meta: itemMetaOf(item), revision: savedRevisionOf(item) })
       } catch (err) {
         if (err instanceof AccountBoundaryChangedError || !isCurrentAccountEpoch(accountEpoch)) throw new AccountBoundaryChangedError()
         // Skip items that fail to decode
@@ -2290,7 +3914,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
               assertCurrentAccountEpoch(accountEpoch)
               const contentStr = typeof content === 'string' ? content : new TextDecoder().decode(content)
               collectionItems.push({ item, content: contentStr })
-              allResults.push({ uid: item.uid, content: contentStr, collectionUid: freshCollection.uid, meta })
+              allResults.push({ uid: item.uid, content: contentStr, collectionUid: freshCollection.uid, meta, revision: core.savedRevisionOf(item) })
             } catch (err) {
               if (err instanceof AccountBoundaryChangedError) throw err
               // Skip items that fail to decode
@@ -2380,24 +4004,35 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
   },
 
   destroy: () => {
-    bumpAccountEpoch()
-    const { syncEngine } = get()
-    if (syncEngine) {
-      syncEngine.stop()
+    const epoch = bumpAccountEpoch()
+    // The account goes with its generation; released first so the check below sees only this bump.
+    releaseLogoutGeneration()
+    // Any failure after the bump, including a nested teardown's typed error,
+    // is stamped with this invocation's token so callers never adopt another.
+    try {
+      const { syncEngine } = get()
+      if (syncEngine) {
+        syncEngine.stop()
+      }
+      // A synchronously re-entrant account boundary now owns this store.
+      if (!isCurrentAccountEpoch(epoch)) return epoch
+      set({
+        account: null,
+        accountFingerprint: null,
+        collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] },
+        itemCache: new Map(),
+        itemTypeMap: new Map(),
+        itemCollectionMap: new Map(),
+        isInitialized: false,
+        restoreBlocked: false,
+        domainLoadState: unknownDomainLoadState(),
+        syncEngine: null,
+      })
+      logger.debug('[etebase-store] Destroyed')
+      return epoch
+    } catch (err) {
+      throw new EtebaseTeardownError(epoch, err)
     }
-    set({
-      account: null,
-      accountFingerprint: null,
-      collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] },
-      itemCache: new Map(),
-      itemTypeMap: new Map(),
-      itemCollectionMap: new Map(),
-      isInitialized: false,
-      restoreBlocked: false,
-      domainLoadState: unknownDomainLoadState(),
-      syncEngine: null,
-    })
-    logger.debug('[etebase-store] Destroyed')
   },
 
   onSyncChange: (handler) => {

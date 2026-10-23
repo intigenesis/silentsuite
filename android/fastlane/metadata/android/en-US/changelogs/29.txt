@@ -1,0 +1,3 @@
+- Restore contacts that showed in SilentSuite but were missing from your phone's Contacts app, including after an address book was recreated. Local group changes and deletions are kept.
+- Explain when a compatible task app needs to be installed for Tasks to sync.
+- Make Notes storage safer, so an unfinished write cannot replace a saved note.
