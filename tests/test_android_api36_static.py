@@ -12,10 +12,10 @@ DRAWER_RUNTIME = ROOT / "android/app/src/androidTest/java/io/silentsuite/sync/ui
 WORKFLOW = ROOT / ".github/workflows/build-android.yml"
 
 
-def test_final_app_targets_api_36_without_changing_the_api_21_floor():
+def test_final_app_targets_api_36_with_the_android_10_floor():
     app_build = APP_BUILD.read_text(encoding="utf-8")
 
-    assert "minSdkVersion 21" in app_build
+    assert "minSdkVersion 29" in app_build
     assert "targetSdkVersion 36" in app_build
     assert "targetSdkVersion 35" not in app_build
 
