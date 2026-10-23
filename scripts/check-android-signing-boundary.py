@@ -1106,7 +1106,7 @@ def check_umbrel_publication(server: Mapping[str, Any], violations: list[str]) -
         violations.append("web producer permissions must be contents:read and packages:write")
     if web.get("strategy") != (jobs.get("build") or {}).get("strategy"):
         violations.append("web producer must use the server native matrix")
-    if web.get("env") != {"DOCKER_CONFIG": "${{ runner.temp }}/web-registry-${{ matrix.arch }}"}:
+    if web.get("env") != {"DOCKER_CONFIG": "${{ github.workspace }}/.web-registry-${{ matrix.arch }}"}:
         violations.append("web registry credentials need an isolated Docker config")
     named = {step.get("name"): step for step in job_steps(web)}
     build = (named.get("Build and push owner-enabled web by digest") or {}).get("with") or {}

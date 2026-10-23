@@ -167,7 +167,7 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
     env:
-      DOCKER_CONFIG: ${{ runner.temp }}/web-registry-${{ matrix.arch }}
+      DOCKER_CONFIG: ${{ github.workspace }}/.web-registry-${{ matrix.arch }}
     steps:
       - name: Checkout the admitted commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

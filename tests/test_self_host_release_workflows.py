@@ -1413,7 +1413,7 @@ def test_web_native_producer_and_alias_loop_are_admission_bound():
     job = RELEASE["jobs"]["build-web"]
     assert job["needs"] == "build"
     assert job["strategy"]["matrix"] == RELEASE["jobs"]["build"]["strategy"]["matrix"]
-    assert job["env"] == {"DOCKER_CONFIG": "${{ runner.temp }}/web-registry-${{ matrix.arch }}"}
+    assert job["env"] == {"DOCKER_CONFIG": "${{ github.workspace }}/.web-registry-${{ matrix.arch }}"}
     build = step_named(job, "Build and push owner-enabled web by digest")["with"]
     assert build["context"] == "candidate" and build["file"] == "candidate/Dockerfile.web"
     assert build["platforms"] == "${{ matrix.platform }}"
