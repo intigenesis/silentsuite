@@ -107,6 +107,21 @@ class SiblingRoutesRuntimeTest {
         }
     }
 
+    // Action-completion fixtures use the real button listener, not touch-injection acceptance.
+    private fun activateDialogButton(buttonId: Int) {
+        onView(androidx.test.espresso.matcher.ViewMatchers.withId(buttonId)).inRoot(isDialog())
+            .perform(object : androidx.test.espresso.ViewAction {
+                override fun getConstraints(): org.hamcrest.Matcher<View> = isDisplayed()
+                override fun getDescription() = "activate the real dialog button $buttonId"
+                override fun perform(controller: androidx.test.espresso.UiController, view: View) {
+                    assertEquals(buttonId, view.id)
+                    assertTrue("Dialog button must be enabled", view.isEnabled)
+                    assertTrue("Dialog button must handle the click", view.performClick())
+                    controller.loopMainThreadUntilIdle()
+                }
+            })
+    }
+
     private fun waitUntil(description: String, timeoutMillis: Long = 10_000, predicate: () -> Boolean) {
         val deadline = SystemClock.uptimeMillis() + timeoutMillis
         while (SystemClock.uptimeMillis() < deadline) {
@@ -228,7 +243,9 @@ class SiblingRoutesRuntimeTest {
                 }
                 onView(withText(context.getString(R.string.change_encryption_password_are_you_sure)))
                     .check(matches(isDisplayed()))
-                onView(withText(android.R.string.yes)).perform(click())
+                activateDialogButton(android.R.id.button1)
+                onView(withText(context.getString(R.string.change_encryption_password_are_you_sure)))
+                    .check(androidx.test.espresso.assertion.ViewAssertions.doesNotExist())
                 assertTrue("Timed out waiting for password success dialog",
                     successDialogShown.await(10, TimeUnit.SECONDS))
                 // The password work uses Dispatchers.IO, which Espresso does not own.  Wait for
@@ -244,7 +261,7 @@ class SiblingRoutesRuntimeTest {
                 }
                 onView(withText(context.getString(R.string.change_encryption_password_success_title))).check(matches(isDisplayed()))
                 onView(withText(context.getString(R.string.change_encryption_password_success_body))).check(matches(isDisplayed()))
-                onView(withText(android.R.string.ok)).perform(click())
+                activateDialogButton(android.R.id.button1)
                 waitUntil("password caller return") { scenario.state == Lifecycle.State.DESTROYED }
                 assertEquals(android.app.Activity.RESULT_CANCELED, scenario.result.resultCode)
             }
@@ -1065,7 +1082,7 @@ class SiblingRoutesRuntimeTest {
     fun collectionMembersRenderRemoveAndReturnToExactCollection() {
         val context=InstrumentationRegistry.getInstrumentation().targetContext;val manager=AccountManager.get(context);val account=addAccount(manager,"ac41-members","ac41-members-generation");val initialState=fixture(members=listOf(RuntimeMember("admin",com.etebase.client.CollectionAccessLevel.Admin),RuntimeMember("writer",com.etebase.client.CollectionAccessLevel.ReadWrite)));val state=AtomicReference(initialState);val calls=AtomicInteger()
         runtimeFixtureOverride=exactFixture(account,"ac41-members-generation",initialState.uid,null) { state.get() };memberRemoveOverride={ _,id,user -> assertEquals(account,id.account);assertEquals("ac41-members-generation",id.creationId);assertEquals(initialState.uid,id.collectionUid);assertEquals(initialState.type,id.collectionType);assertEquals("writer",user);state.set(state.get().copy(members=state.get().members.filter {it.username!=user}));calls.incrementAndGet();true }
-        try { ActivityScenario.launchActivityForResult<CollectionActivity>(CollectionActivity.newIntent(context,account,"ac41-members-generation",initialState.uid)).use { s -> waitUntil("view") {var ok=false;s.onActivity {ok=it.supportFragmentManager.findFragmentById(R.id.fragment_container) is ViewCollectionFragment};ok};s.onActivity { (it.supportFragmentManager.findFragmentById(R.id.fragment_container) as ViewCollectionFragment).onOptionsItemSelected(MenuBuilder(it).add(0, R.id.on_manage_members, 0, "Members")) };waitUntil("members") {var ok=false;s.onActivity {ok=it.supportFragmentManager.findFragmentById(R.id.fragment_container) is CollectionMembersFragment};ok};waitUntil("member rows laid out") { var ok=false;s.onActivity { val list=memberListView(it);ok=list!=null&&list.adapter?.count==2&&list.childCount>=2&&list.getChildAt(0)!=null&&list.getChildAt(1)!=null&&it.findViewById<TextView>(R.id.display_name).text.toString()==initialState.name };ok };s.recreate();waitUntil("recreated member rows laid out") { var ok=false;s.onActivity { val list=memberListView(it);ok=list!=null&&list.adapter?.count==2&&list.childCount>=2&&list.getChildAt(0)!=null&&list.getChildAt(1)!=null };ok };s.onActivity { val list=requireNotNull(memberListView(it));assertTrue(list.performItemClick(requireNotNull(list.getChildAt(0)),0,0)) };onView(withText(android.R.string.ok)).inRoot(isDialog()).perform(click());s.onActivity { val list=requireNotNull(memberListView(it));assertTrue(list.performItemClick(requireNotNull(list.getChildAt(1)),1,1)) };onView(withText(android.R.string.yes)).inRoot(isDialog()).perform(click());waitUntil("writer absent") {var ok=false;s.onActivity { val list=memberListView(it);ok=list?.adapter?.let { adapter -> adapter.count==1&&(adapter.getItem(0) as RuntimeMember).username=="admin" }==true };ok};assertEquals(1,calls.get());s.onActivity {it.onBackPressedDispatcher.onBackPressed()};waitUntil("parent collection") {var ok=false;s.onActivity {ok=it.supportFragmentManager.findFragmentById(R.id.fragment_container) is ViewCollectionFragment};ok};s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as ViewCollectionFragment;assertEquals(account,f.arguments!!.getParcelable("collection.identity.account"));assertEquals("ac41-members-generation",f.arguments!!.getString("collection.identity.creationId"));assertEquals(initialState.uid,f.arguments!!.getString("collection.identity.uid"));assertEquals(initialState.type,f.arguments!!.getString("collection.identity.type"));it.onBackPressedDispatcher.onBackPressed()};assertEquals(android.app.Activity.RESULT_CANCELED,s.result.resultCode) }} finally {memberRemoveOverride=null;runtimeFixtureOverride=null;removeAccountAndWait(manager,account)}
+        try { ActivityScenario.launchActivityForResult<CollectionActivity>(CollectionActivity.newIntent(context,account,"ac41-members-generation",initialState.uid)).use { s -> waitUntil("view") {var ok=false;s.onActivity {ok=it.supportFragmentManager.findFragmentById(R.id.fragment_container) is ViewCollectionFragment};ok};s.onActivity { (it.supportFragmentManager.findFragmentById(R.id.fragment_container) as ViewCollectionFragment).onOptionsItemSelected(MenuBuilder(it).add(0, R.id.on_manage_members, 0, "Members")) };waitUntil("members") {var ok=false;s.onActivity {ok=it.supportFragmentManager.findFragmentById(R.id.fragment_container) is CollectionMembersFragment};ok};waitUntil("member rows laid out") { var ok=false;s.onActivity { val list=memberListView(it);ok=list!=null&&list.adapter?.count==2&&list.childCount>=2&&list.getChildAt(0)!=null&&list.getChildAt(1)!=null&&it.findViewById<TextView>(R.id.display_name).text.toString()==initialState.name };ok };s.recreate();waitUntil("recreated member rows laid out") { var ok=false;s.onActivity { val list=memberListView(it);ok=list!=null&&list.adapter?.count==2&&list.childCount>=2&&list.getChildAt(0)!=null&&list.getChildAt(1)!=null };ok };s.onActivity { val list=requireNotNull(memberListView(it));assertTrue(list.performItemClick(requireNotNull(list.getChildAt(0)),0,0)) };onView(withText(R.string.collection_members_remove_admin)).inRoot(isDialog()).check(matches(isDisplayed()));activateDialogButton(android.R.id.button2);onView(withText(R.string.collection_members_remove_admin)).check(androidx.test.espresso.assertion.ViewAssertions.doesNotExist());assertEquals("admin cannot be removed",0,calls.get());assertEquals(initialState.members,state.get().members);s.onActivity { val list=requireNotNull(memberListView(it));assertTrue(list.performItemClick(requireNotNull(list.getChildAt(1)),1,1)) };onView(withText(context.getString(R.string.collection_members_remove,"writer"))).inRoot(isDialog()).check(matches(isDisplayed()));assertEquals("writer removal needs confirmation",0,calls.get());activateDialogButton(android.R.id.button1);onView(withText(context.getString(R.string.collection_members_remove,"writer"))).check(androidx.test.espresso.assertion.ViewAssertions.doesNotExist());waitUntil("writer absent") {var ok=false;s.onActivity { val list=memberListView(it);ok=list?.adapter?.let { adapter -> adapter.count==1&&(adapter.getItem(0) as RuntimeMember).username=="admin" }==true };ok};assertEquals(1,calls.get());s.onActivity {it.onBackPressedDispatcher.onBackPressed()};waitUntil("parent collection") {var ok=false;s.onActivity {ok=it.supportFragmentManager.findFragmentById(R.id.fragment_container) is ViewCollectionFragment};ok};s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as ViewCollectionFragment;assertEquals(account,f.arguments!!.getParcelable("collection.identity.account"));assertEquals("ac41-members-generation",f.arguments!!.getString("collection.identity.creationId"));assertEquals(initialState.uid,f.arguments!!.getString("collection.identity.uid"));assertEquals(initialState.type,f.arguments!!.getString("collection.identity.type"));it.onBackPressedDispatcher.onBackPressed()};assertEquals(android.app.Activity.RESULT_CANCELED,s.result.resultCode) }} finally {memberRemoveOverride=null;runtimeFixtureOverride=null;removeAccountAndWait(manager,account)}
     }
 
     @Test
