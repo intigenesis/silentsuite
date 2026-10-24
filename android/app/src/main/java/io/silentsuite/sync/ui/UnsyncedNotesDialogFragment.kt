@@ -15,24 +15,38 @@ import io.silentsuite.sync.notes.edit.UnsyncedNotes
  * the discard. For a store that could not be listed, where a confirmation deletes nothing and is only
  * an acknowledgement, both steps have words of their own ([UnsyncedNotesSignOutPolicy.Text.Unlisted]):
  * none of them calls it a discard or says that anything will be deleted, and no button names a sign-out.
- * The dialog keeps the exact account generation and all of the answer it showed, the
- * names that answer was counted from included, in its arguments, and sends both with every answer,
- * so the screen can turn away an answer for another account. It
- * decides nothing itself: an answer goes to the account screen that hosts it, and so do Cancel and
- * a canceled dialog ([onCancel]).
+ * The dialog keeps the exact account generation, all of the answer it showed, the names that answer
+ * was counted from included, and the token of the app process that made it ([ProcessIncarnation]) in
+ * its arguments, and sends them with every answer, so the screen can turn away an answer for another
+ * account, and count again and ask again for one from a dialog that Android restored in a new
+ * process. It decides nothing itself: an answer goes to the account screen that hosts it, and so do
+ * Cancel and a canceled dialog ([onCancel]). Once it has sent either, it has [ended].
  */
 class UnsyncedNotesDialogFragment : DialogFragment() {
+    /**
+     * Set once this dialog has sent an answer or reported its end. Its window closes after that, or has closed
+     * already for Back and a tap outside, and the platform removes the dialog later still, so an answer that shows
+     * this step again can find it; the screen does not count an ended dialog as open. In memory only: a dialog
+     * brought back by a recreation starts unset, and holds its step until it ends.
+     */
+    internal var ended = false
+        private set
+
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
         val args = requireArguments()
         val identity = ExactAccountIdentity(args.getString(ARG_TYPE)!!, args.getString(ARG_NAME)!!,
             args.getString(ARG_CREATION_ID)!!)
+        // The app process that made the dialog; null for a dialog with none, which counts as another process.
+        val shownIn = args.getString(ARG_PROCESS)
         // All of the answer, the names it was counted from included: a confirmation covers only what it names.
         val shown = UnsyncedNotes(args.getInt(ARG_COUNT), args.getLong(ARG_SEQUENCE), args.getBoolean(ARG_UNREADABLE),
             args.getBoolean(ARG_LISTED), args.getStringArrayList(ARG_NAMES)!!.toSet())
         fun send(answer: UnsyncedNotesSignOutPolicy.Answer) {
-            (activity as? AccountActivity)?.onUnsyncedNotesAnswer(identity, answer, shown)
+            ended = true
+            (activity as? AccountActivity)?.onUnsyncedNotesAnswer(identity, answer, shown, shownIn)
         }
         fun closedWithoutSignOut() {
+            ended = true
             (activity as? AccountActivity)?.onSignOutDialogClosedWithoutSignOut()
         }
         val text = UnsyncedNotesSignOutPolicy.text(shown)
@@ -81,6 +95,7 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
      */
     override fun onCancel(dialog: DialogInterface) {
         super.onCancel(dialog)
+        ended = true
         (activity as? AccountActivity)?.onSignOutDialogClosedWithoutSignOut()
     }
 
@@ -94,8 +109,16 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
         private const val ARG_LISTED = "unsyncedNotes.listed"
         private const val ARG_NAMES = "unsyncedNotes.names"
         private const val ARG_STEP = "unsyncedNotes.step"
+        /**
+         * The app process that made the dialog ([ProcessIncarnation]). Internal for the device case, which writes
+         * another.
+         */
+        internal const val ARG_PROCESS = "unsyncedNotes.process"
 
-        /** One tag per step. The screen looks the tag up before it shows a step and shows none while it finds one. */
+        /**
+         * One tag per step. The screen looks the tag up before it shows a step and shows none while it finds one that
+         * has not [ended].
+         */
         internal fun tag(step: UnsyncedNotesSignOutPolicy.Step) = "unsynced-notes-" + step.name
 
         internal fun newInstance(
@@ -103,7 +126,7 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
             step: UnsyncedNotesSignOutPolicy.Step,
             shown: UnsyncedNotes,
         ) = UnsyncedNotesDialogFragment().apply {
-            arguments = Bundle(9).apply {
+            arguments = Bundle(10).apply {
                 putString(ARG_TYPE, identity.type)
                 putString(ARG_NAME, identity.name)
                 putString(ARG_CREATION_ID, identity.creationId)
@@ -113,6 +136,7 @@ class UnsyncedNotesDialogFragment : DialogFragment() {
                 putBoolean(ARG_LISTED, shown.listed)
                 putStringArrayList(ARG_NAMES, ArrayList(shown.names.sorted()))
                 putString(ARG_STEP, step.name)
+                putString(ARG_PROCESS, ProcessIncarnation.current())
             }
         }
     }

@@ -8,7 +8,7 @@ import io.silentsuite.sync.notes.edit.UnsyncedNotes
  * What the sign-out screen does next, decided from the answer to a dialog and from what the caller
  * passes as the store's answer at that moment, and what it says when a sign-out stops. Pure, so the
  * rules can be tested without a screen: of the three answers only DISCARD, the answer to the separate
- * discard confirmation, gives [Next.ConfirmAndSignOut].
+ * discard confirmation, gives [Next.ConfirmAndSignOut], and only for a dialog made in this app process.
  */
 internal object UnsyncedNotesSignOutPolicy {
     enum class Step { COUNT, DISCARD }
@@ -47,15 +47,22 @@ internal object UnsyncedNotesSignOutPolicy {
 
     /**
      * The user answered [answer] in a dialog that showed [shown]. [now] is what the caller passes as
-     * the store's answer at this moment. SYNC_NOW gives [Next.SyncNotes]. GO_ON_WITHOUT_SYNCING gives
-     * step 2 for [now], or the plain question when [now] holds nothing. DISCARD is accepted only when
-     * [now] holds nothing, or when [UnsyncedNotes.covers] says that a confirmation for [shown] still
-     * holds for [now]; see its limits there. Otherwise the count is shown again, for [now].
+     * the store's answer at this moment. [fromThisProcess] is false for a dialog made in another app
+     * process, as one Android restores after the process ended, or for one with no token: whatever the
+     * answer, that gives [start] for [now], the count again or the plain question, and never a
+     * confirmation, a sync or step 2. Otherwise SYNC_NOW gives [Next.SyncNotes]. GO_ON_WITHOUT_SYNCING
+     * gives step 2 for [now], or the plain question when [now] holds nothing. DISCARD is accepted only
+     * when [now] holds nothing, or when [UnsyncedNotes.covers] says that a confirmation for [shown]
+     * still holds for [now]; see its limits there. Otherwise the count is shown again, for [now].
      */
-    fun answered(answer: Answer, shown: UnsyncedNotes, now: UnsyncedNotes): Next = when (answer) {
-        Answer.SYNC_NOW -> Next.SyncNotes
-        Answer.GO_ON_WITHOUT_SYNCING -> if (now.anything) Next.ShowDiscard(now) else Next.AskPlain
-        Answer.DISCARD -> if (!now.anything || shown.covers(now)) Next.ConfirmAndSignOut(shown) else Next.ShowCount(now)
+    fun answered(answer: Answer, shown: UnsyncedNotes, now: UnsyncedNotes, fromThisProcess: Boolean): Next {
+        if (!fromThisProcess) return start(now)
+        return when (answer) {
+            Answer.SYNC_NOW -> Next.SyncNotes
+            Answer.GO_ON_WITHOUT_SYNCING -> if (now.anything) Next.ShowDiscard(now) else Next.AskPlain
+            Answer.DISCARD ->
+                if (!now.anything || shown.covers(now)) Next.ConfirmAndSignOut(shown) else Next.ShowCount(now)
+        }
     }
 
     /**

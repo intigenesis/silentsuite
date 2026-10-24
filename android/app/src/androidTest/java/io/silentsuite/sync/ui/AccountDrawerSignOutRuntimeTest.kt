@@ -502,6 +502,41 @@ class AccountDrawerSignOutRuntimeTest {
         }
         /** What the screen and the coordinator asked of the seams since [since] calls, in order. */
         fun callsSince(since: Int) = fake.calls.drop(since)
+        /**
+         * What a new app process changes for an open dialog of [step]: its token is not this process's ([token]), or
+         * it has none (null, a dialog from before the token). The arguments are edited before the screen is created
+         * again, so the dialog comes back from them.
+         */
+        fun restoredFromAnotherProcess(scenario: ActivityScenario<AccountActivity>,
+            step: UnsyncedNotesSignOutPolicy.Step, token: String?) {
+            scenario.onActivity { activity ->
+                activity.supportFragmentManager.executePendingTransactions()
+                val args = requireNotNull(activity.supportFragmentManager
+                    .findFragmentByTag(UnsyncedNotesDialogFragment.tag(step))) { "the $step dialog" }.requireArguments()
+                assertEquals("made in this process", ProcessIncarnation.current(),
+                    args.getString(UnsyncedNotesDialogFragment.ARG_PROCESS))
+                if (token == null) args.remove(UnsyncedNotesDialogFragment.ARG_PROCESS)
+                else args.putString(UnsyncedNotesDialogFragment.ARG_PROCESS, token)
+            }
+            scenario.recreate()
+            settle(scenario)
+        }
+        /** The dialogs of [step] the screen holds, ended ones included. */
+        fun dialogsOf(activity: AccountActivity, step: UnsyncedNotesSignOutPolicy.Step): List<UnsyncedNotesDialogFragment> {
+            activity.supportFragmentManager.executePendingTransactions()
+            return activity.supportFragmentManager.fragments.filterIsInstance<UnsyncedNotesDialogFragment>()
+                .filter { it.tag == UnsyncedNotesDialogFragment.tag(step) }
+        }
+        /** One dialog of [step], made in this process, after [what]. */
+        fun assertOneFromThisProcess(scenario: ActivityScenario<AccountActivity>, step: UnsyncedNotesSignOutPolicy.Step,
+            what: String) {
+            scenario.onActivity { activity ->
+                val open = dialogsOf(activity, step)
+                assertEquals("$what: one $step dialog", 1, open.size)
+                assertEquals("$what: made in this process", ProcessIncarnation.current(),
+                    open.single().requireArguments().getString(UnsyncedNotesDialogFragment.ARG_PROCESS))
+            }
+        }
         try {
             val intent = AccountActivity.newIntent(fixture.context, fixture.account)
             ActivityScenario.launch<AccountActivity>(intent).use { scenario ->
@@ -664,7 +699,69 @@ class AccountDrawerSignOutRuntimeTest {
                 assertEquals(emptyList<String>(), callsSince(since))
                 fake.unsynced = UnsyncedNotes(2, 8, false)
 
-                // 10. The confirmation survives a recreation, and its own button confirms and starts the
+                // 10. A dialog that Android restores in a new app process has another process's token, or none.
+                // Whatever its answer, the store is counted again and the count is shown again, made in this
+                // process: no step 2, no sync, no confirmation and no sign-out. First, a dialog that has ended does
+                // not hold back its own step, though the platform has not removed it; one that has not ended does.
+                // The dialog reports its end here without closing its window.
+                signOutFromDrawer(scenario)
+                signOutFromDrawer(scenario)
+                var endedDialog: UnsyncedNotesDialogFragment? = null
+                scenario.onActivity { activity ->
+                    assertEquals("an open dialog holds its step", 1, dialogsOf(activity, count).size)
+                    val open = dialogsOf(activity, count).single()
+                    open.onCancel(open.requireDialog())
+                    assertTrue(open.ended)
+                    endedDialog = open
+                }
+                signOutFromDrawer(scenario)
+                scenario.onActivity { activity ->
+                    val others = dialogsOf(activity, count).filter { it !== endedDialog }
+                    assertEquals("the step is shown again", 1, others.size)
+                    assertFalse(others.single().ended)
+                    requireNotNull(endedDialog).dismiss()
+                }
+                tap(scenario, count, negative)
+                assertNoDialog(scenario)
+                // Going on without syncing from the count; the count after the count is also the case of a dialog
+                // that has ended, which the platform may not have removed yet.
+                signOutFromDrawer(scenario)
+                restoredFromAnotherProcess(scenario, count, "another-process")
+                since = fake.calls.size
+                tap(scenario, count, neutral)
+                assertOneFromThisProcess(scenario, count, "going on from another process's count")
+                scenario.onActivity { activity -> assertNull("no step 2", dialogOf(activity, discard)) }
+                assertEquals(listOf("count"), callsSince(since))
+                // Sync now, with Notes on: no run is asked for.
+                restoredFromAnotherProcess(scenario, count, java.util.UUID.randomUUID().toString())
+                val startedBefore = runs.count { it.first }
+                since = fake.calls.size
+                tap(scenario, count, positive)
+                assertTrue(NotesSyncCoordinator.drainForTesting(10_000))
+                assertEquals("no run was asked for: $runs", startedBefore, runs.count { it.first })
+                assertOneFromThisProcess(scenario, count, "Sync now from another process's count")
+                assertEquals(listOf("count"), callsSince(since))
+                // The discard confirmation, with another process's token and with none: nothing is confirmed,
+                // canceled, cleared or removed, and no sign-out starts. Going on from a dialog made in this
+                // process still leads to it.
+                for (token in listOf("another-process", null)) {
+                    tap(scenario, count, neutral)
+                    restoredFromAnotherProcess(scenario, discard, token)
+                    since = fake.calls.size
+                    tap(scenario, discard, positive)
+                    assertOneFromThisProcess(scenario, count, "the discard with token $token")
+                    scenario.onActivity { activity ->
+                        assertNull("no confirmation is shown", dialogOf(activity, discard))
+                        assertEquals(CurrentAccountSignOutState.Idle, model(activity).currentState())
+                        assertFalse("no sign-out started", model(activity).hasStarted())
+                    }
+                    assertEquals("token $token: only counted again", listOf("count"), callsSince(since))
+                    assertEquals(0, fake.removeCalls)
+                }
+                tap(scenario, count, negative)
+                assertNoDialog(scenario)
+
+                // 11. The confirmation survives a recreation, and its own button confirms and starts the
                 // sign-out, in this order: counted at the answer and before anything is canceled, the sync
                 // canceled, the store asked to clear what the dialog showed, and only then the removal. The
                 // clear is held, and the screen is created again while it is: the sign-out goes on in the
@@ -690,7 +787,7 @@ class AccountDrawerSignOutRuntimeTest {
                 }
                 assertEquals(0, fake.removeCalls)
 
-                // 11. The screen closes for good while the clear is still held. A sign-out past its count
+                // 12. The screen closes for good while the clear is still held. A sign-out past its count
                 // goes on without it: the clear ends, the removal is still asked for, and the seams are
                 // closed only after that. The removal then fails, from a thread of its own: its answer is
                 // still taken on the main thread and the store reopened off it, so the steps' scope

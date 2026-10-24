@@ -747,8 +747,10 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     private fun showUnsyncedNotes(step: UnsyncedNotesSignOutPolicy.Step, unsynced: UnsyncedNotes) {
         val tag = UnsyncedNotesDialogFragment.tag(step)
-        // A dialog of this step is open already. It reports its own end.
-        if (supportFragmentManager.findFragmentByTag(tag) != null) return
+        // A dialog of this step that has not ended is open already. It reports its own end. One that has ended is
+        // still found until the platform removes it, which can be after its answer showed this step again.
+        val open = supportFragmentManager.findFragmentByTag(tag) as? UnsyncedNotesDialogFragment
+        if (open != null && !open.ended) return
         val identity = signOutModel.identity()
         if (identity == null || supportFragmentManager.isStateSaved) {
             onSignOutDialogClosedWithoutSignOut()
@@ -759,12 +761,15 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
 
     /**
      * Every answer of the two unsynced-changes dialogs arrives here. For the account this screen
-     * signs out, what follows is decided by [UnsyncedNotesSignOutPolicy].
+     * signs out, what follows is decided by [UnsyncedNotesSignOutPolicy]. [shownIn] is the token of
+     * the app process that made the dialog ([ProcessIncarnation]): an answer from a dialog that Android
+     * restored in a new process, or from one with no token, counts the store again and asks again.
      */
     internal fun onUnsyncedNotesAnswer(
         identity: ExactAccountIdentity,
         answer: UnsyncedNotesSignOutPolicy.Answer,
         shown: UnsyncedNotes,
+        shownIn: String?,
     ) {
         // An answer for another account than the one this screen signs out starts nothing. Its
         // dialog still ended without a sign-out.
@@ -772,8 +777,11 @@ class AccountActivity : BaseActivity(), Toolbar.OnMenuItemClickListener, PopupMe
             onSignOutDialogClosedWithoutSignOut()
             return
         }
+        // A dialog made in another app process, as one Android restores after the process ended, or one
+        // with no token: whatever its answer, the store is counted again and the question asked again.
+        val fromThisProcess = ProcessIncarnation.isCurrent(shownIn)
         withUnsyncedNotes { now ->
-            when (val next = UnsyncedNotesSignOutPolicy.answered(answer, shown, now)) {
+            when (val next = UnsyncedNotesSignOutPolicy.answered(answer, shown, now, fromThisProcess)) {
                 UnsyncedNotesSignOutPolicy.Next.AskPlain -> confirmPlainLogout()
                 is UnsyncedNotesSignOutPolicy.Next.ShowCount ->
                     showUnsyncedNotes(UnsyncedNotesSignOutPolicy.Step.COUNT, next.unsynced)

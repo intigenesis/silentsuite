@@ -16,8 +16,8 @@ class UnsyncedNotesSignOutPolicyTest {
     private val uncounted = UnsyncedNotes(0, 0, unreadable = true)
     private val unlisted = UnsyncedNotes(0, 7, unreadable = true, listed = false)
 
-    private fun answered(answer: Answer, shown: UnsyncedNotes, now: UnsyncedNotes) =
-        UnsyncedNotesSignOutPolicy.answered(answer, shown, now)
+    private fun answered(answer: Answer, shown: UnsyncedNotes, now: UnsyncedNotes, fromThisProcess: Boolean = true) =
+        UnsyncedNotesSignOutPolicy.answered(answer, shown, now, fromThisProcess)
 
     private fun source(name: String) =
         File("src/main/java/io/silentsuite/sync/ui/$name").readText().replace("\r\n", "\n")
@@ -329,5 +329,91 @@ class UnsyncedNotesSignOutPolicyTest {
             .contains("withContext(Dispatchers.IO) { signOutModel.unsyncedNotes() }"))
         assertTrue("the question reads through it", confirm.contains("withUnsyncedNotes { unsynced ->"))
         assertTrue("so does an answer", answer.contains("withUnsyncedNotes { now ->"))
+    }
+
+    @Test fun `an answer from a dialog made in another process counts again and asks again, and never confirms, syncs or goes on`() {
+        val saved = UnsyncedNotes(2, 8, false, names = two.names)
+        for (answer in Answer.values()) for (shown in listOf(two, uncounted, unlisted)) {
+            for (now in listOf(two, uncounted, unlisted, UnsyncedNotes.NOTHING, saved)) {
+                val next = answered(answer, shown, now, fromThisProcess = false)
+                assertEquals("$answer to $shown with $now", UnsyncedNotesSignOutPolicy.start(now), next)
+                assertFalse("$answer to $shown with $now",
+                    next is Next.ConfirmAndSignOut || next == Next.SyncNotes || next is Next.ShowDiscard)
+            }
+        }
+        assertEquals("the discard that a dialog made in this process confirms", Next.ShowCount(two),
+            answered(Answer.DISCARD, two, two, fromThisProcess = false))
+        assertEquals("with nothing left, the plain question", Next.AskPlain,
+            answered(Answer.DISCARD, two, UnsyncedNotes.NOTHING, fromThisProcess = false))
+        assertEquals("Sync now gets the count again too", Next.ShowCount(two),
+            answered(Answer.SYNC_NOW, two, two, fromThisProcess = false))
+        assertEquals("going on gets the count again, not step 2", Next.ShowCount(two),
+            answered(Answer.GO_ON_WITHOUT_SYNCING, two, two, fromThisProcess = false))
+    }
+
+    @Test fun `the dialogs carry this process's token, and the screen compares it after the account and before the policy`() {
+        val fragment = source("UnsyncedNotesDialogFragment.kt")
+        assertTrue("every dialog is made with this process's token",
+            body(fragment, "internal fun newInstance(", "        ")
+                .contains("putString(ARG_PROCESS, ProcessIncarnation.current())"))
+        assertTrue("it is read as given, null for a dialog with none",
+            fragment.contains("val shownIn = args.getString(ARG_PROCESS)\n"))
+        assertFalse("a dialog with none is not taken as this process's", fragment.contains("getString(ARG_PROCESS)!!"))
+        assertTrue("and sent with every answer",
+            body(fragment, "fun send(answer: UnsyncedNotesSignOutPolicy.Answer) {", "        ")
+                .contains("onUnsyncedNotesAnswer(identity, answer, shown, shownIn)"))
+
+        val answer = body(source("AccountActivity.kt"), "internal fun onUnsyncedNotesAnswer(")
+        assertTrue("the screen takes the token with no default", answer.contains("        shownIn: String?,\n    ) {"))
+        val account = answer.indexOf("if (signOutModel.identity() != identity) {")
+        val compared = answer.indexOf("val fromThisProcess = ProcessIncarnation.isCurrent(shownIn)\n")
+        assertTrue("the account is checked first, then the token, then the store is read",
+            account in 0 until compared && compared < answer.indexOf("withUnsyncedNotes { now ->"))
+        assertTrue("and the policy decides with it",
+            answer.contains("UnsyncedNotesSignOutPolicy.answered(answer, shown, now, fromThisProcess)"))
+
+        val policy = source("UnsyncedNotesSignOutPolicy.kt")
+        val signature =
+            "fun answered(answer: Answer, shown: UnsyncedNotes, now: UnsyncedNotes, fromThisProcess: Boolean): Next {"
+        assertTrue("the policy takes it with no default", policy.contains(signature))
+        val answered = body(policy, signature)
+        assertTrue("and decides an answer from another process before any answer",
+            answered.indexOf("if (!fromThisProcess) return start(now)") in
+                0 until answered.indexOf("return when (answer) {"))
+    }
+
+    @Test fun `only the sign-out dialog makes a token, and only the account screen compares one`() {
+        // Each later dialog that keeps a token adds its files here.
+        fun uses(text: String, word: String) = text.split(word).size - 1
+        val found = File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" }
+            .map { file ->
+                val text = file.readText()
+                file.name to Triple(uses(text, "ProcessIncarnation.current()"),
+                    uses(text, "ProcessIncarnation.isCurrent("), text.contains("ARG_PROCESS"))
+            }
+            .filter { it.second != Triple(0, 0, false) }.toList()
+        assertEquals("one entry per file name", found.size, found.toMap().size)
+        assertEquals("made, compared, and the argument named", mapOf(
+            "UnsyncedNotesDialogFragment.kt" to Triple(1, 0, true),
+            "AccountActivity.kt" to Triple(0, 1, false),
+        ), found.toMap())
+    }
+
+    @Test fun `a dialog that has ended does not hold back its own step`() {
+        val fragment = source("UnsyncedNotesDialogFragment.kt")
+        assertTrue("only the dialog sets it", fragment.contains("internal var ended = false\n        private set"))
+        for ((end, text) in listOf(
+            "an answer" to body(fragment, "fun send(answer: UnsyncedNotesSignOutPolicy.Answer) {", "        "),
+            "Cancel" to body(fragment, "fun closedWithoutSignOut() {", "        "),
+            "Back and a tap outside" to body(fragment, "override fun onCancel(dialog: DialogInterface) {"),
+        )) {
+            assertTrue("$end ends the dialog before the screen is told",
+                text.indexOf("ended = true") in 0 until text.indexOf("(activity as? AccountActivity)?."))
+        }
+        val show = body(source("AccountActivity.kt"), "private fun showUnsyncedNotes(")
+        assertTrue("the screen counts a dialog of the step as open only while it has not ended", show.contains(
+            "val open = supportFragmentManager.findFragmentByTag(tag) as? UnsyncedNotesDialogFragment\n" +
+                "        if (open != null && !open.ended) return"))
+        assertFalse("not any dialog it finds", show.contains("findFragmentByTag(tag) != null"))
     }
 }
