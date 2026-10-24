@@ -382,7 +382,7 @@ class UnsyncedNotesSignOutPolicyTest {
                 0 until answered.indexOf("return when (answer) {"))
     }
 
-    @Test fun `only the sign-out dialog makes a token, and only the account screen compares one`() {
+    @Test fun `only the dialogs that keep an answer make a token, and only their screens compare one`() {
         // Each later dialog that keeps a token adds its files here.
         fun uses(text: String, word: String) = text.split(word).size - 1
         val found = File("src/main/java").walkTopDown().filter { it.isFile && it.extension == "kt" }
@@ -396,6 +396,7 @@ class UnsyncedNotesSignOutPolicyTest {
         assertEquals("made, compared, and the argument named", mapOf(
             "UnsyncedNotesDialogFragment.kt" to Triple(1, 0, true),
             "AccountActivity.kt" to Triple(0, 1, false),
+            "UnsyncedNotesFragment.kt" to Triple(1, 1, true),
         ), found.toMap())
     }
 

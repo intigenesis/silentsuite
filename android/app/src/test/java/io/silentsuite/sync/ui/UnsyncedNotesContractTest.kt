@@ -58,8 +58,9 @@ class UnsyncedNotesContractTest {
     @Test fun `the Unsynced Notes screens reach the stores only on the IO dispatcher`() {
         val fragment = code(File(ui, "UnsyncedNotesFragment.kt"))
         val calls = storeCall.findAll(fragment).toList()
-        assertEquals("the hub row's read, the screen's read and its discard",
-            listOf("UnsyncedNotesStores.read", "UnsyncedNotesStores.read", "UnsyncedNotesStores.discard"),
+        assertEquals("the hub row's read, the screen's read, its discard and its read of one store again",
+            listOf("UnsyncedNotesStores.read", "UnsyncedNotesStores.read", "UnsyncedNotesStores.discard",
+                "UnsyncedNotesStores.reread"),
             calls.map { it.groupValues[1] + "." + it.groupValues[4] })
         // Where a withContext(Dispatchers.IO) block's first statement starts: each call must start there.
         val onIo = Regex("""withContext\(\s*Dispatchers\.IO\s*\)\s*\{\s*""").findAll(fragment)

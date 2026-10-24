@@ -28,14 +28,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Settings, Unsynced Notes: one row per Notes store on this device that holds unsynced text or cannot be read, a
- * present account's by its name and any other as not matched to an account, in folder-name order. A row opens the
- * confirmation for that one store ([UnsyncedNotesDiscardDialogFragment]), and the result shows in a Snackbar. No row
- * opens one while a confirmation runs, and the row of a store whose discard did not finish opens none: it goes on only
- * by Retry. It works offline and without a session: it reads the stores through [UnsyncedNotesStores], off the main
- * thread, every time it resumes. The rows say how many changes each store holds, that they could not be counted, or
- * that the store cannot be read right now, never a count of zero, and a last row says when other Notes files could
- * not be shown.
+ * Settings, Unsynced Notes: one row per Notes store on this device that holds unsynced text, cannot be read, or has a
+ * discard that did not finish, a present account's by its name and any other as not matched to an account, in
+ * folder-name order. A row opens the confirmation for that one store ([UnsyncedNotesDiscardDialogFragment]), and the
+ * result shows in a Snackbar. No row opens one while a confirmation runs, and the row of a store whose discard did not
+ * finish opens none: it goes on only by Retry, the Snackbar's while the screen holds that result, else the row's own,
+ * from the store's state, which outlives the screen ([UnsyncedNotesRow.stopped]). It works offline and without a
+ * session: it reads the stores through [UnsyncedNotesStores], off the main thread, every time it resumes. The rows say
+ * how many changes each store holds, that they could not be counted, that the store cannot be read right now, or that
+ * its discard did not finish, never a count of zero, and a last row says when other Notes files could not be shown.
  */
 class UnsyncedNotesFragment : PreferenceFragmentCompat() {
     /** Kept across a rotation and cleared once the screen is left, so a result never shows on a later visit. */
@@ -73,9 +74,14 @@ class UnsyncedNotesFragment : PreferenceFragmentCompat() {
         for (row in listing.rows) screen.addPreference(Preference(requireContext()).apply {
             key = KEY_ROW + row.directory
             title = row.owner?.name ?: getString(R.string.notes_store_unmatched)
-            // A discard of this store that did not finish goes on only by its Retry.
+            // A discard of this store that did not finish goes on only by a Retry: the Snackbar's while the screen
+            // holds its result, else the row's own, from the store's state, which outlives the screen.
             val stopped = UnsyncedNotesDiscardPolicy.notFinished(row.directory, model.result.value)
             summary = if (stopped) {
+                getString(R.string.notes_discard_not_finished)
+            } else if (row.stopped && row.answer != null) {
+                getString(R.string.notes_discard_not_finished_row)
+            } else if (row.stopped) {
                 getString(R.string.notes_discard_not_finished)
             } else when (val text = UnsyncedNotesDiscardPolicy.rowText(row.answer)) {
                 is Text.Counted -> resources.getQuantityString(R.plurals.notes_store_unsynced, text.count, text.count)
@@ -83,13 +89,17 @@ class UnsyncedNotesFragment : PreferenceFragmentCompat() {
                 Text.Unlisted -> getString(R.string.notes_store_unlisted)
             }
             isPersistent = false
-            // A store whose read threw has nothing to confirm.
+            // A store whose read threw has nothing to confirm, and no Retry until it reads again, since the Retry's
+            // discard counts first. When a discard of it stopped, its row still says that the discard did not finish.
             val answer = row.answer
             isEnabled = answer != null && !stopped
             if (answer != null) setOnPreferenceClickListener {
                 // Asked again at the tap: the result can change before the rows are read again.
                 if (UnsyncedNotesDiscardPolicy.rowOpens(row.directory, model.result.value, model.answering)) {
-                    ask(row.directory, row.owner?.name, answer)
+                    // A store whose discard stopped is never asked anew, and never for an acknowledgement: the screen
+                    // may no longer hold the confirmation the user gave, and the store may have deleted already.
+                    if (row.stopped) model.retryStopped(row.directory, row.owner?.name)
+                    else ask(row.directory, row.owner?.name, answer)
                 }
                 true
             }
@@ -116,7 +126,10 @@ class UnsyncedNotesFragment : PreferenceFragmentCompat() {
     private fun ask(directory: String, label: String?, shown: UnsyncedNotes): Boolean {
         val tag = UnsyncedNotesDiscardDialogFragment.tag(UnsyncedNotesDiscardPolicy.step(shown), directory)
         if (childFragmentManager.isStateSaved) return false
-        if (childFragmentManager.findFragmentByTag(tag) == null) {
+        // A dialog of this store and step that has not ended is open already. One that has ended is still found until
+        // the platform removes it, which can be after its result asked for this step again.
+        val open = childFragmentManager.findFragmentByTag(tag) as? UnsyncedNotesDiscardDialogFragment
+        if (open == null || open.ended) {
             UnsyncedNotesDiscardDialogFragment.newInstance(directory, label, shown).show(childFragmentManager, tag)
         }
         return true
@@ -152,9 +165,10 @@ class UnsyncedNotesFragment : PreferenceFragmentCompat() {
         internal fun rowKey(directory: String) = KEY_ROW + directory
 
         /**
-         * Reads the stores off the main thread and shows the Settings hub's [row] only while some store holds anything
-         * or cannot be read, with how many changes there are, or that not all of them could be counted. [fragment]
-         * calls it whenever it resumes, so a return from the screen shows what is there now.
+         * Reads the stores off the main thread and shows the Settings hub's [row] only while some store holds anything,
+         * cannot be read, or has a discard that did not finish, with how many changes there are, or that not all of
+         * them could be counted. [fragment] calls it whenever it resumes, so a return from the screen shows what is
+         * there now.
          */
         internal fun refreshHubRow(fragment: Fragment, row: Preference) {
             val app = fragment.requireContext().applicationContext
@@ -178,23 +192,37 @@ class UnsyncedNotesFragment : PreferenceFragmentCompat() {
  * The confirmation for one store of [UnsyncedNotesFragment]. For a store that listed, a discard: how many changes go,
  * or that they could not be counted, with Discard and Cancel. For a store that could not be listed, an
  * acknowledgement, in words of its own: it never says discard, says that nothing is deleted, and that unsynced Notes
- * text may remain on this device and may no longer sync. The dialog keeps all of the answer it showed in its arguments
- * and sends exactly that with its one confirming button. Cancel, Back and a tap outside send nothing.
+ * text may remain on this device and may no longer sync. The dialog keeps all of the answer it showed, and the token
+ * of the app process that made it ([ProcessIncarnation]), in its arguments, and sends both with its one confirming
+ * button, so the screen counts again and asks again for an answer from a dialog that Android restored in a new
+ * process. Cancel, Back and a tap outside send nothing. Once it has sent its confirmation, it has [ended].
  */
 class UnsyncedNotesDiscardDialogFragment : DialogFragment() {
     private val model: UnsyncedNotesViewModel by viewModels(ownerProducer = { requireParentFragment() })
+
+    /**
+     * Set once this dialog has sent its confirmation. Its window closes after that, and the platform removes the
+     * dialog later still, so a result that shows this step again can find it; the screen does not count an ended
+     * dialog as open. In memory only: a dialog brought back by a recreation starts unset, and holds its step until it
+     * ends. Cancel, Back and a tap outside send nothing and leave it unset.
+     */
+    internal var ended = false
+        private set
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
         val args = requireArguments()
         val directory = args.getString(ARG_DIRECTORY)!!
         val label = args.getString(ARG_LABEL)
+        // The app process that made the dialog; null for a dialog with none, which counts as another process.
+        val shownIn = args.getString(ARG_PROCESS)
         // All of the answer, the names it was counted from included: a confirmation covers only what it names.
         val shown = UnsyncedNotes(args.getInt(ARG_COUNT), args.getLong(ARG_SEQUENCE), args.getBoolean(ARG_UNREADABLE),
             args.getBoolean(ARG_LISTED), args.getStringArrayList(ARG_NAMES)!!.toSet())
         val name = label ?: getString(R.string.notes_store_unmatched_name)
         val text = UnsyncedNotesSignOutPolicy.text(shown)
         fun confirm() {
-            model.answer(directory, label, shown, retry = false)
+            ended = true
+            model.answer(directory, label, shown, shownIn)
         }
         val builder = MaterialAlertDialogBuilder(requireContext())
             .setNegativeButton(android.R.string.cancel, null)
@@ -224,16 +252,22 @@ class UnsyncedNotesDiscardDialogFragment : DialogFragment() {
         private const val ARG_UNREADABLE = "unsyncedNotes.unreadable"
         private const val ARG_LISTED = "unsyncedNotes.listed"
         private const val ARG_NAMES = "unsyncedNotes.names"
+        /**
+         * The app process that made the dialog ([ProcessIncarnation]). Internal for the device case, which writes
+         * another.
+         */
+        internal const val ARG_PROCESS = "unsyncedNotes.process"
 
         /**
          * One tag per store and step. The screen looks the tag up before it shows a step for a store, and shows none
-         * while it finds one, so a dialog for one store never stands in for another store's.
+         * while it finds one that has not [UnsyncedNotesDiscardDialogFragment.ended], so a dialog for one store never
+         * stands in for another store's.
          */
         internal fun tag(step: Step, directory: String) = "unsynced-notes-store-" + step.name + ":" + directory
 
         internal fun newInstance(directory: String, label: String?, shown: UnsyncedNotes) =
             UnsyncedNotesDiscardDialogFragment().apply {
-                arguments = Bundle(7).apply {
+                arguments = Bundle(8).apply {
                     putString(ARG_DIRECTORY, directory)
                     putString(ARG_LABEL, label)
                     putInt(ARG_COUNT, shown.count)
@@ -241,6 +275,7 @@ class UnsyncedNotesDiscardDialogFragment : DialogFragment() {
                     putBoolean(ARG_UNREADABLE, shown.unreadable)
                     putBoolean(ARG_LISTED, shown.listed)
                     putStringArrayList(ARG_NAMES, ArrayList(shown.names.sorted()))
+                    putString(ARG_PROCESS, ProcessIncarnation.current())
                 }
             }
     }
@@ -250,7 +285,7 @@ class UnsyncedNotesDiscardDialogFragment : DialogFragment() {
  * The stores [UnsyncedNotesFragment] shows, and the result of the last confirmation until the screen has shown it.
  * Every store call runs off the main thread. While a confirmation runs, the screen opens no other, and another one
  * that comes is ignored. When the model is cleared while one runs, the store still finishes it, and only its result is
- * dropped.
+ * dropped. An answer from a dialog made in another app process goes to no store: the store is read again instead.
  */
 internal class UnsyncedNotesViewModel(app: Application) : AndroidViewModel(app) {
     private val mutableListing = MutableLiveData<UnsyncedNotesListing>()
@@ -261,7 +296,10 @@ internal class UnsyncedNotesViewModel(app: Application) : AndroidViewModel(app) 
     /** How many reads were started; only the last one started is shown. */
     private var loads = 0
 
-    /** Whether a confirmation runs: set by [answer], and cleared once its result is set. On the main thread only. */
+    /**
+     * Whether a confirmation runs: set by [discard] and [countAgain], and cleared once its result is set. On the main
+     * thread only.
+     */
     var answering = false
         private set
 
@@ -273,8 +311,19 @@ internal class UnsyncedNotesViewModel(app: Application) : AndroidViewModel(app) 
         }
     }
 
-    /** The user confirmed [shown] for the store in [directory]; [retry] after a discard that did not finish. */
-    fun answer(directory: String, label: String?, shown: UnsyncedNotes, retry: Boolean) {
+    /**
+     * The user confirmed [shown] for the store in [directory], in a dialog made in the app process [shownIn]
+     * ([ProcessIncarnation]). Only an answer from this process goes to the store. One from a dialog that Android
+     * restored in a new process, or from one with no token, is counted again ([countAgain]): nothing is discarded or
+     * recorded for it.
+     */
+    fun answer(directory: String, label: String?, shown: UnsyncedNotes, shownIn: String?) {
+        if (ProcessIncarnation.isCurrent(shownIn)) discard(directory, label, shown, retry = false)
+        else countAgain(directory)
+    }
+
+    /** [shown] goes to the store in [directory]; [retry] after a discard that did not finish. */
+    private fun discard(directory: String, label: String?, shown: UnsyncedNotes, retry: Boolean) {
         if (answering) return
         answering = true
         mutableResult.value = null
@@ -290,9 +339,40 @@ internal class UnsyncedNotesViewModel(app: Application) : AndroidViewModel(app) 
         }
     }
 
-    /** Retry sends the confirmation the user gave again; the store counts again and refuses what it does not cover. */
+    /**
+     * Retry sends the confirmation the user gave again; the store counts again and refuses what it does not cover. It
+     * needs no token: the confirmation lives only in this model, which a new process does not have.
+     */
     fun retry(notFinished: Result.NotFinished) =
-        answer(notFinished.directory, notFinished.label, notFinished.shown, retry = true)
+        discard(notFinished.directory, notFinished.label, notFinished.shown, retry = true)
+
+    /**
+     * The Retry of a row whose store's discard stopped ([UnsyncedNotesRow.stopped]), when the screen no longer holds
+     * the confirmation the user gave. It sends an answer of nothing, which covers nothing that holds anything: the
+     * store finishes only a discard that left no unsynced text, and the dialog shows again for any text left. It goes
+     * on only while that discard has not finished ([UnsyncedNotesStores.discard]).
+     */
+    fun retryStopped(directory: String, label: String?) =
+        discard(directory, label, UnsyncedNotes.NOTHING, retry = true)
+
+    /**
+     * An answer from a dialog made in another app process: the store in [directory] is read again, and
+     * [UnsyncedNotesDiscardPolicy.restored] says what follows, the dialog again or only a new read of the stores.
+     */
+    private fun countAgain(directory: String) {
+        if (answering) return
+        answering = true
+        mutableResult.value = null
+        viewModelScope.launch {
+            try {
+                val now = withContext(Dispatchers.IO) { UnsyncedNotesStores.reread(getApplication(), directory) }
+                mutableResult.value = UnsyncedNotesDiscardPolicy.restored(now)
+            } finally {
+                answering = false
+            }
+            load()
+        }
+    }
 
     /** The screen has shown the result. */
     fun consume() {

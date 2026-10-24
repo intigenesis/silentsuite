@@ -797,6 +797,7 @@
     <string name="notes_discard_done">Unsynced Notes changes deleted from this device.</string>
     <string name="notes_discard_nothing_deleted">Couldn’t discard. This attempt deleted no Notes text.</string>
     <string name="notes_discard_not_finished">The discard did not finish. Some unsynced Notes changes may already be deleted.</string>
+    <string name="notes_discard_not_finished_row">The discard did not finish. Some unsynced Notes changes may already be deleted. Tap to try again.</string>
     <string name="notes_acknowledged">This attempt deleted no Notes text. Unsynced Notes text may remain on this device and may no longer sync.</string>
     <string name="notes_acknowledgement_not_recorded">This attempt deleted no Notes text and could not be recorded. Unsynced Notes text may remain on this device and may no longer sync.</string>
 </resources>

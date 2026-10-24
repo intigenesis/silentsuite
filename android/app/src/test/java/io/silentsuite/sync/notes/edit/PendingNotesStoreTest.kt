@@ -3022,6 +3022,110 @@ class PendingNotesStoreTest {
         assertTrue("also once it is dropped", s.clearedInFull())
     }
 
+    @Test fun `a discard or a clear that stopped is told by the instance's state, not by its count`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
+        val shown = store.unsynced()
+        assertFalse("open", store.clearStopped())
+        assertTrue(store.discardStore(UnsyncedNotes.NOTHING) is DiscardOutcome.Changed)
+        PendingNotesDiscardPermits.beforeRecordForTesting = { throw java.io.IOException("could not record the permit") }
+        assertEquals(DiscardOutcome.PermitNotRecorded, store.discardStore(shown))
+        PendingNotesDiscardPermits.beforeRecordForTesting = null
+        assertFalse("nothing was deleted, and the instance stays open", store.clearStopped())
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw java.io.IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(shown))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertTrue("it got as far as deleting", store.clearStopped())
+        assertFalse(store.clearedInFull())
+        // Also while a listing of the store comes back with nothing, and the closed instance counts nothing.
+        PendingNotesStore.listFilesForTesting = { d -> if (d.name == dir.name) emptyArray() else d.listFiles() }
+        assertEquals(UnsyncedNotes.NOTHING, store.unsynced())
+        assertTrue(store.clearStopped())
+        PendingNotesStore.listFilesForTesting = null
+        // A call that asks again leaves it so; one that finishes ends it.
+        assertTrue(store.discardStore(UnsyncedNotes.NOTHING) is DiscardOutcome.Changed)
+        assertTrue(store.clearStopped())
+        assertEquals(DiscardOutcome.Done, store.discardStore(store.unsynced()))
+        assertFalse(store.clearStopped())
+        assertTrue(store.clearedInFull())
+        store.unregister()
+        assertFalse("dropped", store.clearStopped())
+
+        // A clear that stops before it deletes anything has closed the instance as well; one that returns finished.
+        val other = open(tmp.newFolder("other"))
+        other.saveLocal("n1", "b1", "r1", blob("c"), isCreate = false)
+        PendingNotesStore.beforeClearForTesting = { throw java.io.IOException("stopped") }
+        assertThrows(java.io.IOException::class.java) { other.clearAll() }
+        PendingNotesStore.beforeClearForTesting = null
+        assertTrue(other.clearStopped())
+        PendingNotesStore.resetForTesting()
+        assertFalse("a new instance, as after a restart, starts with none", open(other.dir).clearStopped())
+        other.clearAll()
+        assertFalse(other.clearStopped())
+        assertTrue(other.clearedInFull())
+    }
+
+    @Test fun `unregisterIfFinishedOnce drops only an instance that one discard alone finished`() {
+        store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        assertFalse("nothing finished it", store.unregisterIfFinishedOnce())
+        assertSame(store, open(dir))
+        assertEquals(DiscardOutcome.Done, store.discardStore(store.unsynced()))
+        // Another call finishes it as well, over the folder that is gone, as the sign-out's can before or after a
+        // Settings Retry: it stays, closed, so a late save is refused and does not bring the folder back.
+        assertEquals(DiscardOutcome.Done, store.discardStore(store.unsynced()))
+        assertFalse(store.unregisterIfFinishedOnce())
+        assertSame(store, open(dir))
+        assertThrows(PendingNotesStore.Cleared::class.java) {
+            store.saveLocal("n2", "b1", "r1", blob("late"), isCreate = false)
+        }
+        assertFalse(dir.name in tmp.root.list()!!.toSet())
+
+        val once = open(tmp.newFolder("once"))
+        once.saveLocal("n1", "b1", "r1", blob("b"), isCreate = false)
+        assertEquals(DiscardOutcome.Done, once.discardStore(once.unsynced()))
+        assertTrue(once.unregisterIfFinishedOnce())
+        assertNotSame(once, open(once.dir))
+        assertFalse("a second call does nothing", once.unregisterIfFinishedOnce())
+
+        val cleared = open(tmp.newFolder("cleared"))
+        cleared.clearAll()
+        assertEquals(DiscardOutcome.Done, cleared.discardStore(cleared.unsynced()))
+        assertFalse("a clear finished it as well", cleared.unregisterIfFinishedOnce())
+        assertSame(cleared, open(cleared.dir))
+    }
+
+    @Test fun `stoppedIn names the store folders whose discard stopped in this process, from memory alone`() {
+        val noBackup = tmp.newFolder("no_backup")
+        var failAbove = false
+        val gone = identityStore(noBackup, "gen-1") { d ->
+            if (failAbove && d.name == "notes-pending") throw java.io.IOException("could not sync notes-pending")
+        }
+        val partway = identityStore(noBackup, "gen-2")
+        val finished = identityStore(noBackup, "gen-3")
+        // The same account's store in another no_backup folder: another root, whose folder has the same name.
+        val elsewhere = identityStore(tmp.newFolder("elsewhere"), "gen-1")
+        for (s in listOf(gone, partway, finished, elsewhere)) s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        assertEquals(emptyList<String>(), PendingNotesStore.stoppedIn(noBackup))
+        // One stops once its folder is gone, at the sync of the folder above; two stop partway; one finishes.
+        failAbove = true
+        assertEquals(DiscardOutcome.NotFinished, gone.discardStore(gone.unsynced()))
+        failAbove = false
+        PendingNotesStore.beforeRemoveForTesting = {
+            if (it.parentFile == partway.dir || it.parentFile == elsewhere.dir) throw java.io.IOException("stopped")
+        }
+        assertEquals(DiscardOutcome.NotFinished, partway.discardStore(partway.unsynced()))
+        assertEquals(DiscardOutcome.NotFinished, elsewhere.discardStore(elsewhere.unsynced()))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertEquals(DiscardOutcome.Done, finished.discardStore(finished.unsynced()))
+        assertFalse("no listing holds it", gone.dir.name in PendingNotesStore.storeDirectories(noBackup).stores)
+        assertEquals(listOf(gone.dir.name, partway.dir.name).sorted(), PendingNotesStore.stoppedIn(noBackup))
+        // Once its discard finishes, it is no longer named, and after a restart none is.
+        assertEquals(DiscardOutcome.Done, gone.discardStore(gone.unsynced()))
+        assertEquals(listOf(partway.dir.name), PendingNotesStore.stoppedIn(noBackup))
+        PendingNotesStore.resetForTesting()
+        assertEquals(emptyList<String>(), PendingNotesStore.stoppedIn(noBackup))
+    }
+
     /**
      * After a restart, [confirmed], text the user confirmed for a discard that stopped, is held back though a count
      * whose listing left it out recorded the permit: it is not sent, a run records no success, and [unnamed], which
@@ -4328,10 +4432,16 @@ class PendingNotesStoreTest {
         assertTrue("the store defines it",
             File(main, "io/silentsuite/sync/notes/edit/PendingNotesStore.kt").readText().contains("fun discardStore("))
         // Sorted, since the order of the walk is not defined.
-        val callers = listOf("io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt",
-            "io/silentsuite/sync/ui/UnsyncedNotesStores.kt")
-        assertEquals(callers, callersOf("discardStore"))
-        assertEquals(callers, callersOf("unregister"))
+        val signOut = "io/silentsuite/sync/ui/AndroidCurrentAccountSignOut.kt"
+        val settings = "io/silentsuite/sync/ui/UnsyncedNotesStores.kt"
+        assertEquals(listOf(signOut, settings), callersOf("discardStore"))
+        // The sign-out drops its instance after a removal that failed, Settings only one that its own discard alone
+        // finished.
+        assertEquals(listOf(signOut), callersOf("unregister"))
+        assertEquals(listOf(settings), callersOf("unregisterIfFinishedOnce"))
+        assertEquals("only the Settings way out asks whether a discard stopped", listOf(settings),
+            callersOf("clearStopped"))
+        assertEquals(listOf(settings), callersOf("stoppedIn"))
         assertEquals("clearAll is for test teardown only", emptyList<String>(), callersOf("clearAll"))
     }
 }

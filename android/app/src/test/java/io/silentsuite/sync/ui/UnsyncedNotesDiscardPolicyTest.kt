@@ -20,8 +20,8 @@ class UnsyncedNotesDiscardPolicyTest {
     private val unlisted = UnsyncedNotes(0, 7, unreadable = true, listed = false)
     private val directory = "0123456789abcdef".repeat(4)
 
-    private fun row(answer: UnsyncedNotes?, owner: ExactAccountIdentity? = null) =
-        UnsyncedNotesRow(directory, owner, answer)
+    private fun row(answer: UnsyncedNotes?, owner: ExactAccountIdentity? = null, stopped: Boolean = false) =
+        UnsyncedNotesRow(directory, owner, answer, stopped)
 
     private fun listing(vararg answers: UnsyncedNotes?, othersUnlisted: Boolean = false,
                         unknownOthers: Boolean = false) =
@@ -152,7 +152,8 @@ class UnsyncedNotesDiscardPolicyTest {
             for (failure in Failure.values()) {
                 assertEquals("$failure", Result.AcknowledgementNotRecorded, failed(unlisted, failure, retry))
             }
-            // After an acknowledgement: no Done or PermitNotRecorded, and NotFinished only after a stop; each reloads.
+            // After an acknowledgement the store never gives Done or PermitNotRecorded, and NotFinished only over a
+            // store whose discard stopped, recording nothing; the screen then only reloads.
             for (outcome in listOf(DiscardOutcome.Done, DiscardOutcome.NotFinished, DiscardOutcome.PermitNotRecorded)) {
                 assertEquals("$outcome", Result.Reload, result(unlisted, outcome, retry))
             }
@@ -221,7 +222,7 @@ class UnsyncedNotesDiscardPolicyTest {
             Regex("R\\.string\\.notes_discard\\b").findAll(dialog).count())
         assertEquals("one place sends a confirmation", 1, Regex("model\\.answer\\(").findAll(dialog).count())
         assertTrue(body(dialog, "fun confirm() {", "        ")
-            .contains("model.answer(directory, label, shown, retry = false)"))
+            .contains("model.answer(directory, label, shown, shownIn)"))
     }
 
     @Test fun `Cancel and Back send nothing`() {
@@ -321,5 +322,99 @@ class UnsyncedNotesDiscardPolicyTest {
         assertTrue(fragment.contains("internal fun tag(step: Step, directory: String) = " +
             "\"unsynced-notes-store-\" + step.name + \":\" + directory"))
         assertTrue(fragment.contains("DiscardDialogFragment.tag(UnsyncedNotesDiscardPolicy.step(shown), directory)"))
+    }
+
+    @Test fun `the row of a store whose discard stopped is its Retry, and never a new step for that store`() {
+        val fragment = source("UnsyncedNotesFragment.kt")
+        val rows = body(fragment, "private fun showListing(listing: UnsyncedNotesListing) {")
+        // Its words: the screen's while it holds that result, else the store's own, which say that a tap goes on.
+        val held = rows.indexOf(
+            "summary = if (stopped) {\n                getString(R.string.notes_discard_not_finished)\n")
+        val own = rows.indexOf("} else if (row.stopped && row.answer != null) {\n" +
+            "                getString(R.string.notes_discard_not_finished_row)\n")
+        // A stopped store whose read threw says so too, with no Retry: with no answer, its row is not enabled.
+        val unread = rows.indexOf("} else if (row.stopped) {\n" +
+            "                getString(R.string.notes_discard_not_finished)\n")
+        assertTrue(rows, held >= 0 && own > held && unread > own)
+        assertEquals(stringText("notes_discard_not_finished") + " Tap to try again.",
+            stringText("notes_discard_not_finished_row"))
+        // Its tap, asked again at the tap and only while a row opens anything: the Retry, never ask().
+        val click = rows.substringAfter("setOnPreferenceClickListener {", "")
+        val opens = click.indexOf(
+            "if (UnsyncedNotesDiscardPolicy.rowOpens(row.directory, model.result.value, model.answering)) {")
+        val retries = click.indexOf("if (row.stopped) model.retryStopped(row.directory, row.owner?.name)\n" +
+            "                    else ask(row.directory, row.owner?.name, answer)")
+        assertTrue(click, opens >= 0 && retries > opens)
+        val model = body(fragment, "internal class UnsyncedNotesViewModel", "")
+        assertTrue("an answer of nothing, as a Retry", model.contains(
+            "fun retryStopped(directory: String, label: String?) =\n" +
+                "        discard(directory, label, UnsyncedNotes.NOTHING, retry = true)"))
+        // The hub row of a stopped store that counts nothing shows, and says that not all could be counted.
+        assertEquals(Text.Uncounted, UnsyncedNotesDiscardPolicy.hubSummary(
+            UnsyncedNotesListing(listOf(row(UnsyncedNotes.NOTHING, stopped = true)), false, false)))
+    }
+
+    @Test fun `an answer from a dialog made in another process counts again, and discards and says nothing`() {
+        val alice = ExactAccountIdentity("io.silentsuite", "alice", "gen-1")
+        for (answer in listOf(two, uncounted, unlisted, UnsyncedNotes.NOTHING, null)) {
+            for (stopped in listOf(false, true)) {
+                val next = UnsyncedNotesDiscardPolicy.restored(row(answer, alice, stopped))
+                val asks = !stopped && answer != null && answer.anything
+                assertEquals("$answer, stopped $stopped",
+                    if (asks) Result.Ask(directory, "alice", answer!!) else Result.Reload, next)
+                assertNull("$answer, stopped $stopped", UnsyncedNotesDiscardPolicy.message(next))
+                assertFalse(UnsyncedNotesDiscardPolicy.offersRetry(next))
+            }
+        }
+        assertEquals("the count again, made in this process", Result.Ask(directory, "alice", two),
+            UnsyncedNotesDiscardPolicy.restored(row(two, alice)))
+        assertEquals("the acknowledgement again, for a store still unlisted", Result.Ask(directory, "alice", unlisted),
+            UnsyncedNotesDiscardPolicy.restored(row(unlisted, alice)))
+        assertEquals("a store whose discard stopped: its row is the Retry", Result.Reload,
+            UnsyncedNotesDiscardPolicy.restored(row(two, alice, stopped = true)))
+        assertEquals("a read that threw", Result.Reload, UnsyncedNotesDiscardPolicy.restored(row(null, alice)))
+        assertEquals("a store not matched to an account", Result.Ask(directory, null, two),
+            UnsyncedNotesDiscardPolicy.restored(row(two)))
+    }
+
+    @Test fun `the Settings dialog carries this process's token, and only its answers reach the store`() {
+        val fragment = source("UnsyncedNotesFragment.kt")
+        assertTrue("every dialog is made with this process's token",
+            body(dialog, "internal fun newInstance(", "        ")
+                .contains("putString(ARG_PROCESS, ProcessIncarnation.current())"))
+        assertTrue("it is read as given, null for a dialog with none",
+            dialog.contains("val shownIn = args.getString(ARG_PROCESS)\n"))
+        assertFalse("a dialog with none is not taken as this process's", dialog.contains("getString(ARG_PROCESS)!!"))
+        assertTrue(dialog.contains("internal const val ARG_PROCESS = \"unsyncedNotes.process\""))
+        assertTrue("and sent with its confirmation",
+            body(dialog, "fun confirm() {", "        ").contains("model.answer(directory, label, shown, shownIn)"))
+
+        val model = body(fragment, "internal class UnsyncedNotesViewModel", "")
+        val signature = "fun answer(directory: String, label: String?, shown: UnsyncedNotes, shownIn: String?) {"
+        assertTrue("the model takes it with no default", model.contains(signature))
+        assertTrue("and compares it once, before anything reaches the store", body(model, signature).contains(
+            "if (ProcessIncarnation.isCurrent(shownIn)) discard(directory, label, shown, retry = false)\n" +
+                "        else countAgain(directory)"))
+        assertTrue(model.contains(
+            "private fun discard(directory: String, label: String?, shown: UnsyncedNotes, retry: Boolean) {"))
+        assertTrue("a Retry needs no token", model.contains("fun retry(notFinished: Result.NotFinished) =\n" +
+            "        discard(notFinished.directory, notFinished.label, notFinished.shown, retry = true)"))
+        val again = body(model, "private fun countAgain(directory: String) {")
+        assertTrue(again, again.contains("UnsyncedNotesStores.reread(getApplication(), directory)") &&
+            again.contains("UnsyncedNotesDiscardPolicy.restored(now)"))
+        assertFalse("it discards nothing", again.contains("discard(") || again.contains("answer("))
+    }
+
+    @Test fun `a Settings dialog that has sent its confirmation does not hold back its step`() {
+        val fragment = source("UnsyncedNotesFragment.kt")
+        assertTrue("only the dialog sets it", dialog.contains("internal var ended = false\n        private set"))
+        val confirm = body(dialog, "fun confirm() {", "        ")
+        assertTrue(confirm, confirm.indexOf("ended = true") in 0 until confirm.indexOf("model.answer("))
+        assertEquals("and nothing else sets it", 1, fragment.split("ended = true").size - 1)
+        val ask = body(fragment, "private fun ask(directory: String, label: String?, shown: UnsyncedNotes): Boolean {")
+        assertTrue("the screen counts a dialog of the step as open only while it has not ended", ask.contains(
+            "val open = childFragmentManager.findFragmentByTag(tag) as? UnsyncedNotesDiscardDialogFragment\n" +
+                "        if (open == null || open.ended) {"))
+        assertFalse("not any dialog it finds", ask.contains("findFragmentByTag(tag) == null"))
     }
 }

@@ -85,6 +85,10 @@ class UnsyncedNotesStoresTest {
     /** What a discard asked of the Notes job and the store, in order. */
     private val calls = ArrayList<String>()
 
+    /**
+     * A discard as the screen asks for one; [ownerNow] is the account found again after a discard that finished. A
+     * discard of the store that stopped in this process is read from memory, as on a device.
+     */
     private fun discard(
         folder: String,
         shown: UnsyncedNotes,
@@ -92,10 +96,17 @@ class UnsyncedNotesStoresTest {
         retry: Boolean = false,
         running: Boolean = false,
         open: (String) -> PendingNotesStore = ::opened,
+        ownerNow: () -> ExactAccountIdentity? = { owner },
     ): Result = UnsyncedNotesStores.discard(folder, owner?.name, shown, retry, owner,
         open = { calls += "open"; open(it) },
         running = { calls += "running ${it.name}"; running },
-        cancel = { calls += "cancel ${it.name}" })
+        cancel = { calls += "cancel ${it.name}" },
+        ownerNow = ownerNow,
+        stoppedBefore = { folder in PendingNotesStore.stoppedIn(noBackup) })
+
+    /** The Settings screen's call of [UnsyncedNotesStores.discard], as it is wired on a device. */
+    private fun deviceWiring() = File("src/main/java/io/silentsuite/sync/ui/UnsyncedNotesStores.kt").readText()
+        .replace("\r\n", "\n").substringAfter("fun discard(context: Context", "").substringBefore("\n\n")
 
     private fun permitOf(folder: String) =
         PendingNotesDiscardPermits(discards, {}, atomicMove, PendingNotesStore.nioPresence).read(folder)
@@ -462,7 +473,8 @@ class UnsyncedNotesStoresTest {
         assertEquals(Result.Done, discard(folder, shown, retry = true))
         assertFalse(folder in namesIn(pending))
         assertNull(permitOf(folder))
-        assertNotSame(instance, opened(folder))
+        assertSame("with no present account, the finished instance stays, closed", instance, opened(folder))
+        assertTrue(instance.clearedInFull())
     }
 
     @Test fun `an acknowledgement deletes nothing, records no permit, stays recorded and keeps the store open`() {
@@ -520,7 +532,7 @@ class UnsyncedNotesStoresTest {
 
         // An instance dropped after a discard that finished, while a new one owns the folder again.
         val dropped = opened(folder)
-        assertEquals(Result.Done, discard(folder, shown))
+        assertEquals(Result.Done, discard(folder, shown, owner = owner))
         saveIn(owner, "n1")
         val again = read().rows.single().answer!!
         val refilled = filesUnder(pending)
@@ -545,6 +557,197 @@ class UnsyncedNotesStoresTest {
         assertEquals(Result.AcknowledgementNotRecorded, discard(other, unlistedShown))
         PendingNotesDiscardPermits.beforeRecordForTesting = null
         assertFalse("$other.acknowledgement" in namesIn(discards))
+    }
+
+    // ---- a discard that stopped, once the screen was left ----
+
+    @Test fun `a stopped discard keeps its row and Retry with nothing left to count, and the Retry finishes it`() {
+        val folder = saveIn(account("a"), "n1")
+        val shown = read().rows.single().answer!!
+        PendingNotesStore.resetForTesting()
+        // Opened first, so its functions are the ones kept: the sync right after n1.note's unlink fails once, as an
+        // EIO from fsync can. Every sync after that is recorded.
+        var unlinked = false
+        var failed = false
+        val synced = ArrayList<String>()
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n1.note") unlinked = true }
+        val instance = PendingNotesStore.forNoBackupDirectory(noBackup, folder, { d ->
+            if (failed) {
+                synced += d.name
+            } else if (unlinked && d.name == folder) {
+                failed = true
+                throw IOException("could not sync the store folder")
+            }
+        }, atomicMove)
+        assertEquals(Result.NotFinished(folder, null, shown), discard(folder, shown))
+        assertEquals("the text went, the rest stays", setOf("b1.notebook", "sequence"), namesIn(File(pending, folder)))
+        assertEquals("the closed instance counts nothing", UnsyncedNotes.NOTHING, instance.unsynced())
+        assertEquals("the permit stays", shown, permitOf(folder))
+
+        // The screen was left, so it holds no result: the store's own state keeps the row, and the hub row.
+        val listing = read()
+        assertEquals(listOf(UnsyncedNotesRow(folder, null, UnsyncedNotes.NOTHING, stopped = true)), listing.rows)
+        assertEquals(Text.Uncounted, UnsyncedNotesDiscardPolicy.hubSummary(listing))
+
+        // Its Retry, an answer of nothing, finishes it, and syncs the store folder and the folder above.
+        assertEquals(Result.Done, discard(folder, UnsyncedNotes.NOTHING, retry = true))
+        assertTrue("$synced", folder in synced && "notes-pending" in synced)
+        assertFalse(folder in namesIn(pending))
+        assertNull(permitOf(folder))
+        assertFalse(instance.clearStopped())
+        val after = read()
+        assertEquals(emptyList<UnsyncedNotesRow>(), after.rows)
+        assertNull(UnsyncedNotesDiscardPolicy.hubSummary(after))
+    }
+
+    @Test fun `a stopped discard that still holds text asks again for it, and is never said to have deleted nothing`() {
+        identifyDirectories()
+        val folder = saveIn(account("a"), "n1", "n2")
+        val shown = read().rows.single().answer!!
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw IOException("the removal stops") }
+        assertEquals(Result.NotFinished(folder, null, shown), discard(folder, shown))
+        PendingNotesStore.beforeRemoveForTesting = null
+        val left = UnsyncedNotes(1, 2, false, names = setOf("n2.note"))
+        assertEquals(listOf(UnsyncedNotesRow(folder, null, left, stopped = true)), read().rows)
+
+        // The row's Retry, an answer of nothing, deletes nothing while text is left: the dialog shows again for it.
+        val before = filesUnder(pending)
+        assertEquals(Result.Ask(folder, null, left), discard(folder, UnsyncedNotes.NOTHING, retry = true))
+        assertEquals(before, filesUnder(pending))
+        assertEquals("the permit stays", shown, permitOf(folder))
+        // That dialog's confirmation, whose permit cannot be recorded, deleted nothing itself, but the attempt before
+        // it did: not finished, never that nothing was deleted.
+        PendingNotesDiscardPermits.beforeRecordForTesting = { throw IOException("could not record the permit") }
+        assertEquals(Result.NotFinished(folder, null, left), discard(folder, left))
+        PendingNotesDiscardPermits.beforeRecordForTesting = null
+        assertEquals(before, filesUnder(pending))
+        // Nor when it fails before the store is reached: a discard of the store stopped in this process, which is
+        // read from memory, on a device too.
+        assertEquals(Result.NotFinished(folder, null, left),
+            discard(folder, left, open = { throw IOException("could not open") }))
+        assertEquals(before, filesUnder(pending))
+        assertTrue(deviceWiring().contains(
+            "stoppedBefore = { directory in PendingNotesStore.stoppedIn(context.noBackupFilesDir) })"))
+
+        // While the folder cannot be listed, the row is still the Retry, which is not finished again, and an
+        // acknowledgement over it records nothing and says nothing.
+        unlisted(folder)
+        val row = read().rows.single()
+        assertTrue("$row", row.stopped && row.answer?.listed == false)
+        assertEquals(Result.NotFinished(folder, null, UnsyncedNotes.NOTHING),
+            discard(folder, UnsyncedNotes.NOTHING, retry = true))
+        assertEquals(Result.Reload, discard(folder, row.answer!!))
+        assertFalse("$folder.acknowledgement" in namesIn(discards))
+        assertEquals(before, filesUnder(pending))
+        // Settings reloads before the store call, so a call that would throw never says that nothing was deleted.
+        PendingNotesStore.listFilesForTesting = { d ->
+            if (d.name == folder) throw SecurityException("the listing is refused") else d.listFiles()
+        }
+        assertEquals(Result.Reload, discard(folder, row.answer!!))
+        assertFalse("$folder.acknowledgement" in namesIn(discards))
+
+        // Once it lists, the confirmation of what is left finishes it.
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals(Result.Done, discard(folder, left))
+        assertFalse(folder in namesIn(pending))
+        assertNull(permitOf(folder))
+    }
+
+    @Test fun `a discard that stopped once its folder was gone keeps its row, though no listing finds the folder`() {
+        val folder = saveIn(account("orphan"), "n1")
+        val shown = read().rows.single().answer!!
+        PendingNotesStore.resetForTesting()
+        // The sync of notes-pending fails, as an EIO from fsync can, after the folder is gone.
+        var failAbove = true
+        PendingNotesStore.forNoBackupDirectory(noBackup, folder, { d ->
+            if (failAbove && d.name == "notes-pending") throw IOException("could not sync notes-pending")
+        }, atomicMove)
+        assertEquals(Result.NotFinished(folder, null, shown), discard(folder, shown))
+        assertFalse(folder in namesIn(pending))
+        assertEquals("the permit stays", shown, permitOf(folder))
+
+        val listing = read()
+        assertEquals(listOf(UnsyncedNotesRow(folder, null, UnsyncedNotes.NOTHING, stopped = true)), listing.rows)
+        assertEquals(Text.Uncounted, UnsyncedNotesDiscardPolicy.hubSummary(listing))
+        failAbove = false
+        assertEquals(Result.Done, discard(folder, UnsyncedNotes.NOTHING, retry = true))
+        assertNull(permitOf(folder))
+        assertEquals(emptyList<UnsyncedNotesRow>(), read().rows)
+    }
+
+    @Test fun `an answer of nothing over a discard not stopped deletes nothing, Retry or not, and cancels no run`() {
+        val p = account("p")
+        val folder = saveIn(p, "n1")
+        // Pushed and cleared from the store: only the notebook copy and the counter are left, which hold no text.
+        storeOf(p).discard("n1")
+        val before = filesUnder(pending)
+        PendingNotesStore.beforeClearForTesting = { calls += "deleting" }
+        // Only a row's Retry sends one, but the rule does not rest on that.
+        for (retry in listOf(true, false)) {
+            calls.clear()
+            assertEquals("retry $retry", Result.Reload,
+                discard(folder, UnsyncedNotes.NOTHING, owner = p, retry = retry, running = true))
+            assertEquals("retry $retry", before, filesUnder(pending))
+            assertEquals("no run is canceled for an answer of nothing", listOf("open"), calls)
+        }
+        assertFalse(storeOf(p).clearStopped())
+
+        // One that another call finished, as the sign-out does: Done, and the instance it keeps stays.
+        val q = account("q")
+        val finished = saveIn(q, "n1")
+        val kept = storeOf(q)
+        assertEquals(PendingNotesStore.DiscardOutcome.Done, kept.discardStore(kept.unsynced()))
+        calls.clear()
+        assertEquals(Result.Done, discard(finished, UnsyncedNotes.NOTHING, owner = q, retry = true, running = true))
+        assertEquals(listOf("open"), calls)
+        assertSame(kept, storeOf(q))
+    }
+
+    @Test fun `Settings drops an instance only when its discard alone finished it and an account owns the folder`() {
+        val p = account("p")
+        val folder = saveIn(p, "n1", "n2")
+        val shown = read(p).rows.single().answer!!
+        val instance = storeOf(p)
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw IOException("the removal stops") }
+        assertEquals(Result.NotFinished(folder, "p", shown), discard(folder, shown, owner = p))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertSame(instance, storeOf(p))
+        // The sign-out finishes it and keeps it, closed, for its account, which it removes next.
+        assertEquals(PendingNotesStore.DiscardOutcome.Done, storeOf(p).discardStore(storeOf(p).unsynced()))
+        // A Settings Retry finishes it as well, whether the account is still found or not: it stays.
+        for (now in listOf(null, p)) {
+            assertEquals(Result.Done, discard(folder, shown, owner = p, retry = true, ownerNow = { now }))
+            assertSame("$now", instance, storeOf(p))
+        }
+        assertTrue(runCatching { storeOf(p).saveLocal("n3", "b1", "r1", "late".toByteArray(), isCreate = false) }
+            .exceptionOrNull() is PendingNotesStore.Cleared)
+        assertFalse(folder in namesIn(pending))
+
+        // The sign-out finishes the instance between Settings' Done and its drop: it stays.
+        val r = account("r")
+        val raced = saveIn(r, "n1")
+        val racedInstance = storeOf(r)
+        assertEquals(Result.Done, discard(raced, read(r).rows.single().answer!!, owner = r, ownerNow = {
+            assertEquals(PendingNotesStore.DiscardOutcome.Done, storeOf(r).discardStore(storeOf(r).unsynced()))
+            r
+        }))
+        assertSame(racedInstance, storeOf(r))
+
+        // An account removed while Settings' own discard ran, and an account read that throws: each keeps its
+        // finished instance, closed.
+        for ((name, ownerNow) in listOf<Pair<String, () -> ExactAccountIdentity?>>(
+            "q" to { null }, "s" to { throw SecurityException("denied") })) {
+            val owner = account(name)
+            val other = saveIn(owner, "n1")
+            val opened = storeOf(owner)
+            assertEquals(name, Result.Done, discard(other, read(owner).rows.single().answer!!, owner = owner,
+                ownerNow = ownerNow))
+            assertSame(name, opened, storeOf(owner))
+            assertTrue(name, opened.clearedInFull())
+        }
+
+        // On a device, the account is found again after Done.
+        assertTrue(deviceWiring().contains("ownerNow = { ownerOf(context, directory) },"))
     }
 
     // ---- a store folder that is a link ----

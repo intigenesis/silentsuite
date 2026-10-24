@@ -38,6 +38,7 @@ import io.silentsuite.sync.notes.MainThreadStoreProbe
 import io.silentsuite.sync.notes.NotesSyncCoordinator
 import io.silentsuite.sync.notes.edit.PendingNotesDiscardPermits
 import io.silentsuite.sync.notes.edit.PendingNotesStore
+import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import io.silentsuite.sync.syncadapter.SyncNotification
 import io.silentsuite.sync.ui.UnsyncedNotesDiscardPolicy.Step
 import io.silentsuite.sync.ui.settings.AppPreferences
@@ -61,6 +62,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -717,10 +719,11 @@ class SettingsRuntimeTest {
     /**
      * Settings, Unsynced Notes from the sign-in screen's menu, with no account and no session: two stores whose account
      * is gone. One is discarded after Cancel and Back changed nothing and across a recreation of its open dialog, its
-     * permit on disk before the first file goes. The other cannot be listed: it is offered only an acknowledgement,
-     * which deletes nothing, and once it lists, a discard with its real count. A third store's folder is then replaced
-     * by a link to it: it too is offered only an acknowledgement, under the link's own name, and nothing behind the
-     * link changes. Every request is refused and counted, and so is every Notes run.
+     * permit on disk before the first file goes. A dialog that Android restores in a new app process discards nothing,
+     * and the orphan's finished instance stays closed. The other cannot be listed: it is offered only an
+     * acknowledgement, which deletes nothing, and once it lists, a discard with its real count. A third store's folder
+     * is then replaced by a link to it: it too is offered only an acknowledgement, under the link's own name, and
+     * nothing behind the link changes. Every request is refused and counted, and so is every Notes run.
      */
     @Test
     fun unsyncedNotesFromSignInAreDiscardedOfflineAndAnUnlistableStoreIsOnlyAcknowledged() {
@@ -806,12 +809,32 @@ class SettingsRuntimeTest {
                     val discard = notes.texts(settings, Step.DISCARD, a)
                     assertEquals(message, discard.message)
                     assertEquals(context.getString(R.string.notes_discard), discard.positive)
+                    // A dialog that Android restores in a new app process has another process's token, or none: its
+                    // Discard deletes and records nothing, and the dialog shows again, made in this process.
+                    for (token in listOf("another-process", null)) {
+                        val (had, restored) = notes.restoredFromAnotherProcess(settings, Step.DISCARD, a, token)
+                        settings = restored
+                        assertEquals("made in this process", ProcessIncarnation.current(), had)
+                        assertEquals("token $token", message, notes.texts(settings, Step.DISCARD, a).message)
+                        notes.tap(settings, Step.DISCARD, a, DialogInterface.BUTTON_POSITIVE)
+                        notes.awaitOneFromThisProcess(settings, Step.DISCARD, a)
+                        assertNull("token $token: nothing was removed", notes.atFirstRemoval(a))
+                        assertFalse("token $token: no permit", "$a.permit" in notes.permits())
+                        notes.assertFiles("token $token", a, filesA)
+                    }
                     notes.tap(settings, Step.DISCARD, a, DialogInterface.BUTTON_POSITIVE)
                     notes.awaitSnackbar(settings, done)
                     assertTrue("the permit was on disk at the first removal: ${notes.atFirstRemoval(a)}",
                         "$a.permit" in notes.atFirstRemoval(a).orEmpty())
                     assertFalse(a in notes.stores())
                     assertFalse("$a.permit" in notes.permits())
+                    // A has no present account, so its finished instance stays closed: a late save is refused and
+                    // does not bring the folder back.
+                    val kept = PendingNotesStore.forDirectory(context, a)
+                    assertTrue(kept.clearedInFull())
+                    val late = runCatching { notes.save(kept, "n2") }.exceptionOrNull()
+                    assertTrue("$late", late is PendingNotesStore.Cleared)
+                    assertFalse(a in notes.stores())
 
                     // 5. B, which cannot be listed: an acknowledgement, never called a discard, deletes nothing.
                     notes.awaitRows(settings, listOf(UnsyncedNotesOnDevice.Row(UnsyncedNotesFragment.rowKey(b),
@@ -906,8 +929,9 @@ class SettingsRuntimeTest {
      * The Settings hub row and the screen for a present account's store, with no session, while notes-pending cannot
      * be listed: the store is still found by its path. Its discard deletes the files but cannot show the folder gone,
      * so it is not finished: Retry is offered and stays not finished, and the store's row opens nothing meanwhile.
-     * Once the folder above lists, Retry finishes under the same permit, and the account's store takes saves again in
-     * a new instance.
+     * Once the screen is left, the row still says the discard did not finish, from the store's state, and is the
+     * Retry; once the folder above lists, the store counts nothing, the row and the hub row stay, and the row's Retry
+     * finishes under the same permit, and the account's store takes saves again in a new instance.
      */
     @Test
     fun unsyncedNotesOfAPresentAccountStayReachableWhenTheStoreFolderCannotBeListed() {
@@ -924,8 +948,11 @@ class SettingsRuntimeTest {
         val two = context.resources.getQuantityString(R.plurals.notes_store_unsynced, 2, 2)
         val stopped = UnsyncedNotesOnDevice.Row(row, account.name,
             context.getString(R.string.notes_discard_not_finished), enabled = false)
+        val retryRow = UnsyncedNotesOnDevice.Row(row, account.name,
+            context.getString(R.string.notes_discard_not_finished_row))
         val others = UnsyncedNotesOnDevice.Row(UnsyncedNotesFragment.KEY_OTHERS,
             context.getString(R.string.notes_stores_others_unlisted), null, enabled = false)
+        val uncounted = context.getString(R.string.settings_unsynced_notes_uncounted)
         var added = false
         try {
             notes.isolate()
@@ -981,14 +1008,35 @@ class SettingsRuntimeTest {
                 assertTrue("$folder.permit" in notes.permits())
                 notes.awaitRows(settings, listOf(stopped, others))
 
-                // 6. Once notes-pending lists, the folder is shown gone, and Retry finishes under the same permit.
+                // 6. Leaving the screen takes its result and the bar away, yet the store's state keeps the row: it says
+                // the discard did not finish and is the Retry. Tapped while notes-pending still cannot be listed, it is
+                // not finished again, and is never an acknowledgement.
+                notes.leaveAndReopen(settings, uncounted)
+                notes.awaitRows(settings, listOf(retryRow, others))
+                assertEquals("a new screen holds no result", false to null, notes.confirmationOf(settings))
+                notes.tapRow(settings, folder)
+                notes.awaitRetryBar(settings, null)
+                notes.awaitNoDialog(settings)
+                assertEquals(false to UnsyncedNotesDiscardPolicy.Result.NotFinished(folder, account.name,
+                    UnsyncedNotes.NOTHING), notes.confirmationOf(settings))
+                notes.awaitRows(settings, listOf(stopped, others))
+                assertTrue("$folder.permit" in notes.permits())
+
+                // 7. Once notes-pending lists, the closed instance counts nothing, yet the row and the hub row stay
+                // once the screen is left again, and the row's Retry finishes under the same permit.
                 notes.probe.listing = null
                 assertFalse("the folder itself went", folder in notes.stores())
                 assertTrue("$folder.permit" in notes.permits())
                 val closed = PendingNotesStore.forIdentity(context, account.type, account.name, generation)
-                notes.tapRetry(settings)
+                assertEquals(UnsyncedNotes.NOTHING, closed.unsynced())
+                assertTrue(closed.clearStopped())
+                notes.leaveAndReopen(settings, uncounted)
+                notes.awaitRows(settings, listOf(retryRow))
+                notes.tapRow(settings, folder)
                 notes.awaitSnackbar(settings, context.getString(R.string.notes_discard_done))
                 assertFalse("$folder.permit" in notes.permits())
+                notes.awaitRows(settings, listOf(UnsyncedNotesOnDevice.Row(UnsyncedNotesFragment.KEY_NONE,
+                    context.getString(R.string.notes_stores_none), null, enabled = false)))
                 val next = PendingNotesStore.forIdentity(context, account.type, account.name, generation)
                 assertNotSame(closed, next)
                 assertTrue(next.saveLocal("n3", "b1", "r1", ByteArray(1), isCreate = false)
@@ -1333,6 +1381,72 @@ private class UnsyncedNotesOnDevice(private val context: Context) {
         screen?.childFragmentManager?.executePendingTransactions()
         screen != null && screen.childFragmentManager.fragments
             .filterIsInstance<UnsyncedNotesDiscardDialogFragment>().none { it.dialog?.isShowing == true }
+    }
+
+    /** The dialogs of [step] for the store in [folder] the screen holds, ended ones included; on the main thread. */
+    private fun dialogsOf(settings: AppSettingsActivity, step: Step, folder: String):
+        List<UnsyncedNotesDiscardDialogFragment> {
+        val screen = screenOf(settings) ?: return emptyList()
+        screen.childFragmentManager.executePendingTransactions()
+        return screen.childFragmentManager.fragments.filterIsInstance<UnsyncedNotesDiscardDialogFragment>()
+            .filter { it.tag == UnsyncedNotesDiscardDialogFragment.tag(step, folder) }
+    }
+
+    /**
+     * What a new app process changes for the open dialog of [step] for the store in [folder]: its token is not this
+     * process's ([token]), or it has none (null, a dialog from before the token). The arguments are edited before the
+     * screen is created again, so the dialog comes back from them. Gives the token the dialog had, and the new screen.
+     * Read and edited on the main thread, and checked here.
+     */
+    fun restoredFromAnotherProcess(settings: AppSettingsActivity, step: Step, folder: String, token: String?):
+        Pair<String?, AppSettingsActivity> {
+        var open = 0
+        var had: String? = null
+        instrumentation.runOnMainSync {
+            val dialogs = dialogsOf(settings, step, folder).filter { !it.ended }
+            open = dialogs.size
+            dialogs.singleOrNull()?.arguments?.let { args ->
+                had = args.getString(UnsyncedNotesDiscardDialogFragment.ARG_PROCESS)
+                if (token == null) args.remove(UnsyncedNotesDiscardDialogFragment.ARG_PROCESS)
+                else args.putString(UnsyncedNotesDiscardDialogFragment.ARG_PROCESS, token)
+            }
+        }
+        assertEquals("one open $step dialog", 1, open)
+        instrumentation.runOnMainSync { settings.recreate() }
+        return had to resumedSettings(settings)
+    }
+
+    /**
+     * Waits until the screen holds exactly one dialog of [step] for the store in [folder], ended ones included: one
+     * that shows, has not ended, and was made in this process.
+     */
+    fun awaitOneFromThisProcess(settings: AppSettingsActivity, step: Step, folder: String) =
+        await("one $step dialog, made in this process") {
+            val dialogs = dialogsOf(settings, step, folder)
+            val one = dialogs.singleOrNull()
+            one != null && !one.ended && one.dialog?.isShowing == true &&
+                one.arguments?.getString(UnsyncedNotesDiscardDialogFragment.ARG_PROCESS) == ProcessIncarnation.current()
+        }
+
+    /**
+     * Back from the screen to the Settings hub, which clears the screen's view model and the result it holds; then,
+     * once the hub row reads [hub], its tap opens the screen again.
+     */
+    fun leaveAndReopen(settings: AppSettingsActivity, hub: String) {
+        instrumentation.runOnMainSync { settings.onBackPressedDispatcher.onBackPressed() }
+        await("the screen closed") { screenOf(settings) == null }
+        awaitHubSummary(hub)
+        var tapped = false
+        instrumentation.runOnMainSync {
+            val home = settings.supportFragmentManager.findFragmentById(android.R.id.content)
+                as? AppSettingsActivity.HomeFragment
+            home?.findPreference<Preference>(AppSettingsActivity.HomeFragment.UNSYNCED_NOTES_KEY)?.let {
+                it.performClick()
+                tapped = true
+            }
+        }
+        assertTrue("the hub row was tapped", tapped)
+        await("the screen") { screenOf(settings) != null }
     }
 
     /**

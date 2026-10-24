@@ -68,14 +68,16 @@ internal object UnsyncedNotesDiscardPolicy {
 
     /**
      * What follows a confirmation of [shown] for the store in [directory] that the store answered with [ended]. [retry]
-     * is a Retry after [Result.NotFinished]. [label] is the account the row named, or null for a store not matched to
-     * one.
+     * is a Retry after [Result.NotFinished], or any confirmation of a store whose discard stopped, whoever started it
+     * ([UnsyncedNotesRow.stopped]): the attempt before may have deleted already. [label] is the account the row named,
+     * or null for a store not matched to one.
      *
      * After a discard, a store that can no longer be listed on a Retry is a discard that is not finished: its folder
      * may be gone while the folder above it cannot be listed to show that. A Retry that records no permit deleted
      * nothing itself, but the attempt before it may have, so it is not finished either and keeps Retry. After an
      * acknowledgement, the store gives neither Done nor PermitNotRecorded, since it deletes nothing under one, and
-     * NotFinished only over a store whose discard stopped, recording nothing; the screen then only reloads.
+     * NotFinished only over a store whose discard stopped, recording nothing; the screen then only reads the stores
+     * again, and the store's row is the Retry.
      */
     fun result(shown: UnsyncedNotes, retry: Boolean, directory: String, label: String?, ended: DiscardOutcome): Result =
         when (step(shown)) {
@@ -143,8 +145,21 @@ internal object UnsyncedNotesDiscardPolicy {
      * Whether a tap on the row of the store in [directory] opens a confirmation now. Not while one runs
      * ([answering]), so none is dropped unseen and no result is read as another store's. And not while the screen
      * holds a discard of that store that did not finish ([notFinished]): only its Retry goes on, so the screen never
-     * moves from "may already be deleted" to a new step for that store, such as an acknowledgement.
+     * moves from "may already be deleted" to a new step for that store, such as an acknowledgement. Once the screen no
+     * longer holds that result, the row of a store whose discard stopped ([UnsyncedNotesRow.stopped]) is that Retry.
      */
     fun rowOpens(directory: String, held: Result?, answering: Boolean): Boolean =
         !answering && !notFinished(directory, held)
+
+    /**
+     * What follows an answer from a dialog made in another app process ([ProcessIncarnation]), once its store was read
+     * again as [now]: the dialog again, for what [now] holds and made in this process, only while it holds anything and
+     * its discard has not stopped. Otherwise the screen only reads the stores again: a store that holds nothing; one
+     * whose read threw, whose row then opens nothing; and one whose discard stopped, whose row then says so and is its
+     * Retry once the store reads. Nothing is discarded or recorded, and nothing is said about a deletion.
+     */
+    fun restored(now: UnsyncedNotesRow): Result =
+        if (!now.stopped && now.answer != null && now.answer.anything) {
+            Result.Ask(now.directory, now.owner?.name, now.answer)
+        } else Result.Reload
 }
