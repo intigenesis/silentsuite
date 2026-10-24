@@ -16,8 +16,10 @@ import java.io.IOException
  * store, and so does one recorded for an answer that could not be counted, whose names come only from listings,
  * which can come back short, while the user confirmed all of the store; a damaged one names nothing ([lookup]).
  * A permit recorded in place of either of these is recorded as for an answer that could not be counted, whatever
- * its own count showed ([PendingNotesStore.discardStore], step 3), so it holds back every note as well and covers
- * no counted answer ([UnsyncedNotes.covers]).
+ * its own count showed ([PendingNotesStore.discardStore], step 3), so it holds back every note as well, covers no
+ * counted answer, and covers an answer that could not be counted at its sequence ([UnsyncedNotes.covers],
+ * [PendingNotesStore.removalCheck]), such as a listing of the store that lacks its counter and lists no note; a
+ * removal check takes no permit as cover for such a listing that lists a note.
  *
  * Permits live in a root of their own (noBackupFilesDir/notes-discard, one "<store>.permit" per store
  * directory name). Not in the store, which the discard deletes, and not beside the stores in

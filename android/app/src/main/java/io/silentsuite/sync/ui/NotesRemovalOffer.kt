@@ -4,6 +4,7 @@ import android.accounts.Account
 import android.accounts.AccountManager
 import android.accounts.AccountManagerCallback
 import android.content.Context
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.system.ErrnoException
@@ -144,11 +145,10 @@ internal class NotesRemovalOffer(
         override fun fingerprint(decision: Decision) = NotesRemovalOffer.fingerprint(context.noBackupFilesDir, decision,
             stat = { stat(it) }, lstat = { lstat(it) })
 
-        @Suppress("DEPRECATION")
         override fun remove(type: String, name: String, removed: () -> Unit) {
-            val answered = AccountManagerCallback<Boolean> { io.launch { removed() } }
+            val answered = AccountManagerCallback<Bundle> { io.launch { removed() } }
             try {
-                AccountManager.get(context).removeAccount(Account(name, type), answered,
+                AccountManager.get(context).removeAccount(Account(name, type), null, answered,
                     Handler(Looper.getMainLooper()))
             } catch (e: Exception) {
                 // Nothing was started; the row is read again all the same.

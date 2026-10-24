@@ -69,7 +69,10 @@ class PendingNotesRemovalGuardTest {
     private fun listed(vararg stores: String, unknown: Boolean = false): () -> StoreFolders =
         { StoreFolders(stores.toList(), if (unknown) listOf("future.dat") else emptyList()) }
 
-    /** By default a row "b" without a creation id, alone on the device, with both folders listed and empty. */
+    /**
+     * By default a row "b" without a creation id, alone on the device, with both folders listed and empty, and every
+     * store folder that a listing of notes-pending leaves out shown absent by its presence check.
+     */
     private fun input(
         name: String? = "b",
         id: CreationId = CreationId.Unreadable,
@@ -78,11 +81,13 @@ class PendingNotesRemovalGuardTest {
         pending: () -> StoreFolders = listed(),
         discard: () -> Set<String>? = { emptySet() },
         known: () -> Set<String> = { emptySet() },
+        presence: (String) -> PendingNotesStore.Presence = { PendingNotesStore.Presence.ABSENT },
     ) = Input(TYPE, type, name, id,
         accounts = { asked += "accounts"; accounts() },
         pending = { asked += "pending"; pending() },
         discard = { asked += "discard"; discard() },
         known = { asked += "known"; known() },
+        presence = { folder -> asked += "presence $folder"; presence(folder) },
         folderOf = ::folder,
         check = { folder -> asked += "check $folder"; (answers[folder] ?: { RemovalCheck.Clean })() })
 
@@ -161,7 +166,57 @@ class PendingNotesRemovalGuardTest {
             decide(input(pending = listed("orphan"))))
     }
 
-    @Test fun `row 5, with the account list unreadable, a row without a creation id is refused unless all is clean`() {
+    @Test fun `row 5, a listing of notes-pending that leaves out a folder known by path refuses a row without an id`() {
+        val short = PendingNotesRemovalGuard.PENDING_LISTED_SHORT
+        assertEquals("refused until the maintainer decides", Verdict.REFUSE_UNREADABLE, short)
+        assertFalse(short.eligible)
+        val there: (String) -> PendingNotesStore.Presence = { PendingNotesStore.Presence.PRESENT }
+        // A folder from each source that the listing left out and that is there: a record in notes-discard, a known
+        // path, and another row's own.
+        val rows = { listOf(Row("b", CreationId.Unreadable), Row("c", CreationId.Readable("gen-c"))) }
+        assertEquals("notes-discard", short,
+            decide(input(pending = listed("orphan"), discard = { setOf("missing") }, presence = there)))
+        assertEquals("known", short,
+            decide(input(pending = listed("orphan"), known = { setOf("missing") }, presence = there)))
+        assertEquals("another row's own", short,
+            decide(input(accounts = rows, pending = listed("orphan"), presence = there)))
+        // A check that fails is no absence; a folder shown absent, as one never made, allows.
+        assertEquals("unknown", short, decide(input(pending = listed("orphan"), known = { setOf("missing") },
+            presence = { PendingNotesStore.Presence.UNKNOWN })))
+        assertEquals(Verdict.ALLOW, decide(input(pending = listed("orphan"), known = { setOf("missing") })))
+        assertEquals(Verdict.ALLOW, decide(input(accounts = rows, pending = listed("orphan"))))
+        // What the listing held is still checked, and a store that refuses on its own comes first (row 4).
+        answer("orphan", RemovalCheck.Blocks(draft))
+        assertEquals(Verdict.REFUSE_STORE,
+            decide(input(pending = listed("orphan"), known = { setOf("missing") }, presence = there)))
+        // So do a store that could not withdraw its acknowledgement while notes-discard lists (row 3), and one absent by
+        // lstat alone while notes-pending lists (row 4).
+        answer("orphan", RemovalCheck.NothingUnwithdrawn)
+        assertEquals("row 3 first", Verdict.REFUSE_FAILED,
+            decide(input(pending = listed("orphan"), known = { setOf("missing") }, presence = there)))
+        answer("orphan", RemovalCheck.UnlistedAbsent)
+        assertEquals("row 4 first", Verdict.REFUSE_STORE,
+            decide(input(pending = listed("orphan"), known = { setOf("missing") }, presence = there)))
+        answers.clear()
+        // Before the rows after it: the account list unread, notes-discard unlistable beside a store that could not
+        // withdraw, and names of an unknown kind with the maintainer's yes.
+        assertEquals("not REFUSE_ACCOUNTS", short, decide(input(accounts = { null }, pending = listed("orphan"),
+            known = { setOf("missing") }, presence = there)))
+        answer("orphan", RemovalCheck.NothingUnwithdrawn)
+        assertEquals("not PERMITS_UNLISTABLE_ONLY", short, decide(input(pending = listed("orphan"), discard = { null },
+            known = { setOf("missing") }, presence = there)))
+        answers.clear()
+        assertEquals("not UNKNOWN_KIND_ONLY", short, yes(input(pending = listed("orphan", unknown = true),
+            known = { setOf("missing") }, presence = there)))
+        // Each folder read comes first, then the presence check of the names the listing left out, and only then the
+        // first store check.
+        asked.clear()
+        decide(input(pending = listed("orphan"), known = { setOf("missing") }))
+        assertEquals(listOf("accounts", "pending", "discard", "known", "presence missing", "check missing",
+            "check orphan"), asked)
+    }
+
+    @Test fun `row 6, with the account list unreadable, a row without a creation id is refused unless all is clean`() {
         assertEquals(Verdict.ALLOW, decide(input(accounts = { null }, pending = listed("orphan"))))
         answer("orphan", RemovalCheck.Covered)
         assertEquals("ownership cannot change that answer", Verdict.ALLOW,
@@ -189,7 +244,7 @@ class PendingNotesRemovalGuardTest {
         assertEquals(Verdict.REFUSE_ACCOUNTS, yes(unknown))
     }
 
-    @Test fun `row 6, a name of an unknown kind in notes-pending refuses a row without a creation id for now`() {
+    @Test fun `row 7, a name of an unknown kind in notes-pending refuses a row without a creation id for now`() {
         assertEquals("refused until the maintainer decides", Verdict.REFUSE_UNKNOWN_KIND,
             PendingNotesRemovalGuard.UNKNOWN_KIND_IN_PENDING)
         answer("covered", RemovalCheck.Covered)
@@ -203,7 +258,7 @@ class PendingNotesRemovalGuardTest {
         assertEquals("a row with a creation id lists no notes-pending", listOf("check $a"), asked)
     }
 
-    @Test fun `row 6, with a yes, names of an unknown kind alone are eligible, only while notes-discard lists`() {
+    @Test fun `row 7, with a yes, names of an unknown kind alone are eligible, only while notes-discard lists`() {
         answer("covered", RemovalCheck.Covered)
         answer("acknowledged", RemovalCheck.Acknowledged)
         // Beside clean, covered and acknowledged stores, or none, with notes-discard listed or shown gone.
@@ -222,7 +277,7 @@ class PendingNotesRemovalGuardTest {
                 yes(input(pending = listed("other", unknown = true), discard = { null })))
         }
         // Never beside a store that needs its own way out (row 4), one that failed to withdraw while notes-discard
-        // lists (row 3), or with the account list unread (row 5), and never for a row whose creation id reads.
+        // lists (row 3), or with the account list unread (row 6), and never for a row whose creation id reads.
         for (blocking in listOf(RemovalCheck.Blocks(draft), RemovalCheck.Unlisted, RemovalCheck.UnlistedAbsent)) {
             answer("other", blocking)
             assertEquals("$blocking", Verdict.REFUSE_STORE, yes(input(pending = listed("other", unknown = true))))
@@ -254,7 +309,7 @@ class PendingNotesRemovalGuardTest {
             listOf("accounts", "pending", "discard", "known", "check orphan"), asked)
     }
 
-    @Test fun `row 7, an account's own folder absent by lstat while it cannot be listed allows that removal alone`() {
+    @Test fun `row 8, an account's own folder absent by lstat while it cannot be listed allows that removal alone`() {
         answer(a, RemovalCheck.UnlistedAbsent)
         assertEquals(Verdict.ALLOW, decide(own()))
         assertEquals("its own store alone: no account list, notes-pending, notes-discard or store found by path",
@@ -278,7 +333,7 @@ class PendingNotesRemovalGuardTest {
         assertEquals(Verdict.ROOT_UNLISTABLE_ONLY, decide(input(pending = unlistable, known = { setOf("orphan") })))
     }
 
-    @Test fun `row 8, only notes-pending unreadable, every store clean, covered, acknowledged or absent`() {
+    @Test fun `row 9, only notes-pending unreadable, every store clean, covered, acknowledged or absent`() {
         answer("acknowledged", RemovalCheck.Acknowledged)
         answer("covered", RemovalCheck.Covered)
         answer("absent", RemovalCheck.UnlistedAbsent)
@@ -293,7 +348,7 @@ class PendingNotesRemovalGuardTest {
         assertEquals(Verdict.REFUSE_FAILED, decide(input(pending = unlistable, known = found)))
     }
 
-    @Test fun `row 9, only notes-discard unreadable, every store clean and at least one unwithdrawn`() {
+    @Test fun `row 10, only notes-discard unreadable, every store clean and at least one unwithdrawn`() {
         assertEquals("refused for a row whose id reads, until the maintainer decides", Verdict.REFUSE_UNREADABLE,
             PendingNotesRemovalGuard.READABLE_ID_UNDER_UNLISTED_PERMITS)
         answer(a, RemovalCheck.NothingUnwithdrawn)
@@ -309,7 +364,7 @@ class PendingNotesRemovalGuardTest {
         assertEquals(Verdict.ALLOW, decide(input(pending = listed("clean"), discard = { null })))
     }
 
-    @Test fun `row 10, both folders unreadable, every store clean, unwithdrawn or absent, gives one allowance`() {
+    @Test fun `row 11, both folders unreadable, every store clean, unwithdrawn or absent, gives one allowance`() {
         answer("orphan", RemovalCheck.NothingUnwithdrawn)
         answer("absent", RemovalCheck.UnlistedAbsent)
         answer("covered", RemovalCheck.Covered)
@@ -318,14 +373,14 @@ class PendingNotesRemovalGuardTest {
         assertEquals(Verdict.BOTH_UNLISTABLE_ONLY, both("orphan", "absent", "clean"))
         assertEquals(setOf(Cause.PENDING_UNLISTED, Cause.DISCARD_UNLISTED), Verdict.BOTH_UNLISTABLE_ONLY.reason)
         // Never one of the single-folder verdicts, which bind one folder only: not with no store found, nor with only
-        // stores absent by lstat (row 8 needs notes-discard), nor with only clean and unwithdrawn ones (row 9 needs
+        // stores absent by lstat (row 9 needs notes-discard), nor with only clean and unwithdrawn ones (row 10 needs
         // notes-pending).
         assertEquals("no store found", Verdict.BOTH_UNLISTABLE_ONLY, both())
         assertEquals("only absent ones", Verdict.BOTH_UNLISTABLE_ONLY, both("absent"))
         assertEquals("clean and unwithdrawn", Verdict.BOTH_UNLISTABLE_ONLY, both("orphan", "clean"))
-        // Not with a store that only its permit covers, which would rest on a permit read (row 12), nor with the
-        // account list unread (row 5), nor with a store holding text or there unlisted (row 4).
-        assertEquals("a covered one, by row 12", Verdict.REFUSE_UNREADABLE, both("covered", "clean"))
+        // Not with a store that only its permit covers, which would rest on a permit read (row 13), nor with the
+        // account list unread (row 6), nor with a store holding text or there unlisted (row 4).
+        assertEquals("a covered one, by row 13", Verdict.REFUSE_UNREADABLE, both("covered", "clean"))
         assertEquals(Verdict.REFUSE_ACCOUNTS, decide(input(accounts = { null }, pending = unlistable,
             discard = { null }, known = { setOf("orphan", "absent") })))
         answer("held", RemovalCheck.Blocks(draft))
@@ -334,7 +389,7 @@ class PendingNotesRemovalGuardTest {
         assertEquals(Verdict.REFUSE_STORE, both("absent", "there"))
     }
 
-    @Test fun `row 11, every store clean, covered or acknowledged allows`() {
+    @Test fun `row 12, every store clean, covered or acknowledged allows`() {
         for (fine in listOf(RemovalCheck.Clean, RemovalCheck.Covered, RemovalCheck.Acknowledged)) {
             answer(a, fine)
             assertEquals("$fine", Verdict.ALLOW, decide(own()))
@@ -345,7 +400,7 @@ class PendingNotesRemovalGuardTest {
         assertNull(Verdict.ALLOW.reason)
     }
 
-    @Test fun `row 12, an unwithdrawn store beside a covered or acknowledged one refuses as unreadable`() {
+    @Test fun `row 13, an unwithdrawn store beside a covered or acknowledged one refuses as unreadable`() {
         answer("orphan", RemovalCheck.NothingUnwithdrawn)
         for (beside in listOf(RemovalCheck.Covered, RemovalCheck.Acknowledged)) {
             answer("other", beside)
@@ -405,8 +460,8 @@ class PendingNotesRemovalGuardTest {
     @Test fun `every account read comes before the first store check, and every store is checked once`() {
         answer("orphan", RemovalCheck.Covered)
         decide(input(pending = listed("orphan", "x"), discard = { setOf("x", "y") }, known = { setOf("y", "z") }))
-        assertEquals(listOf("accounts", "pending", "discard", "known", "check orphan", "check x", "check y", "check z"),
-            asked)
+        assertEquals(listOf("accounts", "pending", "discard", "known", "presence y", "presence z", "check orphan",
+            "check x", "check y", "check z"), asked)
     }
 
     // ---- real stores ----
@@ -472,6 +527,33 @@ class PendingNotesRemovalGuardTest {
         }
         assertEquals("clean again, with notes-pending listed", Verdict.ALLOW,
             PendingNotesRemovalGuard.decide(real(noBackup, "b", CreationId.Unreadable, rows)))
+    }
+
+    @Test fun `a notes-pending listing that comes back empty does not allow a row without an id over a store it hid`() {
+        val noBackup = tmp.newFolder("no_backup")
+        // a, the active account, whose creation id reads: its last change was pushed, so its store is clean. b's id
+        // does not read, and a store that no live account owns holds a draft.
+        val a = storeIn(noBackup, "a", "gen-a")
+        a.saveLocal("n1", "b1", "r1", "text".toByteArray(), isCreate = false)
+        assertEquals(SendOutcome.Done, a.completeSend("n1", a.beginSend("n1")!!.version, "r1", "landed".toByteArray()))
+        val orphan = storeIn(noBackup, "b", "gen-b")
+        orphan.saveLocal("n1", "b1", "r1", "draft".toByteArray(), isCreate = false)
+        val rows = listOf(Row("a", CreationId.Readable("gen-a")), Row("b", CreationId.Unreadable))
+        fun decided() = PendingNotesRemovalGuard.decide(real(noBackup, "b", CreationId.Unreadable, rows,
+            active = "a" to "gen-a"))
+        assertEquals("with the whole listing, the draft refuses", Verdict.REFUSE_STORE, decided())
+        // A listing of notes-pending that comes back with nothing, while a's folder, known by path, is there.
+        PendingNotesStore.listFilesForTesting = { d ->
+            if (d.name == PendingNotesStore.PENDING) emptyArray() else d.listFiles()
+        }
+        assertEquals(PendingNotesRemovalGuard.PENDING_LISTED_SHORT, decided())
+        // The limit: a listing that leaves out only the folder that no path names is not caught.
+        PendingNotesStore.listFilesForTesting = { d ->
+            val all = d.listFiles()
+            if (all != null && d.name == PendingNotesStore.PENDING) all.filter { it.name != orphan.dir.name }
+                .toTypedArray() else all
+        }
+        assertEquals("not caught: no path names b's folder", Verdict.ALLOW, decided())
     }
 
     @Test fun `the Settings list finds by path the stores the guard finds, from notes-discard and the known paths`() {
