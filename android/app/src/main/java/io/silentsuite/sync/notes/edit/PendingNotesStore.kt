@@ -944,7 +944,9 @@ internal class PendingNotesStore private constructor(
         /**
          * The deletion stopped, the directory is not shown gone, or its removal could not be synced (step 6 of
          * [discardStore]). A permit recorded for it stays. While it still covers what is left (step 5), a later
-         * call can finish; otherwise that call gives [Changed], and the user is asked again.
+         * call can finish; otherwise that call gives [Changed], and the user is asked again. Also the answer,
+         * with nothing recorded or deleted, while the directory cannot be listed in an instance that a clear or
+         * a discard closed and that is not cleared in full (step 2): a later call can finish once it lists.
          */
         object NotFinished : DiscardOutcome()
 
@@ -956,7 +958,9 @@ internal class PendingNotesStore private constructor(
          * finds. A confirmation given for a store that could not be listed ([UnsyncedNotes.listed] false) covers
          * no answer from a store that lists, so once the store lists, the user is asked again with what it
          * holds, and a permit of its own is recorded before anything goes. discardStore does not close the
-         * instance here (one that [clearAll] or an earlier discard closed stays closed).
+         * instance here. It is never the answer of an instance that [clearAll] or an earlier discard closed and
+         * that is not cleared in full ([clearedInFull]): that clear or discard may have deleted, so the answer
+         * there is [NotFinished], and nothing is recorded.
          *
          * The confirmation's text is the caller's, chosen from [UnsyncedNotes.listed] before it asks. It must not
          * call this a discard, and must say that nothing was deleted, and that unsynced text may remain on this
@@ -995,6 +999,9 @@ internal class PendingNotesStore private constructor(
      *    though one that reached the disk may read as held for a new one
      *    ([DiscardOutcome.AcknowledgementNotRecorded]). A folder that is a link, or whose lstat cannot tell, is
      *    never listed ([unsynced]), so it gets this step alone, bound to the link's own identity under its own name.
+     *    In an instance that [clearAll] or an earlier discard closed and that is not cleared in full
+     *    ([clearedInFull]), nothing is recorded ([DiscardOutcome.NotFinished]): that clear or discard may have
+     *    deleted, and an acknowledgement would let a caller say that nothing was.
      * 3. When anything is there, a permit for it is recorded ([PendingNotesDiscardPermits.record]) before any
      *    file goes. Besides what the count names, it names what [confirmed] and a permit from before name: the
      *    count's listing can come back short and leave out a note the user confirmed, whose text must still not
@@ -1125,9 +1132,12 @@ internal class PendingNotesStore private constructor(
     /**
      * Step 2 of [discardStore]: the acknowledgement of this store, bound to its directory's identity now. When
      * the record fails, whatever may have reached the disk is withdrawn when it can be, and this instance
-     * takes none for valid until it records one.
+     * takes none for valid until it records one. An instance that a clear or a discard closed and that is not
+     * cleared in full ([clearedInFull]) records none and answers [DiscardOutcome.NotFinished]: what closed it
+     * may have deleted, and an acknowledgement would let a caller say that nothing was.
      */
     private fun acknowledge(): DiscardOutcome {
+        if (closed && !discarded && !clearReturned) return DiscardOutcome.NotFinished
         val now = identityOf(dir) ?: return DiscardOutcome.AcknowledgementNotRecorded
         try {
             permits.acknowledge(dir.name, now)
@@ -1166,7 +1176,8 @@ internal class PendingNotesStore private constructor(
      * - once the directory is replaced: its identity is no longer the recorded one, or cannot be read, and the
      *   record is passed over until a listing or a write of the store removes it.
      * An instance that has listed or written the store since takes none for valid, also while a removal that
-     * failed left the record on disk.
+     * failed left the record on disk. An instance that a clear or a discard closed and that is not cleared in
+     * full records none ([discardStore], step 2).
      */
     fun acknowledged(): Boolean = synchronized(lock) {
         checkNotDropped()

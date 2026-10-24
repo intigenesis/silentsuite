@@ -84,10 +84,11 @@ internal object UnsyncedNotesSignOutPolicy {
      * data were preserved, would be false. A clear that stopped with no confirmed changes, and a removal that
      * failed after a clear of none, say only that the account was kept: the store, or part of it, may be gone, and
      * a clear an earlier confirmed attempt stopped may have deleted changes the count no longer shows. Only a
-     * removal that failed before any clear keeps the usual words. A store that could not be listed had nothing
-     * deleted, and the confirmation was only an acknowledgement: the words say that, and that unsynced text may
-     * remain on this device and may no longer sync, and never call it a discard or say that changes may already
-     * be deleted.
+     * removal that failed before any clear keeps the usual words. A store that could not be listed, where the
+     * confirmation was taken as an acknowledgement, had nothing deleted: the words say that, and that unsynced text
+     * may remain on this device and may no longer sync, and never call it a discard or say that changes may already
+     * be deleted. While a discard that stopped in this process has not finished, the store takes no confirmation as
+     * an acknowledgement (its DiscardOutcome.NotFinished), and the words are those of a clear that stopped.
      */
     @StringRes
     fun failureMessage(failed: CurrentAccountSignOutState): Int = when {

@@ -3700,6 +3700,48 @@ class PendingNotesStoreTest {
         assertFalse(s.dir.exists())
     }
 
+    @Test fun `after a discard that stopped, no acknowledgement is recorded, and the discard finishes once the store lists`() {
+        identifyDirectories()
+        val s = identityStore()
+        s.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
+        val v2 = saved(s.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false))
+        val shown = s.unsynced()
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw java.io.IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertFalse("the discard deleted before it stopped", File(s.dir, "n1.note").exists())
+        val left = filesOf(s.dir)
+        val permit = permitsOf(s).read(s.dir.name)
+        assertNotNull(permit)
+
+        // The store cannot be listed now. A confirmation of what it answers is no acknowledgement here, since the
+        // discard that closed the instance deleted: nothing is recorded, with an identity to bind it to or none.
+        unlisted(s)
+        val unlistedNow = s.unsynced()
+        assertEquals(UnsyncedNotes(0, v2, unreadable = true, listed = false), unlistedNow)
+        repeat(2) {
+            assertEquals(DiscardOutcome.NotFinished, s.discardStore(unlistedNow))
+            assertFalse(s.acknowledged())
+            assertNull("no record", permitsOf(s).acknowledgement(s.dir.name))
+        }
+        PendingNotesStore.identityForTesting = { null }
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(unlistedNow))
+        identifyDirectories()
+        assertEquals("nothing was recorded", listOf(s.dir.name + ".permit"), permitsOf(s).root.list()!!.toList())
+        assertEquals("the permit stays as it was", permit, permitsOf(s).read(s.dir.name))
+        assertFalse(s.clearedInFull())
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("and nothing more was deleted", left, filesOf(s.dir))
+
+        // Once the store lists again, a discard confirmed for what is left finishes.
+        val now = s.unsynced()
+        assertEquals(UnsyncedNotes(1, v2, false, names = notes("n2")), now)
+        assertEquals(DiscardOutcome.Done, s.discardStore(now))
+        assertFalse(s.dir.exists())
+        assertTrue(s.clearedInFull())
+        assertNull(permitsOf(s).read(s.dir.name))
+    }
+
     @Test fun `while the acknowledgement cannot be shown gone, nothing is written or removed, and none holds`() {
         identifyDirectories()
         val noBackup = tmp.newFolder("no_backup")

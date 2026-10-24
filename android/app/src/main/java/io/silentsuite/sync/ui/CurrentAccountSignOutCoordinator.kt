@@ -37,9 +37,10 @@ sealed class CurrentAccountSignOutState {
     /**
      * Clearing the account's pending Notes store failed, stopped partway or deleted nothing, so the account was
      * not removed. Another confirmed sign-out can finish the clear. With [notesDiscarded], the store held unsynced
-     * changes the user confirmed, as for [RemovalFailed], and the clear may have removed part of them: it stopped,
-     * or it threw, which can happen while it deletes. A permit that could not be recorded deleted nothing
-     * ([PendingNotesStore.DiscardOutcome.PermitNotRecorded]), so [notesDiscarded] is false then.
+     * changes the user confirmed, as for [RemovalFailed], and a clear may have removed part of them: this one
+     * stopped or threw, which can happen while it deletes, or an earlier one in this process stopped and the store
+     * cannot be listed now ([PendingNotesStore.DiscardOutcome.NotFinished]). A permit that could not be recorded
+     * deleted nothing ([PendingNotesStore.DiscardOutcome.PermitNotRecorded]), so [notesDiscarded] is false then.
      *
      * With [acknowledgement], the store's directory could not be listed, so nothing in it was deleted and the
      * user's confirmation was taken only as an acknowledgement, never as a discard

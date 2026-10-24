@@ -1,12 +1,19 @@
 package io.silentsuite.sync.ui
 
+import io.silentsuite.sync.R
+import io.silentsuite.sync.notes.edit.PendingNotesStore
 import io.silentsuite.sync.notes.edit.PendingNotesStore.DiscardOutcome
 import io.silentsuite.sync.notes.edit.UnsyncedNotes
 import org.junit.Assert.*
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import java.io.File
 import java.io.IOException
 
 class CurrentAccountSignOutCoordinatorTest {
+    @get:Rule val tmp = TemporaryFolder()
+
     private val target = ExactAccountIdentity("main", "z@example.invalid", "target-generation")
     private val sibling = ExactAccountIdentity("main", "a@example.invalid", "sibling-generation")
     private val two = UnsyncedNotes(2, 7, false)
@@ -368,6 +375,63 @@ class CurrentAccountSignOutCoordinatorTest {
             assertTrue("$name: ${c.state}", c.state is CurrentAccountSignOutState.Complete)
             assertEquals(listOf<UnsyncedNotes?>(unlisted, two), f.discardedWith)
             assertEquals(1, f.removeCalls)
+        }
+    }
+
+    @Test fun `a sign-out after a clear that stopped, over a store that cannot be listed, says what may be gone`() {
+        // A real store, so the outcome is the store's own. Its directories get an identity, as on a device.
+        PendingNotesStore.identityForTesting = { d ->
+            if (d.isDirectory) PendingNotesStore.DirectoryIdentity(device = 7, inode = 1) else null
+        }
+        try {
+            val store = PendingNotesStore.forNoBackup(tmp.newFolder("no_backup"), target.type, target.name,
+                target.creationId, syncDirectory = {}, rename = { from, to ->
+                    java.nio.file.Files.move(from.toPath(), to.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                })
+            store.saveLocal("n1", "b1", "r1", "a".toByteArray(), isCreate = false)
+            store.saveLocal("n2", "b1", "r1", "b".toByteArray(), isCreate = false)
+            val f = Fake()
+            val c = CurrentAccountSignOutCoordinator(object : CurrentAccountSignOutCoordinator.Seams by f {
+                override fun unsyncedNotes(main: ExactAccountIdentity) = store.unsynced()
+                override fun discardPendingNotes(main: ExactAccountIdentity, confirmed: UnsyncedNotes?) =
+                    store.discardStore(confirmed)
+            })
+
+            // 1. A confirmed sign-out whose clear deletes n1 and stops: the store's instance is closed.
+            val shown = c.unsyncedNotes(target)
+            PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw IOException("stopped") }
+            c.confirmNotesDiscard(target, shown); c.begin()
+            PendingNotesStore.beforeRemoveForTesting = null
+            assertEquals(CurrentAccountSignOutState.NotesClearFailed(1, notesDiscarded = true), c.state)
+            assertFalse("the clear deleted before it stopped", File(store.dir, "n1.note").exists())
+
+            // 2. The store cannot be listed now, and the user goes on over what the dialog shows. That is no
+            // acknowledgement: the sign-out reports a clear that did not finish, not that nothing was deleted.
+            PendingNotesStore.listFilesForTesting = { d -> if (d.name == store.dir.name) null else d.listFiles() }
+            val unlisted = c.unsyncedNotes(target)
+            assertFalse(unlisted.listed)
+            c.confirmNotesDiscard(target, unlisted); c.begin()
+            assertEquals(CurrentAccountSignOutState.NotesClearFailed(2, notesDiscarded = true), c.state)
+            assertEquals(R.string.notes_sign_out_stopped, UnsyncedNotesSignOutPolicy.failureMessage(c.state))
+            assertFalse(store.acknowledged())
+            assertEquals("the removal is never asked for", 0, f.removeCalls)
+
+            // 3. Once the store lists again, a sign-out confirmed for what is left finishes.
+            PendingNotesStore.listFilesForTesting = null
+            val left = c.unsyncedNotes(target)
+            assertEquals(1, left.count)
+            c.confirmNotesDiscard(target, left); c.begin()
+            assertTrue("${c.state}", c.state is CurrentAccountSignOutState.Removing)
+            assertFalse("the store is gone before the removal", store.dir.exists())
+            f.absent = true; f.removeCallback!!(true); f.childrenCallback!!(true)
+            assertTrue("${c.state}", c.state is CurrentAccountSignOutState.Complete)
+            assertEquals(1, f.removeCalls)
+        } finally {
+            PendingNotesStore.beforeRemoveForTesting = null
+            PendingNotesStore.listFilesForTesting = null
+            PendingNotesStore.identityForTesting = null
+            PendingNotesStore.resetForTesting()
         }
     }
 
