@@ -198,8 +198,8 @@ internal class PendingNotesStore private constructor(
      * discard in a discard that has not finished, which is never sent ([startSend]). [discardUnfinished] says
      * whether any file the permit names is there, checked by path and not taken from the listing, which can come
      * back short and leave such a note out of [headers]: a run does not record success while it is. While a permit
-     * that may be there cannot be read ([permitNames]), [discardConfirmed] holds every note among [headers], and
-     * [discardUnfinished] is true.
+     * that may be there cannot be read, or the permit was recorded as for an answer that could not be counted
+     * ([permitNames]), [discardConfirmed] holds every note among [headers], and [discardUnfinished] is true.
      */
     data class Snapshot(
         val headers: List<EntryHeader>,
@@ -246,8 +246,8 @@ internal class PendingNotesStore private constructor(
 
     /**
      * What a rebase and a conflict copy throw, before anything is written, while a file the store's discard permit
-     * names is there, or a permit that may be there cannot be read ([nextRunVersion]). An IOException, so a run
-     * takes it for that entry's storage failure.
+     * names is there, or a permit that may be there cannot be read or was recorded as for an answer that could not be
+     * counted ([nextRunVersion]). An IOException, so a run takes it for that entry's storage failure.
      */
     class HeldBack : IOException("a discard that has not finished holds back new versions")
 
@@ -438,9 +438,10 @@ internal class PendingNotesStore private constructor(
      * confirmed its discard, and a discard that stopped keeps the permit until it finishes, while any save
      * withdraws it first ([withdrawPermit]), and a run makes no new version while a file it names is there
      * ([nextRunVersion]). A save or a release that fails after it withdrew the permit has released those notes as
-     * well, as one that works does by design. While a permit may be there but cannot be read, no note is sent
-     * ([permitNames]); a damaged one holds nothing back. Once this instance has shown the permit gone, nothing is
-     * held back until a [discardStore], which has it read the permit again.
+     * well, as one that works does by design. While a permit may be there but cannot be read, or the permit was
+     * recorded as for an answer that could not be counted, no note is sent ([permitNames]); a damaged one holds
+     * nothing back. Once this instance has shown the permit gone, nothing is held back until a [discardStore],
+     * which has it read the permit again.
      */
     fun startSend(noteUid: String): SendStart = locked {
         val confirmed = permitNames()
@@ -494,7 +495,8 @@ internal class PendingNotesStore private constructor(
         LINKED_COPY,
         /**
          * Text the store's discard permit names: the user confirmed its discard, which has not finished. Every note,
-         * while a permit that may be there cannot be read.
+         * while a permit that may be there cannot be read, or the permit was recorded as for an answer that could not
+         * be counted.
          */
         DISCARD_CONFIRMED,
     }
@@ -549,8 +551,8 @@ internal class PendingNotesStore private constructor(
      * as another client's and become a conflicted copy (design 3.8). No other revision is removed here;
      * if [onto] joins a list that is already full, the cap drops the oldest one, as on any send.
      *
-     * While a file the store's discard permit names is there, or a permit that may be there cannot be read, it
-     * throws and writes nothing ([nextRunVersion]).
+     * While a file the store's discard permit names is there, or a permit that may be there cannot be read or was
+     * recorded as for an answer that could not be counted, it throws and writes nothing ([nextRunVersion]).
      */
     fun rebase(noteUid: String, expectedVersion: Long, onto: String, revision: String, blob: ByteArray): Boolean = locked {
         var applied = false
@@ -681,8 +683,8 @@ internal class PendingNotesStore private constructor(
      * that still named the original would otherwise write a new entry for it (design 3.2). The
      * original's landed record goes with its entry, since it no longer describes the server's copy.
      *
-     * While a file the store's discard permit names is there, or a permit that may be there cannot be read, it
-     * throws and writes nothing ([nextRunVersion]).
+     * While a file the store's discard permit names is there, or a permit that may be there cannot be read or was
+     * recorded as for an answer that could not be counted, it throws and writes nothing ([nextRunVersion]).
      */
     fun replaceWithNewNote(originalUid: String, expectedVersion: Long, serverRevision: String, newNote: PendingEntry): Boolean =
         locked {
@@ -767,9 +769,9 @@ internal class PendingNotesStore private constructor(
      * first write that is not committed yet ("<uid>.note.new"), which may be the only copy of a note
      * whose notebook no committed entry names. A listing that fails throws, as every listing of the store
      * does, and nothing is removed. Skipped as well while a file the store's discard permit names is there, or a
-     * permit that may be there cannot be read ([Snapshot.discardUnfinished]): the listing can come back short
-     * and leave out such a file, whose notebook copy may be the only key to its text once a save withdraws the
-     * permit. Skipping a prune is always safe.
+     * permit that may be there cannot be read or was recorded as for an answer that could not be counted
+     * ([Snapshot.discardUnfinished]): the listing can come back short and leave out such a file, whose notebook
+     * copy may be the only key to its text once a save withdraws the permit. Skipping a prune is always safe.
      *
      * It runs no recovery: while one is owed, it lists and removes nothing and returns at once. The runner
      * only logs a prune that fails, so a recovery that failed here would be logged and nothing more. The
@@ -1005,13 +1007,17 @@ internal class PendingNotesStore private constructor(
      * 3. When anything is there, a permit for it is recorded ([PendingNotesDiscardPermits.record]) before any
      *    file goes. Besides what the count names, it names what [confirmed] and a permit from before name: the
      *    count's listing can come back short and leave out a note the user confirmed, whose text must still not
-     *    be sent ([startSend]). A permit from before is still there only while no new version has withdrawn it, so
-     *    what it names is still text the user confirmed. Those names delete nothing in this call: what goes is still
-     *    what the count's listing held (step 5). A permit from before that cannot be read names nothing here, and
-     *    this one takes its place all the same, so that a lasting read failure does not refuse the sign-out. When
-     *    the record fails, nothing is deleted ([DiscardOutcome.PermitNotRecorded]), though a permit may be left for
-     *    the next new version to withdraw, and a permit from before stays unless its presence check shows it not
-     *    there ([PendingNotesDiscardPermits.mayHold]), read or not.
+     *    be sent ([startSend]). A permit for an answer that could not be counted holds back every note of the
+     *    store all the same, since the user confirmed the discard of all of it ([permitNames]), and so does one
+     *    recorded in place of such a permit from before, or of one that cannot be read, which may be such a
+     *    permit, whatever this count shows: it is recorded as for an answer that could not be counted. A permit
+     *    from before is still there only while no new version has withdrawn it, so what it names is still text the
+     *    user confirmed. Those names delete nothing in this call: what goes is still what the count's listing held
+     *    (step 5). A permit from before that cannot be read names nothing here, and this one takes its place all
+     *    the same, so that a lasting read failure does not refuse the sign-out. When the record fails,
+     *    nothing is deleted ([DiscardOutcome.PermitNotRecorded]), though a permit may be left for the next new
+     *    version to withdraw, and a permit from before stays unless its presence check shows it not there
+     *    ([PendingNotesDiscardPermits.mayHold]), read or not.
      * 4. The instance is closed for the rest of the process, as by [clearAll]: every operation but [unsynced],
      *    [discardStore], [unregister], [acknowledged], [clearedInFull] and [clearAll] is refused.
      * 5. The files the count listed go ([deleteAll]), each of a kind this build writes with its write beside it, in
@@ -1049,12 +1055,17 @@ internal class PendingNotesStore private constructor(
             // holds back the text the user confirmed.
             val earlierThere = permits.mayHold(dir.name)
             // A permit from before that cannot be read names nothing here, and this one takes its place all the same.
-            val earlier = permits.read(dir.name)
+            val found = permits.lookup(dir.name)
+            val earlier = (found as? PendingNotesDiscardPermits.Lookup.Found)?.permit
             // A recount whose listing came back short can leave out a note the user confirmed, now or for a discard
             // that stopped, so the permit names it too, and its text stays held back.
             val heldBack = now.names + earlier?.names.orEmpty() + confirmed?.names.orEmpty()
+            // A permit from before for an answer that could not be counted holds back every note, which the user
+            // confirmed the discard of, and so does one that cannot be read, which may be such a permit. So the one
+            // that replaces either does too, whatever this count shows.
+            val holdsAll = earlier?.unreadable == true || found == PendingNotesDiscardPermits.Lookup.Unknown
             try {
-                permits.record(dir.name, now.copy(names = heldBack))
+                permits.record(dir.name, now.copy(unreadable = now.unreadable || holdsAll, names = heldBack))
             } catch (e: IOException) {
                 // A permit from before, such as the one a discard that stopped keeps, covers what is left, so it
                 // stays, read or not, and so does one this call put in its place. Otherwise one that reached the
@@ -1082,7 +1093,10 @@ internal class PendingNotesStore private constructor(
         try {
             permits.remove(dir.name)
         } catch (e: IOException) {
-            // Harmless: it is for a directory that is gone, and the next new version withdraws it.
+            // It is for a directory that is gone, and the next new version withdraws it, or a later sign-out that
+            // finishes removes it. Until then a store opened again in that folder, as after an account removal that
+            // fails, holds back by it: for one recorded as for an answer that could not be counted, every note, so
+            // each of its runs records a storage failure.
             Logger.log.warning("Pending notes discard permit could not be removed")
         }
         DiscardOutcome.Done
@@ -1311,9 +1325,10 @@ internal class PendingNotesStore private constructor(
      * [nextVersion] for a step of a Notes run, a rebase or a conflict copy, which the user did not ask for. While a
      * file the store's discard permit names is there ([namedThere]), it throws [HeldBack] before anything is
      * written: a new version would withdraw the permit, and the text the user confirmed for that discard would then
-     * be sent. So does a permit that may be there but cannot be read ([permitNames]). The note waits for a later run
-     * as it is. A save and a release from holding still withdraw the permit. Once this instance has shown the permit
-     * gone ([withdrawPermit]), nothing holds a new version back, and the permit is not read again ([permitNames]).
+     * be sent. So does a permit that may be there but cannot be read, and one recorded as for an answer that could not
+     * be counted, whatever the store holds ([permitNames]). The note waits for a later run as it is. A save and a
+     * release from holding still withdraw the permit. Once this instance has shown the permit gone
+     * ([withdrawPermit]), nothing holds a new version back, and the permit is not read again ([permitNames]).
      */
     private fun nextRunVersion(): Long {
         if (namedThere(permitNames())) throw HeldBack()
@@ -1355,11 +1370,15 @@ internal class PendingNotesStore private constructor(
      * finished was confirmed for, which is not sent ([startSend], [Snapshot.discardConfirmed]), and while one of
      * them is there a run makes no new version ([nextRunVersion]) and records no success
      * ([Snapshot.discardUnfinished]). Empty when there is no permit, and for a damaged one, which holds nothing back
-     * ([PendingNotesDiscardPermits.Lookup.Damaged]). Null while a permit may be there but cannot be read: every note
-     * is held back then, until a save or a release withdraws it, a sign-out records one in its place, or a sign-out
-     * that finishes removes it, none of which needs to read it. While the check of whether it is there fails as
-     * well, as when notes-discard itself cannot be checked, a save or a release that cannot unlink it fails, and
-     * every note stays held back until that check works again or a sign-out's record works there.
+     * ([PendingNotesDiscardPermits.Lookup.Damaged]). Null while a permit may be there but cannot be read, and for a
+     * permit recorded as for an answer that could not be counted ([UnsyncedNotes.unreadable]): one for such an
+     * answer, or one recorded in place of such a permit or of one that cannot be read, whatever its own count showed
+     * ([discardStore], step 3). A permit for such an answer names only what listings held, the count's, its
+     * confirmation's and an earlier permit's, each of which can come back short and say nothing, while the user
+     * confirmed the discard of all of the store. Every note is held back then, until a save or a release withdraws
+     * the permit, or a sign-out that finishes removes it, none of which needs to read it. While the check of whether
+     * a permit that cannot be read is there fails as well, as when notes-discard itself cannot be checked, a save or
+     * a release that cannot unlink it fails, and every note stays held back until that check works again.
      *
      * Once this instance has shown the permit gone ([withdrawPermit]), it is empty and nothing is read: only
      * [discardStore] records a permit, and it has this instance read it again first, under the same lock. So a
@@ -1368,7 +1387,7 @@ internal class PendingNotesStore private constructor(
     private fun permitNames(): Set<String>? {
         if (permitWithdrawn) return emptySet()
         return when (val found = permits.lookup(dir.name)) {
-            is PendingNotesDiscardPermits.Lookup.Found -> found.permit.names
+            is PendingNotesDiscardPermits.Lookup.Found -> if (found.permit.unreadable) null else found.permit.names
             PendingNotesDiscardPermits.Lookup.Unknown -> null
             PendingNotesDiscardPermits.Lookup.Absent, PendingNotesDiscardPermits.Lookup.Damaged -> emptySet()
         }
@@ -1383,7 +1402,8 @@ internal class PendingNotesStore private constructor(
      * folder is a link, or lstat cannot tell ([followable]), nothing is looked up through it and any name counts as
      * there: every caller runs under [locked], which refuses such a folder at its start, so this is for a link that
      * takes the folder's place during the operation. No names, as for no permit or a damaged one, is false. Null,
-     * for a permit that may be there but cannot be read, is true, and nothing is looked up.
+     * for a permit that may be there but cannot be read or was recorded as for an answer that could not be counted, is
+     * true, and nothing is looked up.
      */
     private fun namedThere(names: Set<String>?): Boolean {
         if (names == null) return true

@@ -204,8 +204,8 @@ internal class NotePushStep(
         if (snapshot.unreadable.isNotEmpty()) noteFailure(FailureKind.LOCAL)
         // Text a discard that has not finished was confirmed for is never sent ([PendingNotesStore.startSend]),
         // and the run does not record success while it is there, also when the listing came back short without it.
-        // One line in the log gives the reason, also while a permit that cannot be read holds back every note, so
-        // that each is refused before any upload.
+        // One line in the log gives the reason, also while a permit that cannot be read, or one recorded as for an
+        // answer that could not be counted, holds back every note, so that each is refused before any upload.
         if (snapshot.discardUnfinished) {
             noteFailure(FailureKind.LOCAL)
             Logger.log.warning("Notes changes wait: a discard that has not finished holds them back")

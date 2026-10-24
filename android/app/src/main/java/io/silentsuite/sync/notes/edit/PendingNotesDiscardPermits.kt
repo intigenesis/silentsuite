@@ -13,7 +13,11 @@ import java.io.IOException
  * otherwise the user is asked again. Its names also hold what the user confirmed that a listing which came back
  * short left out of that answer: that text stays held back, and the discard deletes only what its count listed
  * ([PendingNotesStore.discardStore]). A permit that may be there but cannot be read holds back every note of its
- * store, and a damaged one names nothing ([lookup]).
+ * store, and so does one recorded for an answer that could not be counted, whose names come only from listings,
+ * which can come back short, while the user confirmed all of the store; a damaged one names nothing ([lookup]).
+ * A permit recorded in place of either of these is recorded as for an answer that could not be counted, whatever
+ * its own count showed ([PendingNotesStore.discardStore], step 3), so it holds back every note as well and covers
+ * no counted answer ([UnsyncedNotes.covers]).
  *
  * Permits live in a root of their own (noBackupFilesDir/notes-discard, one "<store>.permit" per store
  * directory name). Not in the store, which the discard deletes, and not beside the stores in

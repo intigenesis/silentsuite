@@ -252,8 +252,9 @@ internal object NotesSyncRunner {
     /**
      * Whether [waiting] gives a run nothing to push, so it makes no request: no entry, nothing unreadable, and no
      * file there that a discard that has not finished was confirmed for, or a permit that may be there and cannot
-     * be read ([PendingNotesStore.Snapshot.discardUnfinished]). While one is, the push step runs, also over a
-     * listing that showed nothing, and records a storage failure.
+     * be read or was recorded as for an answer that could not be counted
+     * ([PendingNotesStore.Snapshot.discardUnfinished]). While one is, the push step runs, also over a listing that
+     * showed nothing, and records a storage failure.
      */
     internal fun nothingToPush(waiting: PendingNotesStore.Snapshot): Boolean =
         waiting.headers.isEmpty() && waiting.unreadable.isEmpty() && !waiting.discardUnfinished
@@ -270,10 +271,10 @@ internal object NotesSyncRunner {
      * the fetch still runs. This instance never pushes what a clear that stopped left. After a restart a new
      * instance sends none of the notes the clear's discard permit names
      * ([PendingNotesStore.Snapshot.discardConfirmed]), every note counting as named while the permit cannot be
-     * read, makes no rebase or conflict copy while a file it names is there ([PendingNotesStore.HeldBack]), and the
-     * push step records a storage failure while one is ([PendingNotesStore.Snapshot.discardUnfinished]), until
-     * another confirmed sign-out finishes the clear, or a save or a release from holding withdraws the permit. A
-     * listing that fails still throws IOException, as before.
+     * read or was recorded as for an answer that could not be counted, makes no rebase or conflict copy while a file it
+     * names is there ([PendingNotesStore.HeldBack]), and the push step records a storage failure while one is
+     * ([PendingNotesStore.Snapshot.discardUnfinished]), until another confirmed sign-out finishes the clear, or a
+     * save or a release from holding withdraws the permit. A listing that fails still throws IOException, as before.
      */
     internal fun waitingIn(store: PendingNotesStore): PendingNotesStore.Snapshot? = try {
         store.snapshot { false }

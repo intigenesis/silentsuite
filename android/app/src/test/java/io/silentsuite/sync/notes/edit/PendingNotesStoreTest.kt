@@ -2805,7 +2805,7 @@ class PendingNotesStoreTest {
         }
     }
 
-    @Test fun `a permit that is there but cannot be read holds back every note, until a save withdraws it or a sign-out records its own in its place`() {
+    @Test fun `a permit that is there but cannot be read holds back every note, until a save withdraws it, and so does the permit a sign-out records in its place`() {
         store.saveLocal("n1", "b1", "r1", blob("a"), isCreate = false)
         store.saveLocal("n2", "b1", "r1", blob("b"), isCreate = false)
         val permit = File(permitsOf(store).root, "${dir.name}.permit")
@@ -2836,7 +2836,9 @@ class PendingNotesStoreTest {
         assertTrue(s.startSend("n1") is PendingNotesStore.SendStart.Ready)
 
         // After a restart, a sign-out records its own permit in place of one it cannot read, and goes on. It names
-        // what the count and the confirmation name, and not p0, which only the permit it could not read named.
+        // what the count and the confirmation name, and not p0, which only the permit it could not read named. It is
+        // recorded as for an answer that could not be counted, since the one it could not read may have been for such
+        // an answer, so it holds back every note too.
         PendingNotesDiscardPermits.onReadForTesting = null
         permitsOf(s).record(dir.name, UnsyncedNotes(1, 2, false, names = notes("n1", "p0")))
         s = restarted()
@@ -2847,13 +2849,92 @@ class PendingNotesStoreTest {
         assertEquals(DiscardOutcome.NotFinished, s.discardStore(shown))
         PendingNotesStore.beforeRemoveForTesting = null
         PendingNotesDiscardPermits.onReadForTesting = null
-        assertEquals("the count and the confirmation, and nothing more", shown, permitsOf(s).read(dir.name))
+        assertEquals("the count and the confirmation, and nothing more, as for an answer that could not be counted",
+            shown.copy(unreadable = true), permitsOf(s).read(dir.name))
 
         // And a sign-out over a permit it cannot read finishes, and removes it.
         s = restarted()
         permitReadsFail()
         assertEquals(DiscardOutcome.Done, s.discardStore(s.unsynced()))
         assertFalse("the permit went with the store", permit.exists())
+    }
+
+    @Test fun `a permit for an answer that could not be counted holds back every note, one its count's listing missed included, until a save withdraws it`() {
+        val v1 = saved(store.saveLocal("n1", "b1", "r1", blob("missed by the count"), isCreate = false))
+        store.putNotebook("b9", blob("key b9"))
+        // A file of a kind this build does not know, so the store cannot be counted, and a count's listing that
+        // leaves out n1, as a listing that comes back short can.
+        File(dir, "x.draft").writeBytes(blob("kept by a newer build"))
+        PendingNotesStore.listFilesForTesting = { d ->
+            val all = d.listFiles()
+            if (all != null && d.name == dir.name) all.filter { it.name != "n1.note" }.toTypedArray() else all
+        }
+        val shown = store.unsynced()
+        assertEquals(UnsyncedNotes(0, v1, unreadable = true, names = setOf("x.draft")), shown)
+        // The user confirms the discard of all of it, and the discard stops before anything goes.
+        PendingNotesStore.beforeClearForTesting = { throw java.io.IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(shown))
+        PendingNotesStore.beforeClearForTesting = null
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("the permit names only what the count's listing held", shown, permitsOf(store).read(dir.name))
+
+        // After a restart, with the listing whole, n1 is not sent, though the permit does not name it.
+        val s = restarted()
+        assertEquals(PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.DISCARD_CONFIRMED), s.startSend("n1"))
+        val waiting = s.snapshot { false }
+        assertEquals("every note counts as confirmed", setOf("n1"), waiting.discardConfirmed)
+        assertTrue(waiting.discardUnfinished)
+        // With the file the permit names gone, the rule alone holds back: a run records no success, a rebase writes
+        // nothing, and no notebook copy is pruned.
+        assertTrue(File(dir, "x.draft").delete())
+        assertTrue(s.snapshot { false }.discardUnfinished)
+        assertThrows(PendingNotesStore.HeldBack::class.java) {
+            s.rebase("n1", s.entry("n1").version, "r1", "r2", blob("rebased"))
+        }
+        assertEquals(emptyList<String>(), s.pruneNotebooks())
+        // A save, of any note, withdraws the permit, and n1 is sent again.
+        assertTrue(s.saveLocal("n2", "b1", "r1", blob("typed later"), isCreate = false) is SaveOutcome.Saved)
+        assertNull(permitsOf(s).read(dir.name))
+        assertTrue(s.startSend("n1") is PendingNotesStore.SendStart.Ready)
+    }
+
+    @Test fun `a sign-out confirmed for a counted answer in place of a permit for one that could not be counted still holds back every note, until a save withdraws it`() {
+        store.saveLocal("n1", "b1", "r1", blob("missed by every count"), isCreate = false)
+        val v2 = saved(store.saveLocal("n2", "b1", "r1", blob("counted"), isCreate = false))
+        // A file of a kind this build does not know, so the store cannot be counted, and listings that leave out n1,
+        // as a listing that comes back short can.
+        File(dir, "x.draft").writeBytes(blob("kept by a newer build"))
+        PendingNotesStore.listFilesForTesting = { d ->
+            val all = d.listFiles()
+            if (all != null && d.name == dir.name) all.filter { it.name != "n1.note" }.toTypedArray() else all
+        }
+        val uncounted = store.unsynced()
+        assertEquals(UnsyncedNotes(1, v2, unreadable = true, names = setOf("n2.note", "x.draft")), uncounted)
+        // The user confirms the discard of all of it, and the discard stops before anything goes.
+        PendingNotesStore.beforeClearForTesting = { throw java.io.IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, store.discardStore(uncounted))
+
+        // After a restart, with the file of an unknown kind gone, the store is counted, though the listing still
+        // leaves out n1, and a sign-out confirmed for that count stops as well.
+        assertTrue(File(dir, "x.draft").delete())
+        var s = restarted()
+        val counted = s.unsynced()
+        assertEquals(UnsyncedNotes(1, v2, unreadable = false, names = notes("n2")), counted)
+        assertEquals(DiscardOutcome.NotFinished, s.discardStore(counted))
+        PendingNotesStore.beforeClearForTesting = null
+        PendingNotesStore.listFilesForTesting = null
+        assertEquals("its permit does not name n1", setOf("n2.note", "x.draft"), permitsOf(s).read(dir.name)!!.names)
+
+        // After another restart, with the listing whole, n1 is still not sent.
+        s = restarted()
+        assertEquals(PendingNotesStore.SendStart.Refused(PendingNotesStore.Refusal.DISCARD_CONFIRMED), s.startSend("n1"))
+        val waiting = s.snapshot { false }
+        assertEquals("every note counts as confirmed", setOf("n1", "n2"), waiting.discardConfirmed)
+        assertTrue(waiting.discardUnfinished)
+        // A save, of any note, withdraws the permit, and n1 is sent again.
+        assertTrue(s.saveLocal("n3", "b1", "r1", blob("typed later"), isCreate = false) is SaveOutcome.Saved)
+        assertNull(permitsOf(s).read(dir.name))
+        assertTrue(s.startSend("n1") is PendingNotesStore.SendStart.Ready)
     }
 
     @Test fun `once a save has withdrawn the permit, a check of its path that keeps failing holds nothing back, until a sign-out has it read again`() {
