@@ -1087,9 +1087,72 @@ class SiblingRoutesRuntimeTest {
 
     @Test
     fun invitationAcceptCompletionReturnsToCallerForExactGeneration() {
-        val context=InstrumentationRegistry.getInstrumentation().targetContext;val manager=AccountManager.get(context);val account=addAccount(manager,"ac41-accept","ac41-accept-generation");val row=RuntimeInvitation("invite-a","alice",com.etebase.client.CollectionAccessLevel.ReadWrite,"AA:BB");val calls=AtomicInteger()
-        invitationsOverride={ listOf(row) };invitationActionOverride={ _,id,key,action -> assertEquals(account,id.account);assertEquals("ac41-accept-generation",id.creationId);assertEquals("invite-a",key);assertEquals(RuntimeInvitationAction.ACCEPT,action);calls.incrementAndGet();Result.success(Unit) }
-        try { ActivityScenario.launchActivityForResult<InvitationsActivity>(InvitationsActivity.newIntent(context,account,"ac41-accept-generation")).use { s -> s.recreate();waitUntil("invitation row laid out") {var ok=false;s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as? InvitationsListFragment;ok=f?.listAdapter?.count==1&&f.listView.getChildAt(0)!=null };ok};s.onActivity { val f=it.supportFragmentManager.findFragmentById(R.id.fragment_container) as InvitationsListFragment;assertEquals("ac41-accept-generation",f.arguments!!.getString("invitation.identity.creationId"));assertEquals("Invitation from alice",(f.listAdapter!!.getItem(0) as InvitationRow).let { row -> context.getString(R.string.invitations_from,row.runtime.fromUsername) });f.onItemClick(f.listView,requireNotNull(f.listView.getChildAt(0)),0,0) };onView(withText("AA:BB")).inRoot(isDialog()).check(matches(isDisplayed()));onView(withText(R.string.invitations_accept)).inRoot(isDialog()).perform(click());waitUntil("accept return") {s.state==Lifecycle.State.DESTROYED};assertEquals(1,calls.get());assertEquals(android.app.Activity.RESULT_CANCELED,s.result.resultCode) }} finally { invitationActionOverride=null;invitationsOverride=null;removeAccountAndWait(manager,account) }
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val account = addAccount(manager, "ac41-accept", "ac41-accept-generation")
+        val row = RuntimeInvitation("invite-a", "alice", com.etebase.client.CollectionAccessLevel.ReadWrite, "AA:BB")
+        val calls = AtomicInteger()
+        invitationsOverride = { listOf(row) }
+        invitationActionOverride = { _, identity, key, action ->
+            assertEquals(account, identity.account)
+            assertEquals("ac41-accept-generation", identity.creationId)
+            assertEquals("invite-a", key)
+            assertEquals(RuntimeInvitationAction.ACCEPT, action)
+            calls.incrementAndGet()
+            Result.success(Unit)
+        }
+        try {
+            ActivityScenario.launchActivityForResult<InvitationsActivity>(
+                InvitationsActivity.newIntent(context, account, "ac41-accept-generation")
+            ).use { scenario ->
+                scenario.recreate()
+                waitUntil("invitation row laid out") {
+                    var ready = false
+                    scenario.onActivity { activity ->
+                        val fragment = activity.supportFragmentManager.findFragmentById(R.id.fragment_container)
+                            as? InvitationsListFragment
+                        ready = fragment?.listAdapter?.count == 1 && fragment.listView.getChildAt(0) != null
+                    }
+                    ready
+                }
+                scenario.onActivity { activity ->
+                    val fragment = activity.supportFragmentManager.findFragmentById(R.id.fragment_container)
+                        as InvitationsListFragment
+                    assertEquals("ac41-accept-generation", fragment.arguments!!.getString("invitation.identity.creationId"))
+                    assertEquals("Invitation from alice", (fragment.listAdapter!!.getItem(0) as InvitationRow)
+                        .let { row -> context.getString(R.string.invitations_from, row.runtime.fromUsername) })
+                    fragment.onItemClick(fragment.listView, requireNotNull(fragment.listView.getChildAt(0)), 0, 0)
+                }
+                onView(withText("AA:BB")).inRoot(isDialog()).check(matches(isDisplayed()))
+                // Opening the confirmation accepts nothing and keeps the exact caller open.
+                assertEquals("accept needs confirmation", 0, calls.get())
+                assertEquals(Lifecycle.State.RESUMED, scenario.state)
+                // This tests action completion, not touch injection during window recreation.
+                // Activate the actual dialog button and witness its listener, never invoke the
+                // invitation override directly or dismiss the dialog on the fixture's behalf.
+                onView(withText(R.string.invitations_accept)).inRoot(isDialog())
+                    .perform(object : androidx.test.espresso.ViewAction {
+                        override fun getConstraints(): org.hamcrest.Matcher<View> = isDisplayed()
+                        override fun getDescription() = "activate the real Accept dialog button"
+                        override fun perform(controller: androidx.test.espresso.UiController, view: View) {
+                            assertEquals(android.R.id.button1, view.id)
+                            assertTrue("Accept button must be enabled", view.isEnabled)
+                            assertTrue("Accept button must handle the click", view.performClick())
+                            controller.loopMainThreadUntilIdle()
+                            // The dialog's own button handler dismisses it only after running the listener.
+                            assertFalse("Accept listener must dismiss its dialog", view.isAttachedToWindow)
+                        }
+                    })
+                waitUntil("accept return") { scenario.state == Lifecycle.State.DESTROYED }
+                assertEquals(1, calls.get())
+                assertEquals(Lifecycle.State.DESTROYED, scenario.state)
+                assertEquals(android.app.Activity.RESULT_CANCELED, scenario.result.resultCode)
+            }
+        } finally {
+            invitationActionOverride = null
+            invitationsOverride = null
+            removeAccountAndWait(manager, account)
+        }
     }
 
     @Test
