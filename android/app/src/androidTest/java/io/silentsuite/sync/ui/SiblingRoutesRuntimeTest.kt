@@ -1047,6 +1047,146 @@ class SiblingRoutesRuntimeTest {
         }
     }
 
+    /**
+     * For a calendar, a task list, an address book and a notebook in turn: a collection delete whose upload
+     * fails, then a rename and Save on the same edit screen, then a delete that goes through, over the real
+     * Etebase binding against the in-process stand-in server and the account's real cache. Each kind gets its
+     * own collection and screen, and only that collection's uploads are counted or dropped. A kind that fails
+     * is recorded under its name and the next kind still runs, so one run shows every kind that fails.
+     */
+    @Test
+    fun collectionSaveAfterAFailedDeleteRenamesAndKeepsEachKindOfCollection() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val manager = AccountManager.get(context)
+        val generation = "delete-then-save-generation"
+        val fake = io.silentsuite.sync.notes.FakeEtebaseServer()
+        val client = com.etebase.client.Client.create(
+            okhttp3.OkHttpClient.Builder().addInterceptor(fake).build(), fake.baseUrl)
+        val session = com.etebase.client.Account.signup(client,
+            com.etebase.client.User("delete-then-save-${System.nanoTime()}", "delete-then-save@example.invalid"),
+            "stand-in-server-only").save(null)
+        val colMgr = com.etebase.client.Account.restore(client, session, null).collectionManager
+        val account = addAccount(manager, "delete-then-save", generation)
+        io.silentsuite.sync.HttpClient.testInterceptor = fake
+        io.silentsuite.sync.syncadapter.requestSyncDispatchOverride = { _, _, _ -> }
+        try {
+            (at.bitfire.ical4android.TaskProvider.TASK_PROVIDERS.map { it.authority } +
+                listOf(android.provider.CalendarContract.AUTHORITY, App.addressBooksAuthority)).forEach {
+                android.content.ContentResolver.setIsSyncable(account, it, 0)
+            }
+            AccountSettings.setUserData(manager, account, java.net.URI(fake.baseUrl), account.name)
+            check(AccountSettings.writeVerified(manager, account, AccountSettings.KEY_CREATION_ID, generation))
+            AccountSettings(context, account).etebaseSession = session
+            // Notes stays off, so the requestSync after a notebook's Save or delete starts no Notes run.
+            assertFalse("Notes is off", AccountSettings.notesEnabled(manager, account))
+            val cache = io.silentsuite.sync.EtebaseLocalCache.getInstance(context, account.name)
+            fun screen(a: CollectionActivity) = a.supportFragmentManager.findFragmentById(R.id.fragment_container)
+            fun showing(s: ActivityScenario<CollectionActivity>, type: Class<*>): Boolean {
+                var shown = false
+                s.onActivity { shown = type.isInstance(screen(it)) }
+                return shown
+            }
+            fun select(s: ActivityScenario<CollectionActivity>, id: Int) = s.onActivity {
+                val item = MenuBuilder(it).add(0, id, 0, "")
+                when (val shown = screen(it)) {
+                    is ViewCollectionFragment -> shown.onOptionsItemSelected(item)
+                    is EditCollectionFragment -> shown.onOptionsItemSelected(item)
+                    else -> throw AssertionError("menu item $id with ${shown?.javaClass?.simpleName} shown")
+                }
+            }
+            fun dialogShown(title: Int) =
+                runCatching { onView(withText(title)).inRoot(isDialog()).check(matches(isDisplayed())) }.isSuccess
+            fun dialogButton(id: Int) =
+                onView(androidx.test.espresso.matcher.ViewMatchers.withId(id)).inRoot(isDialog())
+
+            /** One kind of collection; [color] is null for the address book, whose edit screen has no color. */
+            class Kind(val label: String, val type: String, val color: String?)
+
+            fun deleteFailsThenSave(kind: Kind) {
+                val created = colMgr.create(kind.type, com.etebase.client.ItemMetadata().apply {
+                    name = "Delete then save ${kind.label}"
+                    kind.color?.let { color = it }
+                }, "")
+                colMgr.upload(created)
+                val uid = created.uid
+                synchronized(cache) { cache.collectionSet(colMgr, colMgr.fetch(uid)) }
+                val renamed = "Renamed ${kind.label} after a failed delete"
+                // This collection's uploads only, so an answer a failed kind left unused never reaches the next kind.
+                val uploadPath = Regex("collection/${Regex.escape(uid)}/item/(batch|transaction)/")
+                fun uploads() = fake.requests.count { it.startsWith("POST ") && uploadPath.containsMatchIn(it) }
+
+                val intent = CollectionActivity.newIntent(context, account, generation, uid)
+                ActivityScenario.launch<CollectionActivity>(intent).use { s ->
+                    waitUntil("collection view") { showing(s, ViewCollectionFragment::class.java) }
+                    s.onActivity {
+                        val loaded = androidx.lifecycle.ViewModelProvider(it)[CollectionViewModel::class.java].value
+                        assertEquals("the kind on the screen", kind.type, loaded?.collectionType)
+                    }
+                    select(s, R.id.on_edit)
+                    waitUntil("edit screen") { showing(s, EditCollectionFragment::class.java) }
+
+                    // Delete, confirm with the upload dropped once: the error shows and the server copy is untouched.
+                    val before = uploads()
+                    fake.answer("POST", uploadPath, null)
+                    select(s, R.id.on_delete)
+                    waitUntil("delete confirmation") { dialogShown(R.string.delete_collection_confirm_title) }
+                    dialogButton(android.R.id.button1).perform(click())
+                    waitUntil("delete error", 20_000) { dialogShown(R.string.exception) }
+                    assertEquals("one delete upload was tried", before + 1, uploads())
+                    assertFalse("the failed delete deleted nothing on the server", colMgr.fetch(uid).isDeleted)
+                    dialogButton(android.R.id.button1).perform(click())
+
+                    // The edit screen stays; rename and Save.
+                    assertTrue("the edit screen stays", showing(s, EditCollectionFragment::class.java))
+                    s.onActivity { it.findViewById<android.widget.EditText>(R.id.display_name).setText(renamed) }
+                    select(s, R.id.on_save)
+                    waitUntil("collection view after Save", 20_000) { showing(s, ViewCollectionFragment::class.java) }
+                    assertEquals("the Save made one more upload", before + 2, uploads())
+                    val onServer = colMgr.fetch(uid)
+                    assertFalse("the Save after a failed delete deleted the collection on the server",
+                        onServer.isDeleted)
+                    assertEquals("the new name on the server", renamed, onServer.meta.name)
+                    if (kind.color != null) assertEquals("the color on the server", kind.color, onServer.meta.color)
+                    else assertTrue("no color on the server", onServer.meta.color.isNullOrEmpty())
+                    assertFalse("the cache marks the collection deleted",
+                        synchronized(cache) { cache.collectionGet(colMgr, uid) }.col.isDeleted)
+
+                    // A delete that goes through still deletes it, and closes the screen.
+                    select(s, R.id.on_edit)
+                    waitUntil("edit screen again") { showing(s, EditCollectionFragment::class.java) }
+                    select(s, R.id.on_delete)
+                    waitUntil("delete confirmation again") { dialogShown(R.string.delete_collection_confirm_title) }
+                    dialogButton(android.R.id.button1).perform(click())
+                    waitUntil("the screen to close after the delete", 20_000) { s.state == Lifecycle.State.DESTROYED }
+                    assertEquals("the delete made one more upload", before + 3, uploads())
+                }
+                assertTrue("the delete reached the server", colMgr.fetch(uid).isDeleted)
+                assertTrue("the cache marks it deleted",
+                    synchronized(cache) { cache.collectionGet(colMgr, uid) }.col.isDeleted)
+            }
+
+            val failures = listOf(
+                Kind("calendar", Constants.ETEBASE_TYPE_CALENDAR, "#3366CC"),
+                Kind("task list", Constants.ETEBASE_TYPE_TASKS, "#339966"),
+                Kind("address book", Constants.ETEBASE_TYPE_ADDRESS_BOOK, null),
+                Kind("notebook", Constants.ETEBASE_TYPE_NOTES, "#996633"),
+            ).mapNotNull { kind ->
+                runCatching { deleteFailsThenSave(kind) }.exceptionOrNull()
+                    ?.let { AssertionError("${kind.label}: ${it.toString().lineSequence().first()}", it) }
+            }
+            // One failure names every kind that failed; each kind's own failure and stack trace stay attached.
+            if (failures.isNotEmpty()) {
+                throw AssertionError(failures.joinToString("; ") { it.message.orEmpty() })
+                    .apply { failures.forEach { addSuppressed(it) } }
+            }
+        } finally {
+            io.silentsuite.sync.HttpClient.testInterceptor = null
+            io.silentsuite.sync.syncadapter.requestSyncDispatchOverride = null
+            removeAccountAndWait(manager, account)
+            io.silentsuite.sync.EtebaseLocalCache.clearUserCache(context, account.name)
+        }
+    }
+
     @Test
     fun collectionCreateCompletionRendersCreatedCollectionAndPreservesReturn() {
         val context=InstrumentationRegistry.getInstrumentation().targetContext;val manager=AccountManager.get(context);val account=addAccount(manager,"ac41-create","ac41-create-generation");val state=AtomicReference(fixture("created-uid",""));val calls=AtomicInteger()
