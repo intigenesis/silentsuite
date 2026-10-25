@@ -26,6 +26,7 @@ interface NewContact {
   photoUrl?: string | null
   categories?: string[]
   favorite?: boolean
+  unknownProperties?: string[]
   listId?: string
 }
 
@@ -89,6 +90,7 @@ function buildContact(input: NewContact, uid: string, now: Date): Contact {
     photoUrl: input.photoUrl ?? null,
     categories: input.categories ?? [],
     favorite: input.favorite ?? false,
+    ...(input.unknownProperties?.length ? { unknownProperties: input.unknownProperties } : {}),
     listId: input.listId ?? defaultContactListId(),
     created_at: now,
     updated_at: now,
