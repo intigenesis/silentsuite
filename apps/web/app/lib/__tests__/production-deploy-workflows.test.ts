@@ -264,7 +264,7 @@ function sshHostVerificationViolations(parsed: ParsedWorkflow): string[] {
 }
 
 // Complete parsed-object binding and separately readable effective controls for standalone Web.
-const standaloneWebWorkflowDigest = 'a941546b1f834ea13d17692a82d9877148d0f8919e1a40f0524ba18d786d3b48'
+const standaloneWebWorkflowDigest = '5f4cb2a3ccd053b88a5490223d5c42104732caa2cb2923839877d694f1ea7c18'
 const standaloneWebAuthorizationDigest = 'b7eb5ce5bef0fba7ece1736fee05cbf1b4cfd86b27d3a88ef6320c130774a069'
 const standaloneWebPredicates = {
   "build": "needs.admission.result == 'success' && github.event_name == 'workflow_dispatch' && github.repository == 'silent-suite/silentsuite' && github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && vars.WEB_STANDALONE_DEPLOY_APPROVED_SHA == inputs.expected_sha",
@@ -1323,33 +1323,66 @@ function standaloneWebProgramFailures(run: string, authorization: boolean): stri
   return failures
 }
 
-function runWebPublicationFixture(script: string, corruptConfig = false) {
+// The runner's local image handle (build output imageid, inspect .Id) is the configuration
+// digest on a classic store and the manifest digest on the containerd image store.
+const publicationClassicConfig = 'sha256:' + 'e'.repeat(64)
+const publicationContainerdConfig = 'sha256:' + 'c'.repeat(64)
+const publicationManifest = (configDescriptor: Record<string, unknown>) => JSON.stringify({
+  schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json', config: configDescriptor,
+})
+// Independently frozen verified containerd handle: the digest of the admitted manifest bytes.
+const admittedContainerdHandle = 'sha256:' + sha256(publicationManifest({ digest: publicationContainerdConfig }))
+
+type PublicationOptions = {
+  store?: 'classic' | 'containerd'
+  storeDeclaration?: string | null
+  manifestConfig?: Record<string, unknown>
+  verifiedImageId?: string
+  pushOutput?: string
+  raw?: string
+  pulledId?: string
+  pulledRevision?: string
+}
+
+function runWebPublicationFixture(script: string, corruptConfig = false, options: PublicationOptions = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'silentsuite-web-publication-'))
   const bin = join(directory, 'bin')
   const output = join(directory, 'output')
   const trace = join(directory, 'trace')
-  const imageId = 'sha256:' + 'e'.repeat(64)
+  const store = options.store ?? 'classic'
+  const imageId = store === 'containerd' ? publicationContainerdConfig : publicationClassicConfig
   const sha = admittedSha, imageName = webCutoverIdentities.imageName
-  const manifest = JSON.stringify({
-    schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json',
-    config: { digest: corruptConfig ? 'sha256:' + '9'.repeat(64) : imageId },
-  })
+  const manifest = publicationManifest(options.manifestConfig ?? { digest: corruptConfig ? 'sha256:' + '9'.repeat(64) : imageId })
   const manifestDigest = 'sha256:' + sha256(manifest)
-  const config = { sha, imageName, imageId, manifest, manifestDigest, output, trace,
-    imageRef: imageName + ':standalone-' + sha + '-7-1' }
+  const verifiedImageId = options.verifiedImageId ?? (store === 'containerd' ? manifestDigest : imageId)
+  const config = { sha, imageName, imageId, manifest, manifestDigest, output, trace, verifiedImageId,
+    imageRef: imageName + ':standalone-' + sha + '-7-1', storeFormat: dockerStoreFormat,
+    storeDeclaration: options.storeDeclaration === undefined ? dockerStoreDeclarations[store] : options.storeDeclaration,
+    pushOutput: options.pushOutput ?? 'synthetic: digest: ' + manifestDigest + ' size: 1234\n',
+    raw: options.raw ?? manifest + '\n',
+    pulledId: options.pulledId ?? (store === 'containerd' ? manifestDigest : imageId),
+    pulledRevision: options.pulledRevision ?? sha }
   const program = String.raw`
 const fs = require('node:fs')
 const c = JSON.parse(process.env.WEB_PUBLICATION_FIXTURE)
 const args = process.argv.slice(2)
 const exact = c.imageName + '@' + c.manifestDigest
 const same = value => JSON.stringify(args) === JSON.stringify(value)
+const image = (id, revision) => process.stdout.write(JSON.stringify([{ Id: id, Config: { Labels: { 'org.opencontainers.image.revision': revision } } }]))
 fs.appendFileSync(c.trace, JSON.stringify(args) + '\n')
-if (args.length === 3 && args[0] === 'image' && args[1] === 'inspect' && [c.imageId, c.imageRef, exact].includes(args[2])) {
-  process.stdout.write(JSON.stringify([{ Id: c.imageId, Config: { Labels: { 'org.opencontainers.image.revision': c.sha } } }]))
+if (args.length === 3 && args[0] === 'image' && args[1] === 'inspect' && [c.verifiedImageId, c.imageRef].includes(args[2])) {
+  image(c.verifiedImageId, c.sha)
+} else if (args.length === 3 && args[0] === 'image' && args[1] === 'inspect' && args[2] === exact) {
+  image(c.pulledId, c.pulledRevision)
+} else if (same(['info', '--format', c.storeFormat])) {
+  if (c.storeDeclaration === null) {
+    process.stderr.write('synthetic daemon unavailable\n')
+    process.exitCode = 1
+  } else process.stdout.write(c.storeDeclaration + '\n')
 } else if (same(['push', c.imageRef])) {
-  process.stdout.write('synthetic: digest: ' + c.manifestDigest + ' size: 1234\n')
+  process.stdout.write(c.pushOutput)
 } else if (same(['buildx', 'imagetools', 'inspect', '--raw', exact])) {
-  process.stdout.write(c.manifest + '\n')
+  process.stdout.write(c.raw)
 } else if (same(['pull', exact])) {
   process.stdout.write('synthetic immutable pull\n')
 } else {
@@ -1367,7 +1400,7 @@ if (args.length === 3 && args[0] === 'image' && args[1] === 'inspect' && [c.imag
     const result = spawnSync('bash', ['--noprofile', '--norc', '-se'], {
       input: script, cwd: directory, encoding: 'utf8', timeout: 5000,
       env: { PATH: bin + ':' + resolve(process.execPath, '..') + ':/usr/bin:/bin',
-        EXPECTED_SHA: sha, VERIFIED_IMAGE_ID: imageId, GITHUB_RUN_ID: '7', GITHUB_RUN_ATTEMPT: '1',
+        EXPECTED_SHA: sha, VERIFIED_IMAGE_ID: verifiedImageId, GITHUB_RUN_ID: '7', GITHUB_RUN_ATTEMPT: '1',
         GITHUB_OUTPUT: output, WEB_PUBLICATION_FIXTURE: JSON.stringify(config) },
     })
     return { result, receipt: readFileSync(output, 'utf8'), trace: readFileSync(trace, 'utf8'), config }
@@ -1459,6 +1492,119 @@ describe('production deployment workflow integrity', () => {
     const noOp = 'exit 0\n' + auth
     expect(standaloneWebProgramFailures(noOp, true)).toContain('wrong checkout')
   }, 20000)
+
+  it('publishes the admitted containerd manifest handle', () => {
+    const parsed = parseWorkflow(workflow('deploy-web-standalone.yml'))
+    const script = parsed.jobs['build-and-push'].steps?.find(step => step.name === 'Publish verified image and bind registry identity')?.run ?? ''
+    expect(script).not.toBe('')
+    const run = runWebPublicationFixture(script, false, { store: 'containerd' })
+    const calls = run.trace.split('\n').filter(Boolean).map(line => JSON.parse(line) as string[] | string)
+    const named = (first: string) => calls.filter(call => Array.isArray(call) && call[0] === first).length
+    const evidence = JSON.stringify({ status: run.result.status, stderr: run.result.stderr, calls })
+    // Registry identities stay distinct: the verified containerd handle is the manifest digest, not the config digest.
+    expect(run.config.verifiedImageId).toBe(admittedContainerdHandle)
+    expect(run.config.manifestDigest).toBe(admittedContainerdHandle)
+    expect(run.config.imageId).not.toBe(admittedContainerdHandle)
+    expect(run.result.error, evidence).toBeUndefined()
+    expect(run.trace, evidence).not.toContain('UNSUPPORTED')
+    expect(named('push'), evidence).toBe(1)
+    expect(calls.filter(call => Array.isArray(call) && call.includes('--raw')).length, evidence).toBe(1)
+    expect(run.result.status, 'containerd manifest-handle publication: ' + evidence).toBe(0)
+    expect(named('pull'), evidence).toBe(1)
+    expect(run.receipt).toBe('image-digest=' + admittedContainerdHandle + '\nimage-config-id=' + publicationContainerdConfig + '\nimage-revision=' + admittedSha + '\n')
+  }, 15000)
+
+  describe('standalone Web publisher typed local handle', () => {
+    const publisher = () => parseWorkflow(workflow('deploy-web-standalone.yml')).jobs['build-and-push'].steps
+      ?.find(step => step.name === 'Publish verified image and bind registry identity')?.run ?? ''
+    const callsOf = (run: ReturnType<typeof runWebPublicationFixture>) =>
+      run.trace.split('\n').filter(Boolean).map(line => JSON.parse(line) as string[] | string)
+    const count = (run: ReturnType<typeof runWebPublicationFixture>, first: string) =>
+      callsOf(run).filter(call => Array.isArray(call) && call[0] === first).length
+    const refusedAt = (run: ReturnType<typeof runWebPublicationFixture>, stage: string, pushes: number) => {
+      expect(run.result.error).toBeUndefined()
+      expect(run.trace).not.toContain('UNSUPPORTED')
+      expect(run.result.status).not.toBe(0)
+      expect(run.receipt).toBe('')
+      expect(count(run, 'push')).toBe(pushes)
+      expect(run.result.stderr).toBe('Standalone Web publication or registry identity verification failed at stage: ' + stage + '\n')
+    }
+
+    it.each(['classic', 'containerd'] as const)('publishes on a %s runner after reading its store declaration first', (store) => {
+      const run = runWebPublicationFixture(publisher(), false, { store })
+      expect(run.result.status, run.result.stderr).toBe(0)
+      const calls = callsOf(run)
+      const info = calls.findIndex(call => Array.isArray(call) && call[0] === 'info')
+      expect(info).toBe(0)
+      expect(calls.findIndex(call => Array.isArray(call) && call[0] === 'push')).toBeGreaterThan(info)
+      expect(count(run, 'pull')).toBe(1)
+      expect(run.receipt).toBe('image-digest=' + run.config.manifestDigest + '\nimage-config-id=' + run.config.imageId + '\nimage-revision=' + admittedSha + '\n')
+      expect(JSON.parse(run.result.stdout)).toEqual({ imageDigest: run.config.manifestDigest, imageConfigId: run.config.imageId, revision: admittedSha, runnerImageStore: store })
+    })
+
+    it.each([
+      ['a failed declaration', null],
+      ['a malformed declaration', 'not-json'],
+      ['a duplicate field', '{"Driver":"overlay2","Driver":"overlayfs","DriverStatus":[["driver-type","io.containerd.snapshotter.v1"]]}'],
+      ['an escaped alternative field spelling', '{"Dri\\u0076er":"overlayfs","DriverStatus":[["driver-type","io.containerd.snapshotter.v1"]]}'],
+      ['an extra field', '{"Driver":"overlayfs","DriverStatus":[["driver-type","io.containerd.snapshotter.v1"]],"Extra":true}'],
+      ['a duplicate status key', JSON.stringify({ Driver: 'overlayfs', DriverStatus: [['driver-type', 'io.containerd.snapshotter.v1'], ['driver-type', 'io.containerd.snapshotter.v1']] })],
+      ['conflicting overlay2 and containerd signals', JSON.stringify({ Driver: 'overlay2', DriverStatus: [['driver-type', 'io.containerd.snapshotter.v1']] })],
+      ['an unsupported snapshotter value', JSON.stringify({ Driver: 'overlayfs', DriverStatus: [['driver-type', 'io.containerd.snapshotter.v2']] })],
+      ['absence of driver-type alone', JSON.stringify({ Driver: 'overlay2', DriverStatus: [] })],
+      ['an unsupported classic driver', JSON.stringify({ Driver: 'vfs', DriverStatus: [] })],
+      ['a malformed overlay2 status value', JSON.stringify({ Driver: 'overlay2', DriverStatus: [['Backing Filesystem', 'extfs'], ['Supports d_type', 'maybe'],
+        ['Using metacopy', 'false'], ['Native Overlay Diff', 'true'], ['userxattr', 'false']] })],
+      ['a malformed status entry', JSON.stringify({ Driver: 'overlayfs', DriverStatus: [['driver-type']] })],
+    ] as const)('refuses %s before any push', (_label, storeDeclaration) => {
+      refusedAt(runWebPublicationFixture(publisher(), false, { storeDeclaration }), 'store-declaration', 0)
+    })
+
+    it('refuses cross-namespace verified handles at the configuration binding', () => {
+      // containerd runner reporting the configuration digest as its handle.
+      refusedAt(runWebPublicationFixture(publisher(), false, { store: 'containerd', verifiedImageId: publicationContainerdConfig }), 'config-binding', 1)
+      // classic runner reporting the manifest digest as its handle.
+      const classicManifest = 'sha256:' + sha256(publicationManifest({ digest: publicationClassicConfig }))
+      refusedAt(runWebPublicationFixture(publisher(), false, { verifiedImageId: classicManifest }), 'config-binding', 1)
+    })
+
+    it.each([
+      ['a substituted registry manifest', { digest: 'sha256:' + 'b'.repeat(64) }],
+      ['a configuration claiming the verified manifest handle (no feasible fixed point; the manifest digest then differs)', { digest: admittedContainerdHandle }],
+    ] as const)('keeps the frozen containerd handle and refuses %s at the configuration binding', (_label, manifestConfig) => {
+      refusedAt(runWebPublicationFixture(publisher(), false, { store: 'containerd', verifiedImageId: admittedContainerdHandle, manifestConfig }), 'config-binding', 1)
+    })
+
+    it.each([
+      ['a missing configuration digest', {}],
+      ['a malformed configuration digest', { digest: 'sha256:short' }],
+      ['a non-string configuration digest', { digest: 7 }],
+    ] as const)('refuses %s at the configuration binding', (_label, manifestConfig) => {
+      // The verified handle is the digest of these exact bytes, so only the configuration check can reject.
+      refusedAt(runWebPublicationFixture(publisher(), false, { store: 'containerd', manifestConfig }), 'config-binding', 1)
+    })
+
+    it('refuses push output without exactly one digest and raw bytes that do not hash to it', () => {
+      refusedAt(runWebPublicationFixture(publisher(), false, { store: 'containerd', pushOutput: 'synthetic: pushed\n' }), 'push-digest', 1)
+      refusedAt(runWebPublicationFixture(publisher(), false, { store: 'containerd',
+        pushOutput: 'a: digest: ' + admittedContainerdHandle + ' size: 1\nb: digest: sha256:' + '1'.repeat(64) + ' size: 2\n' }), 'push-digest', 1)
+      refusedAt(runWebPublicationFixture(publisher(), false, { store: 'containerd', raw: publicationManifest({ digest: 'sha256:' + 'b'.repeat(64) }) + '\n' }), 'raw-manifest', 1)
+    })
+
+    it.each(['classic', 'containerd'] as const)('refuses a wrong pulled handle or revision on a %s runner', (store) => {
+      const otherHandle = store === 'containerd' ? publicationContainerdConfig : 'sha256:' + sha256(publicationManifest({ digest: publicationClassicConfig }))
+      for (const fault of [{ pulledId: otherHandle }, { pulledRevision: 'c'.repeat(40) }]) {
+        const run = runWebPublicationFixture(publisher(), false, { store, ...fault })
+        refusedAt(run, 'pull-identity', 1)
+        expect(count(run, 'pull')).toBe(1)
+      }
+    })
+
+    it('keeps raw errors and identity values out of the failure report', () => {
+      const run = runWebPublicationFixture(publisher(), false, { store: 'containerd', verifiedImageId: publicationContainerdConfig })
+      expect(run.result.stderr).not.toMatch(/sha256:|Error|assert|synthetic/)
+    })
+  })
 
   it('standalone Web publishes the verified config through an authenticated manifest digest mapping', () => {
     const parsed = parseWorkflow(workflow('deploy-web-standalone.yml'))
