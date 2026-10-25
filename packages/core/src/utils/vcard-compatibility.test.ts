@@ -371,3 +371,71 @@ describe('unsupported property preservation matrix (#865)', () => {
     expect(deserializeContact(card()).unknownProperties).toBeUndefined();
   });
 });
+
+// ── #865: retained-line folding must stay linear in the admitted property size ──
+
+describe('retained-line fold work bound (#865)', () => {
+  /** Counts per-character string iterator steps (every `for…of` over a string) while fn runs. */
+  const countStringSteps = <T>(fn: () => T): { result: T; steps: number } => {
+    const proto = Object.getPrototypeOf(''[Symbol.iterator]()) as { next: (this: Iterator<string>) => IteratorResult<string> };
+    const original = proto.next;
+    let steps = 0;
+    proto.next = function next(this: Iterator<string>) {
+      steps++;
+      return original.call(this);
+    };
+    try {
+      const result = fn();
+      return { result, steps };
+    } finally {
+      proto.next = original;
+    }
+  };
+
+  const logical = (wire: string) => wire.replace(/\r\n[ \t]/g, '').split('\r\n');
+
+  it('counts string iteration (harness self-check)', () => {
+    expect(countStringSteps(() => [...'abc'].length).steps).toBe(4);
+  });
+
+  it.each([
+    ['an all-= parameter before a late colon', `X-FOO;X-P=${'='.repeat(30_000)}:v`],
+    // Period 3 against 75/74-octet segments, so fold points rotate onto '='.
+    ['repeating ab= in a parameter before a late colon', `X-FOO;X-P=${'ab='.repeat(10_000)}:v`],
+  ])('serializes and re-parses %s without re-scanning growing prefixes', (_label, line) => {
+    const parsed = parseVCard(card(line), { strictTextEncoding: true });
+    expect(parsed.unknownProperties).toEqual([line]);
+
+    const generated = countStringSteps(() => generateVCard(parsed));
+    // Linear: a small constant number of passes over the property, not one per fold.
+    expect(generated.steps).toBeLessThan(20 * line.length);
+    expect(logical(generated.result)).toContain(line);
+
+    const reparsed = countStringSteps(() => parseVCard(generated.result, { strictTextEncoding: true }));
+    expect(reparsed.steps).toBeLessThan(20 * line.length);
+    expect(reparsed.result.unknownProperties).toEqual([line]);
+  });
+
+  it('still folds =-heavy content within 75 octets, never ending a continued segment with =', () => {
+    const line = `X-FOO;X-P=${'ab='.repeat(10_000)}:v`;
+    const physical = generateVCard(parseVCard(card(line))).split('\r\n');
+    const segments = physical.slice(physical.findIndex((l) => l.startsWith('X-FOO;')));
+    const end = segments.findIndex((l, i) => i > 0 && !l.startsWith(' '));
+    const fold = segments.slice(0, end);
+    expect(fold.length).toBeGreaterThan(1);
+    for (const segment of fold) expect(Buffer.byteLength(segment, 'utf8')).toBeLessThanOrEqual(75);
+    for (const segment of fold.slice(0, -1)) expect(segment.endsWith('=')).toBe(false);
+    expect(fold.map((segment, i) => (i === 0 ? segment : segment.slice(1))).join('')).toBe(line);
+  });
+
+  it('keeps the reviewers\' exact 900,000-= admitted property within a linear work bound', () => {
+    const line = `X-FOO;X-P=${'='.repeat(900_000)}:v`;
+    const parsed = parseVCard(card(line), { strictTextEncoding: true });
+    expect(parsed.unknownProperties).toEqual([line]);
+    const generated = countStringSteps(() => generateVCard(parsed));
+    expect(generated.steps).toBeLessThan(20 * line.length);
+    const reparsed = countStringSteps(() => parseVCard(generated.result, { strictTextEncoding: true }));
+    expect(reparsed.steps).toBeLessThan(20 * line.length);
+    expect(reparsed.result.unknownProperties).toEqual([line]);
+  });
+});
