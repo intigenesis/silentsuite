@@ -584,6 +584,42 @@ VCARD_4_TO_3_PHOTO_URI_REGEX = re.compile(
 VCARD_4_TO_3_PHOTO_INLINE_REGEX = re.compile(
     r"^(PHOTO|LOGO):data:image/([^;]*);base64,", re.MULTILINE
 )
+# vCard 3.0 has no year-less date. A vCard 4 --MMDD / --MM-DD birthday is served
+# with the marked sentinel year that Apple clients and vcard4android read back
+# without a year; 1604 is a leap year, so --02-29 survives. ASCII digits only,
+# like the web/core parser.
+VCARD_4_YEARLESS_DATE_REGEX = re.compile(r"--([0-9]{2})-?([0-9]{2})")
+_OMIT_YEAR_PARAM = "X-APPLE-OMIT-YEAR"
+_OMIT_YEAR_SENTINEL = "1604"
+_LEAP_YEAR_MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _mark_yearless_birthdays(item):
+    """Rewrite valid year-less BDAY dates of a downgraded vCard in place.
+
+    Text-typed values, full dates and anything that is not an existing month
+    and day are left exactly as they are.
+    """
+    for line in item.contents.get("bday", []):
+        value_keys = [key for key in line.params if key.upper() == "VALUE"]
+        value_types = {
+            value_type.strip().lower()
+            for key in value_keys
+            for value in line.params[key]
+            for value_type in str(value).split(",")
+        }
+        if "text" in value_types or not isinstance(line.value, str):
+            continue
+        match = VCARD_4_YEARLESS_DATE_REGEX.fullmatch(line.value)
+        if match is None:
+            continue
+        month, day = match.groups()
+        if not 1 <= int(month) <= 12 or not 1 <= int(day) <= _LEAP_YEAR_MONTH_DAYS[int(month) - 1]:
+            continue
+        for key in value_keys:
+            del line.params[key]
+        line.params[_OMIT_YEAR_PARAM] = [_OMIT_YEAR_SENTINEL]
+        line.value = f"{_OMIT_YEAR_SENTINEL}-{month}-{day}"
 
 
 # --- Radicale Item ---
@@ -925,6 +961,7 @@ class Collection(BaseCollection):
                             del item.contents["photo"]
 
                     item.contents["version"][0].value = "3.0"
+                    _mark_yearless_birthdays(item)
 
             # Ensure VCARD has FN property
             if item.name == "VCARD" and not hasattr(item, "fn"):
