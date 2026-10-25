@@ -154,3 +154,67 @@ describe('ContactImport categories normalization', () => {
     expect(mocks.importContacts).not.toHaveBeenCalled()
   })
 })
+
+// Yearless and text birthdays through the rendered importer (repair plan v2, D2-D4).
+// BEHAVIOR messages are the regression; FIXTURE marks a broken harness.
+describe('ContactImport birthdays', () => {
+  type FlaggedContact = Contact & { birthdayIsText?: boolean }
+  const bdayLines = (wire: string) => wire.split('\r\n').filter((line) => /^BDAY[;:]/i.test(line))
+
+  beforeEach(() => {
+    mocks.importContacts.mockReset().mockResolvedValue(7)
+    mocks.onImportComplete.mockReset()
+  })
+
+  it('imports yearless dates without a year and keeps date-shaped text as text', async () => {
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    const cards: Array<[string, string, string]> = [
+      ['4.0', 'Basic', 'BDAY:--0416'],
+      ['3.0', 'Apple', 'BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['4.0', 'Text basic', 'BDAY;VALUE=text:--0416'],
+      ['3.0', 'Text extended', 'BDAY;VALUE=TEXT:--04-16'],
+      ['4.0', 'Leap', 'BDAY:--02-29'],
+      ['3.0', 'Full', 'BDAY:1990-04-16'],
+      ['3.0', 'None', ''],
+    ]
+    const source = cards
+      .map(([version, name, bday]) => ['BEGIN:VCARD', `VERSION:${version}`, `FN:${name}`, ...(bday ? [bday] : []), 'END:VCARD'].join('\r\n'))
+      .join('\r\n')
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File([source], 'synthetic-birthdays.vcf', { type: 'text/vcard' })] },
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /Import 7 contacts/ }))
+    await waitFor(() => expect(mocks.importContacts).toHaveBeenCalledTimes(1))
+
+    const payload = mocks.importContacts.mock.calls[0]![0] as FlaggedContact[]
+    if (payload.length !== 7) throw new Error(`FIXTURE: expected 7 imported cards, got ${payload.length}`)
+    expect(payload.map((c) => [c.displayName, c.birthday, c.birthdayIsText === true]), 'BEHAVIOR: imported birthday values and types').toEqual([
+      ['Basic', '--04-16', false],
+      ['Apple', '--04-16', false],
+      ['Text basic', '--0416', true],
+      ['Text extended', '--04-16', true],
+      ['Leap', '--02-29', false],
+      ['Full', '1990-04-16', false],
+      ['None', null, false],
+    ])
+
+    const expectedLines = [
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['BDAY;VALUE=text:--0416'],
+      ['BDAY;VALUE=text:--04-16'],
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-02-29'],
+      ['BDAY:1990-04-16'],
+      [],
+    ]
+    payload.forEach((imported, index) => {
+      // Add the identity/timestamps assigned by the store; exercise real wire persistence and reload.
+      const record = { ...imported, id: `synthetic-${index}`, uid: `synthetic-${index}`, created_at: new Date(), updated_at: new Date() }
+      const wire = serializeContact(record)
+      expect(bdayLines(wire), `BEHAVIOR: ${imported.displayName} persisted form`).toEqual(expectedLines[index])
+      const reloaded = deserializeContact(wire) as FlaggedContact
+      expect([reloaded.birthday, reloaded.birthdayIsText === true], `BEHAVIOR: ${imported.displayName} reload`).toEqual([imported.birthday, imported.birthdayIsText === true])
+      expect(bdayLines(serializeContact(reloaded)), `BEHAVIOR: ${imported.displayName} repeated serialization`).toEqual(expectedLines[index])
+    })
+  })
+})

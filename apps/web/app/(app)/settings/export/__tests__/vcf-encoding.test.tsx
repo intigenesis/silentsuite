@@ -268,6 +268,52 @@ describe('contacts .vcf export bytes', () => {
     const imported = mockData.importContacts.mock.calls[0]![0] as Contact[]
     expect(imported[0]!.displayName).toBe('Zoë Ångström')
   })
+
+  // Repair plan v2: yearless dates export in the marked vCard 3 form, text stays
+  // text, full dates are unchanged, and the export re-imports to the same model.
+  // BEHAVIOR messages are the regression; FIXTURE marks a broken harness.
+  it('exports yearless, text and full-date birthdays in their wire forms and re-imports them', async () => {
+    const withBirthday = (id: string, name: string, birthday: string, birthdayIsText?: boolean) => ({
+      ...contact(id, name, name, ''),
+      birthday,
+      ...(birthdayIsText === undefined ? {} : { birthdayIsText }),
+    })
+    mockData.contacts = [
+      withBirthday('b1', 'Yearless', '--04-16'),
+      withBirthday('b2', 'Legacy basic', '--0416'),
+      withBirthday('b3', 'Text', '--0416', true),
+      withBirthday('b4', 'Full', '1990-04-16'),
+    ]
+    render(<ExportPage />)
+    fireEvent.click(screen.getByText(/Export Contacts/))
+    const bytes = await readBlobBytes(downloadedBlob())
+    const text = new TextDecoder('utf-8').decode(bytes)
+    const cards = text.split('END:VCARD').filter((chunk) => chunk.includes('BEGIN:VCARD'))
+    if (cards.length !== 4) throw new Error(`FIXTURE: expected 4 exported cards, got ${cards.length}`)
+    const bdays = cards.map((chunk) => chunk.split('\r\n').filter((line) => /^BDAY[;:]/i.test(line)))
+    expect(bdays, 'BEHAVIOR: exported birthday lines').toEqual([
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['BDAY;VALUE=text:--0416'],
+      ['BDAY:1990-04-16'],
+    ])
+    cleanup()
+
+    mockData.importContacts.mockResolvedValue(4)
+    const { container } = renderWithIntl(<ContactImport onImportComplete={vi.fn()} />)
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File([bytes], 'silentsuite-contacts.vcf', { type: 'text/vcard' })] },
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /Import 4 contacts/ }))
+    await waitFor(() => expect(mockData.importContacts).toHaveBeenCalledTimes(1))
+    const imported = mockData.importContacts.mock.calls[0]![0] as Array<Contact & { birthdayIsText?: boolean }>
+    expect(imported.map((c) => [c.birthday, c.birthdayIsText === true]), 'BEHAVIOR: re-imported birthdays').toEqual([
+      ['--04-16', false],
+      ['--04-16', false],
+      ['--0416', true],
+      ['1990-04-16', false],
+    ])
+  })
 })
 
 function countBoms(bytes: Uint8Array): number {
