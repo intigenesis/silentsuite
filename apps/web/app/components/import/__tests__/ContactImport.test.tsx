@@ -208,8 +208,25 @@ describe('ContactImport birthdays', () => {
       [],
     ]
     payload.forEach((imported, index) => {
-      // Add the identity/timestamps assigned by the store; exercise real wire persistence and reload.
-      const record = { ...imported, id: `synthetic-${index}`, uid: `synthetic-${index}`, created_at: new Date(), updated_at: new Date() }
+      // Add the identity/timestamps and the empty name/list defaults the store's buildContact
+      // assigns (these cards have no N, TEL, EMAIL or ADR); exercise real wire persistence and reload.
+      const name = {
+        prefix: imported.name?.prefix ?? '',
+        given: imported.name?.given ?? '',
+        family: imported.name?.family ?? '',
+        suffix: imported.name?.suffix ?? '',
+      }
+      const record = {
+        ...imported,
+        name,
+        phones: imported.phones ?? [],
+        emails: imported.emails ?? [],
+        addresses: imported.addresses ?? [],
+        id: `synthetic-${index}`,
+        uid: `synthetic-${index}`,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }
       const wire = serializeContact(record)
       expect(bdayLines(wire), `BEHAVIOR: ${imported.displayName} persisted form`).toEqual(expectedLines[index])
       const reloaded = deserializeContact(wire) as FlaggedContact

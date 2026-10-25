@@ -22,6 +22,7 @@ interface NewContact {
   title?: string
   notes?: string
   birthday?: string | null
+  birthdayIsText?: boolean
   photoUrl?: string | null
   categories?: string[]
   favorite?: boolean
@@ -84,6 +85,7 @@ function buildContact(input: NewContact, uid: string, now: Date): Contact {
     title: input.title ?? '',
     notes: input.notes ?? '',
     birthday: input.birthday ?? null,
+    ...(input.birthdayIsText === true && input.birthday ? { birthdayIsText: true } : {}),
     photoUrl: input.photoUrl ?? null,
     categories: input.categories ?? [],
     favorite: input.favorite ?? false,
@@ -341,6 +343,9 @@ export const useContactStore = create<ContactState & ContactActions>()(
         const base = get().contacts.find((contact) => contact.id === id)
         if (!base) return false
         const draft: StoredContact = { ...base, ...patch, updated_at: new Date(), revision: null }
+        // A birthday set without its own type is a date: a text type read with
+        // the previous value must not carry over to it.
+        if ('birthday' in patch && !('birthdayIsText' in patch)) delete draft.birthdayIsText
         const star = sealIntent === 'favorite'
           ? { value: draft.favorite === true, base: { ...base, favorite: base.favorite === true } }
           : undefined

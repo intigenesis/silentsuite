@@ -140,6 +140,7 @@ export default function ContactImport({ onImportComplete, heading }: ContactImpo
         title: contact.title ?? '',
         notes: contact.note ?? '',
         birthday: contact.bday ?? null,
+        birthdayIsText: contact.bdayIsText === true,
         photoUrl: contact.photo ?? null,
         categories: normalizeLabels(contact.categories ?? []),
         favorite: contact.favorite === true,
