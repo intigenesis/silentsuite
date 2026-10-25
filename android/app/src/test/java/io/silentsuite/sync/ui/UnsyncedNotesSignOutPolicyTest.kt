@@ -192,7 +192,7 @@ class UnsyncedNotesSignOutPolicyTest {
         assertTrue(model.contains("PendingNotesStore.forIdentity(context, main.type, main.name, main.creationId)"))
     }
 
-    @Test fun `a sign-out stopped at a store that could not be listed says nothing was deleted and never discard`() {
+    @Test fun `a sign-out stopped at a store that could not be listed says this attempt deleted no text and never discard`() {
         for (acknowledgement in CurrentAccountSignOutState.NotesClearFailed.Acknowledgement.values()) {
             for (discarded in listOf(false, true)) {
                 val state = CurrentAccountSignOutState.NotesClearFailed(1, discarded, acknowledgement)
@@ -201,12 +201,13 @@ class UnsyncedNotesSignOutPolicyTest {
             }
         }
         val text = stringText("notes_sign_out_stopped_nothing_deleted")
-        assertTrue(text, text.contains("Nothing was deleted") && text.contains("may remain on this device") &&
+        assertTrue(text, text.contains("This attempt deleted no Notes text") && text.contains("may remain on this device") &&
             text.contains("may no longer sync"))
+        assertFalse("does not deny deletion in an earlier attempt: $text", text.contains("Nothing was deleted"))
         assertFalse("never called a discard: $text", text.contains("discard", ignoreCase = true))
         assertFalse(text, text.contains("may already be deleted"))
         assertTrue("the words of a clear that stopped are another string",
-            stringText("notes_sign_out_stopped").contains("may already be deleted"))
+            stringText("notes_sign_out_stopped").contains("may already have been deleted"))
     }
 
     @Test fun `a store that could not be listed gets words of its own in both steps, never those of a discard`() {
