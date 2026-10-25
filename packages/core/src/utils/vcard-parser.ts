@@ -313,34 +313,45 @@ function isRetainable(line: string, prop: ParsedProperty, consumedLabelGroups: S
 
 /** Fold a kept line at code-point boundaries. The legacy foldLine stays in use
  *  for owned fields so their wire bytes are unchanged. QP lines, folds whose
- *  continuation a line-trimming importer would read as a card boundary, and any
- *  fold our own unfolding would not restore exactly, are emitted unfolded. */
+ *  continuation a line-trimming importer would read as a card boundary, and
+ *  lines that cannot be cut outside a run of '=', are emitted unfolded. */
 function foldRetainedLine(line: string): string {
   if (parseProperty(line).params['ENCODING']?.toUpperCase() === 'QUOTED-PRINTABLE') return line;
+  const chars = Array.from(line);
   const parts: string[] = [];
-  let current = '';
-  let bytes = 0;
+  let start = 0;
   let limit = 75;
-  for (const ch of line) {
-    const charBytes = Buffer.byteLength(ch, 'utf8');
-    if (current && bytes + charBytes > limit) {
-      parts.push(current);
-      current = '';
-      bytes = 0;
-      limit = 74;
+  while (start < chars.length) {
+    let end = start;
+    let bytes = 0;
+    while (end < chars.length) {
+      const charBytes = Buffer.byteLength(chars[end]!, 'utf8');
+      if (end > start && bytes + charBytes > limit) break;
+      bytes += charBytes;
+      end++;
     }
-    current += ch;
-    bytes += charBytes;
+    if (end < chars.length) {
+      // Never end a segment with '=': unfoldLines would re-parse the growing
+      // prefix as a possible QP continuation at every fold (quadratic work).
+      // A run of '=' too long to cut around leaves the line unfolded.
+      let cut = end;
+      while (cut > start && chars[cut - 1] === '=') cut--;
+      if (cut === start) return line;
+      end = cut;
+    }
+    parts.push(chars.slice(start, end).join(''));
+    start = end;
+    limit = 74;
   }
-  parts.push(current);
   // Same predicate as the Web importer's card splitter (trim + toUpperCase), so
   // Unicode case mappings such as dotless ı → I are covered exactly.
   if (parts.slice(1).some((part) => {
     const normalized = part.trim().toUpperCase();
     return normalized === 'BEGIN:VCARD' || normalized === 'END:VCARD';
   })) return line;
-  const folded = parts.join('\r\n ');
-  return unfoldLines(folded) === line ? folded : line;
+  // Kept lines hold no CR/LF and no segment but the last ends with '=', so
+  // unfoldLines restores this fold exactly without its QP branch.
+  return parts.join('\r\n ');
 }
 
 function splitStructuredValue(value: string): string[] {
