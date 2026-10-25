@@ -300,4 +300,59 @@ describe('ContactImport birthdays', () => {
       expect(bdayLines(serializeContact(reloaded)), `BEHAVIOR: ${imported.displayName} repeated serialization`).toEqual(expectedLines[index])
     })
   })
+
+  // A text birthday is written with a `BDAY;VALUE=text:` header (16 octets), so 59 more
+  // octets fill the first 75-octet line and the next characters start a continuation.
+  // The importer's line-trimming splitter must never read a continuation as a frame.
+  describe('re-imports an exported text birthday that folds near a card-boundary word', () => {
+    const FOLLOWING = 'X-FOLLOW:kept'
+    const exportedContact = (uid: string, displayName: string, birthday: string | null, unknownProperties?: string[]): FlaggedContact => ({
+      id: uid, uid, displayName, name: { prefix: '', given: displayName, family: '', suffix: '' },
+      phones: [], emails: [], addresses: [], organization: '', title: '', notes: '',
+      birthday, ...(birthday ? { birthdayIsText: true } : {}), photoUrl: null,
+      categories: [], favorite: false, ...(unknownProperties ? { unknownProperties } : {}),
+      created_at: new Date(Date.UTC(2026, 9, 25)), updated_at: new Date(Date.UTC(2026, 9, 25)),
+    })
+    /** The same bytes Settings Export downloads: BOM, then each serialized card terminated by CRLF. */
+    const exportedFile = (contacts: Contact[]) =>
+      new File([`﻿${contacts.map((contact) => `${serializeContact(contact)}\r\n`).join('')}`], 'silentsuite-contacts.vcf', { type: 'text/vcard' })
+    const cardFrame = (line: string) => /^(BEGIN|END):VCARD$/.test(line.trim().toUpperCase())
+
+    it.each([
+      ['END:VCARD at the first fold', `${'a'.repeat(59)}END:VCARD`],
+      ['BEGIN:VCARD at the first fold', `${'a'.repeat(59)}BEGIN:VCARD`],
+      ['a lowercase boundary word', `${'a'.repeat(59)}end:vcard`],
+      ['leading whitespace before the word', `${'a'.repeat(59)}  BEGIN:VCARD`],
+      ['the word at a later fold', `${'a'.repeat(59)}${'b'.repeat(74)}END:VCARD`],
+      ['a dotless i that uppercases to the boundary word', `${'a'.repeat(59)}begın:vcard`],
+      ['an ordinary long folded text birthday', `circa ${'x'.repeat(90)}`],
+    ])('keeps count, names, text birthday and the following property with %s', async (_label, birthday) => {
+      const contacts = [
+        exportedContact('text-bday-1', 'Text Birthday', birthday, [FOLLOWING]),
+        exportedContact('text-bday-2', 'Second Person', null),
+      ]
+      const wire = serializeContact(contacts[0]!)
+      // Control: the canonical parser unfolds the stored card correctly either way.
+      const stored = deserializeContact(wire) as FlaggedContact
+      expect([stored.birthday, stored.birthdayIsText, stored.unknownProperties], 'BEHAVIOR: stored card round trip').toEqual([birthday, true, [FOLLOWING]])
+
+      const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+      mocks.importContacts.mockReset().mockResolvedValue(2)
+      fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [exportedFile(contacts)] } })
+      // Wait for whichever outcome the importer reaches, then assert the behaviour itself.
+      await waitFor(() => expect(screen.queryByRole('button', { name: /Import \d+ contacts/ }) ?? screen.queryByText(/Failed to parse the file/)).not.toBeNull())
+      expect(screen.queryByText(/Failed to parse the file/), 'BEHAVIOR: exported file parses').toBeNull()
+      expect(screen.getByRole('button', { name: /Import \d+ contacts/ }).textContent, 'BEHAVIOR: one exported card stays one card').toMatch(/Import 2 contacts/)
+      fireEvent.click(screen.getByRole('button', { name: /Import \d+ contacts/ }))
+      await waitFor(() => expect(mocks.importContacts).toHaveBeenCalledTimes(1))
+
+      const payload = mocks.importContacts.mock.calls[0]![0] as FlaggedContact[]
+      expect(payload.map((contact) => contact.displayName), 'BEHAVIOR: imported card names').toEqual(['Text Birthday', 'Second Person'])
+      expect([payload[0]!.birthday, payload[0]!.birthdayIsText], 'BEHAVIOR: text birthday and type survive').toEqual([birthday, true])
+      expect(payload[0]!.unknownProperties, 'BEHAVIOR: the property after BDAY survives').toEqual([FOLLOWING])
+      expect(payload[1]!.unknownProperties, 'BEHAVIOR: nothing leaks into the following card').toBeUndefined()
+      // Only the real frame lines may look like a card boundary to a line-trimming splitter.
+      expect(wire.split('\r\n').filter(cardFrame), 'BEHAVIOR: no continuation reads as a frame').toEqual(['BEGIN:VCARD', 'END:VCARD'])
+    })
+  })
 })

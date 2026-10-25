@@ -653,7 +653,12 @@ export function generateVCard(vcard: VCard): string {
   if (vcard.favorite === true) {
     lines.push(`${FAVORITE_PROPERTY}:1`);
   }
-  if (vcard.bday) lines.push(foldLine(birthdayLine(vcard.bday, vcard.bdayIsText === true)));
+  if (vcard.bday) {
+    const bdayLine = birthdayLine(vcard.bday, vcard.bdayIsText === true);
+    // A text birthday is free text behind a longer header, so it folds like a kept
+    // line: never into a continuation the importer would read as a card boundary.
+    lines.push(vcard.bdayIsText === true ? foldRetainedLine(bdayLine) : foldLine(bdayLine));
+  }
   if (vcard.photo) {
     if (vcard.photo.startsWith('data:') || vcard.photo.startsWith('http://') || vcard.photo.startsWith('https://')) {
       lines.push(foldLine(`PHOTO;VALUE=URI:${vcard.photo}`));
