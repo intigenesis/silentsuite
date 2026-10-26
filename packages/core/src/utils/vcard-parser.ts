@@ -41,7 +41,11 @@ export interface VCard {
   /** CATEGORIES (RFC 2426/6350) — comma-separated user labels */
   categories?: string[];
   note?: string;
+  /** A birthday without a year is held as `--MM-DD`; other values as read. */
   bday?: string;
+  /** `bday` was declared `VALUE=text`, so it is never read as a date. Only
+   *  `true` is meaningful; absence means a date. */
+  bdayIsText?: boolean;
   photo?: string;
   rev?: string;
   /** SilentSuite-owned favorite flag, wire form `X-SILENTSUITE-FAVORITE:1`.
@@ -374,6 +378,50 @@ function splitStructuredValue(value: string): string[] {
   return parts;
 }
 
+// ── Birthdays ──
+
+/** Year written with X-APPLE-OMIT-YEAR for a birthday without a year, as
+ *  vcard4android does for vCard 3. A leap year, so --02-29 survives. */
+const OMIT_YEAR_PARAM = 'X-APPLE-OMIT-YEAR';
+const OMIT_YEAR_SENTINEL = '1604';
+
+/** `--MM-DD` when month and day exist in a leap year; null otherwise. */
+function monthDay(month: string, day: string): string | null {
+  const days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][Number(month) - 1];
+  const date = Number(day);
+  return days !== undefined && date >= 1 && date <= days ? `--${month}-${day}` : null;
+}
+
+/** A year-less `--MMDD` or `--MM-DD` as `--MM-DD`; null for anything else. */
+function yearlessDate(value: string): string | null {
+  const match = /^--(\d{2})-?(\d{2})$/.exec(value);
+  return match ? monthDay(match[1]!, match[2]!) : null;
+}
+
+function isTextValue(params: Record<string, string>): boolean {
+  return (params['VALUE'] ?? '').split(',').some((type) => type.trim().toLowerCase() === 'text');
+}
+
+/** A date BDAY as the model holds it: year-less, or dated in the year its
+ *  omit-year marker names, becomes `--MM-DD`. Anything else is kept as read. */
+function birthdayValue(value: string, params: Record<string, string>): string {
+  const yearless = yearlessDate(value);
+  if (yearless) return yearless;
+  const omitYear = params[OMIT_YEAR_PARAM] ?? '';
+  const dated = /^(\d{4})-?(\d{2})-?(\d{2})$/.exec(value);
+  if (dated && /^\d{4}$/.test(omitYear) && dated[1] === omitYear) return monthDay(dated[2]!, dated[3]!) ?? value;
+  return value;
+}
+
+/** vCard 3.0 has no year-less date, so one is written with the marked sentinel
+ *  year; text keeps its type; every other value is written as before. */
+function birthdayLine(bday: string, isText: boolean): string {
+  if (isText) return `BDAY;VALUE=text:${bday}`;
+  const yearless = yearlessDate(bday);
+  if (yearless) return `BDAY;${OMIT_YEAR_PARAM}=${OMIT_YEAR_SENTINEL}:${OMIT_YEAR_SENTINEL}${yearless.slice(1)}`;
+  return `BDAY:${bday}`;
+}
+
 // ── Parser ──
 
 /**
@@ -461,7 +509,13 @@ export function parseVCard(vcardStr: string, options: { strictTextEncoding?: boo
         vcard.note = text();
         break;
       case 'BDAY':
-        vcard.bday = prop.value;
+        if (isTextValue(prop.params)) {
+          vcard.bday = prop.value;
+          vcard.bdayIsText = true;
+        } else {
+          vcard.bday = birthdayValue(prop.value, prop.params);
+          delete vcard.bdayIsText;
+        }
         break;
       case 'PHOTO': {
         const val = prop.value;
@@ -610,7 +664,12 @@ export function generateVCard(vcard: VCard): string {
   if (vcard.favorite === true) {
     lines.push(`${FAVORITE_PROPERTY}:1`);
   }
-  if (vcard.bday) lines.push(foldLine(`BDAY:${vcard.bday}`));
+  if (vcard.bday) {
+    const bdayLine = birthdayLine(vcard.bday, vcard.bdayIsText === true);
+    // A text birthday is free text behind a longer header, so it folds like a kept
+    // line: never into a continuation the importer would read as a card boundary.
+    lines.push(vcard.bdayIsText === true ? foldRetainedLine(bdayLine) : foldLine(bdayLine));
+  }
   if (vcard.photo) {
     if (vcard.photo.startsWith('data:') || vcard.photo.startsWith('http://') || vcard.photo.startsWith('https://')) {
       lines.push(foldLine(`PHOTO;VALUE=URI:${vcard.photo}`));

@@ -289,6 +289,33 @@ class Contact {
                 c.uid = UUID.randomUUID().toString()
             }
 
+            // SilentSuite: recover legacy yearless BDAY before unparsed dates are dropped.
+            if (c.birthDay == null) {
+                val monthDay = Regex("--([0-9]{2})-?([0-9]{2})")
+                for (prop in vCard.extendedProperties) {
+                    if (!prop.propertyName.equals("BDAY", true))
+                        continue
+                    // ez-vcard may move VALUE=text from parameters into the raw data type.
+                    if (prop.dataType == ezvcard.VCardDataType.TEXT ||
+                        prop.getParameter("VALUE")?.split(',')?.any { it.trim().equals("text", true) } == true)
+                        continue
+                    val match = monthDay.matchEntire(prop.value?.trim() ?: continue) ?: continue
+                    val month = match.groupValues[1].toInt()
+                    val day = match.groupValues[2].toInt()
+                    // Validate in a leap year, but never attach a year to the birthday.
+                    val maxDay = when (month) {
+                        2 -> 29
+                        4, 6, 9, 11 -> 30
+                        in 1..12 -> 31
+                        else -> continue
+                    }
+                    if (day !in 1..maxDay)
+                        continue
+                    c.birthDay = Birthday(PartialDate.builder().month(month).date(day).build())
+                    break
+                }
+            }
+
             // remove properties which
             // - couldn't be parsed (and thus are treated as extended/unknown properties), and
             // - must occur once max.

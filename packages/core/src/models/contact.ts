@@ -24,7 +24,11 @@ export interface Contact {
   organization: string;
   title: string;
   notes: string;
+  /** A birthday without a year is `--MM-DD`; never given an invented year. */
   birthday: string | null;
+  /** The birthday was read as `VALUE=text`, so it is never treated as a date.
+   *  Optional so existing callers keep compiling; absence means a date. */
+  birthdayIsText?: boolean;
   photoUrl: string | null;
   /** User-defined labels/categories for grouping and filtering.
    *  Round-tripped via the vCard CATEGORIES property (comma-separated).
@@ -60,6 +64,7 @@ export function toVCard(contact: Contact): string {
     categories: contact.categories && contact.categories.length > 0 ? contact.categories : undefined,
     note: contact.notes || undefined,
     bday: contact.birthday ?? undefined,
+    bdayIsText: contact.birthdayIsText === true ? true : undefined,
     photo: contact.photoUrl ?? undefined,
     favorite: contact.favorite === true ? true : undefined,
     rev: formatRevTimestamp(contact.updated_at),
@@ -103,6 +108,7 @@ export function fromVCard(vcardStr: string): Contact {
     title: vcard.title ?? '',
     notes: vcard.note ?? '',
     birthday: vcard.bday ?? null,
+    ...(vcard.bdayIsText === true ? { birthdayIsText: true } : {}),
     photoUrl: vcard.photo ?? null,
     // Preserve CATEGORIES for round-trip; default to [] for legacy records
     categories: vcard.categories ?? [],
