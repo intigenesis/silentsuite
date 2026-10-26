@@ -781,4 +781,23 @@
     <string name="notes_acknowledge_title">Continue without deleting?</string>
     <string name="notes_acknowledge_text">The Notes changes on this device could not be read. Nothing will be deleted while they cannot be read, and your account stays signed in. Unsynced Notes text may remain on this device and may no longer sync.</string>
     <string name="notes_acknowledge_continue">Continue</string>
+    <!-- Settings, Unsynced Notes: every Notes store on this device that holds unsynced text or cannot be read, and the confirmed discard of one store, offline and without signing in. A store that could not be listed gets an acknowledgement only, which reuses the title and the button above: never "discard", and never that anything is deleted. Placeholder wording, pending review. -->
+    <string name="settings_unsynced_notes">Unsynced Notes</string>
+    <string name="settings_unsynced_notes_uncounted">Unsynced Notes changes on this device could not all be counted</string>
+    <string name="notes_store_unmatched">Not matched to an account on this device</string>
+    <string name="notes_store_unmatched_name">an account not matched on this device</string>
+    <string name="notes_store_uncounted">Unsynced changes that could not be counted</string>
+    <string name="notes_store_unlisted">Can’t be read right now. It may hold unsynced changes.</string>
+    <string name="notes_stores_others_unlisted">Other Notes files on this device can’t be listed, so they can’t be shown here. They may hold unsynced changes.</string>
+    <string name="notes_stores_others_unknown">Some Notes files on this device are of a kind this version can’t read, so they can’t be shown here. They may hold unsynced changes.</string>
+    <string name="notes_stores_none">Nothing to show right now.</string>
+    <string name="notes_discard_store_uncounted">The unsynced Notes changes from %1$s could not be counted. All of them will be deleted from this device. This cannot be undone.</string>
+    <string name="notes_discard">Discard</string>
+    <string name="notes_store_acknowledge_text">The Notes files from %1$s can’t be read right now. If you go on, nothing is deleted. Unsynced Notes text may remain on this device and may no longer sync.</string>
+    <string name="notes_discard_done">Unsynced Notes changes deleted from this device.</string>
+    <string name="notes_discard_nothing_deleted">Couldn’t discard. This attempt deleted no Notes text.</string>
+    <string name="notes_discard_not_finished">The discard did not finish. Some unsynced Notes changes may already be deleted.</string>
+    <string name="notes_discard_not_finished_row">The discard did not finish. Some unsynced Notes changes may already be deleted. Tap to try again.</string>
+    <string name="notes_acknowledged">This attempt deleted no Notes text. Unsynced Notes text may remain on this device and may no longer sync.</string>
+    <string name="notes_acknowledgement_not_recorded">This attempt deleted no Notes text and could not be recorded. Unsynced Notes text may remain on this device and may no longer sync.</string>
 </resources>

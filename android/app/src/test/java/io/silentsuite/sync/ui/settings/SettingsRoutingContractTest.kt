@@ -21,6 +21,8 @@ class SettingsRoutingContractTest {
         listOf("settings_category_account", "settings_category_sync", "settings_category_notifications",
             "settings_category_appearance", "settings_category_privacy_security", "settings_category_help")
             .forEach { assertTrue(home.contains("android:key=\"$it\"")) }
+        assertTrue("the Unsynced Notes row is in the hub and keeps no value", home.substringAfter(
+            "android:key=\"unsynced_notes\"", "").substringBefore("/>").contains("android:persistent=\"false\""))
         val advanced = File(resourceRoot, "settings_advanced.xml").readText()
         listOf("override_proxy", "distrust_system_certs", "select_language", "log_to_file", "log_verbose")
             .forEach { assertTrue(advanced.contains("android:key=\"$it\"")) }
