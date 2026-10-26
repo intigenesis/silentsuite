@@ -1,0 +1,1 @@
+Requires Android 10 or newer. Preserves birthdays without a year and safe extra contact text fields. Adds offline Unsynced Notes recovery and sign-out safeguards. The task-app reminder can be dismissed. Saving a collection after a failed delete no longer deletes it.
