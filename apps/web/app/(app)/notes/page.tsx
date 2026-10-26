@@ -384,7 +384,7 @@ function NoteEditor({ note, canWrite, notebooks, autoFocusTitle = false, onDelet
         }}
         placeholder={t('titlePlaceholder')}
         aria-label={t('titleLabel')}
-        readOnly={!canWrite}
+        readOnly={!canWrite || moving}
         // Browser spellcheck and writing suggestions can send text to third-party
         // services; the body editor disables them too.
         spellCheck={false}
@@ -465,7 +465,7 @@ function NoteEditor({ note, canWrite, notebooks, autoFocusTitle = false, onDelet
         }}
         placeholder={t('bodyPlaceholder')}
         ariaLabel={t('bodyLabel')}
-        readOnly={!canWrite}
+        readOnly={!canWrite || moving}
         className={preview
           ? 'hidden'
           : `min-h-[16rem] flex-1 overflow-hidden rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--surface))] focus-within:ring-2 focus-within:ring-emerald-500 ${!canWrite ? 'opacity-60' : ''}`}
