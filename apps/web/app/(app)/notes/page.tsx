@@ -194,10 +194,12 @@ function NoteRow({ note, notebook, selected, dateLabel, onSelect }: {
  * the editor unmounts (note switch or navigation). Mount with `key={note.id}`
  * so each note gets its own draft.
  */
-function NoteEditor({ note, canWrite, notebooks, autoFocusTitle = false, onDelete, onMove }: {
+function NoteEditor({ note, canWrite, moveRunning, notebooks, autoFocusTitle = false, onDelete, onMove }: {
   /** With the revision its text was read at; edits save only through that base (#744). */
   note: StoredNote
   canWrite: boolean
+  /** A move of this note is running, perhaps started from an earlier editor of it (#849). */
+  moveRunning: boolean
   /** Choices for the notebook picker: the note's own plus every shown, writable notebook. */
   notebooks: Notebook[]
   /** Focus the title on mount, for a note the user has just created. */
@@ -384,7 +386,7 @@ function NoteEditor({ note, canWrite, notebooks, autoFocusTitle = false, onDelet
         }}
         placeholder={t('titlePlaceholder')}
         aria-label={t('titleLabel')}
-        readOnly={!canWrite}
+        readOnly={!canWrite || moving || moveRunning}
         // Browser spellcheck and writing suggestions can send text to third-party
         // services; the body editor disables them too.
         spellCheck={false}
@@ -406,7 +408,7 @@ function NoteEditor({ note, canWrite, notebooks, autoFocusTitle = false, onDelet
             <select
               value={note.notebookId ?? ''}
               onChange={(e) => void handleMove(e.target.value)}
-              disabled={!canWrite || moving || notebooks.length < 2}
+              disabled={!canWrite || moving || moveRunning || notebooks.length < 2}
               className="min-w-0 max-w-[11rem] rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--surface))] py-1 pl-2 pr-6 text-xs text-[rgb(var(--foreground))] focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-60"
             >
               {notebooks.map((notebook) => (
@@ -465,7 +467,7 @@ function NoteEditor({ note, canWrite, notebooks, autoFocusTitle = false, onDelet
         }}
         placeholder={t('bodyPlaceholder')}
         ariaLabel={t('bodyLabel')}
-        readOnly={!canWrite}
+        readOnly={!canWrite || moving || moveRunning}
         className={preview
           ? 'hidden'
           : `min-h-[16rem] flex-1 overflow-hidden rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--surface))] focus-within:ring-2 focus-within:ring-emerald-500 ${!canWrite ? 'opacity-60' : ''}`}
@@ -510,6 +512,9 @@ function NotesPageBody() {
   const timeFormat = usePreferencesStore((s) => s.timeFormat)
   const locale = useLocale()
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  // Notes whose move is running. A move deletes the note it started from, so an
+  // editor opened on such a note stays read-only until the move ends (#849).
+  const [movingNoteIds, setMovingNoteIds] = useState<ReadonlySet<string>>(new Set())
   // The note just created here; its title gets focus so typing can start at once.
   const [newNoteId, setNewNoteId] = useState<string | null>(null)
   const [collectionSheetOpen, setCollectionSheetOpen] = useState(false)
@@ -561,9 +566,11 @@ function NotesPageBody() {
     return own && !targets.includes(own) ? [own, ...targets] : targets
   }, [notebooks, notebookById, selectedNote?.notebookId])
 
+  // A note whose move is running keeps its selection when the store swaps in the
+  // copy, so handleMove can still follow it to the copy's id.
   useEffect(() => {
-    if (selectedId && !visibleNotes.some((note) => note.id === selectedId)) setSelectedId(null)
-  }, [selectedId, visibleNotes])
+    if (selectedId && !movingNoteIds.has(selectedId) && !visibleNotes.some((note) => note.id === selectedId)) setSelectedId(null)
+  }, [selectedId, movingNoteIds, visibleNotes])
 
   // A filter on a notebook that was hidden or deleted falls back to all notebooks.
   useEffect(() => {
@@ -582,11 +589,17 @@ function NotesPageBody() {
     }
   }, [canCreateNote, createNote, newNoteTarget])
 
-  // The moved note is a new Etebase item, so the selection follows its new id.
+  // The moved note is a new Etebase item, so the selection follows its new id,
+  // unless another note, or none, was opened while the move ran.
   const handleMove = useCallback(async (noteId: string, notebookId: string) => {
-    const movedId = await moveNote(noteId, notebookId)
-    if (movedId) setSelectedId(movedId)
-    return movedId !== null
+    setMovingNoteIds((ids) => new Set(ids).add(noteId))
+    try {
+      const movedId = await moveNote(noteId, notebookId)
+      if (movedId) setSelectedId((current) => (current === noteId ? movedId : current))
+      return movedId !== null
+    } finally {
+      setMovingNoteIds((ids) => new Set([...ids].filter((id) => id !== noteId)))
+    }
   }, [moveNote])
 
   return (
@@ -749,6 +762,7 @@ function NotesPageBody() {
               key={selectedNote.id}
               note={selectedNote}
               canWrite={canEditSelected}
+              moveRunning={movingNoteIds.has(selectedNote.id)}
               notebooks={pickerNotebooks}
               autoFocusTitle={selectedNote.id === newNoteId}
               onDelete={canEditSelected ? () => setConfirmDelete(true) : undefined}
