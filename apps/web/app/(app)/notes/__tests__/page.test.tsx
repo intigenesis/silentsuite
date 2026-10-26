@@ -632,6 +632,31 @@ describe('NotesPage', () => {
     expect([title.readOnly, body.readOnly]).toEqual([false, false])
   })
 
+  it('keeps a note opened again during its own move read-only until the move ends (#849)', async () => {
+    loaded([
+      note('n1', { title: 'Mover', content: 'body', notebookId: 'notes-1' }),
+      note('n2', { title: 'Other', notebookId: 'notes-1' }),
+    ], [NOTEBOOK, WORK])
+    let finishMove: (movedId: string | null) => void = () => {}
+    storeMock.noteState.moveNote.mockImplementation(() => new Promise<string | null>((resolve) => { finishMove = resolve }))
+    renderWithIntl(<NotesPage />)
+    fireEvent.click(screen.getByRole('button', { name: /Mover/ }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Notebook' }), { target: { value: 'notes-2' } })
+    await vi.waitFor(() => expect(storeMock.noteState.moveNote).toHaveBeenCalledWith('n1', 'notes-2'))
+
+    // Another note, then this one again: a new editor while the move still runs.
+    fireEvent.click(screen.getByRole('button', { name: /Other/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Mover/ }))
+    const title = screen.getByRole<HTMLInputElement>('textbox', { name: 'Note title' })
+    const body = screen.getByRole<HTMLTextAreaElement>('textbox', { name: 'Note body' })
+    const picker = screen.getByRole<HTMLSelectElement>('combobox', { name: 'Notebook' })
+    expect(title).toHaveValue('Mover')
+    expect([title.readOnly, body.readOnly, picker.disabled]).toEqual([true, true, true])
+
+    await act(async () => { finishMove(null) })
+    expect([title.readOnly, body.readOnly, picker.disabled]).toEqual([false, false, false])
+  })
+
   it('offers notebook management on desktop while the sidebar is collapsed', () => {
     loaded([note('n1', { title: 'Any' })])
     useSidebarStore.setState({ isExpanded: false })
