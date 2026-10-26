@@ -306,8 +306,10 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   build-pr:
     name: Build (unsigned, PR/main)
-    needs: [conscrypt-r28, etebase-16kb]
-    if: github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/v')
+    needs: [static-contracts, conscrypt-r28, etebase-16kb]
+    # Runs unless the run is cancelled, so a failed or skipped dependency fails this
+    # job at its first step instead of leaving a skipped job behind.
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -318,6 +320,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require successful static contracts and native producers
+        env:
+          STATIC_RESULT: ${{ needs.static-contracts.result }}
+          CONSCRYPT_RESULT: ${{ needs.conscrypt-r28.result }}
+          ETEBASE_RESULT: ${{ needs.etebase-16kb.result }}
+        run: |
+          set -euo pipefail
+          for dependency in STATIC_RESULT CONSCRYPT_RESULT ETEBASE_RESULT; do
+            result="${!dependency}"
+            if [ "$result" != success ]; then
+              echo "::error::$dependency is '$result'; build-pr requires every dependency to succeed" >&2
+              exit 1
+            fi
+          done
 
       - name: Download rebuilt Conscrypt AAR
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v7.0.1
@@ -355,9 +372,6 @@ jobs:
       - name: Install Android static contract dependencies
         run: |
           python -m pip install --disable-pip-version-check pytest PyYAML==6.0.3
-
-      - name: Run Android static Python contracts
-        run: python -m pytest ../tests/test_android_*.py -q
 
       - name: Install Android NDK r28
         run: |
