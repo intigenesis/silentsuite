@@ -2,21 +2,28 @@
 
 * superseded pull_request runs are cancelled per workflow and PR; every other run
   has its own group and is never cancelled;
-* the static contract suite also runs early in its own read-only job, while
-  build-pr keeps running it as before;
+* the static contract suite runs once, in its own unconditional read-only job;
+  build-pr no longer repeats it, but needs that job and starts with a
+  dependency-result gate, so a failed, skipped or cancelled static job (or native
+  producer) fails build-pr instead of skipping it;
 * Etebase is built once per run by one producer, and every native consumer admits
   that same-run artifact before its first Gradle or emulator step, keeping its
   NDK provisioning and every later gate.
 
-The checker runs against a byte copy of the predecessor workflow (immutable base
-f867267e) to show the exact violations it rejects, against the candidate, which
-must have none, and against candidate mutations, which must each be caught.
+The checker runs against byte copies of the original predecessor (immutable base
+f867267e) and of the immediate predecessor (8cb81b42) to show the exact violations
+it rejects, against the candidate, which must have none, and against candidate
+mutations, which must each be caught. The gate's real shell script is also
+executed with every dependency outcome.
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -67,6 +74,52 @@ ADMISSION_STEP_NAMES = (
     "Verify admitted Etebase 16 KB AAR",
 )
 
+PREDECESSOR_FIXTURE = ROOT / "tests/fixtures/build-android-base-8cb81b42.yml"
+PREDECESSOR_FIXTURE_SHA256 = "c071ade5be4e8e69425941df7a5c016a96fca92815dfc9b79b4c313ac284832a"
+
+# The static suite exactly as both jobs provision and run it.
+EXPECTED_PYTHON_SETUP = {
+    "name": "Set up Python for static Android contracts",
+    "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+    "with": {"python-version": "3.x"},
+}
+EXPECTED_DEPENDENCY_INSTALL = {
+    "name": "Install Android static contract dependencies",
+    "run": "python -m pip install --disable-pip-version-check pytest PyYAML==6.0.3\n",
+}
+EXPECTED_STATIC_RUN_STEP = {"name": "Run Android static Python contracts", "run": STATIC_RUN}
+
+# build-pr waits for the static job, and runs (unless the run is cancelled) even
+# when a dependency did not succeed, so that its first step fails it closed rather
+# than leaving a skipped job that a required check would count as passing.
+BUILD_PR_NEEDS = [STATIC_JOB, "conscrypt-r28", PRODUCER]
+EVENT_CONDITION = "github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/v')"
+BUILD_PR_IF = f"${{{{ !cancelled() && ({EVENT_CONDITION}) }}}}"
+GATE_NAME = "Require successful static contracts and native producers"
+GATE_ENV = {
+    "STATIC_RESULT": "${{ needs.static-contracts.result }}",
+    "CONSCRYPT_RESULT": "${{ needs.conscrypt-r28.result }}",
+    "ETEBASE_RESULT": "${{ needs.etebase-16kb.result }}",
+}
+# The only build-pr steps allowed a condition: report-only uploads that execute no
+# candidate code and download or admit nothing.
+REPORT_UPLOAD_NAMES = ("Upload unit test reports and results", "Upload lint reports")
+
+DEDUP_VIOLATIONS = sorted(
+    [
+        "build-pr: must not repeat the static contract suite",
+        "build-pr: must also need static-contracts",
+        "build-pr: must run unless cancelled and fail closed on dependency results",
+        "build-pr: missing dependency-result gate",
+    ]
+)
+GATE_KEYS_VIOLATION = "build-pr: dependency-result gate must have only name, env and run"
+GATE_ENV_VIOLATION = "build-pr: dependency-result gate must bind exactly the three needs results"
+GATE_PLACEMENT_VIOLATION = "build-pr: dependency-result gate must immediately follow checkout"
+REPORT_CONDITION_VIOLATION = "build-pr: only the two report uploads may carry a step condition"
+BUILD_PR_CONTINUE_VIOLATION = "build-pr: must not continue on error"
+PYTHON_PROVISIONING_VIOLATION = "build-pr: must keep Python setup and static dependency installation"
+
 CONCURRENCY_VIOLATION = "concurrency: must cancel only superseded pull_request runs in workflow-and-PR groups"
 EXPECTED_BASE_VIOLATIONS = sorted(
     [
@@ -77,6 +130,7 @@ EXPECTED_BASE_VIOLATIONS = sorted(
         *(f"{job}: installs Rust" for job in CONSUMERS),
         *(f"{job}: must need conscrypt-r28 and etebase-16kb" for job in CONSUMERS),
         *(f"{job}: missing Etebase admission" for job in CONSUMERS),
+        *DEDUP_VIOLATIONS,
     ]
 )
 
@@ -106,6 +160,47 @@ def _is_native_verify(step: dict) -> bool:
     return all(part in _run(step) for part in NATIVE_VERIFY)
 
 
+def _needs(job: dict) -> list:
+    needs = job.get("needs")
+    return [needs] if isinstance(needs, str) else list(needs or [])
+
+
+def _gate(job: dict):
+    return next((step for step in job.get("steps") or [] if step.get("name") == GATE_NAME), None)
+
+
+def _build_pr_gating_violations(job: dict) -> list[str]:
+    violations = []
+    steps = job.get("steps") or []
+    if any(_run(step).strip() == STATIC_RUN for step in steps):
+        violations.append("build-pr: must not repeat the static contract suite")
+    if STATIC_JOB not in _needs(job):
+        violations.append("build-pr: must also need static-contracts")
+    if job.get("if") != BUILD_PR_IF:
+        violations.append("build-pr: must run unless cancelled and fail closed on dependency results")
+    gate = _gate(job)
+    if gate is None:
+        violations.append("build-pr: missing dependency-result gate")
+    else:
+        if set(gate) != {"name", "env", "run"}:
+            violations.append(GATE_KEYS_VIOLATION)
+        if gate.get("env") != GATE_ENV:
+            violations.append(GATE_ENV_VIOLATION)
+        checkout = _index(steps, lambda step: _uses(step).startswith("actions/checkout@"))
+        if checkout is None or steps.index(gate) != checkout + 1:
+            violations.append(GATE_PLACEMENT_VIOLATION)
+    conditional = [step for step in steps if "if" in step]
+    if sorted(step.get("name") for step in conditional) != sorted(REPORT_UPLOAD_NAMES) or any(
+        step.get("if") != "always()" or _uses(step) != UPLOAD or "run" in step for step in conditional
+    ):
+        violations.append(REPORT_CONDITION_VIOLATION)
+    if "continue-on-error" in job or any("continue-on-error" in step for step in steps):
+        violations.append(BUILD_PR_CONTINUE_VIOLATION)
+    if EXPECTED_PYTHON_SETUP not in steps or EXPECTED_DEPENDENCY_INSTALL not in steps:
+        violations.append(PYTHON_PROVISIONING_VIOLATION)
+    return violations
+
+
 def ci_speed_violations(workflow: dict) -> list[str]:
     jobs = workflow.get("jobs") or {}
     violations = []
@@ -131,10 +226,17 @@ def ci_speed_violations(workflow: dict) -> list[str]:
             violations.append(f"{STATIC_JOB}: must not depend on another job")
         if static.get("permissions") != {"contents": "read"} or "environment" in static:
             violations.append(f"{STATIC_JOB}: must be read-only")
-        if not any(_run(step).strip() == STATIC_RUN for step in static.get("steps") or []):
+        static_steps = static.get("steps") or []
+        if any(step not in static_steps for step in (EXPECTED_PYTHON_SETUP, EXPECTED_DEPENDENCY_INSTALL, EXPECTED_STATIC_RUN_STEP)):
             violations.append(f"{STATIC_JOB}: must run the exact Android static contract suite")
-    if not any(_run(step).strip() == STATIC_RUN for step in (jobs.get("build-pr") or {}).get("steps") or []):
-        violations.append("build-pr: static contract suite removed")
+        if "if" in static or any("if" in step for step in static_steps):
+            violations.append(f"{STATIC_JOB}: must not be conditional")
+        if "continue-on-error" in static or any("continue-on-error" in step for step in static_steps):
+            violations.append(f"{STATIC_JOB}: must not continue on error")
+
+    build_pr = jobs.get("build-pr")
+    if build_pr is not None:
+        violations.extend(_build_pr_gating_violations(build_pr))
 
     producer = jobs.get(PRODUCER)
     if producer is None:
@@ -162,9 +264,10 @@ def ci_speed_violations(workflow: dict) -> list[str]:
         if job is None:
             violations.append(f"{name}: missing consumer job")
             continue
-        needs = job.get("needs")
-        needs = [needs] if isinstance(needs, str) else list(needs or [])
-        if sorted(needs) != ["conscrypt-r28", PRODUCER]:
+        needs = set(_needs(job))
+        # build-pr additionally needs the static job; that rule is checked with its gate.
+        allowed = set(BUILD_PR_NEEDS) if name == "build-pr" else {"conscrypt-r28", PRODUCER}
+        if not {"conscrypt-r28", PRODUCER} <= needs or not needs <= allowed:
             violations.append(f"{name}: must need conscrypt-r28 and etebase-16kb")
         steps = job.get("steps") or []
         first = _first_build(steps)
@@ -221,10 +324,51 @@ def _without_admission(job: dict) -> dict:
     return job
 
 
+def _without_static_dedup(job: dict) -> dict:
+    """build-pr minus the gating edits: its condition, gate and repeated static suite."""
+    job = copy.deepcopy(job)
+    job["steps"] = [
+        step
+        for step in job.get("steps") or []
+        if step.get("name") != GATE_NAME and _run(step).strip() != STATIC_RUN
+    ]
+    job.pop("if", None)
+    job.pop("needs", None)
+    return job
+
+
+def _expected_build_pr(predecessor_job: dict, gate_run: str) -> dict:
+    """The 8cb81b42 build-pr with exactly the four admitted edits applied."""
+    job = copy.deepcopy(predecessor_job)
+    job["needs"] = list(BUILD_PR_NEEDS)
+    job["if"] = BUILD_PR_IF
+    steps = [step for step in job["steps"] if _run(step).strip() != STATIC_RUN]
+    checkout = _index(steps, lambda step: _uses(step).startswith("actions/checkout@"))
+    assert checkout is not None, "8cb81b42 build-pr must check out first"
+    steps.insert(checkout + 1, {"name": GATE_NAME, "env": dict(GATE_ENV), "run": gate_run})
+    job["steps"] = steps
+    return job
+
+
+def _gate_run(workflow: dict) -> str:
+    job = (workflow.get("jobs") or {}).get("build-pr") or {}
+    gate = _gate(job)
+    assert gate is not None, f"build-pr: dependency-result gate {GATE_NAME!r} is missing"
+    run = gate.get("run")
+    assert isinstance(run, str) and run.strip(), "build-pr: dependency-result gate has no run script"
+    return run
+
+
 @pytest.fixture(scope="module")
 def base() -> dict:
     assert hashlib.sha256(BASE_FIXTURE.read_bytes()).hexdigest() == BASE_FIXTURE_SHA256
     return _load(BASE_FIXTURE)
+
+
+@pytest.fixture(scope="module")
+def predecessor() -> dict:
+    assert hashlib.sha256(PREDECESSOR_FIXTURE.read_bytes()).hexdigest() == PREDECESSOR_FIXTURE_SHA256
+    return _load(PREDECESSOR_FIXTURE)
 
 
 @pytest.fixture(scope="module")
@@ -234,6 +378,10 @@ def candidate() -> dict:
 
 def test_predecessor_workflow_is_rejected_with_exactly_the_expected_violations(base):
     assert ci_speed_violations(base) == EXPECTED_BASE_VIOLATIONS
+
+
+def test_immediate_predecessor_is_rejected_only_for_the_repeated_static_suite(predecessor):
+    assert ci_speed_violations(predecessor) == DEDUP_VIOLATIONS
 
 
 def test_candidate_workflow_satisfies_every_speed_contract(candidate):
@@ -249,23 +397,86 @@ def test_candidate_changes_nothing_else_relative_to_the_predecessor(base, candid
     # Consumers lose only the Rust toolchain and the Etebase compile, and gain only
     # the admission steps: NDK, build-tools, JDKs, matrices, runtime scripts,
     # ledgers, producer manifests and every final gate are otherwise identical.
+    # build-pr additionally differs only by its static-suite gating.
     for name in CONSUMERS:
-        assert _without_admission(candidate["jobs"][name]) == _without_native_compile(base["jobs"][name]), name
+        current = _without_admission(candidate["jobs"][name])
+        original = _without_native_compile(base["jobs"][name])
+        if name == "build-pr":
+            current, original = _without_static_dedup(current), _without_static_dedup(original)
+        assert current == original, name
 
 
-def test_static_job_runs_the_same_suite_as_build_pr(candidate):
-    static = candidate["jobs"][STATIC_JOB]["steps"]
-    build_pr = candidate["jobs"]["build-pr"]["steps"]
+def test_candidate_changes_only_build_pr_gating_relative_to_8cb81b42(predecessor, candidate):
+    assert {key: value for key, value in candidate.items() if key != "jobs"} == {
+        key: value for key, value in predecessor.items() if key != "jobs"
+    }
+    assert set(candidate["jobs"]) == set(predecessor["jobs"])
+    for name, job in predecessor["jobs"].items():
+        if name != "build-pr":
+            assert candidate["jobs"][name] == job, name
+    expected = _expected_build_pr(predecessor["jobs"]["build-pr"], _gate_run(candidate))
+    assert candidate["jobs"]["build-pr"] == expected, (
+        "build-pr may differ from 8cb81b42 only by needs, if, the dependency-result gate "
+        "and the removed static suite"
+    )
 
-    def same(name):
-        left = next(step for step in static if step.get("name") == name)
-        right = next(step for step in build_pr if step.get("name") == name)
-        return left == right
 
-    assert same("Set up Python for static Android contracts")
-    assert same("Install Android static contract dependencies")
-    assert same("Run Android static Python contracts")
-    assert candidate["jobs"][STATIC_JOB]["defaults"] == {"run": {"working-directory": "android"}}
+def test_static_job_runs_the_suite_build_pr_ran_before(predecessor, candidate):
+    static = candidate["jobs"][STATIC_JOB]
+    previous = predecessor["jobs"]["build-pr"]["steps"]
+    for expected in (EXPECTED_PYTHON_SETUP, EXPECTED_DEPENDENCY_INSTALL, EXPECTED_STATIC_RUN_STEP):
+        assert expected in previous, expected["name"]
+        assert expected in static["steps"], expected["name"]
+    assert static["defaults"] == {"run": {"working-directory": "android"}}
+    assert predecessor["jobs"]["build-pr"]["defaults"] == static["defaults"]
+    assert "needs" not in static and "if" not in static
+
+
+def test_dependency_gate_is_exactly_specified(candidate):
+    job = candidate["jobs"]["build-pr"]
+    gate = _gate(job)
+    assert gate is not None, f"build-pr: dependency-result gate {GATE_NAME!r} is missing"
+    assert set(gate) == {"name", "env", "run"}, sorted(gate)
+    assert gate["env"] == GATE_ENV
+    assert job["steps"].index(gate) == 1 and _uses(job["steps"][0]).startswith("actions/checkout@")
+    assert _needs(job) == BUILD_PR_NEEDS
+    assert job["if"] == BUILD_PR_IF
+
+
+def test_only_report_uploads_are_conditional_in_build_pr(candidate):
+    conditional = [step for step in candidate["jobs"]["build-pr"]["steps"] if "if" in step]
+    assert sorted(step["name"] for step in conditional) == sorted(REPORT_UPLOAD_NAMES)
+    for step in conditional:
+        assert step["if"] == "always()", step["name"]
+        assert _uses(step) == UPLOAD and "run" not in step, step["name"]
+
+
+def _execute_gate(script: str, results: dict, cwd: Path) -> subprocess.CompletedProcess:
+    bash = shutil.which("bash")
+    assert bash is not None, "bash is required to execute the gate script"
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    env.update({key: value for key, value in results.items() if value is not None})
+    # GitHub runs an unconfigured `run` step as `bash -e {0}`.
+    return subprocess.run(
+        [bash, "-e", "-c", script], cwd=cwd, env=env, capture_output=True, text=True, timeout=30, check=False
+    )
+
+
+def test_gate_script_admits_three_successful_dependencies(candidate, tmp_path):
+    result = _execute_gate(_gate_run(candidate), {key: "success" for key in GATE_ENV}, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+NON_SUCCESS = ("failure", "skipped", "cancelled", "", "Success", "SUCCESS", "success ", None)
+
+
+@pytest.mark.parametrize("variable", sorted(GATE_ENV))
+@pytest.mark.parametrize("value", NON_SUCCESS, ids=lambda value: "unset" if value is None else repr(value))
+def test_gate_script_rejects_any_non_successful_dependency(candidate, tmp_path, variable, value):
+    results = {key: "success" for key in GATE_ENV}
+    results[variable] = value
+    result = _execute_gate(_gate_run(candidate), results, tmp_path)
+    assert result.returncode != 0, f"{variable}={value!r} must fail the gate"
 
 
 def _step_named(job: dict, name: str) -> dict:
@@ -314,8 +525,54 @@ def _mutation(workflow: dict, case: str) -> None:
         jobs[PRODUCER]["needs"] = ["signing-policy", "conscrypt-r28"]
     elif case == "static-job-waits":
         jobs[STATIC_JOB]["needs"] = "conscrypt-r28"
-    elif case == "build-pr-drops-static-suite":
-        _remove_step(jobs["build-pr"], lambda step: _run(step).strip() == STATIC_RUN)
+    elif case == "static-job-conditional":
+        jobs[STATIC_JOB]["if"] = "${{ false }}"
+    elif case == "static-job-continue-on-error":
+        _step_named(jobs[STATIC_JOB], EXPECTED_STATIC_RUN_STEP["name"])["continue-on-error"] = True
+    elif case == "static-job-drops-suite":
+        _remove_step(jobs[STATIC_JOB], lambda step: _run(step).strip() == STATIC_RUN)
+    elif case == "build-pr-repeats-static-suite":
+        jobs["build-pr"]["steps"].append(dict(EXPECTED_STATIC_RUN_STEP))
+    elif case == "build-pr-drops-static-need":
+        jobs["build-pr"]["needs"] = ["conscrypt-r28", PRODUCER]
+    elif case == "build-pr-plain-event-condition":
+        jobs["build-pr"]["if"] = EVENT_CONDITION
+    elif case == "build-pr-always-condition":
+        jobs["build-pr"]["if"] = f"${{{{ always() && ({EVENT_CONDITION}) }}}}"
+    elif case == "build-pr-drops-python":
+        _remove_step(jobs["build-pr"], lambda step: step == EXPECTED_DEPENDENCY_INSTALL)
+    elif case == "build-pr-job-continue-on-error":
+        jobs["build-pr"]["continue-on-error"] = True
+    elif case == "gate-removed":
+        _remove_step(jobs["build-pr"], lambda step: step.get("name") == GATE_NAME)
+    elif case == "gate-after-download":
+        steps = jobs["build-pr"]["steps"]
+        gate = _step_named(jobs["build-pr"], GATE_NAME)
+        steps.remove(gate)
+        steps.insert(_index(steps, lambda step: _uses(step) == DOWNLOAD) + 1, gate)
+    elif case == "gate-after-gradle":
+        _move_to_end(jobs["build-pr"], GATE_NAME)
+    elif case == "gate-continue-on-error":
+        _step_named(jobs["build-pr"], GATE_NAME)["continue-on-error"] = True
+    elif case == "gate-if-false":
+        _step_named(jobs["build-pr"], GATE_NAME)["if"] = "${{ false }}"
+    elif case == "gate-if-always":
+        _step_named(jobs["build-pr"], GATE_NAME)["if"] = "always()"
+    elif case == "gate-shell-override":
+        _step_named(jobs["build-pr"], GATE_NAME)["shell"] = "sh"
+    elif case == "gate-swapped-bindings":
+        env = _step_named(jobs["build-pr"], GATE_NAME)["env"]
+        env["STATIC_RESULT"], env["CONSCRYPT_RESULT"] = env["CONSCRYPT_RESULT"], env["STATIC_RESULT"]
+    elif case == "gate-literal-success":
+        _step_named(jobs["build-pr"], GATE_NAME)["env"]["STATIC_RESULT"] = "success"
+    elif case == "gate-outcome-not-result":
+        _step_named(jobs["build-pr"], GATE_NAME)["env"]["ETEBASE_RESULT"] = "${{ needs.etebase-16kb.outcome }}"
+    elif case == "gate-missing-binding":
+        del _step_named(jobs["build-pr"], GATE_NAME)["env"]["CONSCRYPT_RESULT"]
+    elif case == "extra-conditional-step":
+        _step_named(jobs["build-pr"], "Make gradlew executable")["if"] = "always()"
+    elif case == "report-upload-condition-changed":
+        _step_named(jobs["build-pr"], REPORT_UPLOAD_NAMES[0])["if"] = "success()"
     else:
         raise AssertionError(case)
 
@@ -336,12 +593,36 @@ MUTATIONS = {
     "upload-not-last": f"{PRODUCER}: producer must build, verify, record, then upload last",
     "producer-needs-conscrypt": f"{PRODUCER}: producer must need only signing-policy",
     "static-job-waits": f"{STATIC_JOB}: must not depend on another job",
-    "build-pr-drops-static-suite": "build-pr: static contract suite removed",
+    "static-job-conditional": f"{STATIC_JOB}: must not be conditional",
+    "static-job-continue-on-error": f"{STATIC_JOB}: must not continue on error",
+    "static-job-drops-suite": f"{STATIC_JOB}: must run the exact Android static contract suite",
+    "build-pr-repeats-static-suite": "build-pr: must not repeat the static contract suite",
+    "build-pr-drops-static-need": "build-pr: must also need static-contracts",
+    "build-pr-plain-event-condition": "build-pr: must run unless cancelled and fail closed on dependency results",
+    "build-pr-always-condition": "build-pr: must run unless cancelled and fail closed on dependency results",
+    "build-pr-drops-python": PYTHON_PROVISIONING_VIOLATION,
+    "build-pr-job-continue-on-error": BUILD_PR_CONTINUE_VIOLATION,
+    "gate-removed": "build-pr: missing dependency-result gate",
+    "gate-after-download": GATE_PLACEMENT_VIOLATION,
+    "gate-after-gradle": GATE_PLACEMENT_VIOLATION,
+    "gate-continue-on-error": GATE_KEYS_VIOLATION,
+    "gate-if-false": GATE_KEYS_VIOLATION,
+    "gate-if-always": GATE_KEYS_VIOLATION,
+    "gate-shell-override": GATE_KEYS_VIOLATION,
+    "gate-swapped-bindings": GATE_ENV_VIOLATION,
+    "gate-literal-success": GATE_ENV_VIOLATION,
+    "gate-outcome-not-result": GATE_ENV_VIOLATION,
+    "gate-missing-binding": GATE_ENV_VIOLATION,
+    "extra-conditional-step": REPORT_CONDITION_VIOLATION,
+    "report-upload-condition-changed": REPORT_CONDITION_VIOLATION,
 }
 
 
 @pytest.mark.parametrize(("case", "expected"), MUTATIONS.items(), ids=MUTATIONS.keys())
 def test_candidate_mutations_are_rejected(candidate, case, expected):
+    assert ci_speed_violations(candidate) == [], (
+        "the unmutated candidate must be clean for this mutation to be meaningful"
+    )
     mutated = copy.deepcopy(candidate)
     _mutation(mutated, case)
     assert expected in ci_speed_violations(mutated)
