@@ -27,6 +27,7 @@ import io.silentsuite.sync.BuildConfig
 import io.silentsuite.sync.Constants
 import io.silentsuite.sync.R
 import io.silentsuite.sync.ui.BaseActivity
+import io.silentsuite.sync.ui.UnsyncedNotesEntry
 import io.silentsuite.sync.ui.WebViewActivity
 
 /** Sole owner of account-entry navigation, secrets, authenticator delivery and hosted signup. */
@@ -628,6 +629,7 @@ open class LoginActivity : BaseActivity() {
             routeBackOrUp()
             return true
         }
+        if (UnsyncedNotesEntry.opens(this, item)) return true
         return super.onOptionsItemSelected(item)
     }
 
@@ -644,8 +646,10 @@ open class LoginActivity : BaseActivity() {
 
     fun cancelBeforeAccountCreated() = finish()
 
+    /** Help, and Unsynced Notes in the overflow, in every mode: also when Android's Add account opened the screen. */
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.activity_login, menu)
+        UnsyncedNotesEntry.addTo(menu)
         return true
     }
 

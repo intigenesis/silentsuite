@@ -111,6 +111,7 @@ const BASE_TITLE = 'Base title 744'
 const BASE_BODY = 'BASE BODY R0 744'
 const PEER_BODY = 'ACKNOWLEDGED PEER BODY A 744'
 const DRAFT_TITLE = 'Retained draft title B 744'
+const OTHER_TITLE = 'Other note 849'
 
 const mounted: { unmount: () => void }[] = []
 
@@ -291,6 +292,42 @@ describe('#744 the rendered note editor saves only through its captured base', (
 
   const isItemGet = (uid: string) => (method: string, path: string) => method === 'get' && path.endsWith(`item/${uid}`)
   const isTransaction = (method: string, path: string) => method === 'post' && path.endsWith('item/transaction')
+
+  /** A second writable notebook, known to the server and to this context. */
+  async function addNotebook(account: any) {
+    const target = await account.getCollectionManager().create('etebase.md.note', { name: 'Target 849', mtime: 1 }, '')
+    target.encryptedCollection.__markSaved()
+    server.seed(target, [])
+    act(() => {
+      const { collections } = useEtebaseStore.getState()
+      useEtebaseStore.setState({ collections: { ...collections, notes: [...collections.notes, target] } } as any)
+      useNotebookStore.setState((state: any) => ({ lists: [...state.lists, { id: target.uid, name: 'Target 849', color: '#fff', visible: true, accessLevel: 2 }] }))
+    })
+    return target
+  }
+
+  const isSourceTransaction = (collection: any) => (method: string, path: string) => (
+    method === 'post' && path.includes(collection.uid) && path.endsWith('item/transaction')
+  )
+  const notebookPicker = () => ui().getByRole('combobox', { name: 'Notebook' }) as HTMLSelectElement
+  const movedCopy = (target: any) => useNoteStore.getState().notes.find((note: any) => note.notebookId === target.uid)
+
+  /** A second saved note in the seeded notebook, known to the server and to this context. */
+  async function addOtherNote(account: any, collection: any, item: any) {
+    const other = await account.getCollectionManager().getItemManager(collection).create({ name: OTHER_TITLE, mtime: 1 }, 'OTHER BODY 849')
+    other.encryptedItem.__markSaved()
+    server.seed(collection, [item, other])
+    const { itemCache, itemTypeMap, itemCollectionMap } = useEtebaseStore.getState()
+    useEtebaseStore.setState({
+      itemCache: new Map([...itemCache, [other.uid, other]]),
+      itemTypeMap: new Map([...itemTypeMap, [other.uid, 'notes']]),
+      itemCollectionMap: new Map([...itemCollectionMap, [other.uid, collection.uid]]),
+    } as any)
+    const at = new Date(500)
+    useNoteStore.setState((state: any) => ({
+      notes: [...state.notes, { id: other.uid, uid: other.uid, title: OTHER_TITLE, content: 'OTHER BODY 849', notebookId: collection.uid, created_at: at, updated_at: at, revision: other.etag }],
+    }))
+  }
 
   it('#744 refuses a dirty draft typed on R0 after acknowledged A was refreshed in, and A stays', async () => {
     const { account, collection, item } = await openSavedNote()
@@ -699,5 +736,50 @@ describe('#744 the rendered note editor saves only through its captured base', (
 
     // 744 wired boundary
     expect((ui().queryByRole('textbox', { name: 'Note title' }) as HTMLInputElement | null)?.value).toBe('Typed during delete 744')
+  })
+
+  it('#849 keeps the note read-only while its move waits on the source delete, then opens the copy', async () => {
+    const { account, collection } = await openSavedNote()
+    const target = await addNotebook(account)
+    const before = server.transactions.length
+    // A clean note saves nothing first, so the first source transaction is the move's delete.
+    const sourceDelete = server.holdNext(isSourceTransaction(collection))
+
+    fireEvent.change(notebookPicker(), { target: { value: target.uid } })
+    await sourceDelete.arrived
+    expect([titleBox().readOnly, bodyBox().readOnly, notebookPicker().disabled]).toEqual([true, true, true])
+
+    sourceDelete.release(false)
+    await settle()
+    const moved = movedCopy(target)
+    expect([notebookPicker().value, titleBox().readOnly, bodyBox().readOnly, saveStatus().textContent]).toEqual([target.uid, false, false, ''])
+    expect(ui().getAllByRole('button', { name: new RegExp(BASE_TITLE) })).toHaveLength(1)
+    expect(server.transactions.length - before).toBe(1)
+    expect(await serverText(account, target, moved!.id)).toBe(BASE_BODY)
+  })
+
+  it('#849 keeps a note opened again during its own move read-only, then opens the copy', async () => {
+    const { account, collection, item } = await seedSavedNote()
+    await addOtherNote(account, collection, item)
+    renderNotesPage()
+    fireEvent.click(ui().getByRole('button', { name: new RegExp(BASE_TITLE) }))
+    await settle()
+    const target = await addNotebook(account)
+    const sourceDelete = server.holdNext(isSourceTransaction(collection))
+
+    fireEvent.change(notebookPicker(), { target: { value: target.uid } })
+    await sourceDelete.arrived
+    fireEvent.click(ui().getByRole('button', { name: new RegExp(OTHER_TITLE) }))
+    await settle()
+    fireEvent.click(ui().getByRole('button', { name: new RegExp(BASE_TITLE) }))
+    await settle()
+    expect(titleBox().value).toBe(BASE_TITLE)
+    expect([titleBox().readOnly, bodyBox().readOnly, notebookPicker().disabled]).toEqual([true, true, true])
+
+    sourceDelete.release(false)
+    await settle()
+    expect([notebookPicker().value, titleBox().readOnly, bodyBox().readOnly, saveStatus().textContent]).toEqual([target.uid, false, false, ''])
+    expect(ui().getAllByRole('button', { name: new RegExp(BASE_TITLE) })).toHaveLength(1)
+    expect(await serverText(account, target, movedCopy(target)!.id)).toBe(BASE_BODY)
   })
 })
