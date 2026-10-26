@@ -83,9 +83,10 @@ internal object PendingNotesRemovalGuard {
          * For a row without a readable creation id, the account list cannot be read while a folder cannot be listed:
          * notes-pending, or notes-discard while some store could not withdraw its acknowledgement; or while
          * notes-pending holds a name of a kind this build does not know. That takes the failed list read and one of
-         * those at once. Nothing is kept, and the way out is a retry. Through the authenticator it can only appear as
-         * a failure starts: a lasting one ends the process at AccountAuthenticatorService.onCreate's own read of the
-         * list, before the authenticator exists.
+         * those at once. Nothing is kept: every attempt reads the list again and refuses while that read throws, and
+         * the way out is a retry. Whether a lasting failure first ends the process, at the immediate update of the
+         * listener that AccountAuthenticatorService.onCreate adds, before the authenticator exists, is an inference
+         * from that code, not tested.
          */
         REFUSE_ACCOUNTS(null),
 
@@ -211,9 +212,9 @@ internal object PendingNotesRemovalGuard {
      * 6. for a row without a readable id, the account list cannot be read, unless row 12 holds:
      *    [Verdict.REFUSE_ACCOUNTS]. That takes the failed list read and, at once, notes-pending that cannot be listed
      *    or holds a name of an unknown kind, or notes-discard that cannot be listed while a store could not withdraw
-     *    its acknowledgement. Nothing is kept, and the way out is a retry; through the authenticator it can only
-     *    appear as a failure starts, since a lasting one ends the process at AccountAuthenticatorService.onCreate's
-     *    own read of the list;
+     *    its acknowledgement. Nothing is kept: every attempt reads the list again and refuses while that read throws,
+     *    and the way out is a retry. Whether a lasting failure first ends the process at the authenticator service's
+     *    listener, before the authenticator exists, is an inference ([Verdict.REFUSE_ACCOUNTS]);
      * 7. for a row without a readable id, notes-pending holds a name of a kind this build does not know: while
      *    notes-discard lists or is shown gone and every store is clean, covered or acknowledged, which rows 3 and 4
      *    leave, [UNKNOWN_KIND_IN_PENDING]; otherwise, as while notes-discard cannot be listed, where a covered or
