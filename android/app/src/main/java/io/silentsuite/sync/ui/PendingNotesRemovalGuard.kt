@@ -32,8 +32,9 @@ import java.io.IOException
  * counter by path: a listing that lacks the counter while lstat does not show it gone counts as short, and the store
  * as one that could not be counted. A listing that skips an entry and still lists the counter, or one of a store whose
  * counter was lost, can still come back short without saying so, and the guard takes those answers as they come. A
- * listing of notes-pending is checked against every store folder whose path is known: one it left out that lstat does
- * not show gone refuses a row without a readable creation id ([PENDING_LISTED_SHORT]).
+ * listing of notes-pending is checked against every store folder whose path is known, one whose clear or discard
+ * stopped in this process included: one it left out that lstat does not show gone refuses a row without a readable
+ * creation id ([PENDING_LISTED_SHORT]).
  *
  * Nothing is kept between decisions. While the account list cannot be read, no store is left out as a live account's,
  * so any refusal decided then, a [Verdict.REFUSE_STORE] for a store that may be a live account's included, is retried
@@ -133,7 +134,8 @@ internal object PendingNotesRemovalGuard {
 
     /**
      * notes-pending lists, but leaves out a store folder whose path is known (a record in notes-discard, [Input.known],
-     * another row's own) and whose presence check does not show it absent, for a row without a readable creation id:
+     * one whose clear or discard stopped in this process included, another row's own) and whose presence check does
+     * not show it absent, for a row without a readable creation id:
      * the listing came back short, so a store it left out that no path names may hold text. Until the maintainer
      * decides whether this takes a one-time confirmed removal bound to something a listing does not move, refused. It
      * is not [Verdict.ROOT_UNLISTABLE_ONLY]: that allowance binds notes-pending's listing counter, which the guard's
@@ -178,7 +180,10 @@ internal object PendingNotesRemovalGuard {
         val pending: () -> StoreFolders,
         /** The store folders notes-discard holds a record of; null when it cannot be listed. */
         val discard: () -> Set<String>?,
-        /** The store folders of the active-account preference and of the creation registry's records. */
+        /**
+         * The store folders of the active-account preference and of the creation registry's records, and those whose
+         * clear or discard stopped in this process ([PendingNotesStore.stoppedIn]), read from memory.
+         */
         val known: () -> Set<String>,
         /**
          * The presence check, by path, of a store folder in notes-pending; read after [known], and before any store
@@ -201,8 +206,8 @@ internal object PendingNotesRemovalGuard {
      * 4. a store holds what nothing covers or is there unlisted, or, for a row without a readable id, one is absent by
      *    lstat alone while notes-pending lists, which only a race gives: [Verdict.REFUSE_STORE];
      * 5. for a row without a readable id, notes-pending lists but leaves out a store folder whose path is known (a
-     *    record in notes-discard, [Input.known], or another row's own) and its presence check does not answer
-     *    ABSENT: [PENDING_LISTED_SHORT];
+     *    record in notes-discard, [Input.known], one whose clear or discard stopped in this process included, or
+     *    another row's own) and its presence check does not answer ABSENT: [PENDING_LISTED_SHORT];
      * 6. for a row without a readable id, the account list cannot be read, unless row 12 holds:
      *    [Verdict.REFUSE_ACCOUNTS]. That takes the failed list read and, at once, notes-pending that cannot be listed
      *    or holds a name of an unknown kind, or notes-discard that cannot be listed while a store could not withdraw
@@ -228,11 +233,12 @@ internal object PendingNotesRemovalGuard {
      *    [Verdict.REFUSE_UNREADABLE].
      *
      * For a row with a readable id, the only store is its own. For one without, the stores are those notes-pending
-     * lists, those notes-discard holds a record of, and [Input.known], less every store of another row whose id
-     * reads. The row itself owns none, even when the account list reads an id for it, and with the account list
-     * unread no store is left out. The listing of notes-pending is checked against every one of those folders found
-     * by path and every other row's own, by its presence check: a folder it left out that is there, or whose check
-     * fails, shows that it came back short (row 5), while what it listed is still checked.
+     * lists, those notes-discard holds a record of, and [Input.known], those whose clear or discard stopped in this
+     * process included, less every store of another row whose id reads. The row itself owns none, even when the account
+     * list reads an id for it, and with the account list unread no store is left out. The listing of notes-pending is
+     * checked against every one of those folders found by path and every other row's own, by its presence check: a
+     * folder it left out that is there, or whose check fails, shows that it came back short (row 5), while what it
+     * listed is still checked.
      */
     fun decide(input: Input): Verdict = decision(input).verdict
 
@@ -354,9 +360,10 @@ internal object PendingNotesRemovalGuard {
 
     /**
      * Every store folder in [noBackup] whose path is known without a listing of notes-pending: those notes-discard
-     * holds a record of, when it lists ([discardNames]), and [known]'s, the same two readings the guard takes for a row
-     * without a readable creation id ([input]). For the Settings way out, read whether or not notes-pending lists, so
-     * a listing that comes back short does not hide a store that the guard finds.
+     * holds a record of, when it lists ([discardNames]), and [known]'s, two of the readings the guard takes for a row
+     * without a readable creation id ([input]); the third, the stores whose clear or discard stopped in this process
+     * ([PendingNotesStore.stoppedIn]), the Settings list reads itself. For the Settings way out, read whether or not
+     * notes-pending lists, so a listing that comes back short does not hide a store that the guard finds.
      */
     internal fun foundByPath(
         noBackup: File,
@@ -390,7 +397,7 @@ internal object PendingNotesRemovalGuard {
     ) = Input(mainType, type, name, id, accounts,
         pending = { PendingNotesStore.storeDirectories(noBackup, presence) },
         discard = { discardNames(noBackup, presence) },
-        known = { known(noBackup, mainType, active(), records()) },
+        known = { known(noBackup, mainType, active(), records()) + PendingNotesStore.stoppedIn(noBackup) },
         // The seam first, as the store's own checks ask it; on a device presence asks it first already.
         presence = { folder ->
             File(File(noBackup, PendingNotesStore.PENDING), folder)
@@ -407,9 +414,10 @@ internal object PendingNotesRemovalGuard {
 
     /**
      * The guard on this device for [account]: its creation id first, then for a row without one the account list, with
-     * each row's id, then notes-pending, notes-discard, the active-account preference and the registry, and only then
-     * the store checks, each store opened by its folder ([PendingNotesStore.forDirectory]). It never builds
-     * AccountSettings and never takes the Etebase cache's monitor. The log line holds the verdict and a count only.
+     * each row's id, then notes-pending, notes-discard, the active-account preference, the registry and the stores
+     * whose clear or discard stopped in this process, and only then the store checks, each store opened by its folder
+     * ([PendingNotesStore.forDirectory]). It never builds AccountSettings and never takes the Etebase cache's monitor.
+     * The log line holds the verdict and a count only.
      */
     @WorkerThread
     fun decision(context: Context, account: Account?): Decision {

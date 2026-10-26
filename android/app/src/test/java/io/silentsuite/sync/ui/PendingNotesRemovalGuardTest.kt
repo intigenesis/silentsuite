@@ -41,6 +41,7 @@ class PendingNotesRemovalGuardTest {
         PendingNotesStore.listFilesForTesting = null
         PendingNotesStore.presenceForTesting = null
         PendingNotesStore.identityForTesting = null
+        PendingNotesStore.beforeRemoveForTesting = null
         PendingNotesDiscardPermits.beforeRecordForTesting = null
         PendingNotesDiscardPermits.beforeDeleteForTesting = null
         PendingNotesDiscardPermits.onReadForTesting = null
@@ -583,6 +584,61 @@ class PendingNotesRemovalGuardTest {
         assertEquals(byKnownPath, found())
         assertNull(guard.discard())
         assertEquals(found(), guard.known())
+    }
+
+    @Test fun `a store whose discard stopped in this process is checked when no listing or known path names it`() {
+        // A discard of b's store, confirmed for an answer that could not be counted, since a file of a kind this build
+        // does not know stopped the count: it removed n1 and stopped at n2. Once that file is gone, what is left
+        // counts, and a permit recorded as for an answer that could not be counted covers no counted answer.
+        val noBackup = tmp.newFolder("no_backup")
+        val stopped = storeIn(noBackup, "b", "gen-b")
+        stopped.saveLocal("n1", "b1", "r1", "text".toByteArray(), isCreate = false)
+        stopped.saveLocal("n2", "b1", "r1", "text".toByteArray(), isCreate = false)
+        File(stopped.dir, "x.draft").writeBytes(ByteArray(1))
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, stopped.discardStore(stopped.unsynced()))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertTrue(File(stopped.dir, "x.draft").delete())
+        assertTrue(stopped.clearStopped())
+        assertEquals(listOf(stopped.dir.name), PendingNotesStore.stoppedIn(noBackup))
+        assertTrue(stopped.removalCheck() is RemovalCheck.Blocks)
+        // The same discard with no file of an unknown kind, in another no_backup folder: its permit is for a counted
+        // answer and covers what is left.
+        val coveredIn = tmp.newFolder("no_backup_covered")
+        val covered = storeIn(coveredIn, "b", "gen-b")
+        covered.saveLocal("n1", "b1", "r1", "text".toByteArray(), isCreate = false)
+        covered.saveLocal("n2", "b1", "r1", "text".toByteArray(), isCreate = false)
+        PendingNotesStore.beforeRemoveForTesting = { if (it.name == "n2.note") throw IOException("stopped") }
+        assertEquals(DiscardOutcome.NotFinished, covered.discardStore(covered.unsynced()))
+        PendingNotesStore.beforeRemoveForTesting = null
+        assertTrue(covered.clearStopped())
+        assertEquals(RemovalCheck.Covered, covered.removalCheck())
+
+        // No active account, registry record or other row names either store, so only notes-pending's listing,
+        // notes-discard's record of the permit and this process's memory of the stop do.
+        fun decided(root: File, pending: (File) -> Array<File>?, discard: (File) -> Array<File>?): Verdict {
+            PendingNotesStore.listFilesForTesting = { d ->
+                when (d.name) {
+                    PendingNotesStore.PENDING -> pending(d)
+                    PendingNotesDiscardPermits.ROOT -> discard(d)
+                    else -> d.listFiles()
+                }
+            }
+            return PendingNotesRemovalGuard.decide(real(root, "b", CreationId.Unreadable,
+                listOf(Row("b", CreationId.Unreadable))))
+        }
+        val whole: (File) -> Array<File>? = { it.listFiles() }
+        val fails: (File) -> Array<File>? = { null }
+        val verdicts = linkedMapOf(
+            "every folder lists" to decided(noBackup, whole, whole),
+            "notes-pending lists nothing, notes-discard cannot be listed" to decided(noBackup, { emptyArray() }, fails),
+            "neither can be listed" to decided(noBackup, fails, fails),
+            "neither can be listed, what is left covered" to decided(coveredIn, fails, fails))
+        assertEquals(linkedMapOf(
+            "every folder lists" to Verdict.REFUSE_STORE,
+            "notes-pending lists nothing, notes-discard cannot be listed" to Verdict.REFUSE_STORE,
+            "neither can be listed" to Verdict.REFUSE_STORE,
+            "neither can be listed, what is left covered" to Verdict.REFUSE_UNREADABLE), verdicts)
     }
 
     @Test fun `while notes-discard cannot be read, a clean account is decided with no permit or acknowledgement`() {

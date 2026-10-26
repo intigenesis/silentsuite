@@ -5132,7 +5132,9 @@ class PendingNotesStoreTest {
         assertEquals(listOf(settings), callersOf("unregisterIfFinishedOnce"))
         assertEquals("only the Settings way out asks whether a discard stopped", listOf(settings),
             callersOf("clearStopped"))
-        assertEquals(listOf(settings), callersOf("stoppedIn"))
+        // The Settings list and the removal guard read from memory which stores stopped.
+        val guard = "io/silentsuite/sync/ui/PendingNotesRemovalGuard.kt"
+        assertEquals(listOf(guard, settings), callersOf("stoppedIn"))
         assertEquals("clearAll is for test teardown only", emptyList<String>(), callersOf("clearAll"))
     }
 }
