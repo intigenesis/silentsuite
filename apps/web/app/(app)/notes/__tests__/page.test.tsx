@@ -657,6 +657,31 @@ describe('NotesPage', () => {
     expect([title.readOnly, body.readOnly, picker.disabled]).toEqual([false, false, false])
   })
 
+  it('stays on a note opened while another note moves, with its draft (#849)', async () => {
+    loaded([
+      note('n1', { title: 'Mover', content: 'body', notebookId: 'notes-1' }),
+      note('n2', { title: 'Other', notebookId: 'notes-1' }),
+    ], [NOTEBOOK, WORK])
+    let finishMove: (movedId: string | null) => void = () => {}
+    storeMock.noteState.moveNote.mockImplementation(() => new Promise<string | null>((resolve) => { finishMove = resolve }))
+    renderWithIntl(<NotesPage />)
+    fireEvent.click(screen.getByRole('button', { name: /Mover/ }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Notebook' }), { target: { value: 'notes-2' } })
+    await vi.waitFor(() => expect(storeMock.noteState.moveNote).toHaveBeenCalledWith('n1', 'notes-2'))
+
+    fireEvent.click(screen.getByRole('button', { name: /Other/ }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Note title' }), { target: { value: 'Draft while moving' } })
+    // The store swaps in the copy, then the move resolves with the copy's id.
+    await act(async () => {
+      storeMock.noteState.notes = storeMock.noteState.notes.map((n) => (n.id === 'n1' ? { ...n, id: 'n1-moved', uid: 'n1-moved', notebookId: 'notes-2' } : n))
+      finishMove('n1-moved')
+    })
+    expect([
+      screen.getByRole<HTMLInputElement>('textbox', { name: 'Note title' }).value,
+      screen.getByRole<HTMLSelectElement>('combobox', { name: 'Notebook' }).value,
+    ]).toEqual(['Draft while moving', 'notes-1'])
+  })
+
   it('offers notebook management on desktop while the sidebar is collapsed', () => {
     loaded([note('n1', { title: 'Any' })])
     useSidebarStore.setState({ isExpanded: false })

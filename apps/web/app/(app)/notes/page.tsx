@@ -566,9 +566,11 @@ function NotesPageBody() {
     return own && !targets.includes(own) ? [own, ...targets] : targets
   }, [notebooks, notebookById, selectedNote?.notebookId])
 
+  // A note whose move is running keeps its selection when the store swaps in the
+  // copy, so handleMove can still follow it to the copy's id.
   useEffect(() => {
-    if (selectedId && !visibleNotes.some((note) => note.id === selectedId)) setSelectedId(null)
-  }, [selectedId, visibleNotes])
+    if (selectedId && !movingNoteIds.has(selectedId) && !visibleNotes.some((note) => note.id === selectedId)) setSelectedId(null)
+  }, [selectedId, movingNoteIds, visibleNotes])
 
   // A filter on a notebook that was hidden or deleted falls back to all notebooks.
   useEffect(() => {
@@ -587,12 +589,13 @@ function NotesPageBody() {
     }
   }, [canCreateNote, createNote, newNoteTarget])
 
-  // The moved note is a new Etebase item, so the selection follows its new id.
+  // The moved note is a new Etebase item, so the selection follows its new id,
+  // unless another note, or none, was opened while the move ran.
   const handleMove = useCallback(async (noteId: string, notebookId: string) => {
     setMovingNoteIds((ids) => new Set(ids).add(noteId))
     try {
       const movedId = await moveNote(noteId, notebookId)
-      if (movedId) setSelectedId(movedId)
+      if (movedId) setSelectedId((current) => (current === noteId ? movedId : current))
       return movedId !== null
     } finally {
       setMovingNoteIds((ids) => new Set([...ids].filter((id) => id !== noteId)))
