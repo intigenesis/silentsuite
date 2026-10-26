@@ -2,8 +2,11 @@ package io.silentsuite.sync.resource
 
 import android.Manifest
 import android.accounts.Account
+import android.accounts.AccountManager
 import android.content.ContentProviderClient
+import android.content.ContentResolver
 import android.content.ContentValues
+import android.os.Bundle
 import android.provider.ContactsContract
 import android.provider.ContactsContract.Data
 import android.provider.ContactsContract.RawContacts
@@ -28,8 +31,9 @@ import java.io.StringReader
 /**
  * #865: the provider row holding a contact's retained unknown vCard properties.
  *
- * Synthetic contacts only, in a per-test address-book account that is never registered with
- * AccountManager, so no sync adapter runs against it. Behavioral failures are assertion
+ * Synthetic contacts only, in a per-test address-book account registered with AccountManager (so
+ * ContactsProvider keeps its rows), with no owning main account and contacts sync disabled, and
+ * removed again afterwards. Behavioral failures are assertion
  * failures prefixed "BEHAVIOR"; fixture/setup problems are IllegalStateException prefixed
  * "FIXTURE" and must not be read as a reproduction.
  */
@@ -94,17 +98,27 @@ class LocalContactUnknownPropertiesRuntimeTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val provider: ContentProviderClient = context.contentResolver.acquireContentProviderClient(ContactsContract.AUTHORITY)
             ?: throw IllegalStateException("FIXTURE: contacts provider unavailable")
+        val manager = AccountManager.get(context)
         val account = Account("runtime-865-${System.nanoTime()}", App.addressBookAccountType)
         try {
+            // ContactsProvider purges rows of accounts AccountManager does not know on every accounts change.
+            check(manager.addAccountExplicitly(account, null, null)) { "FIXTURE: could not register ${account.name}" }
+            ContentResolver.removePeriodicSync(account, ContactsContract.AUTHORITY, Bundle())
+            ContentResolver.setSyncAutomatically(account, ContactsContract.AUTHORITY, false)
+            ContentResolver.setIsSyncable(account, ContactsContract.AUTHORITY, 0)
             block(LocalAddressBook(context, account, provider))
         } finally {
-            provider.delete(
-                RawContacts.CONTENT_URI.buildUpon().appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true").build(),
-                "${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.ACCOUNT_TYPE}=?",
-                arrayOf(account.name, account.type),
-            )
-            @Suppress("DEPRECATION")
-            provider.release()
+            try {
+                provider.delete(
+                    RawContacts.CONTENT_URI.buildUpon().appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true").build(),
+                    "${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.ACCOUNT_TYPE}=?",
+                    arrayOf(account.name, account.type),
+                )
+            } finally {
+                manager.removeAccountExplicitly(account)
+                @Suppress("DEPRECATION")
+                provider.release()
+            }
         }
     }
 
