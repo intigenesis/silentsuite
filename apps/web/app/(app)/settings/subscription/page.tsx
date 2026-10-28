@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { Button } from '@silentsuite/ui'
 import { BILLING_API_URL } from '@/app/lib/config'
 import { formatDate as formatDateUtil } from '@/app/lib/date'
+import { getAccountEpoch, isCurrentAccountEpoch } from '@/app/lib/account-epoch'
+import { useAuthStore } from '@/app/stores/use-auth-store'
 import AddCardBanner from '@/app/components/add-card-banner'
 import { ModalDialog } from '@/app/components/modal-dialog'
 import PaymentChoicePanel from '@/app/components/payment-choice-panel'
@@ -162,6 +164,13 @@ function CancelDialog({
 }
 
 const PAYMENT_CONFIRMATION_POLL_DELAYS_MS = [2000, 5000, 10000] as const
+const PAYMENT_CONFIRMATION_DELAYED = 'Payment confirmation is taking longer than expected. Retry the payment status or choose another payment method.'
+
+/** The live user object and boundary that started one operation. */
+interface OperationOwner {
+  user: ReturnType<typeof useAuthStore.getState>['user']
+  epoch: number
+}
 
 interface StripePaymentReturn {
   hasStripeParameters: boolean
@@ -233,6 +242,26 @@ export default function SubscriptionPage() {
   // the CTA before any effect runs, so the dialog cannot discover it later.
   const [modalOpener, setModalOpener] = useState<HTMLElement | null>(null)
   const stripeReturnHandledRef = useRef(false)
+  // The page belongs to the account (id and boundary) it was opened for; a later account never
+  // owns its data or actions. Each new operation captures the live user object of that account
+  // before any await or timer, and its continuations stay bound to that exact origin.
+  const [principal] = useState(() => ({ id: useAuthStore.getState().user?.id ?? null, epoch: getAccountEpoch() }))
+  const mountedRef = useRef(false)
+  // Latest-started subscription read; an older response never publishes.
+  const requestSequenceRef = useRef(0)
+  const captureOwner = useCallback((): OperationOwner | null => {
+    const user = useAuthStore.getState().user
+    if (!mountedRef.current || (user?.id ?? null) !== principal.id || !isCurrentAccountEpoch(principal.epoch)) return null
+    return { user, epoch: principal.epoch }
+  }, [principal])
+  const ownerCurrent = useCallback((owner: OperationOwner | null) => owner !== null && mountedRef.current
+    && useAuthStore.getState().user === owner.user
+    && isCurrentAccountEpoch(owner.epoch), [])
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
 
   const requestSubscription = useCallback(async (): Promise<SubscriptionData | null> => {
     try {
@@ -249,12 +278,26 @@ export default function SubscriptionPage() {
     return null
   }, [])
 
-  const fetchSubscription = useCallback(async () => {
-    const nextData = await requestSubscription()
-    if (nextData) setData(nextData)
-    setLoading(false)
-    return nextData
-  }, [requestSubscription])
+  const fetchSubscription = useCallback(async (initialOwner: OperationOwner | null = captureOwner()) => {
+    let owner = initialOwner
+    // A same-account fresh user object rejects the in-flight response; the page's still-current
+    // account then gets one freshly owned read. Another account, logout or unmount gets nothing.
+    for (let read = 0; read < 2 && ownerCurrent(owner); read += 1) {
+      const sequence = ++requestSequenceRef.current
+      const nextData = await requestSubscription()
+      if (sequence !== requestSequenceRef.current) return null
+      if (ownerCurrent(owner)) {
+        if (nextData) setData(nextData)
+        setLoading(false)
+        return nextData
+      }
+      owner = captureOwner()
+    }
+    // Replaced again during the fresh read: end loading for the still-current account only
+    // (existing unavailable view and recovery actions), publishing no stale data.
+    if (owner && captureOwner()) setLoading(false)
+    return null
+  }, [captureOwner, ownerCurrent, requestSubscription])
 
   useEffect(() => {
     if (stripePaymentReturn.paymentIntent && stripePaymentReturn.redirectStatus) return
@@ -292,16 +335,30 @@ export default function SubscriptionPage() {
 
     let cancelled = false
     let settled = false
-    let requestSequence = 0
-    let latestCommittedSequence = 0
     const timers: number[] = []
     const clearTimers = () => timers.forEach(timer => window.clearTimeout(timer))
+    // This attempt acts only while it is current, unsettled and its own origin is still live.
+    const owner = captureOwner()
+    const live = () => !cancelled && !settled && ownerCurrent(owner)
+    // An invalidated origin ends this attempt's own work. Only while the page's account is still
+    // current does it clear this attempt's local confirming state, offering the existing retry;
+    // it never publishes data, and a superseded attempt (cancelled) or another account gets nothing.
+    const endInvalidated = () => {
+      if (cancelled || settled) return
+      settled = true
+      clearTimers()
+      if (!captureOwner()) return
+      setLoading(false)
+      setPaymentConfirmationPending(false)
+      setPaymentReturnFailure(PAYMENT_CONFIRMATION_DELAYED)
+    }
 
     const pollSubscription = async (finalAttempt = false) => {
-      const sequence = ++requestSequence
+      if (!live()) { endInvalidated(); return }
+      const sequence = ++requestSequenceRef.current
       const nextData = await requestSubscription()
-      if (cancelled || settled || sequence < latestCommittedSequence) return
-      latestCommittedSequence = sequence
+      if (cancelled || settled || sequence !== requestSequenceRef.current) return
+      if (!ownerCurrent(owner)) { endInvalidated(); return }
       setLoading(false)
       if (nextData) setData(nextData)
       const capabilities = nextData ? getCapabilities(nextData) : null
@@ -315,18 +372,21 @@ export default function SubscriptionPage() {
         clearTimers()
         setPaymentConfirmationPending(false)
         setPaymentReturnFailure(null)
+        // The confirmed payment refreshes the shared account state for its own signed-in account only.
+        if (owner?.user) void useAuthStore.getState().fetchSubscription()
         return
       }
       if (finalAttempt && !settled) {
         setPaymentConfirmationPending(false)
-        setPaymentReturnFailure('Payment confirmation is taking longer than expected. Retry the payment status or choose another payment method.')
+        setPaymentReturnFailure(PAYMENT_CONFIRMATION_DELAYED)
       }
     }
 
     void pollSubscription()
     PAYMENT_CONFIRMATION_POLL_DELAYS_MS.forEach((delayMs, index) => {
       timers.push(window.setTimeout(() => {
-        if (!settled) void pollSubscription(index === PAYMENT_CONFIRMATION_POLL_DELAYS_MS.length - 1)
+        if (live()) void pollSubscription(index === PAYMENT_CONFIRMATION_POLL_DELAYS_MS.length - 1)
+        else endInvalidated()
       }, delayMs))
     })
 
@@ -334,7 +394,7 @@ export default function SubscriptionPage() {
       cancelled = true
       clearTimers()
     }
-  }, [paymentConfirmationAttempt, requestSubscription])
+  }, [captureOwner, ownerCurrent, paymentConfirmationAttempt, requestSubscription])
 
   useEffect(() => {
     if (!data) return
@@ -351,6 +411,7 @@ export default function SubscriptionPage() {
   }, [data])
 
   function startPaymentConfirmation() {
+    if (!captureOwner()) return
     setPaymentConfirmationPending(true)
     setPaymentReturnFailure(null)
     setShowPlanSelection(false)
@@ -362,6 +423,8 @@ export default function SubscriptionPage() {
   }
 
   function openPaymentRecovery() {
+    // A retained page never opens a payment panel for an account other than its own.
+    if (!captureOwner()) return
     captureModalOpener()
     setPaymentConfirmationPending(false)
     setPaymentReturnFailure(null)
@@ -375,20 +438,24 @@ export default function SubscriptionPage() {
   }
 
   async function handleCancel() {
+    const owner = captureOwner()
+    if (!owner) return
     setCancelling(true)
     try {
       const res = await fetch(`${BILLING_API_URL}/subscription/cancel`, {
         method: 'POST',
         credentials: 'include',
       })
-      if (res.ok) {
+      if (res.ok && ownerCurrent(owner)) {
         setShowCancelDialog(false)
-        await fetchSubscription()
+        await fetchSubscription(owner)
       }
     } catch {
       // API may not be running in dev
     } finally {
-      setCancelling(false)
+      // Neutral local cleanup for the page's still-current account, so a same-account fresh user
+      // object never wedges the dialog; nothing is reset for another account.
+      if (captureOwner()) setCancelling(false)
     }
   }
 
