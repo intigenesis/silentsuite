@@ -6,7 +6,8 @@ const { withSentryConfig } = require('@sentry/nextjs')
 const withNextIntl = createNextIntlPlugin('./i18n/request.ts')
 // `https:` lets users reach their own Etebase server on any host, port or base path.
 // It also admits every other HTTPS origin, so these routes no longer deny analytics via CSP.
-const hostedConnectSources = "connect-src 'self' https://api.silentsuite.io https://server.silentsuite.io wss://server.silentsuite.io https://*.sentry.io https:"
+// `data:` covers libsodium fetching its embedded base64 WASM; the edge policy needs it too.
+const hostedConnectSources = "connect-src 'self' https://api.silentsuite.io https://server.silentsuite.io wss://server.silentsuite.io https://*.sentry.io https: data:"
 const signupConnectSources = `${hostedConnectSources} https://plausible.silentsuite.io https://api.stripe.com`
 const subscriptionConnectSources = `${hostedConnectSources} https://plausible.silentsuite.io`
 
