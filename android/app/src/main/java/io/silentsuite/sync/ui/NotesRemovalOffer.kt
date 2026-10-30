@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.system.ErrnoException
 import android.system.Os
+import android.system.StructStat
 import androidx.annotation.StringRes
 import androidx.annotation.WorkerThread
 import io.silentsuite.sync.App
@@ -185,7 +186,7 @@ internal class NotesRemovalOffer(
         /**
          * What stands in the way in [decision], in [noBackup]: [stat] of each folder of its reason, and for names of an
          * unknown kind in notes-pending, those names from the guard's own listing ([Decision.unknown]) with [lstat] of
-         * each. Nothing here lists a folder, opens an entry or follows a link.
+         * each. Nothing here lists a folder or opens an entry; [stat] follows a link and [lstat] does not.
          */
         internal fun fingerprint(
             noBackup: File,
@@ -200,18 +201,20 @@ internal class NotesRemovalOffer(
             return Fingerprint(stats, decision.unknown, decision.unknown.associateWith { lstat(File(pending, it)) })
         }
 
+        /** [stat] with its change time in nanoseconds: st_ctime's whole seconds would miss a change in the same one. */
+        private fun folderStat(stat: StructStat) = FolderStat.Stat(stat.st_dev, stat.st_ino, stat.st_mode,
+            stat.st_ctim.tv_sec * 1_000_000_000L + stat.st_ctim.tv_nsec)
+
         /** The stat of [path], following a link, or the errno it failed with. */
         private fun stat(path: File): FolderStat = try {
-            val stat = Os.stat(path.path)
-            FolderStat.Stat(stat.st_dev, stat.st_ino, stat.st_mode, stat.st_ctime)
+            folderStat(Os.stat(path.path))
         } catch (e: ErrnoException) {
             FolderStat.Failed(e.errno)
         }
 
         /** The lstat of [path], of a link itself and not its target, or the errno it failed with. */
         private fun lstat(path: File): FolderStat = try {
-            val stat = Os.lstat(path.path)
-            FolderStat.Stat(stat.st_dev, stat.st_ino, stat.st_mode, stat.st_ctime)
+            folderStat(Os.lstat(path.path))
         } catch (e: ErrnoException) {
             FolderStat.Failed(e.errno)
         }

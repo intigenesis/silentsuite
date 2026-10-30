@@ -108,6 +108,13 @@ class UnsyncedNotesRemovalContractTest {
             """NotesFolderListings::count\s*,\s*SystemClock::elapsedRealtime\b""").containsMatchIn(allowance))
     }
 
+    @Test fun `the fingerprint's change time keeps its nanoseconds`() {
+        assertTrue(offer, Regex("""stat\.st_ctim\.tv_sec \* 1_000_000_000L \+ stat\.st_ctim\.tv_nsec""")
+            .containsMatchIn(offer))
+        assertFalse("whole seconds miss a change in the same one", Regex("""\bst_ctime\b(?!')""").containsMatchIn(
+            offer.substringAfter("private fun folderStat(")))
+    }
+
     @Test fun `the tap takes its time first, and hands it to the offer`() {
         val tap = dialog.substringAfter("fun confirm(id: String) {\n", "").substringBefore("\n    }\n")
         assertTrue(tap, tap.trimStart().startsWith("val tapped = NotesRemovalAllowance.process.now()"))
