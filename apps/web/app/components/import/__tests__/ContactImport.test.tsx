@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, onTestFinished, vi } from 'vitest'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import ContactImport from '../ContactImport'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import { deserializeContact, serializeContact, type Contact } from '@silentsuite/core'
@@ -290,6 +290,62 @@ describe('C3a-R6 ContactImport reports only acknowledged contacts and keeps the 
     expect(screen.getByText('Ada One')).toBeInTheDocument()
     expect(screen.getByText('Bea Two')).toBeInTheDocument()
     expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R6 contacts: a file chosen while an import is pending is refused, so the failed import keeps its own file, preview and retry', async () => {
+    let rejectPending!: (reason: unknown) => void
+    mocks.importContacts
+      .mockImplementationOnce(() => new Promise<number>((_, reject) => { rejectPending = reject }))
+      .mockResolvedValueOnce(1)
+    // Never leave the deferred import pending, even when an assertion fails first.
+    onTestFinished(() => rejectPending?.(new Error('settled at test end')))
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    const input = container.querySelector('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [vcf(['Ada One', 'Bea Two'])] } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 contacts' }))
+    await waitFor(() => expect(mocks.importContacts).toHaveBeenCalledTimes(1))
+
+    // Another file while the first import is still pending, given time to be read if it were accepted.
+    const replacement = new File([['BEGIN:VCARD', 'VERSION:4.0', 'FN:Cy Replacement', 'END:VCARD'].join('\r\n')], 'replacement.vcf', { type: 'text/vcard' })
+    fireEvent.change(input, { target: { files: [replacement] } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)) })
+    expect(screen.queryByText('replacement.vcf')).toBeNull()
+    expect(screen.getByText('contacts.vcf')).toBeInTheDocument()
+    expect(screen.queryByText('Cy Replacement')).toBeNull()
+    expect(screen.getByText('Ada One')).toBeInTheDocument()
+
+    await act(async () => { rejectPending(new ImportIncompleteError(1, [1], true)) })
+    await screen.findByText(/Imported 1 of 2 contacts/)
+    expect(screen.getByText('contacts.vcf')).toBeInTheDocument()
+    expect(screen.queryByText('Cy Replacement')).toBeNull()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 contacts' }))
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadNames(1)).toEqual(['Bea Two'])
+    expect(mocks.importContacts).toHaveBeenCalledTimes(2)
+  })
+
+  it('C3a-R6 contacts control: after an import settles, choosing another file still replaces the file, preview and retry', async () => {
+    mocks.importContacts
+      .mockRejectedValueOnce(new ImportIncompleteError(1, [1], true))
+      .mockResolvedValueOnce(1)
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    const input = container.querySelector('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [vcf(['Ada One', 'Bea Two'])] } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 contacts' }))
+    await screen.findByText(/Imported 1 of 2 contacts/)
+
+    const replacement = new File([['BEGIN:VCARD', 'VERSION:4.0', 'FN:Cy Replacement', 'END:VCARD'].join('\r\n')], 'replacement.vcf', { type: 'text/vcard' })
+    fireEvent.change(input, { target: { files: [replacement] } })
+    await screen.findByText('Cy Replacement')
+    expect(screen.queryByText('Bea Two')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 contacts' }))
+
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadNames(1)).toEqual(['Cy Replacement'])
+    expect(screen.getByText('replacement.vcf')).toBeInTheDocument()
+    expect(screen.queryByText(/Imported 1 of 2 contacts/)).toBeNull()
   })
 
   it('C3a-R6 contacts: a fully acknowledged import still reports its true count', async () => {

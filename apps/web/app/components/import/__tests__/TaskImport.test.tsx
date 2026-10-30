@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, onTestFinished, vi } from 'vitest'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import TaskImport from '../TaskImport'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import type { VTodo } from '@silentsuite/core/utils/ical-parser'
@@ -221,6 +221,62 @@ describe('C3a-R5 TaskImport reports only acknowledged tasks and keeps the rest f
     expect(screen.getByText('First task')).toBeInTheDocument()
     expect(screen.getByText('Second task')).toBeInTheDocument()
     expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R5 tasks: a file chosen while an import is pending is refused, so the failed import keeps its own file, preview and retry', async () => {
+    let rejectPending!: (reason: unknown) => void
+    mocks.importTasks
+      .mockImplementationOnce(() => new Promise<number>((_, reject) => { rejectPending = reject }))
+      .mockResolvedValueOnce(1)
+    // Never leave the deferred import pending, even when an assertion fails first.
+    onTestFinished(() => rejectPending?.(new Error('settled at test end')))
+    const { container } = renderWithIntl(<TaskImport onImportComplete={mocks.onImportComplete} />)
+    const input = container.querySelector('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [csv(['First task', 'Second task'])] } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 tasks' }))
+    await waitFor(() => expect(mocks.importTasks).toHaveBeenCalledTimes(1))
+
+    // Another file while the first import is still pending, given time to be read if it were accepted.
+    const replacement = new File(['TYPE,CONTENT\ntask,Replacement task'], 'replacement.csv', { type: 'text/csv' })
+    fireEvent.change(input, { target: { files: [replacement] } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)) })
+    expect(screen.queryByText('replacement.csv')).toBeNull()
+    expect(screen.getByText('todoist.csv')).toBeInTheDocument()
+    expect(screen.queryByText('Replacement task')).toBeNull()
+    expect(screen.getByText('First task')).toBeInTheDocument()
+
+    await act(async () => { rejectPending(new ImportIncompleteError(1, [1], true)) })
+    await screen.findByText(/Imported 1 of 2 tasks/)
+    expect(screen.getByText('todoist.csv')).toBeInTheDocument()
+    expect(screen.queryByText('Replacement task')).toBeNull()
+    expect(screen.getByText('Second task')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 tasks' }))
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadTitles(1)).toEqual(['Second task'])
+    expect(mocks.importTasks).toHaveBeenCalledTimes(2)
+  })
+
+  it('C3a-R5 tasks control: after an import settles, choosing another file still replaces the file, preview and retry', async () => {
+    mocks.importTasks
+      .mockRejectedValueOnce(new ImportIncompleteError(1, [1], true))
+      .mockResolvedValueOnce(1)
+    const { container } = renderWithIntl(<TaskImport onImportComplete={mocks.onImportComplete} />)
+    const input = container.querySelector('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [csv(['First task', 'Second task'])] } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 tasks' }))
+    await screen.findByText(/Imported 1 of 2 tasks/)
+
+    const replacement = new File(['TYPE,CONTENT\ntask,Replacement task'], 'replacement.csv', { type: 'text/csv' })
+    fireEvent.change(input, { target: { files: [replacement] } })
+    await screen.findByText('Replacement task')
+    expect(screen.queryByText('Second task')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 tasks' }))
+
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadTitles(1)).toEqual(['Replacement task'])
+    expect(screen.getByText('replacement.csv')).toBeInTheDocument()
+    expect(screen.queryByText(/Imported 1 of 2 tasks/)).toBeNull()
   })
 
   it('C3a-R5 tasks: a fully acknowledged import still reports its true count', async () => {

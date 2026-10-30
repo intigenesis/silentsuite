@@ -231,7 +231,7 @@ export default function ContactImport({ onImportComplete, heading }: ContactImpo
         label="contact list"
       />
 
-      <FileDropZone accept=".vcf" onFiles={handleFiles} />
+      <FileDropZone accept=".vcf" onFiles={handleFiles} disabled={isImporting} />
 
       {error && (
         <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>

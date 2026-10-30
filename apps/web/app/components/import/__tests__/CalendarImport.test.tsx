@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, onTestFinished, vi } from 'vitest'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import CalendarImport from '../CalendarImport'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import { useCalendarStore } from '@/app/stores/use-calendar-store'
@@ -36,12 +36,14 @@ const ics = (name: string, summaries: string[]) => new File([[
 
 /**
  * The real bridge with a controlled account. `uploads` and `batches` are consumed in call
- * order (default 'ok'); an offline batch fails before anything is applied.
+ * order (default 'ok'); an offline batch fails before anything is applied. `holdBatches`
+ * keeps each batch pending, after it is recorded, until that promise settles.
  */
 function installCalendarAccount(options: {
   existing: { uid: string; name: string }[]
   uploads?: ('ok' | 'fail')[]
   batches?: ('ok' | 'offline-before-apply')[]
+  holdBatches?: Promise<void>
 }) {
   const uploads = [...(options.uploads ?? [])]
   const batchPlan = [...(options.batches ?? [])]
@@ -66,6 +68,7 @@ function installCalendarAccount(options: {
             summaries: items.map(({ content }) => /SUMMARY:(.*)/.exec(content)?.[1]?.trim() ?? ''),
             outcome,
           })
+          await options.holdBatches
           if (outcome === 'offline-before-apply') throw new TypeError('Failed to fetch')
         },
       }),
@@ -129,6 +132,64 @@ describe('C3a CalendarImport reports only acknowledged events and retries only t
     expect(screen.getByText('Event two')).toBeInTheDocument()
     expect(account.batchCalls).toEqual([])
     expect(useCalendarStore.getState().events).toEqual([])
+  })
+
+  it('C3a-R7 events: a file chosen while an import is pending is refused, so the failed import keeps its own file, preview and retry', async () => {
+    let releaseBatch!: () => void
+    const account = installCalendarAccount({
+      existing: [{ uid: 'cal-work', name: 'Work' }],
+      batches: ['offline-before-apply'],
+      holdBatches: new Promise<void>((resolve) => { releaseBatch = resolve }),
+    })
+    // Never leave the held batch pending, even when an assertion fails first.
+    onTestFinished(() => releaseBatch())
+    const view = await dropFiles([ics('Work', ['Event one', 'Event two'])])
+    const input = view.container.querySelector('input[type="file"]')!
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 events' }))
+    await waitFor(() => expect(account.batchCalls).toHaveLength(1))
+
+    // Another file while the first import is still pending, given time to be read if it were accepted.
+    fireEvent.change(input, { target: { files: [ics('Other', ['Other event'])] } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)) })
+    expect(screen.queryByText('other.ics')).toBeNull()
+    expect(screen.getByText('work.ics')).toBeInTheDocument()
+    expect(screen.queryByText('Other event')).toBeNull()
+    expect(screen.getByText('Event one')).toBeInTheDocument()
+
+    await act(async () => { releaseBatch() })
+    await screen.findByText(/Imported 0 of 2 events/)
+    expect(screen.getByText('work.ics')).toBeInTheDocument()
+    expect(screen.queryByText('Other event')).toBeNull()
+    expect(screen.getByText('Event one')).toBeInTheDocument()
+    expect(screen.getByText('Event two')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Import 2 events' }))
+    await waitFor(() => expect(onImportComplete).toHaveBeenCalledWith(2))
+    expect(account.batchCalls.map(({ summaries, outcome }) => [summaries, outcome])).toEqual([
+      [['Event one', 'Event two'], 'offline-before-apply'],
+      [['Event one', 'Event two'], 'ok'],
+    ])
+  })
+
+  it('C3a-R7 events control: after an import settles, choosing another file still replaces the file, preview and retry', async () => {
+    const account = installCalendarAccount({ existing: [{ uid: 'cal-work', name: 'Work' }], batches: ['offline-before-apply'] })
+    const view = await dropFiles([ics('Work', ['Event one', 'Event two'])])
+    const input = view.container.querySelector('input[type="file"]')!
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 events' }))
+    await screen.findByText(/Imported 0 of 2 events/)
+
+    fireEvent.change(input, { target: { files: [ics('Other', ['Other event'])] } })
+    await screen.findByText('Other event')
+    expect(screen.queryByText('Event one')).toBeNull()
+    expect(screen.queryByText(/Imported 0 of 2 events/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 events' }))
+
+    await waitFor(() => expect(onImportComplete).toHaveBeenCalledWith(1))
+    expect(screen.getByText('other.ics')).toBeInTheDocument()
+    expect(account.batchCalls.map(({ summaries, outcome }) => [summaries, outcome])).toEqual([
+      [['Event one', 'Event two'], 'offline-before-apply'],
+      [['Other event'], 'ok'],
+    ])
   })
 
   it('C3a-R8 events: when the second calendar cannot be created, only that file is kept and a lone retry creates only its calendar', async () => {

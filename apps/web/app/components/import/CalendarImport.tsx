@@ -357,7 +357,7 @@ export default function CalendarImport({ onImportComplete, heading }: CalendarIm
         />
       )}
 
-      <FileDropZone accept=".ics" onFiles={handleFiles} />
+      <FileDropZone accept=".ics" onFiles={handleFiles} disabled={isImporting} />
 
       {error && (
         <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>

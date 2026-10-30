@@ -334,7 +334,7 @@ export default function TaskImport({ onImportComplete, heading }: TaskImportProp
         label="task list"
       />
 
-      <FileDropZone accept=".ics,.csv" onFiles={handleFiles} />
+      <FileDropZone accept=".ics,.csv" onFiles={handleFiles} disabled={isImporting} />
 
       {error && (
         <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>
