@@ -1,8 +1,7 @@
 """Static release-version consistency checks.
 
 These tests guard against stale user-visible versions across the bridge, web
-workspace packages, and Android metadata. They intentionally avoid archived
-prototype code under _archive/.
+workspace packages, and Android metadata.
 """
 
 from pathlib import Path
@@ -10,8 +9,8 @@ import json
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-CURRENT_RELEASE_VERSION = "0.5.15-beta"
-CURRENT_ANDROID_VERSION_CODE = 29
+CURRENT_RELEASE_VERSION = "0.5.17-beta"
+CURRENT_ANDROID_VERSION_CODE = 31
 
 PACKAGE_JSON_PATHS = [
     "package.json",

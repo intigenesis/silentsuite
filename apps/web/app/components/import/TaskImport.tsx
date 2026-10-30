@@ -13,6 +13,21 @@ import { useTaskListStore } from '@/app/stores/use-task-list-store'
 import { useEtebaseStore } from '@/app/stores/use-etebase-store'
 import type { Priority } from '@silentsuite/core'
 import { normalizeLabels } from '@/app/components/LabelEditor'
+import type { ImportIncompleteError } from '@/app/lib/import-outcome'
+
+function isImportIncomplete(err: unknown): err is ImportIncompleteError {
+  return err instanceof Error && err.name === 'ImportIncompleteError'
+}
+
+/** Only acknowledged tasks count as imported; an unconfirmed one may still exist remotely. */
+function incompleteImportMessage(saved: number, unsaved: number, uncertain: boolean): string {
+  const total = saved + unsaved
+  if (uncertain) {
+    return `Imported ${saved} of ${total} tasks. The other ${unsaved} weren't confirmed as saved and are listed below. If the connection dropped, some may already be saved, so check your list before importing them again.`
+  }
+  if (saved === 0) return `None of the ${total} tasks were saved. They're listed below so you can import them again.`
+  return `Imported ${saved} of ${total} tasks. The other ${unsaved} weren't saved and are listed below so you can import them again.`
+}
 
 interface TaskImportProps {
   onImportComplete: (count: number) => void
@@ -68,7 +83,7 @@ function extractVTodos(ical: string): VTodo[] {
 
 /** Simple Todoist CSV parser (fallback — the core csv-parser is being built separately) */
 function parseTodoistCsv(csv: string): VTodo[] {
-  const lines = csv.split(/\r?\n/)
+  const lines = splitCSVRecords(csv)
   if (lines.length < 2) return []
 
   // Parse header
@@ -127,6 +142,30 @@ function parseTodoistCsv(csv: string): VTodo[] {
   }
 
   return todos
+}
+
+/**
+ * Split CSV text into logical records. Line breaks inside quoted fields stay
+ * in the record verbatim; LF or CRLF outside quotes ends it. Quote state
+ * follows the parity of '"' characters, matching parseCSVLine.
+ */
+function splitCSVRecords(text: string): string[] {
+  const records: string[] = []
+  let start = 0
+  let inQuotes = false
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '"') {
+      inQuotes = !inQuotes
+    } else if (ch === '\n' && !inQuotes) {
+      const end = i > start && text[i - 1] === '\r' ? i - 1 : i
+      records.push(text.slice(start, end))
+      start = i + 1
+    }
+  }
+  records.push(text.slice(start))
+  return records
 }
 
 /** Parse a single CSV line with basic quote handling */
@@ -217,6 +256,7 @@ export default function TaskImport({ onImportComplete, heading }: TaskImportProp
 
   const handleImport = useCallback(async () => {
     setIsImporting(true)
+    setError(null)
     try {
       const newTasks = tasks.map((task) => ({
         title: task.summary || 'Untitled Task',
@@ -230,8 +270,15 @@ export default function TaskImport({ onImportComplete, heading }: TaskImportProp
       const count = await importTasks(newTasks)
       setImportedCount(count)
       onImportComplete(count)
-    } catch {
-      setError('An error occurred while importing tasks. Please try again.')
+    } catch (err) {
+      if (isImportIncomplete(err)) {
+        // Keep only the original tasks that were not acknowledged, so a retry never resends saved ones.
+        const unsaved = new Set(err.unsaved)
+        setTasks(tasks.filter((_, position) => unsaved.has(position)))
+        setError(incompleteImportMessage(err.saved, err.unsaved.length, err.uncertain))
+      } else {
+        setError('An error occurred while importing tasks. Please try again.')
+      }
     } finally {
       setIsImporting(false)
     }
@@ -287,7 +334,7 @@ export default function TaskImport({ onImportComplete, heading }: TaskImportProp
         label="task list"
       />
 
-      <FileDropZone accept=".ics,.csv" onFiles={handleFiles} />
+      <FileDropZone accept=".ics,.csv" onFiles={handleFiles} disabled={isImporting} />
 
       {error && (
         <p className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>

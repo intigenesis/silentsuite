@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, onTestFinished, vi } from 'vitest'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import ContactImport from '../ContactImport'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import { deserializeContact, serializeContact, type Contact } from '@silentsuite/core'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 const mocks = vi.hoisted(() => ({
   importContacts: vi.fn(),
   createCollection: vi.fn(),
@@ -218,5 +219,277 @@ describe('ContactImport categories normalization', () => {
     expect(await screen.findByText('Failed to parse the file. Please make sure it is a valid .vcf file.')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Import \d+ contacts/ })).not.toBeInTheDocument()
     expect(mocks.importContacts).not.toHaveBeenCalled()
+  })
+})
+
+// C3a-R6 (PLAN U1, U2, U4). The store outcome is controlled here to isolate the recovery UI;
+// the store contract itself is proven against the pinned SDK in use-contact-store.test.ts.
+describe('C3a-R6 ContactImport reports only acknowledged contacts and keeps the rest for retry', () => {
+  const vcf = (names: string[]) => new File(
+    [names.map((name) => ['BEGIN:VCARD', 'VERSION:4.0', `FN:${name}`, 'END:VCARD'].join('\r\n')).join('\r\n')],
+    'contacts.vcf',
+    { type: 'text/vcard' },
+  )
+  const caveat = /may already be saved/i
+  const payloadNames = (call: number) => (mocks.importContacts.mock.calls[call]![0] as { displayName: string }[]).map(({ displayName }) => displayName)
+
+  beforeEach(() => {
+    mocks.importContacts.mockReset()
+    mocks.onImportComplete.mockReset()
+  })
+
+  async function previewContacts(names: string[]) {
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [vcf(names)] } })
+    return screen.findByRole('button', { name: `Import ${names.length} contacts` })
+  }
+
+  it('C3a-R6 contacts: a partial unconfirmed import reports the acknowledged count, warns before retry, and retries only the rest', async () => {
+    mocks.importContacts
+      .mockRejectedValueOnce(new ImportIncompleteError(1, [1], true))
+      .mockResolvedValueOnce(1)
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    const message = await screen.findByText(/Imported 1 of 2 contacts/)
+    expect(message.textContent).toMatch(/(weren't|were not) confirmed as saved/i)
+    expect(message.textContent).toMatch(caveat)
+    expect(screen.queryByText(/contacts imported/)).toBeNull()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+
+    // Only the unacknowledged original record stays previewed and importable.
+    const retry = screen.getByRole('button', { name: 'Import 1 contacts' })
+    expect(screen.queryByText('Ada One')).toBeNull()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+
+    fireEvent.click(retry)
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadNames(1)).toEqual(['Bea Two'])
+    expect(screen.getByText('1 contacts imported')).toBeInTheDocument()
+    expect(screen.queryByText(/Imported 1 of 2 contacts/)).toBeNull()
+  })
+
+  it('C3a-R6 contacts: an unconfirmed import with nothing acknowledged keeps every contact and warns they may already be saved', async () => {
+    mocks.importContacts.mockRejectedValueOnce(new ImportIncompleteError(0, [0, 1], true))
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    const message = await screen.findByText(/Imported 0 of 2 contacts/)
+    expect(message.textContent).toMatch(caveat)
+    expect(screen.getByRole('button', { name: 'Import 2 contacts' })).toBeInTheDocument()
+    expect(screen.getByText('Ada One')).toBeInTheDocument()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R6 contacts: an import that sent nothing says none were saved, without the may-already-be-saved caveat', async () => {
+    mocks.importContacts.mockRejectedValueOnce(new ImportIncompleteError(0, [0, 1], false))
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    const message = await screen.findByText(/None of the 2 contacts were saved/i)
+    expect(message.textContent).not.toMatch(caveat)
+    expect(screen.getByRole('button', { name: 'Import 2 contacts' })).toBeInTheDocument()
+    expect(screen.getByText('Ada One')).toBeInTheDocument()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R6 contacts: a file chosen while an import is pending is refused, so the failed import keeps its own file, preview and retry', async () => {
+    let rejectPending!: (reason: unknown) => void
+    mocks.importContacts
+      .mockImplementationOnce(() => new Promise<number>((_, reject) => { rejectPending = reject }))
+      .mockResolvedValueOnce(1)
+    // Never leave the deferred import pending, even when an assertion fails first.
+    onTestFinished(() => rejectPending?.(new Error('settled at test end')))
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    const input = container.querySelector('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [vcf(['Ada One', 'Bea Two'])] } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 contacts' }))
+    await waitFor(() => expect(mocks.importContacts).toHaveBeenCalledTimes(1))
+
+    // Another file while the first import is still pending, given time to be read if it were accepted.
+    const replacement = new File([['BEGIN:VCARD', 'VERSION:4.0', 'FN:Cy Replacement', 'END:VCARD'].join('\r\n')], 'replacement.vcf', { type: 'text/vcard' })
+    fireEvent.change(input, { target: { files: [replacement] } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)) })
+    expect(screen.queryByText('replacement.vcf')).toBeNull()
+    expect(screen.getByText('contacts.vcf')).toBeInTheDocument()
+    expect(screen.queryByText('Cy Replacement')).toBeNull()
+    expect(screen.getByText('Ada One')).toBeInTheDocument()
+
+    await act(async () => { rejectPending(new ImportIncompleteError(1, [1], true)) })
+    await screen.findByText(/Imported 1 of 2 contacts/)
+    expect(screen.getByText('contacts.vcf')).toBeInTheDocument()
+    expect(screen.queryByText('Cy Replacement')).toBeNull()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 contacts' }))
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadNames(1)).toEqual(['Bea Two'])
+    expect(mocks.importContacts).toHaveBeenCalledTimes(2)
+  })
+
+  it('C3a-R6 contacts control: after an import settles, choosing another file still replaces the file, preview and retry', async () => {
+    mocks.importContacts
+      .mockRejectedValueOnce(new ImportIncompleteError(1, [1], true))
+      .mockResolvedValueOnce(1)
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    const input = container.querySelector('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [vcf(['Ada One', 'Bea Two'])] } })
+    fireEvent.click(await screen.findByRole('button', { name: 'Import 2 contacts' }))
+    await screen.findByText(/Imported 1 of 2 contacts/)
+
+    const replacement = new File([['BEGIN:VCARD', 'VERSION:4.0', 'FN:Cy Replacement', 'END:VCARD'].join('\r\n')], 'replacement.vcf', { type: 'text/vcard' })
+    fireEvent.change(input, { target: { files: [replacement] } })
+    await screen.findByText('Cy Replacement')
+    expect(screen.queryByText('Bea Two')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Import 1 contacts' }))
+
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadNames(1)).toEqual(['Cy Replacement'])
+    expect(screen.getByText('replacement.vcf')).toBeInTheDocument()
+    expect(screen.queryByText(/Imported 1 of 2 contacts/)).toBeNull()
+  })
+
+  it('C3a-R6 contacts: a fully acknowledged import still reports its true count', async () => {
+    mocks.importContacts.mockResolvedValueOnce(2)
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(2))
+    expect(screen.getByText('2 contacts imported')).toBeInTheDocument()
+    expect(payloadNames(0)).toEqual(['Ada One', 'Bea Two'])
+  })
+})
+
+// Yearless and text birthdays through the rendered importer (repair plan v2, D2-D4).
+// BEHAVIOR messages are the regression; FIXTURE marks a broken harness.
+describe('ContactImport birthdays', () => {
+  type FlaggedContact = Contact & { birthdayIsText?: boolean }
+  const bdayLines = (wire: string) => wire.split('\r\n').filter((line) => /^BDAY[;:]/i.test(line))
+
+  beforeEach(() => {
+    mocks.importContacts.mockReset().mockResolvedValue(7)
+    mocks.onImportComplete.mockReset()
+  })
+
+  it('imports yearless dates without a year and keeps date-shaped text as text', async () => {
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    const cards: Array<[string, string, string]> = [
+      ['4.0', 'Basic', 'BDAY:--0416'],
+      ['3.0', 'Apple', 'BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['4.0', 'Text basic', 'BDAY;VALUE=text:--0416'],
+      ['3.0', 'Text extended', 'BDAY;VALUE=TEXT:--04-16'],
+      ['4.0', 'Leap', 'BDAY:--02-29'],
+      ['3.0', 'Full', 'BDAY:1990-04-16'],
+      ['3.0', 'None', ''],
+    ]
+    const source = cards
+      .map(([version, name, bday]) => ['BEGIN:VCARD', `VERSION:${version}`, `FN:${name}`, ...(bday ? [bday] : []), 'END:VCARD'].join('\r\n'))
+      .join('\r\n')
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File([source], 'synthetic-birthdays.vcf', { type: 'text/vcard' })] },
+    })
+    fireEvent.click(await screen.findByRole('button', { name: /Import 7 contacts/ }))
+    await waitFor(() => expect(mocks.importContacts).toHaveBeenCalledTimes(1))
+
+    const payload = mocks.importContacts.mock.calls[0]![0] as FlaggedContact[]
+    if (payload.length !== 7) throw new Error(`FIXTURE: expected 7 imported cards, got ${payload.length}`)
+    expect(payload.map((c) => [c.displayName, c.birthday, c.birthdayIsText === true]), 'BEHAVIOR: imported birthday values and types').toEqual([
+      ['Basic', '--04-16', false],
+      ['Apple', '--04-16', false],
+      ['Text basic', '--0416', true],
+      ['Text extended', '--04-16', true],
+      ['Leap', '--02-29', false],
+      ['Full', '1990-04-16', false],
+      ['None', null, false],
+    ])
+
+    const expectedLines = [
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16'],
+      ['BDAY;VALUE=text:--0416'],
+      ['BDAY;VALUE=text:--04-16'],
+      ['BDAY;X-APPLE-OMIT-YEAR=1604:1604-02-29'],
+      ['BDAY:1990-04-16'],
+      [],
+    ]
+    payload.forEach((imported, index) => {
+      // Add the identity/timestamps and the empty name/list defaults the store's buildContact
+      // assigns (these cards have no N, TEL, EMAIL or ADR); exercise real wire persistence and reload.
+      const name = {
+        prefix: imported.name?.prefix ?? '',
+        given: imported.name?.given ?? '',
+        family: imported.name?.family ?? '',
+        suffix: imported.name?.suffix ?? '',
+      }
+      const record = {
+        ...imported,
+        name,
+        phones: imported.phones ?? [],
+        emails: imported.emails ?? [],
+        addresses: imported.addresses ?? [],
+        id: `synthetic-${index}`,
+        uid: `synthetic-${index}`,
+        created_at: new Date(),
+        updated_at: new Date(),
+      }
+      const wire = serializeContact(record)
+      expect(bdayLines(wire), `BEHAVIOR: ${imported.displayName} persisted form`).toEqual(expectedLines[index])
+      const reloaded = deserializeContact(wire) as FlaggedContact
+      expect([reloaded.birthday, reloaded.birthdayIsText === true], `BEHAVIOR: ${imported.displayName} reload`).toEqual([imported.birthday, imported.birthdayIsText === true])
+      expect(bdayLines(serializeContact(reloaded)), `BEHAVIOR: ${imported.displayName} repeated serialization`).toEqual(expectedLines[index])
+    })
+  })
+
+  // A text birthday is written with a `BDAY;VALUE=text:` header (16 octets), so 59 more
+  // octets fill the first 75-octet line and the next characters start a continuation.
+  // The importer's line-trimming splitter must never read a continuation as a frame.
+  describe('re-imports an exported text birthday that folds near a card-boundary word', () => {
+    const FOLLOWING = 'X-FOLLOW:kept'
+    const exportedContact = (uid: string, displayName: string, birthday: string | null, unknownProperties?: string[]): FlaggedContact => ({
+      id: uid, uid, displayName, name: { prefix: '', given: displayName, family: '', suffix: '' },
+      phones: [], emails: [], addresses: [], organization: '', title: '', notes: '',
+      birthday, ...(birthday ? { birthdayIsText: true } : {}), photoUrl: null,
+      categories: [], favorite: false, ...(unknownProperties ? { unknownProperties } : {}),
+      created_at: new Date(Date.UTC(2026, 9, 25)), updated_at: new Date(Date.UTC(2026, 9, 25)),
+    })
+    /** The same bytes Settings Export downloads: BOM, then each serialized card terminated by CRLF. */
+    const exportedFile = (contacts: Contact[]) =>
+      new File([`﻿${contacts.map((contact) => `${serializeContact(contact)}\r\n`).join('')}`], 'silentsuite-contacts.vcf', { type: 'text/vcard' })
+    const cardFrame = (line: string) => /^(BEGIN|END):VCARD$/.test(line.trim().toUpperCase())
+
+    it.each([
+      ['END:VCARD at the first fold', `${'a'.repeat(59)}END:VCARD`],
+      ['BEGIN:VCARD at the first fold', `${'a'.repeat(59)}BEGIN:VCARD`],
+      ['a lowercase boundary word', `${'a'.repeat(59)}end:vcard`],
+      ['leading whitespace before the word', `${'a'.repeat(59)}  BEGIN:VCARD`],
+      ['the word at a later fold', `${'a'.repeat(59)}${'b'.repeat(74)}END:VCARD`],
+      ['a dotless i that uppercases to the boundary word', `${'a'.repeat(59)}begın:vcard`],
+      ['an ordinary long folded text birthday', `circa ${'x'.repeat(90)}`],
+    ])('keeps count, names, text birthday and the following property with %s', async (_label, birthday) => {
+      const contacts = [
+        exportedContact('text-bday-1', 'Text Birthday', birthday, [FOLLOWING]),
+        exportedContact('text-bday-2', 'Second Person', null),
+      ]
+      const wire = serializeContact(contacts[0]!)
+      // Control: the canonical parser unfolds the stored card correctly either way.
+      const stored = deserializeContact(wire) as FlaggedContact
+      expect([stored.birthday, stored.birthdayIsText, stored.unknownProperties], 'BEHAVIOR: stored card round trip').toEqual([birthday, true, [FOLLOWING]])
+
+      const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+      mocks.importContacts.mockReset().mockResolvedValue(2)
+      fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [exportedFile(contacts)] } })
+      // Wait for whichever outcome the importer reaches, then assert the behaviour itself.
+      await waitFor(() => expect(screen.queryByRole('button', { name: /Import \d+ contacts/ }) ?? screen.queryByText(/Failed to parse the file/)).not.toBeNull())
+      expect(screen.queryByText(/Failed to parse the file/), 'BEHAVIOR: exported file parses').toBeNull()
+      expect(screen.getByRole('button', { name: /Import \d+ contacts/ }).textContent, 'BEHAVIOR: one exported card stays one card').toMatch(/Import 2 contacts/)
+      fireEvent.click(screen.getByRole('button', { name: /Import \d+ contacts/ }))
+      await waitFor(() => expect(mocks.importContacts).toHaveBeenCalledTimes(1))
+
+      const payload = mocks.importContacts.mock.calls[0]![0] as FlaggedContact[]
+      expect(payload.map((contact) => contact.displayName), 'BEHAVIOR: imported card names').toEqual(['Text Birthday', 'Second Person'])
+      expect([payload[0]!.birthday, payload[0]!.birthdayIsText], 'BEHAVIOR: text birthday and type survive').toEqual([birthday, true])
+      expect(payload[0]!.unknownProperties, 'BEHAVIOR: the property after BDAY survives').toEqual([FOLLOWING])
+      expect(payload[1]!.unknownProperties, 'BEHAVIOR: nothing leaks into the following card').toBeUndefined()
+      // Only the real frame lines may look like a card boundary to a line-trimming splitter.
+      expect(wire.split('\r\n').filter(cardFrame), 'BEHAVIOR: no continuation reads as a frame').toEqual(['BEGIN:VCARD', 'END:VCARD'])
+    })
   })
 })

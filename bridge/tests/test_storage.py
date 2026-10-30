@@ -1,5 +1,6 @@
 """Tests for the Radicale storage backend."""
 
+import re
 import threading
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -812,3 +813,89 @@ class TestCreateCollection:
                 )
 
         mock_col_mgr.create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Yearless birthdays on the vCard 4 -> 3 downgrade (repair plan v2, D8)
+# ---------------------------------------------------------------------------
+
+
+class TestYearlessBirthdayDowngrade:
+    """Synthetic, photo-free vCard 4 items as served to CardDAV clients (vCard 3).
+
+    Assertion messages starting with BEHAVIOR are the regression; RuntimeError
+    messages starting with FIXTURE are harness problems, not a reproduction.
+    Served text is parsed again and compared on value and case-folded
+    parameters, so the checks do not depend on vobject's spelling or order.
+    """
+
+    HREF = "birthday.vcf"
+    MARKED = ("1604-04-16", {"X-APPLE-OMIT-YEAR": ["1604"]})
+
+    @classmethod
+    def _serve(cls, mem_db, user, bday_line):
+        lines = ["BEGIN:VCARD", "VERSION:4.0", "UID:bday-1", "FN:Synthetic Person"]
+        if bday_line:
+            lines.append(bday_line)
+        lines.append("END:VCARD")
+        stored = "\r\n".join(lines)
+        collection, _, item = TestFavoriteCardDavRoundTrip._collection(
+            mem_db, user, stored, uid="bday-1", href=cls.HREF
+        )
+        served = dict(collection.get_multi([cls.HREF])).get(cls.HREF)
+        if served is None:
+            raise RuntimeError("FIXTURE: synthetic item was not served")
+        text = served.serialize()
+        card = vobject.readOne(text)
+        if card.contents["version"][0].value != "3.0":
+            raise RuntimeError("FIXTURE: vCard 4 item was not downgraded to vCard 3")
+        assert item.content == stored, "BEHAVIOR: serving must not rewrite the stored item"
+        return text, card
+
+    @staticmethod
+    def _bdays(card):
+        return [
+            (
+                line.value,
+                {key.upper(): [str(v).lower() for v in values] for key, values in line.params.items()},
+            )
+            for line in card.contents.get("bday", [])
+        ]
+
+    @pytest.mark.parametrize("bday_line", [
+        "BDAY:--0416",
+        "BDAY:--04-16",
+        "BDAY;VALUE=date:--0416",
+        "BDAY;VALUE=date-and-or-time:--04-16",
+    ])
+    def test_yearless_birthday_is_served_in_marked_vcard3_form(self, mem_db, user, bday_line):
+        text, card = self._serve(mem_db, user, bday_line)
+        assert self._bdays(card) == [self.MARKED], f"BEHAVIOR: {bday_line} served with omit-year marker"
+        assert re.search(r"(?im)^BDAY;X-APPLE-OMIT-YEAR=1604:1604-04-16\r?$", text), \
+            f"BEHAVIOR: {bday_line} serialized marked form"
+        assert not re.search(r"(?im)^BDAY[^:\r\n]*:--", text), f"BEHAVIOR: {bday_line} no bare partial under 3.0"
+
+    def test_leap_day_is_served_in_marked_form(self, mem_db, user):
+        _, card = self._serve(mem_db, user, "BDAY:--0229")
+        assert self._bdays(card) == [("1604-02-29", {"X-APPLE-OMIT-YEAR": ["1604"]})], "BEHAVIOR: leap day"
+
+    @pytest.mark.parametrize("value", ["--0230", "--0431", "--1301", "--04"])
+    def test_invalid_partial_is_served_unchanged(self, mem_db, user, value):
+        _, card = self._serve(mem_db, user, f"BDAY:{value}")
+        assert self._bdays(card) == [(value, {})], f"BEHAVIOR: invalid {value} unchanged and unmarked"
+
+    @pytest.mark.parametrize("value", ["1990-04-16", "19900416"])
+    def test_full_date_is_served_unchanged(self, mem_db, user, value):
+        text, card = self._serve(mem_db, user, f"BDAY:{value}")
+        assert self._bdays(card) == [(value, {})], f"BEHAVIOR: full date {value} unchanged"
+        assert "X-APPLE-OMIT-YEAR" not in text.upper(), f"BEHAVIOR: full date {value} gets no marker"
+
+    @pytest.mark.parametrize("value", ["--0416", "--04-16", "circa 1800"])
+    def test_text_birthday_is_not_converted(self, mem_db, user, value):
+        text, card = self._serve(mem_db, user, f"BDAY;VALUE=text:{value}")
+        assert self._bdays(card) == [(value, {"VALUE": ["text"]})], f"BEHAVIOR: text {value} keeps value and type"
+        assert "X-APPLE-OMIT-YEAR" not in text.upper(), f"BEHAVIOR: text {value} is not turned into a date"
+
+    def test_card_without_birthday_has_none(self, mem_db, user):
+        _, card = self._serve(mem_db, user, None)
+        assert self._bdays(card) == [], "BEHAVIOR: no BDAY"

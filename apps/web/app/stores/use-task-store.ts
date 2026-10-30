@@ -4,9 +4,10 @@ import { create } from 'zustand'
 import type { Task, TaskStatus, Priority, SyncStatus } from '@silentsuite/core'
 import { useEtebaseStore } from '@/app/stores/use-etebase-store'
 import { useAuthStore } from '@/app/stores/use-auth-store'
-import { enqueue } from '@/app/lib/offline-queue'
+import { enqueue, readOutstanding } from '@/app/lib/offline-queue'
 import { assertOfflineQueueAccountGuard, captureOfflineQueueAccountGuard, isOfflineQueueBoundaryCancellation } from '@/app/lib/offline-queue-account'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 import { showErrorToast } from '@/app/stores/use-toast-store'
 import { useTaskListStore } from '@/app/stores/use-task-list-store'
 import { useLabelSuggestionsStore } from '@/app/stores/use-label-suggestions-store'
@@ -31,11 +32,27 @@ interface TaskState {
   syncStatus: SyncStatus
 }
 
+/**
+ * A task create the server did not acknowledge. `unconfirmed` is false only when nothing was
+ * sent; otherwise the task may still exist remotely (a lost response), so it is never called absent.
+ */
+export class TaskSaveError extends Error {
+  constructor(readonly unconfirmed: boolean) {
+    super(unconfirmed ? 'Task save not confirmed' : 'Task not saved')
+    this.name = 'TaskSaveError'
+  }
+}
+
 interface TaskActions {
+  /**
+   * Resolves once the server acknowledged the task, or once the create is held in the offline
+   * queue; otherwise removes the temp task and rejects with TaskSaveError.
+   */
   createTask: (task: NewTask) => Promise<Task>
   updateTask: (id: string, patch: Partial<Task>) => Promise<void>
   deleteTask: (id: string) => Promise<void>
   toggleComplete: (id: string) => Promise<void>
+  /** Resolves the requested count only when every task was acknowledged; otherwise rejects with ImportIncompleteError. */
   importTasks: (newTasks: NewTask[]) => Promise<number>
   syncFromRemote: (tasks: Task[]) => void
 }
@@ -52,7 +69,8 @@ export const useTaskStore = create<TaskState & TaskActions>()(
       syncStatus: 'synced' as SyncStatus,
 
       createTask: async (newTask: NewTask) => {
-        if (!useAuthStore.getState().canWrite()) throw new Error('Your subscription has ended. Upgrade to make changes.')
+        // Refused before anything is listed or sent: a known, definite non-save.
+        if (!useAuthStore.getState().canWrite()) throw new TaskSaveError(false)
         const tempId = crypto.randomUUID()
         const now = new Date()
         const task: Task = {
@@ -76,31 +94,53 @@ export const useTaskStore = create<TaskState & TaskActions>()(
 
         // Optimistic local update
         set((state) => ({ tasks: [...state.tasks, task] }))
+        // An unacknowledged temp task would vanish on the next refresh; the caller keeps the draft.
+        const withdraw = (unconfirmed: boolean): never => {
+          set((state) => {
+            const remaining = state.tasks.filter((t) => t.id !== tempId)
+            return remaining.length === state.tasks.length ? state : { tasks: remaining }
+          })
+          throw new TaskSaveError(unconfirmed)
+        }
 
         // Sync to Etebase
         const etebase = useEtebaseStore.getState()
-        if (etebase.account) {
-          try {
-            const { serializeTask } = await import('@silentsuite/core')
-            const content = serializeTask(task)
-            const itemUid = await etebase.createItem('tasks', content, tempId, task.listId)
-            if (itemUid) {
-              void useLabelSuggestionsStore.getState().recordUsage('tasks', task.categories ?? [])
-              // Replace temp id with real Etebase item UID
-              set((state) => ({
-                tasks: state.tasks.map((t) =>
-                  t.id === tempId ? { ...t, id: itemUid } : t,
-                ),
-              }))
-              return { ...task, id: itemUid }
-            }
-          } catch (err) {
-            console.error('[task-store] Failed to sync new task to Etebase', getSafeErrorDetails(err))
-            showErrorToast('Failed to save task. Please try again.')
+        if (!etebase.account) return withdraw(false)
+        let dispatched = false
+        try {
+          const { serializeTask } = await import('@silentsuite/core')
+          const content = serializeTask(task)
+          dispatched = true
+          const itemUid = await etebase.createItem('tasks', content, tempId, task.listId)
+          if (itemUid) {
+            void useLabelSuggestionsStore.getState().recordUsage('tasks', task.categories ?? [])
+            // Replace temp id with real Etebase item UID
+            set((state) => ({
+              tasks: state.tasks.map((t) =>
+                t.id === tempId ? { ...t, id: itemUid } : t,
+              ),
+            }))
+            return { ...task, id: itemUid }
           }
+        } catch (err) {
+          console.error('[task-store] Failed to sync new task to Etebase', getSafeErrorDetails(err))
+          showErrorToast('Failed to save task. Please try again.')
         }
 
-        return task
+        // Not acknowledged. A create admitted to the offline queue is durable local custody
+        // awaiting replay, so the temp task stays; anything else may or may not exist remotely.
+        if (dispatched) {
+          const guard = captureOfflineQueueAccountGuard(etebase)
+          if (guard) {
+            try {
+              const outstanding = await readOutstanding({ collectionType: 'tasks', itemUid: tempId }, guard)
+              if (outstanding.some((entry) => entry.type === 'create')) return task
+            } catch {
+              // An unreadable queue proves nothing: the create stays unconfirmed.
+            }
+          }
+        }
+        return withdraw(dispatched)
       },
 
       updateTask: async (id: string, patch: Partial<Task>) => {
@@ -261,30 +301,38 @@ export const useTaskStore = create<TaskState & TaskActions>()(
         // Optimistic local update — add all at once
         set((state) => ({ tasks: [...state.tasks, ...tasks] }))
 
-        // Batch sync to Etebase
+        // Batch sync to Etebase. Input positions the server acknowledged; the rest are rolled back.
+        const acknowledged = new Set<number>()
+        let sent = false
         const etebase = useEtebaseStore.getState()
         if (etebase.account) {
           try {
             const { serializeTask } = await import('@silentsuite/core')
-            const groups = new Map<string | undefined, Task[]>()
-            for (const task of tasks) {
-              const key = task.listId
-              groups.set(key, [...(groups.get(key) ?? []), task])
-            }
+            const groups = new Map<string | undefined, number[]>()
+            tasks.forEach((task, position) => {
+              groups.set(task.listId, [...(groups.get(task.listId) ?? []), position])
+            })
 
-            for (const [targetCollectionUid, groupTasks] of groups) {
-              const contents = groupTasks.map((t) => ({
-                content: serializeTask(t),
-                tempId: t.id,
+            for (const [targetCollectionUid, positions] of groups) {
+              const contents = positions.map((position) => ({
+                content: serializeTask(tasks[position]!),
+                tempId: tasks[position]!.id,
               }))
+              sent = true
               const uids = await etebase.createItemsBatch('tasks', contents, targetCollectionUid)
+              // Each acknowledged task takes its item id and keeps its own VTODO UID.
+              const itemIds = new Map<string, string>()
+              positions.forEach((position, index) => {
+                const itemUid = uids[index]
+                if (!itemUid) return
+                itemIds.set(tasks[position]!.id, itemUid)
+                acknowledged.add(position)
+              })
+              if (itemIds.size === 0) continue
               set((state) => ({
                 tasks: state.tasks.map((t) => {
-                  const idx = groupTasks.findIndex((task) => task.id === t.id)
-                  if (idx !== -1 && uids[idx]) {
-                    return { ...t, id: uids[idx]! }
-                  }
-                  return t
+                  const itemUid = itemIds.get(t.id)
+                  return itemUid ? { ...t, id: itemUid } : t
                 }),
               }))
             }
@@ -293,7 +341,15 @@ export const useTaskStore = create<TaskState & TaskActions>()(
           }
         }
 
-        return tasks.length
+        if (acknowledged.size === tasks.length) return tasks.length
+        const unsaved = tasks.map((_, position) => position).filter((position) => !acknowledged.has(position))
+        // Unacknowledged temp tasks would vanish on the next refresh; the importer keeps their input.
+        const tempIds = new Set(unsaved.map((position) => tasks[position]!.id))
+        set((state) => {
+          const remaining = state.tasks.filter((t) => !tempIds.has(t.id))
+          return remaining.length === state.tasks.length ? state : { tasks: remaining }
+        })
+        throw new ImportIncompleteError(acknowledged.size, unsaved, sent)
       },
 
       syncFromRemote: (remoteTasks: Task[]) => {

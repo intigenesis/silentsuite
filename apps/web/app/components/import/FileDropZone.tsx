@@ -7,21 +7,23 @@ interface FileDropZoneProps {
   accept: string
   onFiles: (files: File[]) => void
   multiple?: boolean
+  /** Refuses new files, keeping the shown filename, e.g. while an import of the current one is pending. */
+  disabled?: boolean
 }
 
-export default function FileDropZone({ accept, onFiles, multiple = true }: FileDropZoneProps) {
+export default function FileDropZone({ accept, onFiles, multiple = true, disabled = false }: FileDropZoneProps) {
   const [isDragOver, setIsDragOver] = useState(false)
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const inputRef = useRef<HTMLInputElement>(null)
 
   const handleFiles = useCallback(
     (files: FileList | null) => {
-      if (!files || files.length === 0) return
+      if (disabled || !files || files.length === 0) return
       const arr = Array.from(files)
       setSelectedFiles(arr)
       onFiles(arr)
     },
-    [onFiles],
+    [disabled, onFiles],
   )
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -55,6 +57,7 @@ export default function FileDropZone({ accept, onFiles, multiple = true }: FileD
     <div className="space-y-2">
       <button
         type="button"
+        disabled={disabled}
         onClick={() => inputRef.current?.click()}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
@@ -83,6 +86,7 @@ export default function FileDropZone({ accept, onFiles, multiple = true }: FileD
         type="file"
         accept={accept}
         multiple={multiple}
+        disabled={disabled}
         onChange={(e) => handleFiles(e.target.files)}
         className="hidden"
       />

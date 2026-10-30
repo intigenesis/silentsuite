@@ -8,6 +8,7 @@ import { AccountBoundaryChangedError, getAccountEpoch, isCurrentAccountEpoch } f
 import { assertOfflineQueueAccountGuard, captureOfflineQueueAccountGuard } from '@/app/lib/offline-queue-account'
 import { readOutstanding } from '@/app/lib/offline-queue'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 import { showErrorToast } from '@/app/stores/use-toast-store'
 import { useContactListStore } from '@/app/stores/use-contact-list-store'
 import { useLabelSuggestionsStore } from '@/app/stores/use-label-suggestions-store'
@@ -22,6 +23,7 @@ interface NewContact {
   title?: string
   notes?: string
   birthday?: string | null
+  birthdayIsText?: boolean
   photoUrl?: string | null
   categories?: string[]
   favorite?: boolean
@@ -56,7 +58,10 @@ interface ContactActions {
   /** Removes the contact only after the server delete is accepted; resolves false otherwise. */
   deleteContact: (id: string) => Promise<boolean>
   setSearchQuery: (query: string) => void
-  /** Resolves with the number of contacts committed and published in the origin account. */
+  /**
+   * Resolves the requested count only when every contact was committed and published in the
+   * origin account; otherwise rejects with ImportIncompleteError (or the account boundary error).
+   */
   importContacts: (newContacts: NewContact[]) => Promise<number>
   syncFromRemote: (contacts: StoredContact[]) => void
 }
@@ -85,6 +90,7 @@ function buildContact(input: NewContact, uid: string, now: Date): Contact {
     title: input.title ?? '',
     notes: input.notes ?? '',
     birthday: input.birthday ?? null,
+    ...(input.birthdayIsText === true && input.birthday ? { birthdayIsText: true } : {}),
     photoUrl: input.photoUrl ?? null,
     categories: input.categories ?? [],
     favorite: input.favorite ?? false,
@@ -343,6 +349,9 @@ export const useContactStore = create<ContactState & ContactActions>()(
         const base = get().contacts.find((contact) => contact.id === id)
         if (!base) return false
         const draft: StoredContact = { ...base, ...patch, updated_at: new Date(), revision: null }
+        // A birthday set without its own type is a date: a text type read with
+        // the previous value must not carry over to it.
+        if ('birthday' in patch && !('birthdayIsText' in patch)) delete draft.birthdayIsText
         const star = sealIntent === 'favorite'
           ? { value: draft.favorite === true, base: { ...base, favorite: base.favorite === true } }
           : undefined
@@ -501,30 +510,48 @@ export const useContactStore = create<ContactState & ContactActions>()(
         const now = new Date()
         // Published at once under explicit temp ids with no revision; each is replaced only
         // by its own committed item, in the origin account (#744 §8).
-        const drafts = newContacts.map((input) => {
+        const drafts = newContacts.map((input, position) => {
           const tempId = crypto.randomUUID()
-          return { tempId, contact: { ...buildContact(input, tempId, now), revision: null } as StoredContact }
+          return { position, tempId, contact: { ...buildContact(input, tempId, now), revision: null } as StoredContact }
         })
         for (const { tempId, contact } of drafts) pendingCreates.set(tempId, { accountEpoch, record: contact })
         set((state) => ({ contacts: [...state.contacts, ...drafts.map(({ contact }) => contact)] }))
         const settleDrafts = () => {
           for (const { tempId, contact } of drafts) if (pendingCreates.get(tempId)?.record === contact) pendingCreates.delete(tempId)
         }
+        // Input positions committed and published in the origin account; the rest are rolled back.
+        const acknowledged = new Set<number>()
+        let sent = false
+        /**
+         * Rejects with what was acknowledged. Only this import's own unacknowledged temp records
+         * leave the list, and only while the origin account is still current.
+         */
+        const rejectIncomplete = (): never => {
+          const unsaved = drafts.filter(({ position }) => !acknowledged.has(position))
+          if (isCurrentAccountEpoch(accountEpoch)) {
+            const temps = new Set(unsaved.map(({ contact }) => contact))
+            set((state) => {
+              const remaining = state.contacts.filter((record) => !temps.has(record))
+              return remaining.length === state.contacts.length ? state : { contacts: remaining }
+            })
+          }
+          throw new ImportIncompleteError(acknowledged.size, unsaved.map(({ position }) => position), sent)
+        }
         const etebase = useEtebaseStore.getState()
         if (!etebase.account) {
           settleDrafts()
-          return drafts.length
+          return rejectIncomplete()
         }
         const { serializeContact, savedRevisionOf } = await import('@silentsuite/core')
         if (!isCurrentAccountEpoch(accountEpoch)) throw new AccountBoundaryChangedError()
 
         const groups = new Map<string | undefined, typeof drafts>()
         for (const draft of drafts) groups.set(draft.contact.listId, [...(groups.get(draft.contact.listId) ?? []), draft])
-        let published = 0
         try {
           for (const [targetCollectionUid, group] of groups) {
             if (!isCurrentAccountEpoch(accountEpoch)) throw new AccountBoundaryChangedError()
             const committed = new Map<string, string | null>()
+            sent = true
             const uids = await etebase.createItemsBatch(
               'contacts',
               group.map(({ tempId, contact }) => ({ content: serializeContact(contact), tempId })),
@@ -537,13 +564,14 @@ export const useContactStore = create<ContactState & ContactActions>()(
             // Only items the server acknowledged in this account replace their temp records,
             // each with its own revision; the rest stay local under their temp ids.
             const committedRecords = new Map<StoredContact, StoredContact>()
-            group.forEach(({ tempId, contact }, index) => {
+            group.forEach(({ position, tempId, contact }, index) => {
               const itemUid = uids[index]
-              if (itemUid && committed.has(tempId)) committedRecords.set(contact, { ...contact, id: itemUid, revision: committed.get(tempId) ?? null })
+              if (!itemUid || !committed.has(tempId)) return
+              committedRecords.set(contact, { ...contact, id: itemUid, revision: committed.get(tempId) ?? null })
+              acknowledged.add(position)
             })
             if (committedRecords.size === 0) continue
             set((state) => ({ contacts: state.contacts.map((record) => committedRecords.get(record) ?? record) }))
-            published += committedRecords.size
             void useLabelSuggestionsStore.getState().recordUsage('contacts', [...committedRecords.values()].flatMap((contact) => contact.categories ?? []))
           }
         } catch (err) {
@@ -552,8 +580,8 @@ export const useContactStore = create<ContactState & ContactActions>()(
         } finally {
           settleDrafts()
         }
-        void published
-        return drafts.length
+        if (acknowledged.size === drafts.length) return drafts.length
+        return rejectIncomplete()
       },
 
       syncFromRemote: (remoteContacts: StoredContact[]) => {

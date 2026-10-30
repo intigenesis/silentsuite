@@ -3365,6 +3365,21 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       return contents.map(() => null)
     }
 
+    /** Queues unacknowledged creates under the captured owner; false once the account boundary moved. */
+    const enqueueCreates = async (pending: typeof contents): Promise<boolean> => {
+      for (const { content, tempId } of pending) {
+        try {
+          assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+          await enqueue({ type: 'create', collectionType: type, collectionUid: collection.uid, content, tempId }, offlineQueueGuard)
+          assertOfflineQueueAccountGuard(offlineQueueGuard, get())
+        } catch (queueErr) {
+          if (!isCurrentAccountEpoch(accountEpoch) || queueErr instanceof AccountBoundaryChangedError) return false
+          console.error('[etebase-store] Failed to enqueue create', getSafeErrorDetails(queueErr))
+        }
+      }
+      return true
+    }
+
     // Pause the sync engine for the duration of the import. The local-crypto
     // phase below blocks the main thread; without this, a 30s poll firing
     // mid-import would also decrypt freshly-imported items on the same thread,
@@ -3399,6 +3414,7 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
       const MAX_BATCH_RETRIES = 3
       let lastSuccessfulItemIndex = -1
       let permanentFailure: unknown = null
+      let offlineAfterAck = false
 
       for (let i = 0; i < items.length; i += BATCH_SIZE) {
         const batch = items.slice(i, i + BATCH_SIZE)
@@ -3415,9 +3431,14 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
             break
           } catch (err) {
             if (err instanceof AccountBoundaryChangedError || !isCurrentAccountEpoch(accountEpoch)) throw new AccountBoundaryChangedError()
-            // Offline errors are handled by the outer catch + offline queue —
-            // bubble out instead of retrying on a known-down network.
-            if (isOfflineError(err)) throw err
+            // Offline errors are not retried on a known-down network. Before any
+            // acknowledgement the outer catch queues everything; after one, the
+            // acknowledged prefix is settled below and only the rest is queued.
+            if (isOfflineError(err)) {
+              if (lastSuccessfulItemIndex < 0) throw err
+              offlineAfterAck = true
+              break
+            }
             attempt++
             if (attempt >= MAX_BATCH_RETRIES) {
               permanentFailure = err
@@ -3488,20 +3509,17 @@ export const useEtebaseStore = create<EtebaseState & EtebaseActions>((set, get) 
         }
       }
 
+      // Went offline after an acknowledged chunk: the acknowledged items stay
+      // published above; only the items never acknowledged go to the queue.
+      if (offlineAfterAck && !await enqueueCreates(contents.slice(lastSuccessfulItemIndex + 1))) {
+        return contents.map(() => null)
+      }
+
       return uids
     } catch (err) {
       if (!isCurrentAccountEpoch(accountEpoch) || err instanceof AccountBoundaryChangedError) return contents.map(() => null)
       if (isOfflineError(err)) {
-        for (const { content, tempId } of contents) {
-          try {
-            assertOfflineQueueAccountGuard(offlineQueueGuard, get())
-            await enqueue({ type: 'create', collectionType: type, collectionUid: collection.uid, content, tempId }, offlineQueueGuard)
-            assertOfflineQueueAccountGuard(offlineQueueGuard, get())
-          } catch (queueErr) {
-            if (!isCurrentAccountEpoch(accountEpoch) || queueErr instanceof AccountBoundaryChangedError) return contents.map(() => null)
-            console.error('[etebase-store] Failed to enqueue create', getSafeErrorDetails(queueErr))
-          }
-        }
+        if (!await enqueueCreates(contents)) return contents.map(() => null)
       } else {
         console.error(`[etebase-store] Failed to batch create ${type} items`, getSafeErrorDetails(err))
         showErrorToast(`Failed to import ${type === 'calendar' ? 'events' : type === 'tasks' ? 'tasks' : type === 'contacts' ? 'contacts' : 'preferences'}. Please try again.`)

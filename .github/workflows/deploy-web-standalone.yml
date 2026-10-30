@@ -246,22 +246,45 @@ jobs:
           import { execFileSync } from 'node:child_process'
           import { createHash } from 'node:crypto'
           import { appendFileSync } from 'node:fs'
+          // Names the operation in progress on failure; raw errors, output and values are never reported.
+          let stage = 'input'
           try {
             const sha = process.env.EXPECTED_SHA, imageId = process.env.VERIFIED_IMAGE_ID
             assert.ok(/^[a-f0-9]{40}$/.test(sha) && sha.length === 40)
             assert.ok(/^sha256:[a-f0-9]{64}$/.test(imageId) && imageId.length === 71)
             const imageName = 'ghcr.io/silent-suite/silentsuite-web'
             const imageRef = imageName + ':standalone-' + sha + '-' + process.env.GITHUB_RUN_ID + '-' + process.env.GITHUB_RUN_ATTEMPT
-            const docker = args => execFileSync('docker', args, { timeout: 180000, maxBuffer: 16 * 1024 * 1024 })
+            const docker = args => execFileSync('docker', args, { timeout: 180000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] })
             const inspect = ref => JSON.parse(docker(['image', 'inspect', ref]).toString('utf8'))[0]
+            // The verified local handle is the configuration digest on a classic overlay2 store and the
+            // manifest digest on the containerd image store. Select exactly one before any push.
+            stage = 'store-declaration'
+            const declaration = docker(['info', '--format', '{"Driver":{{json .Driver}},"DriverStatus":{{json .DriverStatus}}}']).toString('utf8')
+            // Closed format: exactly these two literally spelled fields, so duplicate or escaped field names cannot match.
+            const envelope = /^\{"Driver":("(?:[^"\\\n]|\\.)*"),"DriverStatus":(\[[^\n]*\])\}\n?$/.exec(declaration)
+            assert.ok(envelope)
+            const driver = JSON.parse(envelope[1]), status = JSON.parse(envelope[2])
+            assert.ok(typeof driver === 'string' && Array.isArray(status))
+            assert.ok(status.every(entry => Array.isArray(entry) && entry.length === 2 && entry.every(part => typeof part === 'string')))
+            const keys = status.map(entry => entry[0])
+            assert.equal(new Set(keys).size, keys.length)
+            const overlay2 = ['Backing Filesystem', 'Supports d_type', 'Using metacopy', 'Native Overlay Diff', 'userxattr']
+            let store
+            if (JSON.stringify(status) === JSON.stringify([['driver-type', 'io.containerd.snapshotter.v1']]) && driver !== '' && driver !== 'overlay2') store = 'containerd'
+            else if (driver === 'overlay2' && JSON.stringify(keys) === JSON.stringify(overlay2) && status[0][1] !== '' &&
+              status.slice(1).every(entry => entry[1] === 'true' || entry[1] === 'false')) store = 'classic'
+            else throw new Error('unsupported image store')
+            stage = 'local-identity'
             const local = inspect(imageId)
             assert.equal(local.Id, imageId)
             assert.equal(local.Config.Labels['org.opencontainers.image.revision'], sha)
             assert.equal(inspect(imageRef).Id, imageId)
+            stage = 'push-digest'
             const pushed = docker(['push', imageRef]).toString('utf8')
             const digests = [...pushed.matchAll(/\bdigest: (sha256:[a-f0-9]{64})\b/g)].map(match => match[1])
             assert.equal(digests.length, 1, 'publication must return one final manifest digest')
             const digest = digests[0], exact = imageName + '@' + digest
+            stage = 'raw-manifest'
             const raw = docker(['buildx', 'imagetools', 'inspect', '--raw', exact])
             // Some CLI renderers append one framing newline; admit only bytes hashing to the digest.
             const candidates = raw.at(-1) === 10 ? [raw, raw.subarray(0, -1)] : [raw]
@@ -270,16 +293,24 @@ jobs:
             const manifest = JSON.parse(bytes.toString('utf8'))
             assert.equal(manifest.schemaVersion, 2)
             assert.ok(['application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json'].includes(manifest.mediaType))
+            stage = 'config-binding'
             const configId = manifest.config?.digest
-            assert.equal(configId, imageId, 'manifest configuration must equal the verified local image ID')
+            assert.ok(typeof configId === 'string' && /^sha256:[a-f0-9]{64}$/.test(configId) && configId.length === 71)
+            assert.notEqual(configId, digest)
+            // containerd: the verified handle is this authenticated manifest; classic: it is the manifest's config.
+            if (store === 'containerd') assert.equal(imageId, digest, 'verified containerd handle must be the published manifest')
+            else assert.equal(configId, imageId, 'verified classic handle must be the manifest configuration')
+            const expectedHandle = store === 'containerd' ? digest : configId
+            stage = 'pull-identity'
             docker(['pull', exact])
             const pulled = inspect(exact)
-            assert.equal(pulled.Id, configId, 'immutable pull must have the admitted config ID')
+            assert.equal(pulled.Id, expectedHandle, 'immutable pull must have the admitted local handle')
             assert.equal(pulled.Config.Labels['org.opencontainers.image.revision'], sha)
+            stage = 'outputs'
             appendFileSync(process.env.GITHUB_OUTPUT, 'image-digest=' + digest + '\nimage-config-id=' + configId + '\nimage-revision=' + sha + '\n')
-            console.log(JSON.stringify({ imageDigest: digest, imageConfigId: configId, revision: sha }))
+            console.log(JSON.stringify({ imageDigest: digest, imageConfigId: configId, revision: sha, runnerImageStore: store }))
           } catch {
-            console.error('Standalone Web publication or registry identity verification failed')
+            console.error('Standalone Web publication or registry identity verification failed at stage: ' + stage)
             process.exitCode = 1
           }
           NODE

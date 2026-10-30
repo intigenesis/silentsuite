@@ -1,11 +1,27 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+// @vitest-environment node
+// The pinned Etebase SDK and libsodium reject byte arrays from the jsdom realm, so this file
+// runs in node like the web744 suites; navigator.onLine keeps the browser's online default.
+import { afterAll, afterEach, describe, it, expect, beforeEach, vi } from 'vitest'
 import { useContactStore, getFilteredContacts, resetContactLifecycle } from '../use-contact-store'
 import { useEtebaseStore } from '../use-etebase-store'
 import { useContactListStore } from '../use-contact-list-store'
+import { useAuthStore } from '../use-auth-store'
 import type { Contact } from '@silentsuite/core'
-import { getAll } from '@/app/lib/offline-queue'
-import { AccountBoundaryChangedError } from '@/app/lib/account-epoch'
+import { _setEncryptedQueuePersistenceAvailableForTests, getAll } from '@/app/lib/offline-queue'
+import { AccountBoundaryChangedError, bumpAccountEpoch } from '@/app/lib/account-epoch'
 import { TEST_FINGERPRINT, bumpEpochWhenQueuePutRuns, enqueueCreateFromStore, expectOwnedQueueEntry, queueGuard, replayOwnedEntry, resetRealOfflineQueue } from './offline-queue-store-test-utils'
+import { EtebaseRequest, ReferenceServer, makeSavedNote } from './web744-sdk-fixture'
+
+// Set before any module reads it; restored after the file.
+const onLineDescriptor = vi.hoisted(() => {
+  const original = Object.getOwnPropertyDescriptor(globalThis.navigator, 'onLine')
+  Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, get: () => true })
+  return original
+})
+afterAll(() => {
+  if (onLineDescriptor) Object.defineProperty(globalThis.navigator, 'onLine', onLineDescriptor)
+  else delete (globalThis.navigator as any).onLine
+})
 
 const toastMock = vi.hoisted(() => ({ showErrorToast: vi.fn() }))
 vi.mock('@/app/stores/use-toast-store', () => toastMock)
@@ -30,6 +46,8 @@ function resetStore() {
   })
   useEtebaseStore.setState(useEtebaseStore.getInitialState(), true)
   useContactListStore.setState({ lists: [{ id: 'contacts-1', name: 'Contacts', color: '#fff', visible: true, accessLevel: 2 }], activeListId: 'contacts-1' })
+  // Writable account, as these tests assumed under jsdom; pinned so the node realm cannot change it.
+  useAuthStore.setState({ canWrite: () => true } as any)
 }
 
 function offlineAccount() {
@@ -465,4 +483,151 @@ describe('useContactStore', () => {
       expect(useContactStore.getState().contacts[0]!.favorite).toBe(false)
     })
   })
+})
+
+// C3a import-store contract (PLAN §4, §7 R1–R4, R3b, R3c). The real bridge drives the pinned,
+// patched Etebase SDK against the reference server. Item batch requests are numbered and
+// logged at the transport, so each case proves which chunk was applied before its outcome is read.
+type ChunkFault = { chunk: number; kind: 'offline-before-apply' | 'refused' | 'response-lost' }
+
+const isItemBatch = (method: string, path: string) => method === 'post' && /(^|\/)item\/batch$/.test(path)
+const originalRequest = EtebaseRequest.default
+
+async function installReferenceAccount(collectionType: string, fault?: ChunkFault) {
+  const server = new ReferenceServer()
+  const { account } = await makeSavedNote('C3a store contract', '')
+  const collection = await account.getCollectionManager().create(collectionType, { name: 'C3a', mtime: 1 }, '')
+  collection.encryptedCollection.__markSaved()
+  server.seed(collection, [])
+  const batches: string[] = []
+  EtebaseRequest.default = async (url: string, options: any = {}) => {
+    const method = String(options.method ?? 'get').toLowerCase()
+    const path = new URL(url).pathname.split('/').filter(Boolean).join('/')
+    if (!isItemBatch(method, path)) return server.handle(url, options)
+    const request = batches.length + 1
+    if (fault?.kind === 'offline-before-apply' && request === fault.chunk) {
+      batches.push('network-failure')
+      throw new TypeError('Network request failed')
+    }
+    if (fault?.kind === 'refused' && request >= fault.chunk) {
+      // An unregistered route: the reference server answers 500 and leaves the collection as it is.
+      const response = await server.handle(url.replace(/item\/batch\/?/, 'item/refused/'), options)
+      batches.push(`status-${response.status}`)
+      return response
+    }
+    const response = await server.handle(url, options)
+    if (fault?.kind === 'response-lost' && request === fault.chunk) {
+      batches.push('applied-response-lost')
+      throw new TypeError('Network request failed')
+    }
+    batches.push(response.ok ? 'acknowledged' : `status-${response.status}`)
+    return response
+  }
+  useEtebaseStore.setState({
+    account,
+    accountFingerprint: TEST_FINGERPRINT,
+    collections: { calendar: [], tasks: [], contacts: [collection], notes: [], preferences: [] },
+    itemCache: new Map(),
+    itemTypeMap: new Map(),
+    itemCollectionMap: new Map(),
+    domainLoadState: { calendar: 'loaded', tasks: 'loaded', contacts: 'loaded', notes: 'loaded', preferences: 'unknown' },
+    isInitialized: true,
+    syncEngine: null,
+  } as any)
+  const serverItems = async (): Promise<any[]> =>
+    (await account.getCollectionManager().getItemManager(collection).list()).data.filter((item: any) => !item.isDeleted)
+  return { server, collection, batches, serverItems }
+}
+
+const settle = <T>(promise: Promise<T>) => promise.then((value) => ({ resolved: value }), (error: unknown) => ({ rejected: error }))
+const positions = (from: number, to: number) => Array.from({ length: to - from }, (_, index) => from + index)
+
+const importContractCases: {
+  id: string
+  label: string
+  setup: 'reference' | 'missing-collection' | 'no-account'
+  count: number
+  fault?: ChunkFault
+  batches: string[]
+  serverCount: number
+  saved: number
+  unsaved: number[]
+  uncertain: boolean
+}[] = [
+  { id: 'C3a-R1', label: 'missing collection', setup: 'missing-collection', count: 2, batches: [], serverCount: 0, saved: 0, unsaved: [0, 1], uncertain: true },
+  { id: 'C3a-R2', label: 'offline before the first chunk is applied', setup: 'reference', count: 2, fault: { chunk: 1, kind: 'offline-before-apply' }, batches: ['network-failure'], serverCount: 0, saved: 0, unsaved: [0, 1], uncertain: true },
+  { id: 'C3a-R3', label: 'server refuses the second chunk', setup: 'reference', count: 21, fault: { chunk: 2, kind: 'refused' }, batches: ['acknowledged', 'status-500', 'status-500', 'status-500'], serverCount: 20, saved: 20, unsaved: [20], uncertain: true },
+  { id: 'C3a-R3b', label: 'offline before the second chunk is applied', setup: 'reference', count: 25, fault: { chunk: 2, kind: 'offline-before-apply' }, batches: ['acknowledged', 'network-failure'], serverCount: 20, saved: 20, unsaved: positions(20, 25), uncertain: true },
+  { id: 'C3a-R3c', label: 'second chunk applied but its response lost', setup: 'reference', count: 25, fault: { chunk: 2, kind: 'response-lost' }, batches: ['acknowledged', 'applied-response-lost'], serverCount: 25, saved: 20, unsaved: positions(20, 25), uncertain: true },
+  { id: 'C3a-R4', label: 'no account', setup: 'no-account', count: 2, batches: [], serverCount: 0, saved: 0, unsaved: [0, 1], uncertain: false },
+]
+
+describe('C3a import-store contract: importContacts', () => {
+  beforeEach(async () => {
+    await resetRealOfflineQueue()
+    // Production queue configuration: plaintext create content is refused.
+    _setEncryptedQueuePersistenceAvailableForTests(false)
+    resetStore()
+    toastMock.showErrorToast.mockReset()
+  })
+
+  afterEach(() => {
+    EtebaseRequest.default = originalRequest
+  })
+
+  it.each(importContractCases)('$id contacts: $label reports only acknowledged contacts and keeps no unacknowledged temp', async (c) => {
+    let reference: Awaited<ReturnType<typeof installReferenceAccount>> | null = null
+    if (c.setup === 'reference') reference = await installReferenceAccount('etebase.vcard', c.fault)
+    if (c.setup === 'missing-collection') {
+      useEtebaseStore.setState({ account: {}, accountFingerprint: TEST_FINGERPRINT, collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] } } as any)
+    }
+    const listId = reference?.collection.uid ?? 'missing-address-book'
+    const inputs = Array.from({ length: c.count }, (_, index) => ({ displayName: `C3a contact ${index}`, listId }))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const outcome = await settle(useContactStore.getState().importContacts(inputs))
+
+      // Fixture proof: which chunks reached and were applied by the server, and an empty production queue.
+      expect(reference?.batches ?? []).toEqual(c.batches)
+      const serverItems = reference ? await reference.serverItems() : []
+      expect(serverItems).toHaveLength(c.serverCount)
+      expect(await getAll(queueGuard())).toEqual([])
+
+      // Contract: never the requested count; only acknowledged positions are saved.
+      expect(outcome).toMatchObject({ rejected: { name: 'ImportIncompleteError', saved: c.saved, unsaved: c.unsaved, uncertain: c.uncertain } })
+
+      // Settlement: acknowledged contacts carry server item ids, the revision of that same item and
+      // their own vCard UID; no temp remains, and no draft state is left behind.
+      const contacts = useContactStore.getState().contacts
+      expect(contacts.map((contact) => contact.displayName)).toEqual(inputs.slice(0, c.saved).map((input) => input.displayName))
+      const serverByUid = new Map<string, any>(serverItems.map((item) => [item.uid, item] as [string, any]))
+      for (const contact of contacts) {
+        const item = serverByUid.get(contact.id)
+        expect(item, `server item for ${contact.displayName}`).toBeDefined()
+        expect(contact.revision).toBe(item.etag)
+        expect(contact.uid).not.toBe(contact.id)
+        expect(new TextDecoder().decode(await item.getContent())).toContain(`UID:${contact.uid}`)
+      }
+      expect(useContactStore.getState().contactSaveStates).toEqual({})
+    } finally {
+      errorSpy.mockRestore()
+    }
+  }, 20_000)
+
+  it('C3a contacts: an account change during an import still throws the boundary error and leaves the new account untouched', async () => {
+    const reference = await installReferenceAccount('etebase.vcard')
+    let batchRequests = 0
+    const secondChunk = reference.server.holdNext((method, path) => isItemBatch(method, path) && ++batchRequests === 2)
+    const inputs = Array.from({ length: 25 }, (_, index) => ({ displayName: `C3a boundary ${index}`, listId: reference.collection.uid }))
+    const importing = settle(useContactStore.getState().importContacts(inputs))
+    await secondChunk.arrived
+    const nextAccountContacts: any[] = []
+    bumpAccountEpoch()
+    useContactStore.setState({ contacts: nextAccountContacts })
+    secondChunk.release(false)
+    const outcome = await importing
+
+    expect(outcome).toMatchObject({ rejected: expect.any(AccountBoundaryChangedError) })
+    expect(useContactStore.getState().contacts).toBe(nextAccountContacts)
+  }, 20_000)
 })

@@ -41,7 +41,11 @@ export interface VCard {
   /** CATEGORIES (RFC 2426/6350) — comma-separated user labels */
   categories?: string[];
   note?: string;
+  /** A birthday without a year is held as `--MM-DD`; other values as read. */
   bday?: string;
+  /** `bday` was declared `VALUE=text`, so it is never read as a date. Only
+   *  `true` is meaningful; absence means a date. */
+  bdayIsText?: boolean;
   photo?: string;
   rev?: string;
   /** SilentSuite-owned favorite flag, wire form `X-SILENTSUITE-FAVORITE:1`.
@@ -313,34 +317,45 @@ function isRetainable(line: string, prop: ParsedProperty, consumedLabelGroups: S
 
 /** Fold a kept line at code-point boundaries. The legacy foldLine stays in use
  *  for owned fields so their wire bytes are unchanged. QP lines, folds whose
- *  continuation a line-trimming importer would read as a card boundary, and any
- *  fold our own unfolding would not restore exactly, are emitted unfolded. */
+ *  continuation a line-trimming importer would read as a card boundary, and
+ *  lines that cannot be cut outside a run of '=', are emitted unfolded. */
 function foldRetainedLine(line: string): string {
   if (parseProperty(line).params['ENCODING']?.toUpperCase() === 'QUOTED-PRINTABLE') return line;
+  const chars = Array.from(line);
   const parts: string[] = [];
-  let current = '';
-  let bytes = 0;
+  let start = 0;
   let limit = 75;
-  for (const ch of line) {
-    const charBytes = Buffer.byteLength(ch, 'utf8');
-    if (current && bytes + charBytes > limit) {
-      parts.push(current);
-      current = '';
-      bytes = 0;
-      limit = 74;
+  while (start < chars.length) {
+    let end = start;
+    let bytes = 0;
+    while (end < chars.length) {
+      const charBytes = Buffer.byteLength(chars[end]!, 'utf8');
+      if (end > start && bytes + charBytes > limit) break;
+      bytes += charBytes;
+      end++;
     }
-    current += ch;
-    bytes += charBytes;
+    if (end < chars.length) {
+      // Never end a segment with '=': unfoldLines would re-parse the growing
+      // prefix as a possible QP continuation at every fold (quadratic work).
+      // A run of '=' too long to cut around leaves the line unfolded.
+      let cut = end;
+      while (cut > start && chars[cut - 1] === '=') cut--;
+      if (cut === start) return line;
+      end = cut;
+    }
+    parts.push(chars.slice(start, end).join(''));
+    start = end;
+    limit = 74;
   }
-  parts.push(current);
   // Same predicate as the Web importer's card splitter (trim + toUpperCase), so
   // Unicode case mappings such as dotless ı → I are covered exactly.
   if (parts.slice(1).some((part) => {
     const normalized = part.trim().toUpperCase();
     return normalized === 'BEGIN:VCARD' || normalized === 'END:VCARD';
   })) return line;
-  const folded = parts.join('\r\n ');
-  return unfoldLines(folded) === line ? folded : line;
+  // Kept lines hold no CR/LF and no segment but the last ends with '=', so
+  // unfoldLines restores this fold exactly without its QP branch.
+  return parts.join('\r\n ');
 }
 
 function splitStructuredValue(value: string): string[] {
@@ -361,6 +376,50 @@ function splitStructuredValue(value: string): string[] {
 
   parts.push(current);
   return parts;
+}
+
+// ── Birthdays ──
+
+/** Year written with X-APPLE-OMIT-YEAR for a birthday without a year, as
+ *  vcard4android does for vCard 3. A leap year, so --02-29 survives. */
+const OMIT_YEAR_PARAM = 'X-APPLE-OMIT-YEAR';
+const OMIT_YEAR_SENTINEL = '1604';
+
+/** `--MM-DD` when month and day exist in a leap year; null otherwise. */
+function monthDay(month: string, day: string): string | null {
+  const days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][Number(month) - 1];
+  const date = Number(day);
+  return days !== undefined && date >= 1 && date <= days ? `--${month}-${day}` : null;
+}
+
+/** A year-less `--MMDD` or `--MM-DD` as `--MM-DD`; null for anything else. */
+function yearlessDate(value: string): string | null {
+  const match = /^--(\d{2})-?(\d{2})$/.exec(value);
+  return match ? monthDay(match[1]!, match[2]!) : null;
+}
+
+function isTextValue(params: Record<string, string>): boolean {
+  return (params['VALUE'] ?? '').split(',').some((type) => type.trim().toLowerCase() === 'text');
+}
+
+/** A date BDAY as the model holds it: year-less, or dated in the year its
+ *  omit-year marker names, becomes `--MM-DD`. Anything else is kept as read. */
+function birthdayValue(value: string, params: Record<string, string>): string {
+  const yearless = yearlessDate(value);
+  if (yearless) return yearless;
+  const omitYear = params[OMIT_YEAR_PARAM] ?? '';
+  const dated = /^(\d{4})-?(\d{2})-?(\d{2})$/.exec(value);
+  if (dated && /^\d{4}$/.test(omitYear) && dated[1] === omitYear) return monthDay(dated[2]!, dated[3]!) ?? value;
+  return value;
+}
+
+/** vCard 3.0 has no year-less date, so one is written with the marked sentinel
+ *  year; text keeps its type; every other value is written as before. */
+function birthdayLine(bday: string, isText: boolean): string {
+  if (isText) return `BDAY;VALUE=text:${bday}`;
+  const yearless = yearlessDate(bday);
+  if (yearless) return `BDAY;${OMIT_YEAR_PARAM}=${OMIT_YEAR_SENTINEL}:${OMIT_YEAR_SENTINEL}${yearless.slice(1)}`;
+  return `BDAY:${bday}`;
 }
 
 // ── Parser ──
@@ -450,7 +509,13 @@ export function parseVCard(vcardStr: string, options: { strictTextEncoding?: boo
         vcard.note = text();
         break;
       case 'BDAY':
-        vcard.bday = prop.value;
+        if (isTextValue(prop.params)) {
+          vcard.bday = prop.value;
+          vcard.bdayIsText = true;
+        } else {
+          vcard.bday = birthdayValue(prop.value, prop.params);
+          delete vcard.bdayIsText;
+        }
         break;
       case 'PHOTO': {
         const val = prop.value;
@@ -599,7 +664,12 @@ export function generateVCard(vcard: VCard): string {
   if (vcard.favorite === true) {
     lines.push(`${FAVORITE_PROPERTY}:1`);
   }
-  if (vcard.bday) lines.push(foldLine(`BDAY:${vcard.bday}`));
+  if (vcard.bday) {
+    const bdayLine = birthdayLine(vcard.bday, vcard.bdayIsText === true);
+    // A text birthday is free text behind a longer header, so it folds like a kept
+    // line: never into a continuation the importer would read as a card boundary.
+    lines.push(vcard.bdayIsText === true ? foldRetainedLine(bdayLine) : foldLine(bdayLine));
+  }
   if (vcard.photo) {
     if (vcard.photo.startsWith('data:') || vcard.photo.startsWith('http://') || vcard.photo.startsWith('https://')) {
       lines.push(foldLine(`PHOTO;VALUE=URI:${vcard.photo}`));
