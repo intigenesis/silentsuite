@@ -391,6 +391,23 @@ describe('C3b createTask outcome contract', () => {
     expect(useTaskStore.getState().tasks).toEqual([])
   })
 
+  it('C3b createTask: a refused write (no write access) rejects as definitely unsaved, with no dispatch and no optimistic task', async () => {
+    const { createItem } = acknowledgedAccount()
+    useAuthStore.setState({ canWrite: () => false } as any)
+    const listed: number[] = []
+    const stopRecording = useTaskStore.subscribe((state) => { listed.push(state.tasks.length) })
+
+    const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b refused write' }))
+    stopRecording()
+
+    // The refusal keeps its authority: nothing is sent and nothing was ever listed.
+    expect(createItem).not.toHaveBeenCalled()
+    expect(listed).toEqual([])
+    expect(useTaskStore.getState().tasks).toEqual([])
+    // Known not sent, so it must be the definite outcome the page reports as "not saved".
+    expect(outcome).toMatchObject({ rejected: { name: 'TaskSaveError', unconfirmed: false } })
+  })
+
   it('C3b createTask control: an acknowledged create still resolves with its item id and stays listed', async () => {
     acknowledgedAccount()
 

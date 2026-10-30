@@ -69,7 +69,8 @@ export const useTaskStore = create<TaskState & TaskActions>()(
       syncStatus: 'synced' as SyncStatus,
 
       createTask: async (newTask: NewTask) => {
-        if (!useAuthStore.getState().canWrite()) throw new Error('Your subscription has ended. Upgrade to make changes.')
+        // Refused before anything is listed or sent: a known, definite non-save.
+        if (!useAuthStore.getState().canWrite()) throw new TaskSaveError(false)
         const tempId = crypto.randomUUID()
         const now = new Date()
         const task: Task = {

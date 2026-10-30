@@ -261,10 +261,18 @@ function TaskDialog({
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') close()
+      // While creating, every control is disabled and focus rests on the dialog itself; the shared
+      // trap neither wraps nor cancels from there, so Tab must not move focus into the background.
+      else if (e.key === 'Tab' && creating) e.preventDefault()
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [close])
+  }, [close, creating])
+
+  // After a failed create the draft is editable again: put the keyboard back on it.
+  useEffect(() => {
+    if (createError) titleRef.current?.focus()
+  }, [createError])
 
   const handleSave = useCallback(async () => {
     const trimmed = title.trim()
@@ -275,6 +283,8 @@ function TaskDialog({
     const progress = normalizeTaskProgress(status, percentComplete)
 
     if (mode === 'create') {
+      // Create and every field are about to be disabled; keep focus inside the modal on the dialog itself.
+      dialogRef.current?.focus()
       setCreating(true)
       setCreateError(null)
       try {
@@ -321,7 +331,7 @@ function TaskDialog({
     <>
       <div className="fixed inset-0 z-[60] bg-black/40" aria-hidden="true" onClick={close} />
       <div className="fixed inset-0 z-[61] flex items-end justify-center sm:items-center sm:p-4">
-        <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={mode === 'create' ? 'New Task' : 'Edit Task'} className="flex w-full max-h-[90vh] flex-col bg-[rgb(var(--background))] sm:max-w-lg sm:rounded-xl sm:border sm:border-[rgb(var(--border))] sm:shadow-xl rounded-t-2xl">
+        <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={mode === 'create' ? 'New Task' : 'Edit Task'} tabIndex={-1} className="flex w-full max-h-[90vh] flex-col bg-[rgb(var(--background))] sm:max-w-lg sm:rounded-xl sm:border sm:border-[rgb(var(--border))] sm:shadow-xl rounded-t-2xl focus:outline-none">
           {/* Mobile drag handle */}
           <div className="mx-auto mt-2 mb-1 h-1 w-10 rounded-full bg-[rgb(var(--border))] sm:hidden" />
 

@@ -241,6 +241,61 @@ describe('C3b task drafts survive an unsaved or unconfirmed create', () => {
     expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title, revised')
   })
 
+  /** Disabled by its own attribute or by a disabled fieldset around it, as a browser treats it. */
+  const isDisabledControl = (element: Element) => element.matches(':disabled') || element.closest('fieldset[disabled]') !== null
+
+  /** A real cancelable keydown delivered to the focused element, as a browser starts a Tab move. */
+  function pressTab(shiftKey: boolean) {
+    const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true })
+    ;(document.activeElement ?? document.body).dispatchEvent(event)
+    return event
+  }
+
+  /** Opens a draft, lets the dialog's own autofocus settle, then presses a focused Create. */
+  async function pendingCreateFromFocusedCreate() {
+    const create = deferCreate()
+    renderWithIntl(<TasksPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'New task' }))
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title' } })
+    fireEvent.change(screen.getByPlaceholderText('Add notes...'), { target: { value: 'Draft notes' } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 80)) })
+    const createButton = screen.getByRole('button', { name: 'Create' })
+    createButton.focus()
+    expect(createButton).toHaveFocus()
+    fireEvent.click(createButton)
+    await waitFor(() => expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1))
+    return create
+  }
+
+  it('C3b-R12 dialog focus: a pending create keeps focus on a focusable element inside the dialog, and Tab and Shift+Tab cannot leave it', async () => {
+    const create = await pendingCreateFromFocusedCreate()
+
+    const focused = document.activeElement!
+    expect(dialog()!.contains(focused), `focus is on ${focused.tagName}`).toBe(true)
+    expect(isDisabledControl(focused), `focus is on a disabled ${focused.tagName}`).toBe(false)
+    for (const shiftKey of [false, true]) {
+      // Every draft control is disabled, so only the dialog can stop native traversal leaving it.
+      const event = pressTab(shiftKey)
+      expect(event.defaultPrevented, shiftKey ? 'Shift+Tab' : 'Tab').toBe(true)
+      expect(document.activeElement).toBe(focused)
+    }
+
+    await act(async () => { create.resolve({ id: 'remote-task-1', title: 'Draft title' } as Task) })
+    await waitFor(() => expect(dialog()).toBeNull())
+  })
+
+  it('C3b-R12 dialog focus: after a rejected create, focus is on an editable draft field inside the dialog', async () => {
+    const create = await pendingCreateFromFocusedCreate()
+
+    await act(async () => { create.reject(new TaskSaveError(true)) })
+    await screen.findByText(unconfirmedMessage)
+
+    const focused = document.activeElement!
+    expect(dialog()!.contains(focused), `focus is on ${focused.tagName}`).toBe(true)
+    expect(isDisabledControl(focused), `focus is on a disabled ${focused.tagName}`).toBe(false)
+    expect(['INPUT', 'TEXTAREA'], `focus is on ${focused.tagName}`).toContain(focused.tagName)
+  })
+
   async function submitQuickAdd(title: string) {
     renderWithIntl(<TasksPage />)
     const input = screen.getByPlaceholderText('Add a task...')
