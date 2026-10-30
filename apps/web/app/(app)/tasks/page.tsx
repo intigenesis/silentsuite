@@ -347,7 +347,8 @@ function TaskDialog({
           </div>
 
           {/* Body */}
-          <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4">
+          {/* Disabled while a create is pending, so no edit can arrive after the submitted draft and be lost on close. */}
+          <fieldset disabled={creating} className="min-w-0 flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4">
             {createError && (
               <p role="alert" className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{createError}</p>
             )}
@@ -525,7 +526,7 @@ function TaskDialog({
                 className="flex-1 resize-none rounded-md border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 py-2 text-sm text-[rgb(var(--foreground))] placeholder:text-[rgb(var(--muted))] focus:outline-none focus:ring-2 focus:ring-emerald-500"
               />
             </div>
-          </div>
+          </fieldset>
         </div>
       </div>
     </>

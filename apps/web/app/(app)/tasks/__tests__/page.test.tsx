@@ -191,6 +191,56 @@ describe('C3b task drafts survive an unsaved or unconfirmed create', () => {
     expect(screen.queryByText(definiteMessage)).toBeNull()
   })
 
+  /** Every native control in the open dialog: its header actions and all draft fields, nested editors included. */
+  const draftControls = () => Array.from(dialog()!.querySelectorAll<HTMLElement>('input, textarea, select, button'))
+  const describeControl = (control: HTMLElement) =>
+    `${control.tagName.toLowerCase()} ${control.getAttribute('aria-label') ?? control.getAttribute('placeholder') ?? control.textContent?.trim() ?? ''}`
+
+  it('C3b-R12 dialog: while a create is pending no draft control accepts input, so the acknowledged create closes on exactly the submitted draft', async () => {
+    const create = deferCreate()
+    await openDraft()
+
+    // Pending: native disabled semantics refuse every edit, so no newer input can exist to be discarded.
+    const controls = draftControls()
+    expect(controls.length).toBeGreaterThan(4)
+    for (const control of controls) expect(control, describeControl(control)).toBeDisabled()
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title')
+    expect(screen.getByPlaceholderText('Add notes...')).toHaveValue('Draft notes')
+
+    await act(async () => { create.resolve({ id: 'remote-task-1', title: 'Draft title' } as Task) })
+
+    await waitFor(() => expect(dialog()).toBeNull())
+    expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('C3b-R12 dialog: a rejected create makes the submitted draft editable again', async () => {
+    const create = deferCreate()
+    renderWithIntl(<TasksPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'New task' }))
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title' } })
+    fireEvent.change(screen.getByPlaceholderText('Add notes...'), { target: { value: 'Draft notes' } })
+    // Which controls accept input before submitting; the same ones must accept it again after a rejection.
+    const editableBefore = draftControls().map((control) => !control.matches(':disabled'))
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1))
+
+    for (const control of draftControls()) expect(control, describeControl(control)).toBeDisabled()
+
+    await act(async () => { create.reject(new TaskSaveError(true)) })
+    await screen.findByText(unconfirmedMessage)
+
+    const controls = draftControls()
+    expect(controls).toHaveLength(editableBefore.length)
+    controls.forEach((control, index) => {
+      if (editableBefore[index]) expect(control, describeControl(control)).toBeEnabled()
+      else expect(control, describeControl(control)).toBeDisabled()
+    })
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title')
+    expect(screen.getByPlaceholderText('Add notes...')).toHaveValue('Draft notes')
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title, revised' } })
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title, revised')
+  })
+
   async function submitQuickAdd(title: string) {
     renderWithIntl(<TasksPage />)
     const input = screen.getByPlaceholderText('Add a task...')
