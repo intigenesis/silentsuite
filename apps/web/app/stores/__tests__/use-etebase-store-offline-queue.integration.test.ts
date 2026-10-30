@@ -40,6 +40,8 @@ import { useEtebaseStore, withoutPendingDeletes } from '../use-etebase-store'
 import { useSyncStore } from '../use-sync-store'
 import { useContactStore } from '../use-contact-store'
 import { useContactListStore } from '../use-contact-list-store'
+import { useTaskStore } from '../use-task-store'
+import { useAuthStore } from '../use-auth-store'
 
 // These tests exercise real fake-IndexedDB transactions and remote-replay
 // reconciliation. Leave headroom for heavily loaded CI/review workers so a
@@ -1278,6 +1280,133 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
         expect(queued.map((entry) => entry.tempId)).toEqual(expectedQueuedTempIds)
         expect(queued.every((entry) => entry.type === 'create' && entry.collectionType === 'tasks' && entry.collectionUid === tasksCollection.uid)).toBe(true)
         expect(toastMock.showErrorToast).not.toHaveBeenCalled()
+      } finally {
+        errorSpy.mockRestore()
+      }
+    })
+  })
+
+  // C3b single-create outcomes (PLAN §7 R10, R10b) through the real bridge, the actual core
+  // createItem and the pinned, patched SDK against the reference transport. The transport proves
+  // what the synthetic server holds; it is not real-provider or deployed-server proof.
+  describe('C3b createTask through the pinned SDK', () => {
+    const originalRequest = EtebaseRequest.default
+    const isItemBatch = (method: string, path: string) => method === 'post' && /(^|\/)item\/batch$/.test(path)
+    const settle = <T>(promise: Promise<T>) => promise.then((value) => ({ resolved: value }), (error: unknown) => ({ rejected: error }))
+    let server: ReferenceServer
+    let batches: string[]
+    let fault: 'none' | 'offline-before-apply' | 'response-lost'
+
+    beforeEach(async () => {
+      const actualCore = await vi.importActual<typeof import('@silentsuite/core')>('@silentsuite/core')
+      // This file mocks core createItem; these cases use the actual one, so the SDK sends the write.
+      coreMock.createItem.mockImplementation(actualCore.createItem)
+      // Production queue configuration: plaintext create content is refused.
+      _setEncryptedQueuePersistenceAvailableForTests(false)
+      useAuthStore.setState({ canWrite: () => true } as any)
+      useTaskStore.setState({ tasks: [] })
+      server = new ReferenceServer()
+      batches = []
+      fault = 'none'
+      // Logs what each item batch request did at the transport; everything else passes through.
+      EtebaseRequest.default = async (url: string, options: any = {}) => {
+        const method = String(options.method ?? 'get').toLowerCase()
+        const path = new URL(url).pathname.split('/').filter(Boolean).join('/')
+        if (!isItemBatch(method, path)) return server.handle(url, options)
+        if (fault === 'offline-before-apply') {
+          batches.push('network-failure')
+          throw new TypeError('Network request failed')
+        }
+        const response = await server.handle(url, options)
+        if (fault === 'response-lost') {
+          batches.push('applied-response-lost')
+          throw new TypeError('Network request failed')
+        }
+        batches.push(response.ok ? 'acknowledged' : `status-${response.status}`)
+        return response
+      }
+    })
+
+    afterEach(() => {
+      EtebaseRequest.default = originalRequest
+    })
+
+    async function installRealTaskList() {
+      const { account } = await makeSavedNote('C3b unused', '')
+      const tasksCollection = await account.getCollectionManager().create('etebase.vtodo', { name: 'C3b tasks', mtime: 1 }, '')
+      tasksCollection.encryptedCollection.__markSaved()
+      server.seed(tasksCollection, [])
+      useEtebaseStore.setState({
+        account,
+        accountFingerprint: TEST_FINGERPRINT,
+        collections: { calendar: [], tasks: [tasksCollection], contacts: [], notes: [], preferences: [] },
+        itemCache: new Map(),
+        itemTypeMap: new Map(),
+        itemCollectionMap: new Map(),
+        domainLoadState: { calendar: 'loaded', tasks: 'loaded', contacts: 'loaded', notes: 'loaded', preferences: 'unknown' },
+        isInitialized: true,
+        syncEngine: null,
+      } as any)
+      const serverTexts = async (): Promise<{ uid: string; text: string }[]> => {
+        const response = await account.getCollectionManager().getItemManager(tasksCollection).list()
+        return Promise.all(response.data
+          .filter((item: any) => !item.isDeleted)
+          .map(async (item: any) => ({ uid: item.uid, text: new TextDecoder().decode(await item.getContent()) })))
+      }
+      return { tasksCollection, serverTexts }
+    }
+
+    it('C3b createTask control: an acknowledged create resolves with the item the server holds', async () => {
+      const { tasksCollection, serverTexts } = await installRealTaskList()
+
+      const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b acknowledged task', listId: tasksCollection.uid }))
+
+      expect(batches).toEqual(['acknowledged'])
+      const held = await serverTexts()
+      expect(held).toHaveLength(1)
+      expect(held[0]!.text).toContain('SUMMARY:C3b acknowledged task')
+      expect(outcome).toMatchObject({ resolved: { id: held[0]!.uid, title: 'C3b acknowledged task' } })
+      expect(useTaskStore.getState().tasks.map((task) => task.id)).toEqual([held[0]!.uid])
+      expect(await getAll(queueGuard())).toEqual([])
+    })
+
+    it('C3b-R10 createTask: an offline create the production queue refuses rejects as unconfirmed and leaves no optimistic task', async () => {
+      const { tasksCollection, serverTexts } = await installRealTaskList()
+      fault = 'offline-before-apply'
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b offline task', listId: tasksCollection.uid }))
+
+        // Witnesses: the write failed at the transport, nothing reached the server, and the queue refused custody.
+        expect(batches).toEqual(['network-failure'])
+        expect(await serverTexts()).toEqual([])
+        expect(await getAll(queueGuard())).toEqual([])
+        expect(toastMock.showErrorToast).toHaveBeenCalledWith('Failed to save task for offline sync. Please try again.')
+
+        expect(outcome).toMatchObject({ rejected: { name: 'TaskSaveError', unconfirmed: true } })
+        expect(useTaskStore.getState().tasks).toEqual([])
+      } finally {
+        errorSpy.mockRestore()
+      }
+    })
+
+    it('C3b-R10b createTask: a create the server applied but whose response was lost rejects as unconfirmed while the server holds the task', async () => {
+      const { tasksCollection, serverTexts } = await installRealTaskList()
+      fault = 'response-lost'
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b lost-response task', listId: tasksCollection.uid }))
+
+        // Witnesses: the server applied the write and holds exactly that task, but no acknowledgement arrived.
+        expect(batches).toEqual(['applied-response-lost'])
+        const held = await serverTexts()
+        expect(held).toHaveLength(1)
+        expect(held[0]!.text).toContain('SUMMARY:C3b lost-response task')
+        expect(await getAll(queueGuard())).toEqual([])
+
+        // The outcome is unconfirmed, never "not saved": the task exists remotely and a retry could duplicate it.
+        expect(outcome).toMatchObject({ rejected: { name: 'TaskSaveError', unconfirmed: true } })
+        expect(useTaskStore.getState().tasks).toEqual([])
       } finally {
         errorSpy.mockRestore()
       }

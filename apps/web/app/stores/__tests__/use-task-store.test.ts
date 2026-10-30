@@ -47,6 +47,20 @@ function offlineAccount() {
   useEtebaseStore.setState({ account: {}, accountFingerprint: TEST_FINGERPRINT, itemCache: new Map(), createItem: vi.fn((type, content, tempId, collectionUid) => enqueueCreateFromStore(type, collectionUid, content, tempId!)) } as any)
 }
 
+/** The lower store acknowledging every create, update and delete, as a reachable account does. */
+function acknowledgedAccount() {
+  let sequence = 0
+  const createItem = vi.fn(async () => {
+    const uid = `remote-task-${++sequence}`
+    useEtebaseStore.setState({ itemCache: new Map([...useEtebaseStore.getState().itemCache, [uid, {}]]) } as any)
+    return uid
+  })
+  const updateItem = vi.fn(async () => 'remote')
+  const deleteItem = vi.fn(async () => 'remote')
+  useEtebaseStore.setState({ account: {}, accountFingerprint: TEST_FINGERPRINT, itemCache: new Map(), createItem, updateItem, deleteItem } as any)
+  return { createItem, updateItem, deleteItem }
+}
+
 function queuedTask(id = 'temp-task') {
   return { id, uid: id, title: 'Task', description: '', start_date: null, due_date: null, priority: 'medium' as const, completed: false, status: 'needs-action' as const, percent_complete: 0, location: '', url: '', categories: [], listId: 'tasks-1', created_at: new Date(), updated_at: new Date() }
 }
@@ -57,6 +71,7 @@ describe('useTaskStore', () => {
   })
 
   it('createTask adds a task to the store', async () => {
+    acknowledgedAccount()
     const { createTask } = useTaskStore.getState()
     const task = await createTask({ title: 'Test task', priority: 'high' })
 
@@ -69,6 +84,7 @@ describe('useTaskStore', () => {
   })
 
   it('updateTask modifies an existing task', async () => {
+    acknowledgedAccount()
     const { createTask } = useTaskStore.getState()
     const task = await createTask({ title: 'Original' })
 
@@ -80,6 +96,7 @@ describe('useTaskStore', () => {
   })
 
   it('updateTask does nothing for unknown id', async () => {
+    acknowledgedAccount()
     const { createTask } = useTaskStore.getState()
     await createTask({ title: 'Only task' })
 
@@ -92,6 +109,7 @@ describe('useTaskStore', () => {
   })
 
   it('deleteTask removes a task', async () => {
+    acknowledgedAccount()
     const { createTask } = useTaskStore.getState()
     const task = await createTask({ title: 'To delete' })
 
@@ -103,6 +121,7 @@ describe('useTaskStore', () => {
   })
 
   it('toggleComplete flips completion state', async () => {
+    acknowledgedAccount()
     const { createTask } = useTaskStore.getState()
     const task = await createTask({ title: 'Toggle me' })
     expect(task.completed).toBe(false)
@@ -335,4 +354,49 @@ describe('C3a import-store contract: importTasks', () => {
       errorSpy.mockRestore()
     }
   }, 20_000)
+})
+
+// C3b single-create outcome contract (PLAN §4, §7 R9, R11). A create that the server never
+// acknowledged must not resolve as a saved temporary task, and its optimistic record must not
+// stay listed. The real-SDK refusal and lost-response cases (R10, R10b) live in the node
+// integration test, which hosts the pinned SDK and reference transport.
+describe('C3b createTask outcome contract', () => {
+  beforeEach(async () => {
+    await resetRealOfflineQueue()
+    // Production queue configuration: plaintext create content is refused.
+    _setEncryptedQueuePersistenceAvailableForTests(false)
+    resetStore()
+    toastMock.showErrorToast.mockReset()
+  })
+
+  it('C3b-R9 createTask: a missing task list rejects as unconfirmed and leaves no optimistic task', async () => {
+    // The real lower store: an account with no collection for the requested list.
+    useEtebaseStore.setState({ account: {}, accountFingerprint: TEST_FINGERPRINT, collections: { calendar: [], tasks: [], contacts: [], notes: [], preferences: [] } } as any)
+
+    const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b missing list', listId: 'missing-task-list' }))
+
+    expect(await getAll(queueGuard())).toEqual([])
+    expect(outcome).toMatchObject({ rejected: { name: 'TaskSaveError', unconfirmed: true } })
+    expect(useTaskStore.getState().tasks).toEqual([])
+  })
+
+  it('C3b-R11 createTask: without an account nothing is sent, so it rejects as definitely unsaved and leaves no optimistic task', async () => {
+    const createItem = vi.fn()
+    useEtebaseStore.setState({ createItem } as any)
+
+    const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b no account' }))
+
+    expect(createItem).not.toHaveBeenCalled()
+    expect(outcome).toMatchObject({ rejected: { name: 'TaskSaveError', unconfirmed: false } })
+    expect(useTaskStore.getState().tasks).toEqual([])
+  })
+
+  it('C3b createTask control: an acknowledged create still resolves with its item id and stays listed', async () => {
+    acknowledgedAccount()
+
+    const outcome = await settle(useTaskStore.getState().createTask({ title: 'C3b acknowledged' }))
+
+    expect(outcome).toMatchObject({ resolved: { id: 'remote-task-1', title: 'C3b acknowledged' } })
+    expect(useTaskStore.getState().tasks.map((task) => [task.id, task.title])).toEqual([['remote-task-1', 'C3b acknowledged']])
+  })
 })
