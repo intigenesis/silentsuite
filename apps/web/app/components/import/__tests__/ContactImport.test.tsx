@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react'
 import ContactImport from '../ContactImport'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import { deserializeContact, serializeContact, type Contact } from '@silentsuite/core'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 const mocks = vi.hoisted(() => ({
   importContacts: vi.fn(),
   createCollection: vi.fn(),
@@ -218,6 +219,86 @@ describe('ContactImport categories normalization', () => {
     expect(await screen.findByText('Failed to parse the file. Please make sure it is a valid .vcf file.')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Import \d+ contacts/ })).not.toBeInTheDocument()
     expect(mocks.importContacts).not.toHaveBeenCalled()
+  })
+})
+
+// C3a-R6 (PLAN U1, U2, U4). The store outcome is controlled here to isolate the recovery UI;
+// the store contract itself is proven against the pinned SDK in use-contact-store.test.ts.
+describe('C3a-R6 ContactImport reports only acknowledged contacts and keeps the rest for retry', () => {
+  const vcf = (names: string[]) => new File(
+    [names.map((name) => ['BEGIN:VCARD', 'VERSION:4.0', `FN:${name}`, 'END:VCARD'].join('\r\n')).join('\r\n')],
+    'contacts.vcf',
+    { type: 'text/vcard' },
+  )
+  const caveat = /may already be saved/i
+  const payloadNames = (call: number) => (mocks.importContacts.mock.calls[call]![0] as { displayName: string }[]).map(({ displayName }) => displayName)
+
+  beforeEach(() => {
+    mocks.importContacts.mockReset()
+    mocks.onImportComplete.mockReset()
+  })
+
+  async function previewContacts(names: string[]) {
+    const { container } = renderWithIntl(<ContactImport onImportComplete={mocks.onImportComplete} />)
+    fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [vcf(names)] } })
+    return screen.findByRole('button', { name: `Import ${names.length} contacts` })
+  }
+
+  it('C3a-R6 contacts: a partial unconfirmed import reports the acknowledged count, warns before retry, and retries only the rest', async () => {
+    mocks.importContacts
+      .mockRejectedValueOnce(new ImportIncompleteError(1, [1], true))
+      .mockResolvedValueOnce(1)
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    const message = await screen.findByText(/Imported 1 of 2 contacts/)
+    expect(message.textContent).toMatch(/(weren't|were not) confirmed as saved/i)
+    expect(message.textContent).toMatch(caveat)
+    expect(screen.queryByText(/contacts imported/)).toBeNull()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+
+    // Only the unacknowledged original record stays previewed and importable.
+    const retry = screen.getByRole('button', { name: 'Import 1 contacts' })
+    expect(screen.queryByText('Ada One')).toBeNull()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+
+    fireEvent.click(retry)
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadNames(1)).toEqual(['Bea Two'])
+    expect(screen.getByText('1 contacts imported')).toBeInTheDocument()
+    expect(screen.queryByText(/Imported 1 of 2 contacts/)).toBeNull()
+  })
+
+  it('C3a-R6 contacts: an unconfirmed import with nothing acknowledged keeps every contact and warns they may already be saved', async () => {
+    mocks.importContacts.mockRejectedValueOnce(new ImportIncompleteError(0, [0, 1], true))
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    const message = await screen.findByText(/Imported 0 of 2 contacts/)
+    expect(message.textContent).toMatch(caveat)
+    expect(screen.getByRole('button', { name: 'Import 2 contacts' })).toBeInTheDocument()
+    expect(screen.getByText('Ada One')).toBeInTheDocument()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R6 contacts: an import that sent nothing says none were saved, without the may-already-be-saved caveat', async () => {
+    mocks.importContacts.mockRejectedValueOnce(new ImportIncompleteError(0, [0, 1], false))
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    const message = await screen.findByText(/None of the 2 contacts were saved/i)
+    expect(message.textContent).not.toMatch(caveat)
+    expect(screen.getByRole('button', { name: 'Import 2 contacts' })).toBeInTheDocument()
+    expect(screen.getByText('Ada One')).toBeInTheDocument()
+    expect(screen.getByText('Bea Two')).toBeInTheDocument()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R6 contacts: a fully acknowledged import still reports its true count', async () => {
+    mocks.importContacts.mockResolvedValueOnce(2)
+    fireEvent.click(await previewContacts(['Ada One', 'Bea Two']))
+
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(2))
+    expect(screen.getByText('2 contacts imported')).toBeInTheDocument()
+    expect(payloadNames(0)).toEqual(['Ada One', 'Bea Two'])
   })
 })
 

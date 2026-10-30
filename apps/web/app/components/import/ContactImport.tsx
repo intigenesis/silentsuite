@@ -12,6 +12,21 @@ import { useContactListStore } from '@/app/stores/use-contact-list-store'
 import { useEtebaseStore } from '@/app/stores/use-etebase-store'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
 import { normalizeLabels } from '@/app/components/LabelEditor'
+import type { ImportIncompleteError } from '@/app/lib/import-outcome'
+
+function isImportIncomplete(err: unknown): err is ImportIncompleteError {
+  return err instanceof Error && err.name === 'ImportIncompleteError'
+}
+
+/** Only acknowledged contacts count as imported; an unconfirmed one may still exist remotely. */
+function incompleteImportMessage(saved: number, unsaved: number, uncertain: boolean): string {
+  const total = saved + unsaved
+  if (uncertain) {
+    return `Imported ${saved} of ${total} contacts. The other ${unsaved} weren't confirmed as saved and are listed below. If the connection dropped, some may already be saved, so check your list before importing them again.`
+  }
+  if (saved === 0) return `None of the ${total} contacts were saved. They're listed below so you can import them again.`
+  return `Imported ${saved} of ${total} contacts. The other ${unsaved} weren't saved and are listed below so you can import them again.`
+}
 
 interface ContactImportProps {
   onImportComplete: (count: number) => void
@@ -115,6 +130,7 @@ export default function ContactImport({ onImportComplete, heading }: ContactImpo
 
   const handleImport = useCallback(async () => {
     setIsImporting(true)
+    setError(null)
     try {
       const newContacts = contacts.map((contact) => ({
         displayName: contact.fn || 'Unnamed Contact',
@@ -151,8 +167,15 @@ export default function ContactImport({ onImportComplete, heading }: ContactImpo
       setImportedCount(count)
       onImportComplete(count)
     } catch (err) {
-      console.error('[contact-import] Import failed', getSafeErrorDetails(err))
-      setError('An error occurred while importing contacts. Please try again.')
+      if (isImportIncomplete(err)) {
+        // Keep only the original contacts that were not acknowledged, so a retry never resends saved ones.
+        const unsaved = new Set(err.unsaved)
+        setContacts(contacts.filter((_, position) => unsaved.has(position)))
+        setError(incompleteImportMessage(err.saved, err.unsaved.length, err.uncertain))
+      } else {
+        console.error('[contact-import] Import failed', getSafeErrorDetails(err))
+        setError('An error occurred while importing contacts. Please try again.')
+      }
     } finally {
       setIsImporting(false)
     }

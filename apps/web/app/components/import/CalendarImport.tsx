@@ -10,6 +10,31 @@ import { vEventToImportEvent } from './import-mappers'
 import { useCalendarStore } from '@/app/stores/use-calendar-store'
 import { DEFAULT_CALENDAR_COLORS, useCalendarListStore } from '@/app/stores/use-calendar-list-store'
 import { useEtebaseStore } from '@/app/stores/use-etebase-store'
+import type { ImportIncompleteError } from '@/app/lib/import-outcome'
+
+function isImportIncomplete(err: unknown): err is ImportIncompleteError {
+  return err instanceof Error && err.name === 'ImportIncompleteError'
+}
+
+/**
+ * Only acknowledged events count as imported; an unconfirmed one may still exist remotely.
+ * A calendar whose creation failed may also exist remotely, so it is never called absent.
+ */
+function incompleteImportMessage(saved: number, unsaved: number, uncertain: boolean, unconfirmedCalendar: string | null): string {
+  const total = saved + unsaved
+  let message: string
+  if (uncertain) {
+    message = `Imported ${saved} of ${total} events. The other ${unsaved} weren't confirmed as saved and are listed below. If the connection dropped, some may already be saved, so check your calendars before importing them again.`
+  } else if (saved === 0) {
+    message = `None of the ${total} events were saved. They're listed below so you can import them again.`
+  } else {
+    message = `Imported ${saved} of ${total} events. The other ${unsaved} weren't saved and are listed below so you can import them again.`
+  }
+  if (unconfirmedCalendar) {
+    message += ` The "${unconfirmedCalendar}" calendar couldn't be confirmed as created; check your calendar list before importing again.`
+  }
+  return message
+}
 
 interface CalendarImportProps {
   onImportComplete: (count: number) => void
@@ -22,6 +47,8 @@ interface CalendarImportGroup {
   name: string
   color: string
   events: VEvent[]
+  /** The calendar already created for this file, reused by a retry instead of creating another. */
+  calendarId?: string
 }
 
 type ImportMode = 'single' | 'separate'
@@ -185,21 +212,77 @@ export default function CalendarImport({ onImportComplete, heading }: CalendarIm
   const handleImport = useCallback(async () => {
     if (totalEvents === 0) return
     setIsImporting(true)
+    setError(null)
     try {
-      let count = 0
-      if (importMode === 'separate' && groups.length > 1) {
+      if (importMode === 'separate') {
+        // One calendar per file, even when a retry leaves a single file. Files are imported in
+        // order; the first that is not fully acknowledged stops the run, and it and every later
+        // file stay listed with any calendar already created for them.
+        let saved = 0
+        let unsaved = 0
+        let uncertain = false
+        let unconfirmedCalendar: string | null = null
+        let genericFailure = false
+        const remaining: CalendarImportGroup[] = []
         for (const group of groups) {
+          if (remaining.length > 0) {
+            remaining.push(group)
+            unsaved += group.events.length
+            continue
+          }
           const calendarName = group.name.trim() || stripIcsExtension(group.fileName)
-          const calendarId = await createCollection('calendar', calendarName, group.color)
-          if (!calendarId) throw new Error('Failed to create calendar')
-          count += await importEvents(group.events.map((event) => vEventToImportEvent(event, calendarId)))
+          const calendarId = group.calendarId ?? await createCollection('calendar', calendarName, group.color) ?? undefined
+          if (!calendarId) {
+            // Nothing of this file was sent, but the calendar itself may exist remotely.
+            unconfirmedCalendar = calendarName
+            remaining.push(group)
+            unsaved += group.events.length
+            continue
+          }
+          try {
+            saved += await importEvents(group.events.map((event) => vEventToImportEvent(event, calendarId)))
+          } catch (err) {
+            if (isImportIncomplete(err)) {
+              const unsavedPositions = new Set(err.unsaved)
+              saved += err.saved
+              unsaved += err.unsaved.length
+              uncertain = uncertain || err.uncertain
+              remaining.push({ ...group, calendarId, events: group.events.filter((_, position) => unsavedPositions.has(position)) })
+            } else {
+              genericFailure = true
+              unsaved += group.events.length
+              remaining.push({ ...group, calendarId })
+            }
+          }
         }
-      } else {
-        const allEvents = groups.flatMap((group) => group.events)
-        count = await importEvents(allEvents.map((event) => vEventToImportEvent(event, selectedCalendarId)))
+        if (remaining.length === 0) {
+          setImportedCount(saved)
+          onImportComplete(saved)
+          return
+        }
+        setGroups(remaining)
+        setError(genericFailure
+          ? 'An error occurred while importing events. Please try again.'
+          : incompleteImportMessage(saved, unsaved, uncertain, unconfirmedCalendar))
+        return
       }
-      setImportedCount(count)
-      onImportComplete(count)
+
+      const allEvents = groups.flatMap((group) => group.events)
+      try {
+        const count = await importEvents(allEvents.map((event) => vEventToImportEvent(event, selectedCalendarId)))
+        setImportedCount(count)
+        onImportComplete(count)
+      } catch (err) {
+        if (!isImportIncomplete(err)) throw err
+        // Keep only the original events that were not acknowledged, in their own files.
+        const unsavedPositions = new Set(err.unsaved)
+        let position = 0
+        const remaining = groups
+          .map((group) => ({ ...group, events: group.events.filter(() => unsavedPositions.has(position++)) }))
+          .filter((group) => group.events.length > 0)
+        setGroups(remaining)
+        setError(incompleteImportMessage(err.saved, err.unsaved.length, err.uncertain, null))
+      }
     } catch {
       setError('An error occurred while importing events. Please try again.')
     } finally {
@@ -263,7 +346,8 @@ export default function CalendarImport({ onImportComplete, heading }: CalendarIm
         ))}
       </div>
 
-      {(groups.length <= 1 || importMode === 'single') && (
+      {/* A lone file left by a one-per-file retry keeps its own destination, so the selector stays hidden for it. */}
+      {(importMode === 'single' || groups.length === 0) && (
         <ImportListSelector
           lists={calendars}
           selectedId={selectedCalendarId}

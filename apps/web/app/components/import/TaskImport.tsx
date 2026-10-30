@@ -13,6 +13,21 @@ import { useTaskListStore } from '@/app/stores/use-task-list-store'
 import { useEtebaseStore } from '@/app/stores/use-etebase-store'
 import type { Priority } from '@silentsuite/core'
 import { normalizeLabels } from '@/app/components/LabelEditor'
+import type { ImportIncompleteError } from '@/app/lib/import-outcome'
+
+function isImportIncomplete(err: unknown): err is ImportIncompleteError {
+  return err instanceof Error && err.name === 'ImportIncompleteError'
+}
+
+/** Only acknowledged tasks count as imported; an unconfirmed one may still exist remotely. */
+function incompleteImportMessage(saved: number, unsaved: number, uncertain: boolean): string {
+  const total = saved + unsaved
+  if (uncertain) {
+    return `Imported ${saved} of ${total} tasks. The other ${unsaved} weren't confirmed as saved and are listed below. If the connection dropped, some may already be saved, so check your list before importing them again.`
+  }
+  if (saved === 0) return `None of the ${total} tasks were saved. They're listed below so you can import them again.`
+  return `Imported ${saved} of ${total} tasks. The other ${unsaved} weren't saved and are listed below so you can import them again.`
+}
 
 interface TaskImportProps {
   onImportComplete: (count: number) => void
@@ -241,6 +256,7 @@ export default function TaskImport({ onImportComplete, heading }: TaskImportProp
 
   const handleImport = useCallback(async () => {
     setIsImporting(true)
+    setError(null)
     try {
       const newTasks = tasks.map((task) => ({
         title: task.summary || 'Untitled Task',
@@ -254,8 +270,15 @@ export default function TaskImport({ onImportComplete, heading }: TaskImportProp
       const count = await importTasks(newTasks)
       setImportedCount(count)
       onImportComplete(count)
-    } catch {
-      setError('An error occurred while importing tasks. Please try again.')
+    } catch (err) {
+      if (isImportIncomplete(err)) {
+        // Keep only the original tasks that were not acknowledged, so a retry never resends saved ones.
+        const unsaved = new Set(err.unsaved)
+        setTasks(tasks.filter((_, position) => unsaved.has(position)))
+        setError(incompleteImportMessage(err.saved, err.unsaved.length, err.uncertain))
+      } else {
+        setError('An error occurred while importing tasks. Please try again.')
+      }
     } finally {
       setIsImporting(false)
     }

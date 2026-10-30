@@ -1,5 +1,8 @@
+// @vitest-environment node
+// The pinned Etebase SDK and libsodium reject byte arrays from the jsdom realm, so this file
+// runs in node like the web744 suites; navigator.onLine keeps the browser's online default.
 import 'fake-indexeddb/auto'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { _setEncryptedQueuePersistenceAvailableForTests, enqueue, getAll, getPendingCount, replay } from '@/app/lib/offline-queue'
 import {
   _resetForTests as resetDataCache,
@@ -10,6 +13,18 @@ import {
 } from '@/app/lib/data-cache'
 import { AccountBoundaryChangedError, bumpAccountEpoch, getAccountEpoch } from '@/app/lib/account-epoch'
 import { TEST_FINGERPRINT, bumpEpochWhenQueuePutRuns, changeAccountWhenQueuePutRuns, queueGuard, resetRealOfflineQueue } from './offline-queue-store-test-utils'
+import { EtebaseRequest, ReferenceServer, makeSavedNote } from './web744-sdk-fixture'
+
+// Set before any module reads it (the sync store captures it at load); restored after the file.
+const onLineDescriptor = vi.hoisted(() => {
+  const original = Object.getOwnPropertyDescriptor(globalThis.navigator, 'onLine')
+  Object.defineProperty(globalThis.navigator, 'onLine', { configurable: true, get: () => true })
+  return original
+})
+afterAll(() => {
+  if (onLineDescriptor) Object.defineProperty(globalThis.navigator, 'onLine', onLineDescriptor)
+  else delete (globalThis.navigator as any).onLine
+})
 
 const coreMock = vi.hoisted(() => ({ createItem: vi.fn(), updateItem: vi.fn(), deleteItem: vi.fn(), listItems: vi.fn() }))
 const toastMock = vi.hoisted(() => ({ showErrorToast: vi.fn() }))
@@ -99,6 +114,17 @@ function switchAccountAtBoundary() {
     itemTypeMap: new Map([['new-item', 'calendar']]),
     itemCollectionMap: new Map([['new-item', 'new-col']]),
   })
+}
+
+/**
+ * initializeSync subscribes to the browser's online/offline events on window, which the node
+ * environment lacks. The sync tests lend it Node's real EventTarget only while their
+ * subscriptions exist, so add/remove listener behavior stays real and no other test sees a window.
+ */
+function lendBrowserEventWindow(): () => void {
+  if (typeof (globalThis as any).window !== 'undefined') return () => {}
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: new EventTarget() })
+  return () => { delete (globalThis as any).window }
 }
 
 function expectNewAccountStateUntouched() {
@@ -980,6 +1006,7 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
     // Reload: sync initialization runs before the session is restored, in the same account epoch.
     useEtebaseStore.setState(useEtebaseStore.getInitialState(), true)
     useSyncStore.setState({ pendingQueueCount: 0, failedQueueCount: 0 })
+    const restoreWindow = lendBrowserEventWindow()
     const cleanup = useSyncStore.getState().initializeSync()
     try {
       // Let the count read that started without an account finish before one is published.
@@ -996,6 +1023,7 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
       expect(coreMock.deleteItem).not.toHaveBeenCalled()
     } finally {
       cleanup()
+      restoreWindow()
       useSyncStore.setState(useSyncStore.getInitialState(), true)
     }
   })
@@ -1009,6 +1037,7 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
     useSyncStore.setState({ pendingQueueCount: 0, failedQueueCount: 0 })
     const published: number[] = []
     const stopRecording = useSyncStore.subscribe((state) => { published.push(state.pendingQueueCount) })
+    const restoreWindow = lendBrowserEventWindow()
     const cleanup = useSyncStore.getState().initializeSync()
     try {
       await vi.dynamicImportSettled()
@@ -1041,6 +1070,7 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
     } finally {
       stopRecording()
       cleanup()
+      restoreWindow()
       useSyncStore.setState(useSyncStore.getInitialState(), true)
     }
   })
@@ -1048,6 +1078,7 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
   it('does not publish a restored account pending count after sync initialization was cleaned up', async () => {
     await enqueue({ type: 'delete', collectionType: 'notes', collectionUid: 'notes-1', itemUid: 'note-1' }, queueGuard())
     useSyncStore.setState({ pendingQueueCount: 0, failedQueueCount: 0 })
+    const restoreWindow = lendBrowserEventWindow()
     try {
       // Cleaned up before the account watcher could attach, as in a double-invoked effect.
       useSyncStore.getState().initializeSync()()
@@ -1069,6 +1100,7 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
 
       expect(await getPendingCount(queueGuard())).toBe(1)
     } finally {
+      restoreWindow()
       useSyncStore.setState(useSyncStore.getInitialState(), true)
     }
   })
@@ -1125,5 +1157,130 @@ describe('useEtebaseStore real guarded offline queue integration', () => {
 
     // Reading for the projection never removes or rewrites queue entries.
     expect(await getAll()).toEqual(queuedBefore)
+  })
+
+  // C3a-R14: the real bridge drives the pinned, patched Etebase SDK against the
+  // reference transport. A batch the server acknowledged must stay acknowledged
+  // when a later chunk of the same import fails offline.
+  describe('C3a-R14 acknowledged-prefix settlement through the pinned SDK', () => {
+    const originalRequest = EtebaseRequest.default
+    const isItemBatch = (method: string, path: string) => method === 'post' && /(^|\/)item\/batch$/.test(path)
+    const vtodo = (index: number) => `BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:c3a-r14-${index}\r\nSUMMARY:C3a-R14 ${index}\r\nEND:VTODO\r\nEND:VCALENDAR`
+    const contents = Array.from({ length: 25 }, (_, index) => ({ content: vtodo(index), tempId: `c3a-r14-temp-${index}` }))
+    let server: ReferenceServer
+    let batchOutcomes: string[]
+
+    beforeEach(() => {
+      server = new ReferenceServer()
+      batchOutcomes = []
+      // Records what each item batch request did at the transport; everything else passes through.
+      EtebaseRequest.default = async (url: string, options: any = {}) => {
+        const method = String(options.method ?? 'get').toLowerCase()
+        const path = new URL(url).pathname.split('/').filter(Boolean).join('/')
+        if (!isItemBatch(method, path)) return server.handle(url, options)
+        try {
+          const response = await server.handle(url, options)
+          batchOutcomes.push(response.ok ? 'acknowledged' : `status-${response.status}`)
+          return response
+        } catch (err) {
+          batchOutcomes.push('network-failure')
+          throw err
+        }
+      }
+    })
+
+    afterEach(() => {
+      EtebaseRequest.default = originalRequest
+    })
+
+    async function installRealTasksAccount() {
+      const { account } = await makeSavedNote('C3a-R14 unused', '')
+      const tasksCollection = await account.getCollectionManager().create('etebase.vtodo', { name: 'C3a-R14 tasks', mtime: 1 }, '')
+      tasksCollection.encryptedCollection.__markSaved()
+      server.seed(tasksCollection, [])
+      useEtebaseStore.setState({
+        account,
+        accountFingerprint: TEST_FINGERPRINT,
+        collections: { calendar: [], tasks: [tasksCollection], contacts: [], notes: [], preferences: [] },
+        itemCache: new Map(),
+        itemTypeMap: new Map(),
+        itemCollectionMap: new Map(),
+        domainLoadState: { calendar: 'loaded', tasks: 'loaded', contacts: 'loaded', notes: 'loaded', preferences: 'unknown' },
+        isInitialized: true,
+        syncEngine: null,
+      } as any)
+      return { account, tasksCollection }
+    }
+
+    async function serverItemUids(account: any, tasksCollection: any): Promise<string[]> {
+      const response = await account.getCollectionManager().getItemManager(tasksCollection).list()
+      return response.data.filter((item: any) => !item.isDeleted).map((item: any) => item.uid).sort()
+    }
+
+    it('C3a-R14 control: the pinned SDK fixture acknowledges all 25 items in two chunks', async () => {
+      const { account, tasksCollection } = await installRealTasksAccount()
+      const onCommitted = vi.fn()
+
+      const uids = await useEtebaseStore.getState().createItemsBatch('tasks', contents, tasksCollection.uid, onCommitted)
+
+      expect(batchOutcomes).toEqual(['acknowledged', 'acknowledged'])
+      expect(uids.every((uid) => typeof uid === 'string')).toBe(true)
+      expect(onCommitted).toHaveBeenCalledTimes(25)
+      expect(await serverItemUids(account, tasksCollection)).toEqual([...uids as string[]].sort())
+      expect(await getAll(queueGuard())).toEqual([])
+      expect(toastMock.showErrorToast).not.toHaveBeenCalled()
+    })
+
+    it.each<[string, boolean, string[]]>([
+      ['production queue config', false, []],
+      ['test queue config', true, contents.slice(20).map(({ tempId }) => tempId)],
+    ])('C3a-R14 keeps the 20 acknowledged items when the second chunk fails offline before it is applied (%s)', async (_label, encryptedQueue, expectedQueuedTempIds) => {
+      _setEncryptedQueuePersistenceAvailableForTests(encryptedQueue)
+      const { account, tasksCollection } = await installRealTasksAccount()
+      let batchRequests = 0
+      const secondChunk = server.holdNext((method, path) => isItemBatch(method, path) && ++batchRequests === 2)
+      const onCommitted = vi.fn()
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const settling = useEtebaseStore.getState().createItemsBatch('tasks', contents, tasksCollection.uid, onCommitted)
+
+        // Fixture proof: chunk 1 was acknowledged and applied before chunk 2 reached the transport.
+        await secondChunk.arrived
+        expect(batchOutcomes).toEqual(['acknowledged'])
+        const acknowledgedOnServer = await serverItemUids(account, tasksCollection)
+        expect(acknowledgedOnServer).toHaveLength(20)
+
+        // Chunk 2 fails as a network error before the server applies it.
+        secondChunk.release(true)
+        const uids = await settling
+
+        // Fixture proof: chunk 2 failed at the transport, was not retried, and the server still holds only chunk 1.
+        expect(batchOutcomes).toEqual(['acknowledged', 'network-failure'])
+        expect(await serverItemUids(account, tasksCollection)).toEqual(acknowledgedOnServer)
+
+        // Settlement: the acknowledged prefix is returned and published; the unsent suffix is not.
+        expect(uids).toHaveLength(25)
+        expect(uids.slice(0, 20).every((uid) => typeof uid === 'string')).toBe(true)
+        expect([...uids.slice(0, 20) as string[]].sort()).toEqual(acknowledgedOnServer)
+        expect(uids.slice(20)).toEqual([null, null, null, null, null])
+        expect(onCommitted.mock.calls.map(([tempId]) => tempId)).toEqual(contents.slice(0, 20).map(({ tempId }) => tempId))
+        expect(onCommitted.mock.calls.map(([, item]) => item.uid)).toEqual(uids.slice(0, 20))
+        const state = useEtebaseStore.getState()
+        expect([...state.itemCache.keys()].sort()).toEqual(acknowledgedOnServer)
+        for (const [tempId, item] of onCommitted.mock.calls) {
+          expect(state.itemCache.get(item.uid), `itemCache for ${tempId}`).toBe(item)
+          expect(state.itemTypeMap.get(item.uid)).toBe('tasks')
+          expect(state.itemCollectionMap.get(item.uid)).toBe(tasksCollection.uid)
+        }
+
+        // No acknowledged item is re-enqueued; only the unacknowledged suffix may be, when the queue can hold it.
+        const queued = await getAll(queueGuard())
+        expect(queued.map((entry) => entry.tempId)).toEqual(expectedQueuedTempIds)
+        expect(queued.every((entry) => entry.type === 'create' && entry.collectionType === 'tasks' && entry.collectionUid === tasksCollection.uid)).toBe(true)
+        expect(toastMock.showErrorToast).not.toHaveBeenCalled()
+      } finally {
+        errorSpy.mockRestore()
+      }
+    })
   })
 })

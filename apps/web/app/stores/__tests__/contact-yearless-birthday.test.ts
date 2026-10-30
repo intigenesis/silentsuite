@@ -45,7 +45,13 @@ function onlineAccount() {
     options?.onSaved?.(`etag-${++sequence}`)
     return 'remote'
   })
-  const createItemsBatch = vi.fn(async () => [] as string[])
+  // Every imported record acknowledged with its own committed revision, as an import that succeeds.
+  const createItemsBatch = vi.fn(async (_type: string, items: { content: string; tempId: string }[], _collectionUid?: string, onCommitted?: (tempId: string, item: any) => void) =>
+    items.map((item, index) => {
+      const uid = `remote-import-${index}`
+      onCommitted?.(item.tempId, { etag: `rev-${uid}`, encryptedItem: { lastEtag: `rev-${uid}` } })
+      return uid
+    }))
   useEtebaseStore.setState({ account: {}, accountFingerprint: TEST_FINGERPRINT, itemCache: new Map([[ID, {}]]), updateItem, createItemsBatch } as any)
   return { updateItem, createItemsBatch }
 }

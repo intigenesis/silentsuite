@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react'
 import TaskImport from '../TaskImport'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import type { VTodo } from '@silentsuite/core/utils/ical-parser'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 
 const mocks = vi.hoisted(() => ({
   importTasks: vi.fn(),
@@ -152,5 +153,82 @@ describe('TaskImport CSV quoted fields across line breaks', () => {
         { title: 'Later task', description: 'After, with comma', due_date: new Date(2025, 9, 16), priority: 'urgent', completed: true },
       ],
     })
+  })
+})
+
+// C3a-R5 (PLAN U1, U2, U4). The store outcome is controlled here to isolate the recovery UI;
+// the store contract itself is proven against the pinned SDK in use-task-store.test.ts.
+describe('C3a-R5 TaskImport reports only acknowledged tasks and keeps the rest for retry', () => {
+  // The real Todoist CSV path (this file mocks the iCal parser), so each task keeps its own title.
+  const csv = (titles: string[]) => new File([['TYPE,CONTENT', ...titles.map((title) => `task,${title}`)].join('\n')], 'todoist.csv', { type: 'text/csv' })
+  const caveat = /may already be saved/i
+  const payloadTitles = (call: number) => (mocks.importTasks.mock.calls[call]![0] as { title: string }[]).map(({ title }) => title)
+
+  beforeEach(() => {
+    mocks.importTasks.mockReset()
+    mocks.onImportComplete.mockReset()
+  })
+
+  async function previewTasks(titles: string[]) {
+    const { container } = renderWithIntl(<TaskImport onImportComplete={mocks.onImportComplete} />)
+    fireEvent.change(container.querySelector('input[type="file"]')!, { target: { files: [csv(titles)] } })
+    return screen.findByRole('button', { name: `Import ${titles.length} tasks` })
+  }
+
+  it('C3a-R5 tasks: a partial unconfirmed import reports the acknowledged count, warns before retry, and retries only the rest', async () => {
+    mocks.importTasks
+      .mockRejectedValueOnce(new ImportIncompleteError(1, [1], true))
+      .mockResolvedValueOnce(1)
+    fireEvent.click(await previewTasks(['First task', 'Second task']))
+
+    const message = await screen.findByText(/Imported 1 of 2 tasks/)
+    expect(message.textContent).toMatch(/(weren't|were not) confirmed as saved/i)
+    expect(message.textContent).toMatch(caveat)
+    expect(screen.queryByText(/tasks imported/)).toBeNull()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+
+    // Only the unacknowledged original record stays previewed and importable.
+    const retry = screen.getByRole('button', { name: 'Import 1 tasks' })
+    expect(screen.queryByText('First task')).toBeNull()
+    expect(screen.getByText('Second task')).toBeInTheDocument()
+
+    fireEvent.click(retry)
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(1))
+    expect(payloadTitles(1)).toEqual(['Second task'])
+    expect(screen.getByText('1 tasks imported')).toBeInTheDocument()
+    expect(screen.queryByText(/Imported 1 of 2 tasks/)).toBeNull()
+  })
+
+  it('C3a-R5 tasks: an unconfirmed import with nothing acknowledged keeps every task and warns they may already be saved', async () => {
+    mocks.importTasks.mockRejectedValueOnce(new ImportIncompleteError(0, [0, 1], true))
+    fireEvent.click(await previewTasks(['First task', 'Second task']))
+
+    const message = await screen.findByText(/Imported 0 of 2 tasks/)
+    expect(message.textContent).toMatch(caveat)
+    expect(screen.getByRole('button', { name: 'Import 2 tasks' })).toBeInTheDocument()
+    expect(screen.getByText('First task')).toBeInTheDocument()
+    expect(screen.getByText('Second task')).toBeInTheDocument()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R5 tasks: an import that sent nothing says none were saved, without the may-already-be-saved caveat', async () => {
+    mocks.importTasks.mockRejectedValueOnce(new ImportIncompleteError(0, [0, 1], false))
+    fireEvent.click(await previewTasks(['First task', 'Second task']))
+
+    const message = await screen.findByText(/None of the 2 tasks were saved/i)
+    expect(message.textContent).not.toMatch(caveat)
+    expect(screen.getByRole('button', { name: 'Import 2 tasks' })).toBeInTheDocument()
+    expect(screen.getByText('First task')).toBeInTheDocument()
+    expect(screen.getByText('Second task')).toBeInTheDocument()
+    expect(mocks.onImportComplete).not.toHaveBeenCalled()
+  })
+
+  it('C3a-R5 tasks: a fully acknowledged import still reports its true count', async () => {
+    mocks.importTasks.mockResolvedValueOnce(2)
+    fireEvent.click(await previewTasks(['First task', 'Second task']))
+
+    await waitFor(() => expect(mocks.onImportComplete).toHaveBeenCalledWith(2))
+    expect(screen.getByText('2 tasks imported')).toBeInTheDocument()
+    expect(payloadTitles(0)).toEqual(['First task', 'Second task'])
   })
 })
