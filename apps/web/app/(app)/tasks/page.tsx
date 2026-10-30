@@ -4,7 +4,7 @@ import { useCallback, useMemo, useState, useRef, useEffect } from 'react'
 import { X, ChevronDown, Calendar, Flag, WifiOff, Plus, AlignLeft, Pencil, List, Folder, Tag, MapPin, Link, BarChart3, CircleDot } from 'lucide-react'
 import { useTranslations } from 'next-intl'
 import { LabelEditor, LabelChips } from '@/app/components/LabelEditor'
-import { useTaskStore } from '@/app/stores/use-task-store'
+import { useTaskStore, type TaskSaveError } from '@/app/stores/use-task-store'
 import { useDomainInitializing } from '@/app/hooks/use-domain-initializing'
 import { useTaskListStore } from '@/app/stores/use-task-list-store'
 import { useSyncStore } from '@/app/stores/use-sync-store'
@@ -101,6 +101,17 @@ function normalizeTaskProgress(status: TaskStatus, percent: number): { completed
   return { completed: false, percent_complete: Math.max(0, Math.min(99, Math.round(percent))) }
 }
 
+/**
+ * The outcome shown beside a kept draft. Only a create that was never sent is reported as
+ * unsaved; anything else may already exist remotely, so it is never called absent.
+ */
+function createFailureMessage(err: unknown): string {
+  const neverSent = err instanceof Error && err.name === 'TaskSaveError' && (err as TaskSaveError).unconfirmed === false
+  return neverSent
+    ? 'Task not saved. Please try again.'
+    : "Couldn't confirm this task was saved. If it appears in your list after the next sync, don't add it again."
+}
+
 function sortTasks(tasks: Task[]): Task[] {
   return [...tasks].sort((a, b) => {
     // Incomplete first
@@ -121,6 +132,9 @@ function sortTasks(tasks: Task[]): Task[] {
 
 function TaskQuickAdd() {
   const [title, setTitle] = useState('')
+  // The submitted title stays, read-only, until its create settles.
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const createTask = useTaskStore((s) => s.createTask)
   const canWrite = useAuthStore((s) => s.canWrite())
   const taskLists = useTaskListStore((s) => s.lists)
@@ -134,38 +148,53 @@ function TaskQuickAdd() {
   }, [activeListId, taskLists])
 
   const handleSubmit = useCallback(
-    (e: React.FormEvent) => {
+    async (e: React.FormEvent) => {
       e.preventDefault()
+      if (pending) return
       const trimmed = title.trim()
       if (!trimmed) return
-      createTask({ title: trimmed, listId: defaultListId })
-      setTitle('')
+      setPending(true)
+      setError(null)
+      try {
+        await createTask({ title: trimmed, listId: defaultListId })
+        setTitle('')
+      } catch (err) {
+        setError(createFailureMessage(err))
+      } finally {
+        setPending(false)
+      }
     },
-    [title, createTask, defaultListId],
+    [pending, title, createTask, defaultListId],
   )
 
   return (
-    <form onSubmit={handleSubmit} className="flex gap-2">
-      <input
-        ref={inputRef}
-        type="text"
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        placeholder={canWrite ? 'Add a task...' : 'Read-only mode'}
-        aria-label="Add a task"
-        disabled={!canWrite}
-        className={`flex-1 rounded-lg border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 py-2 text-sm text-[rgb(var(--foreground))] placeholder:text-[rgb(var(--muted))] focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent ${!canWrite ? 'opacity-50 cursor-not-allowed' : ''}`}
-        title={!canWrite ? 'Subscription required' : undefined}
-      />
-      <button
-        type="submit"
-        disabled={!title.trim() || !canWrite}
-        className={`rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 ${canWrite ? 'hover:bg-emerald-500' : ''}`}
-        title={!canWrite ? 'Subscription required' : undefined}
-      >
-        Add
-      </button>
-    </form>
+    <div>
+      <form onSubmit={handleSubmit} className="flex gap-2">
+        <input
+          ref={inputRef}
+          type="text"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder={canWrite ? 'Add a task...' : 'Read-only mode'}
+          aria-label="Add a task"
+          disabled={!canWrite}
+          readOnly={pending}
+          className={`flex-1 rounded-lg border border-[rgb(var(--border))] bg-[rgb(var(--surface))] px-3 py-2 text-sm text-[rgb(var(--foreground))] placeholder:text-[rgb(var(--muted))] focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent ${!canWrite ? 'opacity-50 cursor-not-allowed' : ''}`}
+          title={!canWrite ? 'Subscription required' : undefined}
+        />
+        <button
+          type="submit"
+          disabled={!title.trim() || !canWrite || pending}
+          className={`rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 ${canWrite ? 'hover:bg-emerald-500' : ''}`}
+          title={!canWrite ? 'Subscription required' : undefined}
+        >
+          Add
+        </button>
+      </form>
+      {error && (
+        <p role="alert" className="mt-2 rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</p>
+      )}
+    </div>
   )
 }
 
@@ -215,42 +244,61 @@ function TaskDialog({
   const [url, setUrl] = useState(task?.url ?? '')
   const [categories, setCategories] = useState<string[]>(task?.categories ?? [])
   const [selectedListId, setSelectedListId] = useState(task?.listId ?? defaultListId)
+  // A new task's draft stays open until its create settles (create mode only).
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
 
   useEffect(() => {
     const timer = setTimeout(() => titleRef.current?.focus(), 50)
     return () => clearTimeout(timer)
   }, [])
 
+  // Nothing may discard the draft while its create is pending.
+  const close = useCallback(() => {
+    if (!creating) onClose()
+  }, [creating, onClose])
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') close()
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [close])
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     const trimmed = title.trim()
-    if (!trimmed) return
+    if (!trimmed || creating) return
 
     const parsedStart = parseDateInput(startDate)
     const parsedDue = parseDateInput(dueDate)
     const progress = normalizeTaskProgress(status, percentComplete)
 
     if (mode === 'create') {
-      createTask({
-        title: trimmed,
-        description,
-        start_date: parsedStart,
-        due_date: parsedDue,
-        priority,
-        status,
-        ...progress,
-        location,
-        url,
-        categories,
-        listId: selectedListId,
-      })
+      setCreating(true)
+      setCreateError(null)
+      try {
+        await createTask({
+          title: trimmed,
+          description,
+          start_date: parsedStart,
+          due_date: parsedDue,
+          priority,
+          status,
+          ...progress,
+          location,
+          url,
+          categories,
+          listId: selectedListId,
+        })
+      } catch (err) {
+        // Every field stays as submitted so the draft can be saved again.
+        setCreating(false)
+        setCreateError(createFailureMessage(err))
+        return
+      }
+      onClose()
+      return
     } else if (task) {
       updateTask(task.id, {
         title: trimmed,
@@ -267,11 +315,11 @@ function TaskDialog({
       })
     }
     onClose()
-  }, [title, description, startDate, dueDate, priority, status, percentComplete, location, url, categories, selectedListId, mode, task, createTask, updateTask, onClose])
+  }, [title, creating, description, startDate, dueDate, priority, status, percentComplete, location, url, categories, selectedListId, mode, task, createTask, updateTask, onClose])
 
   return (
     <>
-      <div className="fixed inset-0 z-[60] bg-black/40" aria-hidden="true" onClick={onClose} />
+      <div className="fixed inset-0 z-[60] bg-black/40" aria-hidden="true" onClick={close} />
       <div className="fixed inset-0 z-[61] flex items-end justify-center sm:items-center sm:p-4">
         <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={mode === 'create' ? 'New Task' : 'Edit Task'} className="flex w-full max-h-[90vh] flex-col bg-[rgb(var(--background))] sm:max-w-lg sm:rounded-xl sm:border sm:border-[rgb(var(--border))] sm:shadow-xl rounded-t-2xl">
           {/* Mobile drag handle */}
@@ -280,7 +328,8 @@ function TaskDialog({
           {/* Header */}
           <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[rgb(var(--border))] px-4 py-3">
             <button
-              onClick={onClose}
+              onClick={close}
+              disabled={creating}
               className="shrink-0 rounded-md px-2 py-1 text-sm text-[rgb(var(--muted))] hover:text-[rgb(var(--foreground))] transition-colors"
             >
               Cancel
@@ -290,7 +339,7 @@ function TaskDialog({
             </span>
             <button
               onClick={handleSave}
-              disabled={!title.trim()}
+              disabled={!title.trim() || creating}
               className="shrink-0 rounded-md bg-emerald-600 px-3 py-1 text-sm font-medium text-white hover:bg-emerald-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {mode === 'create' ? 'Create' : 'Save'}
@@ -299,6 +348,10 @@ function TaskDialog({
 
           {/* Body */}
           <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4">
+            {createError && (
+              <p role="alert" className="rounded-md bg-red-500/10 px-3 py-2 text-sm text-red-400">{createError}</p>
+            )}
+
             {/* Title */}
             <input
               ref={titleRef}
