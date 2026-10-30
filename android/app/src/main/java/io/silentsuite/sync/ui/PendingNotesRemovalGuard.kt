@@ -135,8 +135,8 @@ internal object PendingNotesRemovalGuard {
 
     /**
      * notes-pending lists, but leaves out a store folder whose path is known (a record in notes-discard, [Input.known],
-     * one whose clear or discard stopped in this process included, another row's own) and whose presence check does
-     * not show it absent, for a row without a readable creation id:
+     * one whose clear or discard stopped in this process included, one the account list names for any row) and whose
+     * presence check does not show it absent, for a row without a readable creation id:
      * the listing came back short, so a store it left out that no path names may hold text. Until the maintainer
      * decides whether this takes a one-time confirmed removal bound to something a listing does not move, refused. It
      * is not [Verdict.ROOT_UNLISTABLE_ONLY]: that allowance binds notes-pending's listing counter, which the guard's
@@ -207,8 +207,8 @@ internal object PendingNotesRemovalGuard {
      * 4. a store holds what nothing covers or is there unlisted, or, for a row without a readable id, one is absent by
      *    lstat alone while notes-pending lists, which only a race gives: [Verdict.REFUSE_STORE];
      * 5. for a row without a readable id, notes-pending lists but leaves out a store folder whose path is known (a
-     *    record in notes-discard, [Input.known], one whose clear or discard stopped in this process included, or
-     *    another row's own) and its presence check does not answer ABSENT: [PENDING_LISTED_SHORT];
+     *    record in notes-discard, [Input.known], one whose clear or discard stopped in this process included, or one
+     *    the account list names for any row) and its presence check does not answer ABSENT: [PENDING_LISTED_SHORT];
      * 6. for a row without a readable id, the account list cannot be read, unless row 12 holds:
      *    [Verdict.REFUSE_ACCOUNTS]. That takes the failed list read and, at once, notes-pending that cannot be listed
      *    or holds a name of an unknown kind, or notes-discard that cannot be listed while a store could not withdraw
@@ -234,12 +234,12 @@ internal object PendingNotesRemovalGuard {
      *    [Verdict.REFUSE_UNREADABLE].
      *
      * For a row with a readable id, the only store is its own. For one without, the stores are those notes-pending
-     * lists, those notes-discard holds a record of, and [Input.known], those whose clear or discard stopped in this
-     * process included, less every store of another row whose id reads. The row itself owns none, even when the account
-     * list reads an id for it, and with the account list unread no store is left out. The listing of notes-pending is
-     * checked against every one of those folders found by path and every other row's own, by its presence check: a
-     * folder it left out that is there, or whose check fails, shows that it came back short (row 5), while what it
-     * listed is still checked.
+     * lists, those notes-discard holds a record of, [Input.known], those whose clear or discard stopped in this process
+     * included, and the folder the account list names for the row itself, less every store of another row whose id
+     * reads. The row itself owns none, even when the account list reads an id for it, and with the account list unread
+     * no store is left out. The listing of notes-pending is checked against every one of those folders found by path
+     * and every other row's own, by its presence check: a folder it left out that is there, or whose check fails, shows
+     * that it came back short (row 5), while what it listed is still checked.
      */
     fun decide(input: Input): Verdict = decision(input).verdict
 
@@ -286,14 +286,18 @@ internal object PendingNotesRemovalGuard {
         val owned = rows.orEmpty().filter { it.name != name }.mapNotNullTo(HashSet()) { row ->
             (row.id as? CreationId.Readable)?.let { input.folderOf(row.name, it.id) }
         }
+        // Yet that id names a folder, and a path that is known keeps its checks, whoever owns it.
+        val itself = rows.orEmpty().filter { it.name == name }.mapNotNullTo(HashSet()) { row ->
+            (row.id as? CreationId.Readable)?.let { input.folderOf(row.name, it.id) }
+        }
         // A listing of notes-pending can come back short with no error. A store folder whose path is known that it left
         // out, and that lstat does not show absent, shows that it did: what it listed is still checked, but it proves
         // no absence.
         val short = pending != null && pending.stores.toHashSet().let { inListing ->
-            (discard.orEmpty() + known + owned).toSortedSet()
+            (discard.orEmpty() + known + owned + itself).toSortedSet()
                 .any { it !in inListing && input.presence(it) != PendingNotesStore.Presence.ABSENT }
         }
-        val stores = (pending?.stores.orEmpty() + discard.orEmpty() + known).toSortedSet() - owned
+        val stores = (pending?.stores.orEmpty() + discard.orEmpty() + known + itself).toSortedSet() - owned
         val answers = stores.map { checked(input, it) }
         val rootLists = pending != null
         val unknown = pending?.unknown == true

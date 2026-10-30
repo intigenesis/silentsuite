@@ -458,6 +458,19 @@ class PendingNotesRemovalGuardTest {
         assertEquals(CreationId.Readable("gen-c"), CreationId.of { "gen-c" })
     }
 
+    @Test fun `the folder the list names for the row itself is checked, whatever notes-pending says`() {
+        val b = folder("b", "gen-b")
+        val rows = { listOf(Row("b", CreationId.Readable("gen-b"))) }
+        answer(b, RemovalCheck.Blocks(draft))
+        assertEquals("left out of the listing", Verdict.REFUSE_STORE, decide(input(accounts = rows)))
+        assertEquals("no listing at all", Verdict.REFUSE_STORE, decide(input(accounts = rows, pending = unlistable)))
+        answer(b, RemovalCheck.Clean)
+        assertEquals("nothing in it", Verdict.ALLOW, decide(input(accounts = rows)))
+        assertEquals("a listing that leaves out a folder that is there is short",
+            PendingNotesRemovalGuard.PENDING_LISTED_SHORT,
+            decide(input(accounts = rows, presence = { PendingNotesStore.Presence.PRESENT })))
+    }
+
     @Test fun `every account read comes before the first store check, and every store is checked once`() {
         answer("orphan", RemovalCheck.Covered)
         decide(input(pending = listed("orphan", "x"), discard = { setOf("x", "y") }, known = { setOf("y", "z") }))
