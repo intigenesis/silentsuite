@@ -103,6 +103,17 @@ class UnsyncedNotesRemovalContractTest {
             .findAll(offer).count())
     }
 
+    @Test fun `the allowance of this process counts the real account rows and the boot clock`() {
+        assertTrue(allowance, Regex("""val process = NotesRemovalAllowance\(\s*AccountRowChanges\.mainType\s*,\s*""" +
+            """NotesFolderListings::count\s*,\s*SystemClock::elapsedRealtime\b""").containsMatchIn(allowance))
+    }
+
+    @Test fun `the tap takes its time first, and hands it to the offer`() {
+        val tap = dialog.substringAfter("fun confirm(id: String) {\n", "").substringBefore("\n    }\n")
+        assertTrue(tap, tap.trimStart().startsWith("val tapped = NotesRemovalAllowance.process.now()"))
+        assertEquals(1, Regex("""offer\.confirm\(key\.type, key\.name, id, tapped, ::done\)""").findAll(tap).count())
+    }
+
     @Test fun `nothing answers for the authenticator yet, and the stores never name the allowance`() {
         val main = File("src/main/java")
         val answers = Regex("""NotesRemovalAllowance\b[^\n]*\.answer\(|allowance\.answer\(""")

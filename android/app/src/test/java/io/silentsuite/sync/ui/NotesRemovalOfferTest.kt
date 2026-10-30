@@ -207,6 +207,25 @@ class NotesRemovalOfferTest {
         assertEquals(Outcome.RETRY, tap { decision = Decision(Verdict.REFUSE_STORE, null) })
     }
 
+    @Test fun `the two minutes count from the time the tap hands over, not from when the offer starts`() {
+        val shown = offer.show(TYPE, "b")!!
+        // The tap at 0 waited on another thread until 130 seconds; the offer's own work takes no time.
+        now = 130_000
+        val outcomes = ArrayList<Outcome>()
+        offer.confirm(TYPE, "b", shown.id, 0) { outcomes += it }
+        assertNull("no removal started", removal)
+        assertEquals(listOf(Outcome.RETRY), outcomes)
+    }
+
+    @Test fun `a creation that started before the tap ends the confirmation`() {
+        val shown = offer.show(TYPE, "b")!!
+        records = listOf(record("b", Phase.PREPARED))
+        val outcomes = ArrayList<Outcome>()
+        offer.confirm(TYPE, "b", shown.id) { outcomes += it }
+        assertEquals(listOf(Outcome.CHANGED), outcomes)
+        assertNull("the tap used it up", allowance.shown(shown.id))
+    }
+
     @Test fun `confirmation work that runs past two minutes from the tap starts no removal and leaves no allowance`() {
         val shown = offer.show(TYPE, "b")!!
         val before = rows.count()

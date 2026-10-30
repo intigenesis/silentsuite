@@ -77,6 +77,7 @@ internal class NotesRemovalViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The tap on "Remove account" of the confirmation [id]. */
     fun confirm(id: String) {
+        val tapped = NotesRemovalAllowance.process.now()
         if (confirming == id) return
         val key = NotesRemovalAllowance.process.shown(id)?.key
         if (key == null) {
@@ -93,7 +94,7 @@ internal class NotesRemovalViewModel(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                offer.confirm(key.type, key.name, id, ::done)
+                offer.confirm(key.type, key.name, id, tapped, ::done)
             } catch (e: Exception) {
                 done(Outcome.RETRY)
             }

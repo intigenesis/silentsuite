@@ -97,14 +97,15 @@ internal class NotesRemovalOffer(
 
     /**
      * The tap on "Remove account" of the confirmation [id]: the guard, the registry and the fingerprint again, outside
-     * any lock, then the allowance's atomic step ([NotesRemovalAllowance.mint]), then, holding no lock, the removal
-     * itself. [done] gets what it came to: once Android answered, the row is read again, and only a row that is gone
-     * is removed, whoever removed it; then the registry record the confirmation saw is cleared by its own id, so a new
-     * sign-in with that name is not stopped by it until the next launch. Rows that cannot be read then give
-     * [Outcome.UNKNOWN], and the record stays.
+     * any lock, then the allowance's atomic step ([NotesRemovalAllowance.mint]) with the time of the tap, [tapped], so
+     * that those reads count against the allowance's two minutes, then, holding no lock, the removal itself. [done]
+     * gets what it came to: once Android answered, the row is read again, and only a row that is gone is removed,
+     * whoever removed it; then the registry record the confirmation saw is cleared by its own id, so a new sign-in with
+     * that name is not stopped by it until the next launch. Rows that cannot be read then give [Outcome.UNKNOWN], and
+     * the record stays.
      */
     @WorkerThread
-    fun confirm(type: String, name: String, id: String, done: (Outcome) -> Unit) {
+    fun confirm(type: String, name: String, id: String, tapped: Long = allowance.now(), done: (Outcome) -> Unit) {
         val decision = seams.decision(type, name)
         if (creating(seams.records(), type, name)) {
             allowance.cancel(id)
@@ -112,7 +113,8 @@ internal class NotesRemovalOffer(
             return
         }
         val fingerprint = seams.fingerprint(decision)
-        when (val minted = allowance.mint(id, Key(type, name, decision.creationId), decision.verdict, fingerprint)) {
+        val key = Key(type, name, decision.creationId)
+        when (val minted = allowance.mint(id, key, decision.verdict, fingerprint, tapped)) {
             Mint.Readable -> done(Outcome.READABLE)
             Mint.Changed -> done(Outcome.CHANGED)
             Mint.Retry -> done(Outcome.RETRY)

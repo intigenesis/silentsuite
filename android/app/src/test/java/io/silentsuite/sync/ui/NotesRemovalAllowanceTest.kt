@@ -105,6 +105,24 @@ class NotesRemovalAllowanceTest {
         assertEquals(120_000L, NotesRemovalAllowance.WINDOW_MS)
     }
 
+    @Test fun `a tap's reads must end within two minutes of the tap, or it moves no count and makes no slot`() {
+        fun tapThen(read: Long): Mint {
+            val shown = allowance.show(allowance.counts(), b, Verdict.ROOT_UNLISTABLE_ONLY, pending, recovery = null)!!
+            val tapped = allowance.now()
+            now += read
+            return allowance.mint(shown.id, b, Verdict.ROOT_UNLISTABLE_ONLY, pending, tapped)
+        }
+        assertTrue(tapThen(119_999) is Mint.Done)
+        assertTrue("a slot from the tap, with one millisecond left", answer())
+        val before = rows.count()
+        assertEquals(Mint.Retry, tapThen(120_000))
+        assertEquals("the row counter did not move", before, rows.count())
+        // A slot would answer here: the counter at its count, and the clock back inside its window.
+        rows.before()
+        now -= 1
+        assertFalse("and there is no slot", answer())
+    }
+
     @Test fun `each change since the mint voids the slot, and a void is final`() {
         val a = Key(TYPE, "a", "gen-a")
         val voids = listOf<Pair<String, () -> Boolean>>(

@@ -21,8 +21,9 @@ import java.security.SecureRandom
  * 1. A confirmation that opens reads [counts] first, before any account read, then shows ([show]) for an eligible
  *    verdict. One confirmation shows at a time; a newer one, [cancel] or a tap ([mint]) ends it.
  * 2. The tap ([mint]) compares, under the lock, the confirmation it was shown for, the row, the verdict's reason, the
- *    counters it binds and the fingerprint, and then moves the row counter by a compare-and-set from the count the
- *    confirmation read: that is the tap's own move. Only then is there a slot, holding the count after that move.
+ *    counters it binds and the fingerprint, checks that its own reads ended within [WINDOW_MS] of the tap, and then
+ *    moves the row counter by a compare-and-set from the count the confirmation read: that is the tap's own move.
+ *    Only then is there a slot, holding the count after that move and the time of the tap.
  * 3. The authenticator's answer ([answer]) takes a slot for its (type, name) out first, whatever follows, so it is
  *    used once by whoever asks first; it holds only while nothing has changed and the compare-and-set from the
  *    slot's count works.
@@ -89,7 +90,7 @@ internal class NotesRemovalAllowance(
         /** The accounts changed: an add or removal, another creation id, or another confirmation since. */
         object Changed : Mint()
 
-        /** The verdict or the fingerprint is not what the confirmation showed. */
+        /** The verdict or the fingerprint is not what the confirmation showed, or the tap's reads took [WINDOW_MS]. */
         object Retry : Mint()
     }
 
@@ -99,12 +100,15 @@ internal class NotesRemovalAllowance(
         val rows: Long,
         val folders: Map<Folder, Long>,
         val fingerprint: Fingerprint,
-        val minted: Long,
+        val tapped: Long,
     )
 
     private val lock = Any()
     private var shown: Shown? = null
     private var slot: Slot? = null
+
+    /** The time of a tap: read first, on the tap's own thread, so that all that follows counts against [WINDOW_MS]. */
+    fun now(): Long = clock()
 
     /** The counters now: the first step of a confirmation, before the guard reads any account. */
     fun counts(): Counts = Counts(rows.count(), Folder.entries.associateWith { folders(it) })
@@ -133,22 +137,29 @@ internal class NotesRemovalAllowance(
     }
 
     /**
-     * The tap on the confirmation [id], with [key], [verdict] and [fingerprint] read again just now, outside the lock.
-     * It ends the confirmation, whatever it gives, so a later state needs a new one. [Mint.Done] only when the row, the
-     * verdict's reason, the counters it binds and the fingerprint are what it showed, and the row counter moves from
-     * the count it read.
+     * The tap on the confirmation [id] at [tapped], with [key], [verdict] and [fingerprint] read again since, outside
+     * the lock. It ends the confirmation, whatever it gives, so a later state needs a new one. [Mint.Done] only when
+     * the row, the verdict's reason, the counters it binds and the fingerprint are what it showed, less than
+     * [WINDOW_MS] has passed since [tapped], and the row counter moves from the count it read.
      */
-    fun mint(id: String, key: Key, verdict: Verdict, fingerprint: Fingerprint): Mint = synchronized(lock) {
+    fun mint(
+        id: String,
+        key: Key,
+        verdict: Verdict,
+        fingerprint: Fingerprint,
+        tapped: Long = clock(),
+    ): Mint = synchronized(lock) {
         val confirmed = shown?.takeIf { it.id == id } ?: return@synchronized Mint.Changed
         shown = null
         when {
             confirmed.folders.any { (folder, count) -> folders(folder) != count } -> Mint.Readable
             key != confirmed.key -> Mint.Changed
             verdict.reason != confirmed.reason || fingerprint != confirmed.fingerprint -> Mint.Retry
+            clock() - tapped >= WINDOW_MS -> Mint.Retry
             !rows.moveIfUnchanged(confirmed.rows) -> Mint.Changed
             else -> {
                 slot = Slot(confirmed.key, confirmed.reason, confirmed.rows + 1, confirmed.folders,
-                    confirmed.fingerprint, clock())
+                    confirmed.fingerprint, tapped)
                 Mint.Done(confirmed.key, confirmed.recovery)
             }
         }
@@ -158,7 +169,7 @@ internal class NotesRemovalAllowance(
      * The answer to a removal of [key]'s row, for [verdict] and [fingerprint] read just now. A slot for its (type,
      * name) is taken out first, whatever follows. [Verdict.ALLOW] moves the row counter and answers true. Otherwise
      * true only for an eligible verdict with the slot's reason, a slot for this exact [key], with the same fingerprint
-     * and bound folder counters, minted less than [WINDOW_MS] ago, and a compare-and-set of the row counter from the
+     * and bound folder counters, tapped less than [WINDOW_MS] ago, and a compare-and-set of the row counter from the
      * slot's count. A slot for another row stays.
      */
     fun answer(key: Key, verdict: Verdict, fingerprint: Fingerprint?): Boolean = synchronized(lock) {
@@ -170,7 +181,7 @@ internal class NotesRemovalAllowance(
         }
         taken != null && verdict.eligible && verdict.reason == taken.reason && key == taken.key &&
             fingerprint == taken.fingerprint && taken.folders.all { (folder, count) -> folders(folder) == count } &&
-            clock() - taken.minted < WINDOW_MS && rows.moveIfUnchanged(taken.rows)
+            clock() - taken.tapped < WINDOW_MS && rows.moveIfUnchanged(taken.rows)
     }
 
     /** Test seam: no confirmation and no slot, as at process start. The counters are never reset. */
