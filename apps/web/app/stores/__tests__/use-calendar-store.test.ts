@@ -3,7 +3,7 @@ import { useCalendarStore } from '../use-calendar-store'
 import { serializeCalendarEvent, deserializeCalendarEvent } from '@silentsuite/core'
 import type { CalendarEvent } from '@silentsuite/core'
 import { expandEventsForRange } from '@/app/(app)/calendar/lib/calendar-grid-events'
-import { getAll } from '@/app/lib/offline-queue'
+import { _setEncryptedQueuePersistenceAvailableForTests, getAll } from '@/app/lib/offline-queue'
 import { TEST_FINGERPRINT, bumpEpochWhenQueuePutRuns, enqueueCreateFromStore, expectOwnedQueueEntry, expectQuietQueueCommitCancellation, queueGuard, replayOwnedEntry, resetRealOfflineQueue } from './offline-queue-store-test-utils'
 
 const toastMock = vi.hoisted(() => ({ showErrorToast: vi.fn() }))
@@ -62,6 +62,14 @@ function offlineAccount() {
   etebaseMock.state.createItem.mockImplementation((type, content, tempId, collectionUid) => enqueueCreateFromStore(type, collectionUid, content, tempId))
 }
 
+/** Every imported record acknowledged, as an import that succeeds. */
+function acknowledgeImports() {
+  etebaseMock.state.account = {}
+  etebaseMock.state.createItemsBatch.mockImplementation(async (_type: unknown, contents: unknown[]) => (
+    contents.map((_, index) => `acknowledged-${index}`)
+  ))
+}
+
 function makeRecurringEvent(overrides?: Partial<CalendarEvent>): CalendarEvent {
   return {
     id: 'master-item',
@@ -88,6 +96,7 @@ describe('useCalendarStore.importEvents', () => {
   })
 
   it('preserves source TZID on imported events', async () => {
+    acknowledgeImports()
     const { importEvents } = useCalendarStore.getState()
     await importEvents([
       {
@@ -104,6 +113,7 @@ describe('useCalendarStore.importEvents', () => {
   })
 
   it('leaves timezone undefined when none was supplied', async () => {
+    acknowledgeImports()
     const { importEvents } = useCalendarStore.getState()
     await importEvents([
       {
@@ -118,6 +128,7 @@ describe('useCalendarStore.importEvents', () => {
   })
 
   it('serializes a TZID-bearing imported event back out with TZID intact (round-trip)', async () => {
+    acknowledgeImports()
     const { importEvents } = useCalendarStore.getState()
     await importEvents([
       {
@@ -139,6 +150,7 @@ describe('useCalendarStore.importEvents', () => {
   })
 
   it('drops timezone for all-day events (DATE-only, no TZID per RFC 5545)', async () => {
+    acknowledgeImports()
     const { importEvents } = useCalendarStore.getState()
     await importEvents([
       {
@@ -159,6 +171,7 @@ describe('useCalendarStore.importEvents', () => {
 
   it('preserves recurrence exceptions during event import', async () => {
     const exception = new Date('2026-06-03T09:00:00Z')
+    acknowledgeImports()
 
     await useCalendarStore.getState().importEvents([
       {
@@ -496,4 +509,125 @@ describe('useCalendarStore guarded offline queue integration', () => {
       toastMock,
     )
   })
+})
+
+// C3a import-store contract (PLAN §4, §7 R1–R4, R3b, R3c) for importEvents. This file mocks the
+// bridge module and runs in jsdom, where the pinned SDK cannot load, so the store reaches the
+// actual bridge (vi.importActual) and the transport is controlled at its item-manager boundary.
+// The same contract runs against the pinned SDK in the task and contact store tests.
+type ChunkFault = { chunk: number; kind: 'offline-before-apply' | 'refused' | 'response-lost' }
+
+const positions = (from: number, to: number) => Array.from({ length: to - from }, (_, index) => from + index)
+const settle = <T>(promise: Promise<T>) => promise.then((value) => ({ resolved: value }), (error: unknown) => ({ rejected: error }))
+
+const importContractCases: {
+  id: string
+  label: string
+  setup: 'transport' | 'missing-collection' | 'no-account'
+  count: number
+  fault?: ChunkFault
+  batches: string[]
+  serverCount: number
+  saved: number
+  unsaved: number[]
+  uncertain: boolean
+}[] = [
+  { id: 'C3a-R1', label: 'missing collection', setup: 'missing-collection', count: 2, batches: [], serverCount: 0, saved: 0, unsaved: [0, 1], uncertain: true },
+  { id: 'C3a-R2', label: 'offline before the first chunk is applied', setup: 'transport', count: 2, fault: { chunk: 1, kind: 'offline-before-apply' }, batches: ['network-failure'], serverCount: 0, saved: 0, unsaved: [0, 1], uncertain: true },
+  { id: 'C3a-R3', label: 'server refuses the second chunk', setup: 'transport', count: 21, fault: { chunk: 2, kind: 'refused' }, batches: ['acknowledged', 'refused', 'refused', 'refused'], serverCount: 20, saved: 20, unsaved: [20], uncertain: true },
+  { id: 'C3a-R3b', label: 'offline before the second chunk is applied', setup: 'transport', count: 25, fault: { chunk: 2, kind: 'offline-before-apply' }, batches: ['acknowledged', 'network-failure'], serverCount: 20, saved: 20, unsaved: positions(20, 25), uncertain: true },
+  { id: 'C3a-R3c', label: 'second chunk applied but its response lost', setup: 'transport', count: 25, fault: { chunk: 2, kind: 'response-lost' }, batches: ['acknowledged', 'applied-response-lost'], serverCount: 25, saved: 20, unsaved: positions(20, 25), uncertain: true },
+  { id: 'C3a-R4', label: 'no account', setup: 'no-account', count: 2, batches: [], serverCount: 0, saved: 0, unsaved: [0, 1], uncertain: false },
+]
+
+describe('C3a import-store contract: importEvents', () => {
+  let bridge: typeof import('@/app/stores/use-etebase-store')
+
+  beforeEach(async () => {
+    bridge = await vi.importActual<typeof import('@/app/stores/use-etebase-store')>('@/app/stores/use-etebase-store')
+    await resetRealOfflineQueue()
+    // Production queue configuration: plaintext create content is refused.
+    _setEncryptedQueuePersistenceAvailableForTests(false)
+    resetStore()
+    bridge.useEtebaseStore.setState(bridge.useEtebaseStore.getInitialState(), true)
+    toastMock.showErrorToast.mockReset()
+  })
+
+  /** The actual bridge with an item manager whose batches can fail before, or after, the "server" applies them. */
+  function installBridgeTransport(collections: { uid: string }[], fault?: ChunkFault) {
+    const serverUids: string[] = []
+    const batches: string[] = []
+    let created = 0
+    const manager = {
+      create: vi.fn(async () => ({ uid: `c3a-event-item-${++created}` })),
+      batch: vi.fn(async (items: { uid: string }[]) => {
+        const request = batches.length + 1
+        if (fault?.kind === 'offline-before-apply' && request === fault.chunk) {
+          batches.push('network-failure')
+          throw new TypeError('Failed to fetch')
+        }
+        if (fault?.kind === 'refused' && request >= fault.chunk) {
+          batches.push('refused')
+          throw new Error('Server refused the batch')
+        }
+        serverUids.push(...items.map((item) => item.uid))
+        if (fault?.kind === 'response-lost' && request === fault.chunk) {
+          batches.push('applied-response-lost')
+          throw new TypeError('Failed to fetch')
+        }
+        batches.push('acknowledged')
+      }),
+    }
+    const account = { getCollectionManager: () => ({ getItemManager: () => manager }) }
+    bridge.useEtebaseStore.setState({
+      account,
+      accountFingerprint: TEST_FINGERPRINT,
+      collections: { calendar: collections, tasks: [], contacts: [], notes: [], preferences: [] },
+      itemCache: new Map(),
+      itemTypeMap: new Map(),
+      itemCollectionMap: new Map(),
+      syncEngine: null,
+    } as any)
+    etebaseMock.state.account = account
+    etebaseMock.state.accountFingerprint = TEST_FINGERPRINT
+    etebaseMock.state.createItemsBatch.mockImplementation((...args: any[]) => (
+      (bridge.useEtebaseStore.getState().createItemsBatch as (...forwarded: any[]) => unknown)(...args)
+    ))
+    return { batches, serverUids }
+  }
+
+  it.each(importContractCases)('$id events: $label reports only acknowledged events and keeps no unacknowledged temp', async (c) => {
+    let transport: ReturnType<typeof installBridgeTransport> | null = null
+    if (c.setup === 'transport') transport = installBridgeTransport([{ uid: 'c3a-calendar' }], c.fault)
+    if (c.setup === 'missing-collection') transport = installBridgeTransport([])
+    const inputs = Array.from({ length: c.count }, (_, index) => ({
+      title: `C3a event ${index}`,
+      startDate: new Date('2026-06-01T09:00:00Z'),
+      endDate: new Date('2026-06-01T10:00:00Z'),
+      calendarId: 'c3a-calendar',
+    }))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const outcome = await settle(useCalendarStore.getState().importEvents(inputs))
+
+      // Fixture proof: which chunks reached and were applied, and an empty production queue.
+      expect(transport?.batches ?? []).toEqual(c.batches)
+      expect(transport?.serverUids ?? []).toHaveLength(c.serverCount)
+      expect(await getAll(queueGuard())).toEqual([])
+
+      // Contract: never the requested count; only acknowledged positions are saved.
+      expect(outcome).toMatchObject({ rejected: { name: 'ImportIncompleteError', saved: c.saved, unsaved: c.unsaved, uncertain: c.uncertain } })
+
+      // Settlement: acknowledged events carry the item ids the "server" applied and keep their own VEVENT UID.
+      const events = useCalendarStore.getState().events
+      expect(events.map((event) => event.title)).toEqual(inputs.slice(0, c.saved).map((input) => input.title))
+      const applied = new Set(transport?.serverUids ?? [])
+      for (const event of events) {
+        expect(applied.has(event.id), `applied item for ${event.title}`).toBe(true)
+        expect(event.uid).not.toBe(event.id)
+      }
+    } finally {
+      errorSpy.mockRestore()
+    }
+  }, 20_000)
 })

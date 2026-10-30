@@ -7,6 +7,7 @@ import { useAuthStore } from '@/app/stores/use-auth-store'
 import { enqueue } from '@/app/lib/offline-queue'
 import { assertOfflineQueueAccountGuard, captureOfflineQueueAccountGuard, isOfflineQueueBoundaryCancellation } from '@/app/lib/offline-queue-account'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 import { showErrorToast } from '@/app/stores/use-toast-store'
 import { useTaskListStore } from '@/app/stores/use-task-list-store'
 import { useLabelSuggestionsStore } from '@/app/stores/use-label-suggestions-store'
@@ -36,6 +37,7 @@ interface TaskActions {
   updateTask: (id: string, patch: Partial<Task>) => Promise<void>
   deleteTask: (id: string) => Promise<void>
   toggleComplete: (id: string) => Promise<void>
+  /** Resolves the requested count only when every task was acknowledged; otherwise rejects with ImportIncompleteError. */
   importTasks: (newTasks: NewTask[]) => Promise<number>
   syncFromRemote: (tasks: Task[]) => void
 }
@@ -261,30 +263,38 @@ export const useTaskStore = create<TaskState & TaskActions>()(
         // Optimistic local update — add all at once
         set((state) => ({ tasks: [...state.tasks, ...tasks] }))
 
-        // Batch sync to Etebase
+        // Batch sync to Etebase. Input positions the server acknowledged; the rest are rolled back.
+        const acknowledged = new Set<number>()
+        let sent = false
         const etebase = useEtebaseStore.getState()
         if (etebase.account) {
           try {
             const { serializeTask } = await import('@silentsuite/core')
-            const groups = new Map<string | undefined, Task[]>()
-            for (const task of tasks) {
-              const key = task.listId
-              groups.set(key, [...(groups.get(key) ?? []), task])
-            }
+            const groups = new Map<string | undefined, number[]>()
+            tasks.forEach((task, position) => {
+              groups.set(task.listId, [...(groups.get(task.listId) ?? []), position])
+            })
 
-            for (const [targetCollectionUid, groupTasks] of groups) {
-              const contents = groupTasks.map((t) => ({
-                content: serializeTask(t),
-                tempId: t.id,
+            for (const [targetCollectionUid, positions] of groups) {
+              const contents = positions.map((position) => ({
+                content: serializeTask(tasks[position]!),
+                tempId: tasks[position]!.id,
               }))
+              sent = true
               const uids = await etebase.createItemsBatch('tasks', contents, targetCollectionUid)
+              // Each acknowledged task takes its item id and keeps its own VTODO UID.
+              const itemIds = new Map<string, string>()
+              positions.forEach((position, index) => {
+                const itemUid = uids[index]
+                if (!itemUid) return
+                itemIds.set(tasks[position]!.id, itemUid)
+                acknowledged.add(position)
+              })
+              if (itemIds.size === 0) continue
               set((state) => ({
                 tasks: state.tasks.map((t) => {
-                  const idx = groupTasks.findIndex((task) => task.id === t.id)
-                  if (idx !== -1 && uids[idx]) {
-                    return { ...t, id: uids[idx]! }
-                  }
-                  return t
+                  const itemUid = itemIds.get(t.id)
+                  return itemUid ? { ...t, id: itemUid } : t
                 }),
               }))
             }
@@ -293,7 +303,15 @@ export const useTaskStore = create<TaskState & TaskActions>()(
           }
         }
 
-        return tasks.length
+        if (acknowledged.size === tasks.length) return tasks.length
+        const unsaved = tasks.map((_, position) => position).filter((position) => !acknowledged.has(position))
+        // Unacknowledged temp tasks would vanish on the next refresh; the importer keeps their input.
+        const tempIds = new Set(unsaved.map((position) => tasks[position]!.id))
+        set((state) => {
+          const remaining = state.tasks.filter((t) => !tempIds.has(t.id))
+          return remaining.length === state.tasks.length ? state : { tasks: remaining }
+        })
+        throw new ImportIncompleteError(acknowledged.size, unsaved, sent)
       },
 
       syncFromRemote: (remoteTasks: Task[]) => {

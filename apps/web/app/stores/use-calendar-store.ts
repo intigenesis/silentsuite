@@ -5,6 +5,7 @@ import { create } from 'zustand'
 import type { CalendarEvent, SyncStatus, VAlarm } from '@silentsuite/core'
 import type { RecurrenceScope } from '@/app/(app)/calendar/components/RecurrenceScopeDialog'
 import { getSafeErrorDetails } from '@/app/lib/privacy-safe-errors'
+import { ImportIncompleteError } from '@/app/lib/import-outcome'
 import { useEtebaseStore } from '@/app/stores/use-etebase-store'
 import { useAuthStore } from '@/app/stores/use-auth-store'
 import { showErrorToast } from '@/app/stores/use-toast-store'
@@ -59,6 +60,7 @@ interface CalendarActions {
   navigateForward: () => void
   navigateBackward: () => void
   navigateToday: () => void
+  /** Resolves the requested count only when every event was acknowledged; otherwise rejects with ImportIncompleteError. */
   importEvents: (newEvents: NewCalendarEvent[]) => Promise<number>
   syncFromRemote: (events: CalendarEvent[]) => void
   setSearchQuery: (q: string) => void
@@ -567,31 +569,38 @@ export const useCalendarStore = create<CalendarState & CalendarActions>()((set, 
     // Optimistic local update — add all at once
     set((state) => ({ events: [...state.events, ...events] }))
 
-    // Batch sync to Etebase
+    // Batch sync to Etebase. Input positions the server acknowledged; the rest are rolled back.
+    const acknowledged = new Set<number>()
+    let sent = false
     const etebase = useEtebaseStore.getState()
     if (etebase.account) {
       try {
         const { serializeCalendarEvent } = await import('@silentsuite/core')
-        const groups = new Map<string | undefined, CalendarEvent[]>()
-        for (const event of events) {
-          const key = event.calendarId
-          groups.set(key, [...(groups.get(key) ?? []), event])
-        }
+        const groups = new Map<string | undefined, number[]>()
+        events.forEach((event, position) => {
+          groups.set(event.calendarId, [...(groups.get(event.calendarId) ?? []), position])
+        })
 
-        for (const [targetCollectionUid, groupEvents] of groups) {
-          const contents = groupEvents.map((e) => ({
-            content: serializeCalendarEvent(e),
-            tempId: e.id,
+        for (const [targetCollectionUid, positions] of groups) {
+          const contents = positions.map((position) => ({
+            content: serializeCalendarEvent(events[position]!),
+            tempId: events[position]!.id,
           }))
+          sent = true
           const uids = await etebase.createItemsBatch('calendar', contents, targetCollectionUid)
-          // Replace temp IDs with real item UIDs for this concrete collection.
+          // Each acknowledged event takes its item id for this concrete collection and keeps its own VEVENT UID.
+          const itemIds = new Map<string, string>()
+          positions.forEach((position, index) => {
+            const itemUid = uids[index]
+            if (!itemUid) return
+            itemIds.set(events[position]!.id, itemUid)
+            acknowledged.add(position)
+          })
+          if (itemIds.size === 0) continue
           set((state) => ({
             events: state.events.map((e) => {
-              const idx = groupEvents.findIndex((ev) => ev.id === e.id)
-              if (idx !== -1 && uids[idx]) {
-                return { ...e, id: uids[idx]! }
-              }
-              return e
+              const itemUid = itemIds.get(e.id)
+              return itemUid ? { ...e, id: itemUid } : e
             }),
           }))
         }
@@ -600,7 +609,15 @@ export const useCalendarStore = create<CalendarState & CalendarActions>()((set, 
       }
     }
 
-    return events.length
+    if (acknowledged.size === events.length) return events.length
+    const unsaved = events.map((_, position) => position).filter((position) => !acknowledged.has(position))
+    // Unacknowledged temp events would vanish on the next refresh; the importer keeps their input.
+    const tempIds = new Set(unsaved.map((position) => events[position]!.id))
+    set((state) => {
+      const remaining = state.events.filter((e) => !tempIds.has(e.id))
+      return remaining.length === state.events.length ? state : { events: remaining }
+    })
+    throw new ImportIncompleteError(acknowledged.size, unsaved, sent)
   },
 
   syncFromRemote: (remoteEvents: CalendarEvent[]) => {
