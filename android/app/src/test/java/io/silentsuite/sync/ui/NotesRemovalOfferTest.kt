@@ -46,7 +46,10 @@ class NotesRemovalOfferTest {
 
     private val rows = AccountRowChanges()
     private var folderCount = 0L
-    private val allowance = NotesRemovalAllowance(rows, { folderCount }, { 0 }, { "shown" })
+
+    /** The allowance's clock, in milliseconds since boot; it stands still unless a test moves it. */
+    private var now = 0L
+    private val allowance = NotesRemovalAllowance(rows, { folderCount }, { now }, { "shown" })
 
     /** Every reading and step the offer asked for, in order. */
     private val asked = ArrayList<String>()
@@ -202,6 +205,43 @@ class NotesRemovalOfferTest {
         assertEquals("another confirmation since", Outcome.CHANGED,
             tap { allowance.show(allowance.counts(), other, Verdict.ROOT_UNLISTABLE_ONLY, pending, null) })
         assertEquals(Outcome.RETRY, tap { decision = Decision(Verdict.REFUSE_STORE, null) })
+    }
+
+    @Test fun `confirmation work that runs past two minutes from the tap starts no removal and leaves no allowance`() {
+        val shown = offer.show(TYPE, "b")!!
+        val before = rows.count()
+        // The tap at 0, and the guard's reads at the tap take 130 seconds, with nothing else changing.
+        duringDecision = { now += 130_000 }
+        val outcomes = ArrayList<Outcome>()
+        offer.confirm(TYPE, "b", shown.id) { outcomes += it }
+        duringDecision = {}
+        assertNull("no removal started", removal)
+        assertEquals(listOf(Outcome.RETRY), outcomes)
+        assertEquals("the row counter did not move", before, rows.count())
+        assertFalse("and the authenticator gets no allowance", allowance.answer(Key(TYPE, "b", null),
+            Verdict.ROOT_UNLISTABLE_ONLY, pending))
+    }
+
+    @Test fun `the allowance a tap makes ends two minutes after the tap, not after its confirmation work`() {
+        // The tap at 0, a minute of work, and the answer just under two minutes after the tap: it holds.
+        var shown = offer.show(TYPE, "b")!!
+        duringDecision = { now += 60_000 }
+        offer.confirm(TYPE, "b", shown.id) {}
+        duringDecision = {}
+        assertNotNull("within two minutes of the tap, the removal starts", removal)
+        now = 119_999
+        assertTrue(allowance.answer(Key(TYPE, "b", null), Verdict.ROOT_UNLISTABLE_ONLY, pending))
+        // The tap at 200 s, a minute of work, and the answer two minutes after the tap, one after the work: it does not.
+        now = 200_000
+        removal = null
+        shown = offer.show(TYPE, "b")!!
+        duringDecision = { now += 60_000 }
+        offer.confirm(TYPE, "b", shown.id) {}
+        duringDecision = {}
+        assertNotNull(removal)
+        now = 320_000
+        assertFalse("two minutes from the tap, though one from the end of its work", allowance.answer(
+            Key(TYPE, "b", null), Verdict.ROOT_UNLISTABLE_ONLY, pending))
     }
 
     @Test fun `names of an unknown kind bind their row and the guard's own names, and outlast its listings`() {
