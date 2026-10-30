@@ -33,7 +33,8 @@ async function connectSources(pathname) {
 // `https:` admits any HTTPS origin, including user-selected Etebase servers on any
 // port or base path, and therefore also Plausible. Private routes no longer rely on
 // CSP to deny analytics; the named hosts below only document intended destinations.
-const hosted = ["'self'", 'https://api.silentsuite.io', 'https://server.silentsuite.io', 'wss://server.silentsuite.io', 'https://*.sentry.io', 'https:']
+// `data:` lets libsodium 0.7.6 fetch its embedded base64 WASM without a CSP violation.
+const hosted = ["'self'", 'https://api.silentsuite.io', 'https://server.silentsuite.io', 'wss://server.silentsuite.io', 'https://*.sentry.io', 'https:', 'data:']
 const signup = [...hosted, 'https://plausible.silentsuite.io', 'https://api.stripe.com']
 const subscription = [...hosted, 'https://plausible.silentsuite.io']
 
@@ -54,9 +55,23 @@ test('route connect-src admits custom HTTPS servers and keeps the named hosted s
 test('route connect-src adds no plaintext, wildcard or WebSocket scheme source', async () => {
   for (const path of ['/signup', '/calendar', '/contacts', '/tasks', '/notes', '/settings', '/settings/subscription']) {
     const sources = await connectSources(path)
-    for (const unintended of ['http:', '*', 'wss:', 'ws:', 'http://localhost:*']) {
+    for (const unintended of ['http:', '*', 'wss:', 'ws:', 'http://localhost:*', 'blob:', 'filesystem:']) {
       assert.ok(!sources.includes(unintended), `${path} must not allow ${unintended}`)
     }
+  }
+})
+
+// A browser fetches a data: URL only when every enforced connect-src allows it, so
+// the route policy is one necessary half. The edge policy needs the same token.
+test('libsodium data: WASM fetch needs data: in both route and edge connect-src', async () => {
+  const allowsData = (sources) => sources.includes('data:')
+  const edgeWithout = ["'self'", 'https:']
+  const edgeWith = [...edgeWithout, 'data:']
+  for (const path of ['/signup', '/calendar', '/contacts', '/tasks', '/notes', '/settings', '/settings/subscription']) {
+    const route = await connectSources(path)
+    assert.ok(allowsData(route), `${path} route policy must allow data:`)
+    assert.equal([route, edgeWithout].every(allowsData), false, `${path} stays blocked while the edge omits data:`)
+    assert.equal([route, edgeWith].every(allowsData), true, `${path} is allowed once both policies admit data:`)
   }
 })
 
