@@ -49,7 +49,8 @@ class NotesRemovalOfferTest {
 
     /** The allowance's clock, in milliseconds since boot; it stands still unless a test moves it. */
     private var now = 0L
-    private val allowance = NotesRemovalAllowance(rows, { folderCount }, { now }, { "shown" })
+    private var ids = 0
+    private val allowance = NotesRemovalAllowance(rows, { folderCount }, { now }, { "shown-${++ids}" })
 
     /** Every reading and step the offer asked for, in order. */
     private val asked = ArrayList<String>()
@@ -202,8 +203,10 @@ class NotesRemovalOfferTest {
         assertEquals("a creation of that name started", Outcome.CHANGED,
             tap { records = listOf(record("b", Phase.PREPARED)) })
         val other = Key(TYPE, "d", null)
+        var since: String? = null
         assertEquals("another confirmation since", Outcome.CHANGED,
-            tap { allowance.show(allowance.counts(), other, Verdict.ROOT_UNLISTABLE_ONLY, pending, null) })
+            tap { since = allowance.show(allowance.counts(), other, Verdict.ROOT_UNLISTABLE_ONLY, pending, null)!!.id })
+        assertNotNull("and the tap on the old one leaves it showing", allowance.shown(since!!))
         assertEquals(Outcome.RETRY, tap { decision = Decision(Verdict.REFUSE_STORE, null) })
     }
 

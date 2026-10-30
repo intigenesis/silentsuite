@@ -113,7 +113,10 @@ class NotesRemovalAllowanceTest {
             return allowance.mint(shown.id, b, Verdict.ROOT_UNLISTABLE_ONLY, pending, tapped)
         }
         assertTrue(tapThen(119_999) is Mint.Done)
-        assertTrue("a slot from the tap, with one millisecond left", answer())
+        assertTrue("one millisecond left", answer())
+        assertTrue(tapThen(119_999) is Mint.Done)
+        now += 1
+        assertFalse("the slot runs from the tap, not from the end of its reads", answer())
         val before = rows.count()
         assertEquals(Mint.Retry, tapThen(120_000))
         assertEquals("the row counter did not move", before, rows.count())
