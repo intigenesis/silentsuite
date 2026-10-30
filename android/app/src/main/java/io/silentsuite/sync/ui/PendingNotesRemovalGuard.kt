@@ -90,7 +90,10 @@ internal object PendingNotesRemovalGuard {
          */
         REFUSE_ACCOUNTS(null),
 
-        /** Anything else that cannot be shown clean, a listing of notes-pending that came back short included. */
+        /**
+         * Anything else that cannot be shown clean, a listing of notes-pending that came back short included, and what
+         * would be an eligible verdict for a row the account list reads an id for.
+         */
         REFUSE_UNREADABLE(null),
 
         /** Only notes-pending cannot be listed, and every store found is clean, covered, acknowledged or absent. */
@@ -240,6 +243,10 @@ internal object PendingNotesRemovalGuard {
      * no store is left out. The listing of notes-pending is checked against every one of those folders found by path
      * and every other row's own, by its presence check: a folder it left out that is there, or whose check fails, shows
      * that it came back short (row 5), while what it listed is still checked.
+     *
+     * A row the account list reads an id for gets no allowance, as an account whose id can be read (the reply of
+     * 2026-10-21): where rows 7, 9, 10 or 11 would give it an eligible verdict, it gets [Verdict.REFUSE_UNREADABLE],
+     * and the next attempt reads its id again.
      */
     fun decide(input: Input): Verdict = decision(input).verdict
 
@@ -305,7 +312,7 @@ internal object PendingNotesRemovalGuard {
         val unwithdrawn = answers.any { it == RemovalCheck.NothingUnwithdrawn }
         val allowed = rootLists && !unknown &&
             all(RemovalCheck.Clean, RemovalCheck.Covered, RemovalCheck.Acknowledged)
-        return when {
+        val verdict = when {
             discard != null && unwithdrawn -> Verdict.REFUSE_FAILED
             answers.any { it is RemovalCheck.Blocks || it == RemovalCheck.Unlisted } -> Verdict.REFUSE_STORE
             rootLists && answers.any { it == RemovalCheck.UnlistedAbsent } -> Verdict.REFUSE_STORE
@@ -328,6 +335,7 @@ internal object PendingNotesRemovalGuard {
             allowed -> Verdict.ALLOW
             else -> Verdict.REFUSE_UNREADABLE
         }
+        return if (verdict.eligible && itself.isNotEmpty()) Verdict.REFUSE_UNREADABLE else verdict
     }
 
     /** One store's check, tried once more after an IllegalStateException, as from an instance a discard dropped. */

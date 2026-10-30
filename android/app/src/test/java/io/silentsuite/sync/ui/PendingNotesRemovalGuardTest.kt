@@ -471,6 +471,23 @@ class PendingNotesRemovalGuardTest {
             decide(input(accounts = rows, presence = { PendingNotesStore.Presence.PRESENT })))
     }
 
+    @Test fun `a row the list reads an id for gets no allowance, whichever one it would have been`() {
+        val b = folder("b", "gen-b")
+        val read = { listOf(Row("b", CreationId.Readable("gen-b"))) }
+        // Each state twice: with an account list that reads no id for the row, eligible; with one that does, refused.
+        fun both(eligible: Verdict, pending: () -> StoreFolders, discard: () -> Set<String>?,
+            ask: (Input) -> Verdict = ::decide) {
+            assertEquals(eligible, ask(input(pending = pending, discard = discard, known = { setOf(b) })))
+            assertEquals(Verdict.REFUSE_UNREADABLE, ask(input(accounts = read, pending = pending, discard = discard)))
+        }
+        both(Verdict.ROOT_UNLISTABLE_ONLY, unlistable, { emptySet() })
+        answer(b, RemovalCheck.NothingUnwithdrawn)
+        both(Verdict.PERMITS_UNLISTABLE_ONLY, listed(b), { null })
+        both(Verdict.BOTH_UNLISTABLE_ONLY, unlistable, { null })
+        answer(b, RemovalCheck.Clean)
+        both(Verdict.UNKNOWN_KIND_ONLY, listed(b, unknown = true), { emptySet() }, ::yes)
+    }
+
     @Test fun `every account read comes before the first store check, and every store is checked once`() {
         answer("orphan", RemovalCheck.Covered)
         decide(input(pending = listed("orphan", "x"), discard = { setOf("x", "y") }, known = { setOf("y", "z") }))
