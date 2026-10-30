@@ -1,6 +1,6 @@
-import { act, screen } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import TasksPage from '../page'
 import { renderWithIntl } from '@/src/__tests__/render-with-intl'
 import messages from '@/messages/en.json'
@@ -104,5 +104,253 @@ describe('TasksPage mobile reachability', () => {
     // Mobile-only control that meets the minimum touch target.
     expect(folderButton.className).toContain('md:hidden')
     expect(folderButton.className).toContain('touch-target')
+  })
+})
+
+// C3b-R12/R13 (PLAN U6, U7, U8). The store boundary is the existing mock; each create is a
+// controlled deferred promise. The store contract itself (TaskSaveError.unconfirmed) is proven
+// in use-task-store.test.ts and the node SDK integration test.
+describe('C3b task drafts survive an unsaved or unconfirmed create', () => {
+  let TaskSaveError: typeof import('@/app/stores/use-task-store').TaskSaveError
+  const unconfirmedMessage = /(couldn't|could not) confirm/i
+  const definiteMessage = /Task not saved/i
+
+  beforeAll(async () => {
+    ;({ TaskSaveError } = await vi.importActual<typeof import('@/app/stores/use-task-store')>('@/app/stores/use-task-store'))
+  })
+
+  beforeEach(() => {
+    useEtebaseStore.setState(useEtebaseStore.getInitialState(), true)
+    storeMock.taskState.tasks = []
+    storeMock.authState.canWrite.mockReturnValue(true)
+    storeMock.taskState.createTask.mockReset()
+  })
+
+  /**
+   * The next createTask stays pending until the test settles it. Teardown resolves it, never
+   * rejects it, so a handler that does not await it can never surface an unhandled rejection.
+   */
+  function deferCreate() {
+    let resolve!: (task: Task) => void
+    let reject!: (reason: unknown) => void
+    const pending = new Promise<Task>((resolvePending, rejectPending) => { resolve = resolvePending; reject = rejectPending })
+    storeMock.taskState.createTask.mockImplementationOnce(() => pending)
+    onTestFinished(() => resolve({ id: 'settled-at-test-end', title: 'settled' } as Task))
+    return { resolve, reject }
+  }
+
+  const dialog = () => screen.queryByRole('dialog', { name: 'New Task' })
+  const backdrop = () => document.querySelector('div[aria-hidden="true"][class*="bg-black/40"]')
+
+  async function openDraft() {
+    renderWithIntl(<TasksPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'New task' }))
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title' } })
+    fireEvent.change(screen.getByPlaceholderText('Add notes...'), { target: { value: 'Draft notes' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1))
+    expect(storeMock.taskState.createTask).toHaveBeenCalledWith(expect.objectContaining({ title: 'Draft title', description: 'Draft notes' }))
+  }
+
+  it.each([
+    ['unconfirmed', true, unconfirmedMessage, definiteMessage],
+    ['known unsaved', false, definiteMessage, unconfirmedMessage],
+  ] as const)('C3b-R12 dialog: a pending create keeps the draft open and guarded, and an %s outcome keeps every field', async (_label, unconfirmed, shown, notShown) => {
+    const create = deferCreate()
+    await openDraft()
+
+    // Pending: the draft stays mounted, Create cannot dispatch again, and nothing can discard it.
+    expect(dialog()).not.toBeNull()
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.click(backdrop()!)
+    expect(dialog()).not.toBeNull()
+    expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1)
+
+    await act(async () => { create.reject(new TaskSaveError(unconfirmed)) })
+
+    const message = await screen.findByText(shown)
+    if (unconfirmed) expect(message.textContent).toMatch(/(appears|already)/i)
+    expect(screen.queryByText(notShown)).toBeNull()
+    expect(dialog()).not.toBeNull()
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title')
+    expect(screen.getByPlaceholderText('Add notes...')).toHaveValue('Draft notes')
+    expect(screen.getByRole('button', { name: 'Create' })).toBeEnabled()
+  })
+
+  it('C3b-R12 dialog control: an acknowledged create closes the dialog without an outcome message', async () => {
+    const create = deferCreate()
+    await openDraft()
+
+    await act(async () => { create.resolve({ id: 'remote-task-1', title: 'Draft title' } as Task) })
+
+    await waitFor(() => expect(dialog()).toBeNull())
+    expect(screen.queryByText(unconfirmedMessage)).toBeNull()
+    expect(screen.queryByText(definiteMessage)).toBeNull()
+  })
+
+  /** Every native control in the open dialog: its header actions and all draft fields, nested editors included. */
+  const draftControls = () => Array.from(dialog()!.querySelectorAll<HTMLElement>('input, textarea, select, button'))
+  const describeControl = (control: HTMLElement) =>
+    `${control.tagName.toLowerCase()} ${control.getAttribute('aria-label') ?? control.getAttribute('placeholder') ?? control.textContent?.trim() ?? ''}`
+
+  it('C3b-R12 dialog: while a create is pending no draft control accepts input, so the acknowledged create closes on exactly the submitted draft', async () => {
+    const create = deferCreate()
+    await openDraft()
+
+    // Pending: native disabled semantics refuse every edit, so no newer input can exist to be discarded.
+    const controls = draftControls()
+    expect(controls.length).toBeGreaterThan(4)
+    for (const control of controls) expect(control, describeControl(control)).toBeDisabled()
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title')
+    expect(screen.getByPlaceholderText('Add notes...')).toHaveValue('Draft notes')
+
+    await act(async () => { create.resolve({ id: 'remote-task-1', title: 'Draft title' } as Task) })
+
+    await waitFor(() => expect(dialog()).toBeNull())
+    expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1)
+  })
+
+  it('C3b-R12 dialog: a rejected create makes the submitted draft editable again', async () => {
+    const create = deferCreate()
+    renderWithIntl(<TasksPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'New task' }))
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title' } })
+    fireEvent.change(screen.getByPlaceholderText('Add notes...'), { target: { value: 'Draft notes' } })
+    // Which controls accept input before submitting; the same ones must accept it again after a rejection.
+    const editableBefore = draftControls().map((control) => !control.matches(':disabled'))
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1))
+
+    for (const control of draftControls()) expect(control, describeControl(control)).toBeDisabled()
+
+    await act(async () => { create.reject(new TaskSaveError(true)) })
+    await screen.findByText(unconfirmedMessage)
+
+    const controls = draftControls()
+    expect(controls).toHaveLength(editableBefore.length)
+    controls.forEach((control, index) => {
+      if (editableBefore[index]) expect(control, describeControl(control)).toBeEnabled()
+      else expect(control, describeControl(control)).toBeDisabled()
+    })
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title')
+    expect(screen.getByPlaceholderText('Add notes...')).toHaveValue('Draft notes')
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title, revised' } })
+    expect(screen.getByPlaceholderText('Task title')).toHaveValue('Draft title, revised')
+  })
+
+  /** Disabled by its own attribute or by a disabled fieldset around it, as a browser treats it. */
+  const isDisabledControl = (element: Element) => element.matches(':disabled') || element.closest('fieldset[disabled]') !== null
+
+  /** A real cancelable keydown delivered to the focused element, as a browser starts a Tab move. */
+  function pressTab(shiftKey: boolean) {
+    const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true })
+    ;(document.activeElement ?? document.body).dispatchEvent(event)
+    return event
+  }
+
+  /** Opens a draft, lets the dialog's own autofocus settle, then presses a focused Create. */
+  async function pendingCreateFromFocusedCreate() {
+    const create = deferCreate()
+    renderWithIntl(<TasksPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'New task' }))
+    fireEvent.change(screen.getByPlaceholderText('Task title'), { target: { value: 'Draft title' } })
+    fireEvent.change(screen.getByPlaceholderText('Add notes...'), { target: { value: 'Draft notes' } })
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 80)) })
+    const createButton = screen.getByRole('button', { name: 'Create' })
+    createButton.focus()
+    expect(createButton).toHaveFocus()
+    fireEvent.click(createButton)
+    await waitFor(() => expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1))
+    return create
+  }
+
+  it('C3b-R12 dialog focus: a pending create keeps focus on a focusable element inside the dialog, and Tab and Shift+Tab cannot leave it', async () => {
+    const create = await pendingCreateFromFocusedCreate()
+
+    const focused = document.activeElement!
+    expect(dialog()!.contains(focused), `focus is on ${focused.tagName}`).toBe(true)
+    expect(isDisabledControl(focused), `focus is on a disabled ${focused.tagName}`).toBe(false)
+    for (const shiftKey of [false, true]) {
+      // Every draft control is disabled, so only the dialog can stop native traversal leaving it.
+      const event = pressTab(shiftKey)
+      expect(event.defaultPrevented, shiftKey ? 'Shift+Tab' : 'Tab').toBe(true)
+      expect(document.activeElement).toBe(focused)
+    }
+
+    await act(async () => { create.resolve({ id: 'remote-task-1', title: 'Draft title' } as Task) })
+    await waitFor(() => expect(dialog()).toBeNull())
+  })
+
+  it('C3b-R12 dialog focus: after a rejected create, focus is on an editable draft field inside the dialog', async () => {
+    const create = await pendingCreateFromFocusedCreate()
+
+    await act(async () => { create.reject(new TaskSaveError(true)) })
+    await screen.findByText(unconfirmedMessage)
+
+    const focused = document.activeElement!
+    expect(dialog()!.contains(focused), `focus is on ${focused.tagName}`).toBe(true)
+    expect(isDisabledControl(focused), `focus is on a disabled ${focused.tagName}`).toBe(false)
+    expect(['INPUT', 'TEXTAREA'], `focus is on ${focused.tagName}`).toContain(focused.tagName)
+  })
+
+  async function submitQuickAdd(title: string) {
+    renderWithIntl(<TasksPage />)
+    const input = screen.getByPlaceholderText('Add a task...')
+    fireEvent.change(input, { target: { value: title } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }))
+    await waitFor(() => expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1))
+    return input
+  }
+
+  it.each([
+    ['unconfirmed', true, unconfirmedMessage, definiteMessage],
+    ['known unsaved', false, definiteMessage, unconfirmedMessage],
+  ] as const)('C3b-R13 quick add: a pending create keeps the submitted title read-only, and an %s outcome leaves it editable', async (_label, unconfirmed, shown, notShown) => {
+    const create = deferCreate()
+    const input = await submitQuickAdd('First')
+
+    // Pending: the submitted title stays, the field cannot be edited, and Add (with it Enter) cannot submit again.
+    expect(input).toHaveValue('First')
+    expect(input).toHaveAttribute('readonly')
+    const add = screen.getByRole('button', { name: 'Add' })
+    expect(add).toBeDisabled()
+    fireEvent.click(add)
+    expect(storeMock.taskState.createTask).toHaveBeenCalledTimes(1)
+
+    await act(async () => { create.reject(new TaskSaveError(unconfirmed)) })
+
+    const message = await screen.findByText(shown)
+    if (unconfirmed) expect(message.textContent).toMatch(/(appears|already)/i)
+    expect(screen.queryByText(notShown)).toBeNull()
+    expect(input).toHaveValue('First')
+    expect(input).not.toHaveAttribute('readonly')
+    expect(screen.getByRole('button', { name: 'Add' })).toBeEnabled()
+  })
+
+  it('C3b-R13 quick add: an acknowledged create clears the title only once it resolves', async () => {
+    const create = deferCreate()
+    const input = await submitQuickAdd('First')
+
+    expect(input).toHaveValue('First')
+
+    await act(async () => { create.resolve({ id: 'remote-task-1', title: 'First' } as Task) })
+
+    await waitFor(() => expect(input).toHaveValue(''))
+    expect(input).not.toHaveAttribute('readonly')
+    expect(screen.queryByText(unconfirmedMessage)).toBeNull()
+    expect(screen.queryByText(definiteMessage)).toBeNull()
+  })
+
+  it('C3b-R13 quick add control: an acknowledged create sends the title and leaves the field empty', async () => {
+    storeMock.taskState.createTask.mockResolvedValueOnce({ id: 'remote-task-1', title: 'Quick' } as Task)
+    const input = await submitQuickAdd('Quick')
+
+    expect(storeMock.taskState.createTask).toHaveBeenCalledWith(expect.objectContaining({ title: 'Quick' }))
+    await waitFor(() => expect(input).toHaveValue(''))
+    expect(screen.queryByText(unconfirmedMessage)).toBeNull()
+    expect(screen.queryByText(definiteMessage)).toBeNull()
   })
 })
