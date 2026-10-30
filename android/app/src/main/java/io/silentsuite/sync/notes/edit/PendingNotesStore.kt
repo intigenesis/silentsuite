@@ -1004,7 +1004,9 @@ internal class PendingNotesStore private constructor(
      *    [RemovalCheck.UnlistedAbsent] as nothing to lose for one removal of the account this store is for;
      *    [clearAll], [discardStore] and any sweep never take it for gone.
      * 3. Otherwise the store's acknowledgement is withdrawn, as a count withdraws it. When that cannot be shown, this
-     *    instance takes none for valid from then on, and the store is counted all the same.
+     *    instance takes none for valid from then on, and the store is counted all the same, unless a note needs its
+     *    counter rebuilt ([currentSequence]): the rebuild's own listing then fails at the same withdrawal, and the
+     *    store could not be counted.
      * 4. The store is counted as [unsynced] counts it, from that one listing, which can come back short. A listing
      *    that lacks the store's counter while lstat does not show the counter gone counts as short, and the store as
      *    one that could not be counted ([shortOfCounter]); one that skipped an entry and still listed the counter is

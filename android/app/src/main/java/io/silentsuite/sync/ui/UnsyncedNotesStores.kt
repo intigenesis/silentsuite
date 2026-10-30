@@ -31,10 +31,11 @@ internal data class UnsyncedNotesRow(
 
 /**
  * Every store that holds unsynced text, cannot be read, or has a discard that stopped ([UnsyncedNotesRow.stopped]), in
- * folder-name order. [othersUnlisted]: notes-pending could not be listed, so stores other than the present accounts'
- * could not be found; or notes-pending lists but left out a folder whose path is known and that is there, or the
- * folders whose paths are known could not be read. [unknownOthers]: notes-pending holds a name that is not a store
- * folder, of a kind this build cannot read.
+ * folder-name order. [othersUnlisted]: notes-pending could not be listed, so stores that no present account or known
+ * path names could not be found; or notes-pending lists but left out a folder whose path is known and that lstat does
+ * not show absent; or a read of the known paths threw. A notes-discard that cannot be listed, or a creation registry
+ * whose rows do not decode, does not throw there: it names no folders, and sets nothing. [unknownOthers]: notes-pending
+ * holds a name that is not a store folder, of a kind this build cannot read.
  */
 internal data class UnsyncedNotesListing(
     val rows: List<UnsyncedNotesRow>,
@@ -87,7 +88,9 @@ internal object UnsyncedNotesStores {
      * registry), read whether or not notes-pending lists, and every folder whose clear or discard stopped in this
      * process ([PendingNotesStore.stoppedIn]), which can be gone, or left out of a listing, while its Retry is owed. So
      * a listing that comes back short cannot hide a store that a present account or a known path names; a folder that
-     * is not there counts nothing and is not made. A store is kept while it holds anything, its read throws, or its
+     * is not there counts nothing and is not made, though while notes-pending lists and notes-discard cannot be listed,
+     * a first count by a new instance answers that it could not be counted, which keeps a row. A store is kept while
+     * it holds anything, its read throws, or its
      * discard stopped ([UnsyncedNotesRow.stopped]). The last is told by the store's state, never by its count, which
      * can come back short, or find nothing once the text went while an unlink whose sync failed can come back. The
      * counts run no recovery and write nothing in a store, though a count of a store that lists withdraws its

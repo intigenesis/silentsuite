@@ -36,9 +36,9 @@ import java.io.IOException
  * stopped in this process included: one it left out that lstat does not show gone refuses a row without a readable
  * creation id ([PENDING_LISTED_SHORT]).
  *
- * Nothing is kept between decisions. While the account list cannot be read, no store is left out as a live account's,
- * so any refusal decided then, a [Verdict.REFUSE_STORE] for a store that may be a live account's included, is retried
- * first: the next attempt reads the list again.
+ * Nothing is kept between decisions, so the next attempt reads the account list again. While that list cannot be read,
+ * no store is left out as a live account's, so a refusal decided then can be a [Verdict.REFUSE_STORE] for a store that
+ * may be a live account's.
  *
  * Three verdicts are [Verdict.eligible] for the one-time confirmed removal of the second reply of 2026-10-20, for
  * both folders at once by the reply of 2026-10-21: only a folder that cannot be read stands in the way. A fourth,
@@ -83,10 +83,11 @@ internal object PendingNotesRemovalGuard {
          * For a row without a readable creation id, the account list cannot be read while a folder cannot be listed:
          * notes-pending, or notes-discard while some store could not withdraw its acknowledgement; or while
          * notes-pending holds a name of a kind this build does not know. That takes the failed list read and one of
-         * those at once. Nothing is kept: every attempt reads the list again and refuses while that read throws, and
-         * the way out is a retry. Whether a lasting failure first ends the process, at the immediate update of the
-         * listener that AccountAuthenticatorService.onCreate adds, before the authenticator exists, is an inference
-         * from that code, not tested.
+         * those at once. Nothing is kept: every attempt reads the list again and refuses while that read throws. A
+         * failure that passes clears on the next attempt; one that lasts has no way out yet, and the case is held.
+         * Whether a lasting failure first ends the process, at the immediate update of the listener that
+         * AccountAuthenticatorService.onCreate adds, before the authenticator exists, is an inference from that code,
+         * not tested.
          */
         REFUSE_ACCOUNTS(null),
 
@@ -202,7 +203,8 @@ internal object PendingNotesRemovalGuard {
 
     /**
      * The verdict for [input], from the first row of this table that holds:
-     * 1. no target, another type, or any reading that throws outside the store checks: [Verdict.REFUSE_FAILED];
+     * 1. no target, another type, or any reading that throws outside the store checks, other than the IOException of a
+     *    notes-pending that cannot be listed ([Input.pending]): [Verdict.REFUSE_FAILED];
      * 2. a store check throws, after one more try when it was an IllegalStateException, from an instance a discard
      *    dropped, which a new open replaces: [Verdict.REFUSE_FAILED];
      * 3. a store could not withdraw its acknowledgement while notes-discard lists or is shown gone, so it failed for
@@ -215,9 +217,10 @@ internal object PendingNotesRemovalGuard {
      * 6. for a row without a readable id, the account list cannot be read, unless row 12 holds:
      *    [Verdict.REFUSE_ACCOUNTS]. That takes the failed list read and, at once, notes-pending that cannot be listed
      *    or holds a name of an unknown kind, or notes-discard that cannot be listed while a store could not withdraw
-     *    its acknowledgement. Nothing is kept: every attempt reads the list again and refuses while that read throws,
-     *    and the way out is a retry. Whether a lasting failure first ends the process at the authenticator service's
-     *    listener, before the authenticator exists, is an inference ([Verdict.REFUSE_ACCOUNTS]);
+     *    its acknowledgement. Nothing is kept: every attempt reads the list again and refuses while that read throws.
+     *    A failure that passes clears on the next attempt; one that lasts has no way out yet, and the case is held.
+     *    Whether a lasting failure first ends the process at the authenticator service's listener, before the
+     *    authenticator exists, is an inference ([Verdict.REFUSE_ACCOUNTS]);
      * 7. for a row without a readable id, notes-pending holds a name of a kind this build does not know: while
      *    notes-discard lists or is shown gone and every store is clean, covered or acknowledged, which rows 3 and 4
      *    leave, [UNKNOWN_KIND_IN_PENDING]; otherwise, as while notes-discard cannot be listed, where a covered or
@@ -231,8 +234,8 @@ internal object PendingNotesRemovalGuard {
      *    [Verdict.PERMITS_UNLISTABLE_ONLY]; for a row with one, [READABLE_ID_UNDER_UNLISTED_PERMITS];
      * 11. for a row without one, both folders cannot be listed and every store is clean, unwithdrawn or absent by
      *    lstat, so no permit was read: [Verdict.BOTH_UNLISTABLE_ONLY];
-     * 12. every store is clean, covered or acknowledged, and notes-pending lists or is shown gone for a row without a
-     *    readable id: [Verdict.ALLOW];
+     * 12. every store is clean, covered or acknowledged, and, for a row without a readable id, notes-pending lists or
+     *    is shown gone and holds no name of an unknown kind: [Verdict.ALLOW];
      * 13. anything else, such as an unwithdrawn store beside a covered or acknowledged one:
      *    [Verdict.REFUSE_UNREADABLE].
      *
@@ -293,7 +296,7 @@ internal object PendingNotesRemovalGuard {
         val owned = rows.orEmpty().filter { it.name != name }.mapNotNullTo(HashSet()) { row ->
             (row.id as? CreationId.Readable)?.let { input.folderOf(row.name, it.id) }
         }
-        // Yet that id names a folder, and a path that is known keeps its checks, whoever owns it.
+        // Yet that id names a folder, so that folder is checked like any store no other row owns.
         val itself = rows.orEmpty().filter { it.name == name }.mapNotNullTo(HashSet()) { row ->
             (row.id as? CreationId.Readable)?.let { input.folderOf(row.name, it.id) }
         }
